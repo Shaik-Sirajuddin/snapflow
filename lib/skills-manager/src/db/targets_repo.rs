@@ -73,7 +73,10 @@ impl TargetsRepo {
 
     #[allow(dead_code)]
     pub(crate) fn delete(conn: &Connection, target_id: &str) -> Result<(), SkillError> {
-        conn.execute("DELETE FROM skill_targets WHERE id = ?1", params![target_id])?;
+        conn.execute(
+            "DELETE FROM skill_targets WHERE id = ?1",
+            params![target_id],
+        )?;
         Ok(())
     }
 

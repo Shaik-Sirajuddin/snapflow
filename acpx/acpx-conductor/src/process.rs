@@ -73,20 +73,21 @@ async fn warm_npx_cache_if_needed(spec: &SpawnSpec) {
     );
     {
         let warmed = WARMED.get_or_init(Default::default);
-        if !warmed.lock().expect("warmed set poisoned").insert(key.clone()) {
+        if !warmed
+            .lock()
+            .expect("warmed set poisoned")
+            .insert(key.clone())
+        {
             return;
         }
     }
 
-    let lock_path = std::env::temp_dir().join(format!(
-        "acpx-npx-warm-{:016x}.lock",
-        {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            hasher.finish()
-        }
-    ));
+    let lock_path = std::env::temp_dir().join(format!("acpx-npx-warm-{:016x}.lock", {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }));
     let program = spec.program.clone();
     let args = spec.args.clone();
     let env = spec.env.clone();
@@ -120,8 +121,7 @@ async fn warm_npx_cache_if_needed(spec: &SpawnSpec) {
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::var_os("npm_config_cache").map(Into::into))
             .unwrap_or_else(|| {
-                std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                    .join(".npm")
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".npm")
             })
             .join("_npx");
         if let Ok(entries) = std::fs::read_dir(&npx_cache) {
@@ -340,7 +340,8 @@ impl BackendProcess {
             .take()
             .expect("start_demux called twice, or before the reader was ever set");
         let pending = Arc::new(crate::demux::PendingRequests::new());
-        let (unmatched_tx, unmatched_rx) = mpsc::channel(crate::demux::UNMATCHED_FRAME_QUEUE_CAPACITY);
+        let (unmatched_tx, unmatched_rx) =
+            mpsc::channel(crate::demux::UNMATCHED_FRAME_QUEUE_CAPACITY);
         crate::demux::spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
         self.pending = Some(pending);
         unmatched_rx

@@ -62,8 +62,8 @@ fn panel_rust_translated_codes() -> BTreeSet<String> {
 
 #[test]
 fn every_qt_selectable_language_has_a_panel_rust_translation_stub() {
-    let mainwindow_cpp_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../shotcut/src/mainwindow.cpp");
+    let mainwindow_cpp_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../shotcut/src/mainwindow.cpp");
     let Ok(mainwindow_cpp) = std::fs::read_to_string(&mainwindow_cpp_path) else {
         eprintln!(
             "language_coverage_test: skipping -- {} not found (shotcut submodule not \

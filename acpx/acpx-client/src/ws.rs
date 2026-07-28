@@ -64,9 +64,7 @@ pub struct SessionSubscription {
 }
 
 impl SessionSubscription {
-    pub async fn recv(
-        &mut self,
-    ) -> Result<GatewayNotification, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<GatewayNotification, broadcast::error::RecvError> {
         self.receiver.recv().await
     }
 
@@ -205,7 +203,10 @@ impl GatewayWsClient {
         // future first means a `notify_waiters()` from this point
         // onward is guaranteed to be observed by this specific await.
         let notified = self.disconnected.notified();
-        if self.is_disconnected.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .is_disconnected
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
         notified.await;
@@ -439,7 +440,9 @@ mod tests {
             }
         });
 
-        let client = GatewayWsClient::connect(&format!("http://{address}")).await.unwrap();
+        let client = GatewayWsClient::connect(&format!("http://{address}"))
+            .await
+            .unwrap();
         let mut session_two = client.subscribe_session("session-2");
         let mut session_three = client.subscribe_session("session-3");
         client
@@ -460,18 +463,16 @@ mod tests {
         assert_eq!(three["params"]["sessionId"], "session-3");
         assert_eq!(three["params"]["update"]["text"], "three");
 
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            session_two.recv()
-        )
-        .await
-        .is_err());
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            session_three.recv()
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), session_two.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), session_three.recv())
+                .await
+                .is_err()
+        );
         server.await.expect("test websocket server");
     }
 }

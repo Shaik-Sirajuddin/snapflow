@@ -26,7 +26,8 @@ pub(crate) fn hash_dir(dir: &Path) -> Result<String, SkillError> {
     for rel in relative_paths {
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
-        let contents = std::fs::read(dir.join(&rel)).map_err(|e| SkillError::io(dir.join(&rel), e))?;
+        let contents =
+            std::fs::read(dir.join(&rel)).map_err(|e| SkillError::io(dir.join(&rel), e))?;
         hasher.update(&contents);
         hasher.update(b"\0");
     }

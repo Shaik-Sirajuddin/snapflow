@@ -18,11 +18,11 @@
 //!   prompt turn would have produced (a stand-in for "replay history").
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CloseSessionRequest,
-    CloseSessionResponse, ContentBlock, ContentChunk, CancelNotification, DeleteSessionRequest,
+    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, DeleteSessionRequest,
     DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
-    NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptResponse,
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
     ResumeSessionRequest, ResumeSessionResponse, SessionId, SessionInfo, SessionInfoUpdate,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
     ToolCallUpdate, ToolCallUpdateFields,
@@ -31,8 +31,8 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -70,7 +70,10 @@ fn persona_prefix() -> String {
 /// advertises no commands at all, matching `persona_prefix`'s own
 /// "direct, non-gateway dev path stays unchanged" convention.
 fn persona_commands() -> Vec<AvailableCommand> {
-    match std::env::var("RUI_MOCK_AGENT_PERSONA").unwrap_or_default().as_str() {
+    match std::env::var("RUI_MOCK_AGENT_PERSONA")
+        .unwrap_or_default()
+        .as_str()
+    {
         "codex" => vec![
             AvailableCommand::new("codex_plan", "Draft an execution plan (codex persona)"),
             AvailableCommand::new("codex_review", "Review a diff (codex persona)"),
@@ -137,7 +140,9 @@ fn with_sessions<T>(f: impl FnOnce(&mut HashMap<String, SessionState>) -> T) -> 
 static CANCEL_NOTIFY: Mutex<Option<HashMap<String, Arc<Notify>>>> = Mutex::new(None);
 
 fn cancel_notify_for(session_id: &str) -> Arc<Notify> {
-    let mut guard = CANCEL_NOTIFY.lock().expect("mock-agent cancel map poisoned");
+    let mut guard = CANCEL_NOTIFY
+        .lock()
+        .expect("mock-agent cancel map poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
     map.entry(session_id.to_string())
         .or_insert_with(|| Arc::new(Notify::new()))
@@ -408,12 +413,12 @@ async fn main() -> Result<()> {
                         );
                         let _ = connection_for_wait.send_notification(SessionNotification::new(
                             session_id_for_wait.clone(),
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                                TextContent::new(format!(
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(format!(
                                     "{}permission decision: {chosen}",
                                     persona_prefix()
-                                )),
-                            ))),
+                                ))),
+                            )),
                         ));
                         let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                     });
@@ -486,10 +491,10 @@ async fn main() -> Result<()> {
                         agent_client_protocol::util::internal_error("unknown session id"),
                     );
                 }
-               responder.respond(ResumeSessionResponse::new())
-           },
-           agent_client_protocol::on_receive_request!(),
-       )
+                responder.respond(ResumeSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_request(
             async move |request: CloseSessionRequest, responder, _connection| {
                 // Real, stable v1 ACP `session/close` -- Coverage Matrix

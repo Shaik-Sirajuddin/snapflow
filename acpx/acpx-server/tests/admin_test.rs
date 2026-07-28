@@ -449,7 +449,10 @@ async fn disabling_an_agent_over_the_real_admin_http_blocks_a_real_session_new()
     .expect("write stand-in backend script");
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
+        .env(
+            "ACPX_DEFAULT_ACP_COMMAND",
+            format!("sh {}", script_path.display()),
+        )
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")
@@ -568,7 +571,10 @@ async fn closing_all_sessions_over_the_real_admin_http_leaves_the_tenant_count_a
     .expect("write stand-in backend script");
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
+        .env(
+            "ACPX_DEFAULT_ACP_COMMAND",
+            format!("sh {}", script_path.display()),
+        )
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")

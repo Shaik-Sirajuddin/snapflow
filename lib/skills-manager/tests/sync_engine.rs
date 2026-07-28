@@ -69,7 +69,10 @@ fn deleting_target_and_resyncing_self_heals() {
 
     let results = manager.sync_all("codex-acp").unwrap();
     assert_eq!(results[0].status, TargetStatus::Linked);
-    assert!(fs::symlink_metadata(&target_path).unwrap().file_type().is_symlink());
+    assert!(fs::symlink_metadata(&target_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 #[test]

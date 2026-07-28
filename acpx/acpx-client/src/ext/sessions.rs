@@ -148,7 +148,10 @@ mod tests {
             "missing agentId on the wire must not drop every entry"
         );
         assert_eq!(sessions[0].session_id, "backend-native-1");
-        assert_eq!(sessions[0].agent_id, "", "unbackfilled at the parse layer -- list_for_agent backfills separately");
+        assert_eq!(
+            sessions[0].agent_id, "",
+            "unbackfilled at the parse layer -- list_for_agent backfills separately"
+        );
         assert_eq!(sessions[1].session_id, "backend-native-2");
     }
 }

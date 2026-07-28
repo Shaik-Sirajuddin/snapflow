@@ -57,7 +57,9 @@ async fn agents_list_reports_the_big_three_from_the_fallback_registry() {
 
 #[tokio::test]
 async fn agents_status_for_known_npx_agent_is_not_installed_without_ready_marker() {
-    let _guard = install_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = install_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _home = TempHome::new();
     let mut router = Router::new("codex-acp");
     let request = json!({
@@ -73,7 +75,9 @@ async fn agents_status_for_known_npx_agent_is_not_installed_without_ready_marker
 
 #[tokio::test]
 async fn agents_install_then_status_is_installed_without_restart() {
-    let _guard = install_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = install_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _home = TempHome::new();
 
     let mut router = Router::new("codex-acp");
@@ -118,7 +122,9 @@ async fn agents_status_for_unknown_agent_id_errors() {
 
 #[tokio::test]
 async fn agents_install_for_npx_agent_succeeds_when_node_npm_present() {
-    let _guard = install_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = install_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _home = TempHome::new();
     let mut router = Router::new("codex-acp");
     let request = json!({
@@ -154,7 +160,9 @@ async fn dispatch_shared_agents_install_matches_direct_dispatch_shape() {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    let _guard = install_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = install_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _home = TempHome::new();
     let router = Arc::new(Mutex::new(Router::new("codex-acp")));
     let request = json!({
@@ -168,12 +176,10 @@ async fn dispatch_shared_agents_install_matches_direct_dispatch_shape() {
         .expect("dispatch_shared agents/install");
     assert_eq!(response["result"]["id"], json!("codex-acp"));
     assert!(response["result"]["outcome"].is_string());
-    assert!(
-        response["result"]["outcome"]
-            .as_str()
-            .unwrap_or("")
-            .contains("PackageReady")
-    );
+    assert!(response["result"]["outcome"]
+        .as_str()
+        .unwrap_or("")
+        .contains("PackageReady"));
 }
 
 /// Same shared path, unknown agent id -- must still error exactly like

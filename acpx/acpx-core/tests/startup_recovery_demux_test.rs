@@ -80,8 +80,10 @@ async fn wait_for_session_row(store: &PersistenceStore, gateway_id: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_batch_recovery_works_against_a_backend_that_already_has_demux_active() {
     let store = PersistenceStore::open_in_memory().expect("open in-memory store");
-    let counter_file =
-        std::env::temp_dir().join(format!("acpx-startup-recovery-demux-{}", uuid::Uuid::new_v4()));
+    let counter_file = std::env::temp_dir().join(format!(
+        "acpx-startup-recovery-demux-{}",
+        uuid::Uuid::new_v4()
+    ));
 
     // Session A is created and durably persisted (`recovery_method:
     // Load`) on one router instance ...
@@ -123,7 +125,10 @@ async fn startup_batch_recovery_works_against_a_backend_that_already_has_demux_a
     .await
     .expect("must not hang")
     .expect("recovery must not error");
-    assert_eq!(report.restored, 1, "must not panic once demux is already active");
+    assert_eq!(
+        report.restored, 1,
+        "must not panic once demux is already active"
+    );
     assert_eq!(report.failed, 0);
 
     let _ = tokio::fs::remove_file(&counter_file).await;

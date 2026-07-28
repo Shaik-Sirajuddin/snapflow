@@ -71,7 +71,13 @@ impl GatewayProcess {
                 .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
-        register_stand_in_backend(admin_port, &admin_token, "mcp-agents-test-agent", &script_path).await;
+        register_stand_in_backend(
+            admin_port,
+            &admin_token,
+            "mcp-agents-test-agent",
+            &script_path,
+        )
+        .await;
         GatewayProcess { child, base_url }
     }
 }
@@ -134,7 +140,10 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
 
     // Starts empty -- no MCP servers registered yet on a fresh gateway.
     let initial = handle.list_mcp_servers().await.expect("list_mcp_servers");
-    assert!(initial.is_empty(), "expected no servers yet, got {initial:?}");
+    assert!(
+        initial.is_empty(),
+        "expected no servers yet, got {initial:?}"
+    );
 
     let created = handle
         .create_mcp_server(serde_json::json!({
@@ -159,7 +168,8 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
     let after_update = handle.list_mcp_servers().await.expect("list_mcp_servers");
     assert_eq!(after_update.len(), 1);
     assert_eq!(
-        after_update[0].command.as_deref(), Some("mcp-central-fs-v2"),
+        after_update[0].command.as_deref(),
+        Some("mcp-central-fs-v2"),
         "expected update to have replaced the entry, not appended a second one"
     );
 

@@ -34,9 +34,7 @@ pub enum InstallError {
         agent_id: String,
         method: &'static str,
     },
-    #[error(
-        "failed to pre-fetch {method} package `{package}` for agent `{agent_id}`: {detail}"
-    )]
+    #[error("failed to pre-fetch {method} package `{package}` for agent `{agent_id}`: {detail}")]
     PackageFetchFailed {
         agent_id: String,
         method: &'static str,
@@ -164,10 +162,7 @@ pub fn write_ready_marker(
     Ok(path)
 }
 
-async fn install_npx(
-    agent: &Agent,
-    adapters_root: &Path,
-) -> Result<InstallOutcome, InstallError> {
+async fn install_npx(agent: &Agent, adapters_root: &Path) -> Result<InstallOutcome, InstallError> {
     check_runtime("node", agent, "npx").await?;
     check_runtime("npm", agent, "npx").await?;
     let package = agent
@@ -185,10 +180,7 @@ async fn install_npx(
     })
 }
 
-async fn install_uvx(
-    agent: &Agent,
-    adapters_root: &Path,
-) -> Result<InstallOutcome, InstallError> {
+async fn install_uvx(agent: &Agent, adapters_root: &Path) -> Result<InstallOutcome, InstallError> {
     check_runtime("uv", agent, "uvx").await?;
     let package = agent
         .distribution
@@ -224,8 +216,7 @@ async fn prefetch_npx_package(
     let package_owned = package.to_string();
     let agent_id = agent.id.clone();
     let prefix = adapters_root.join(&agent.id);
-    std::fs::create_dir_all(&prefix)
-        .map_err(|e| InstallError::CreateDir(prefix.clone(), e))?;
+    std::fs::create_dir_all(&prefix).map_err(|e| InstallError::CreateDir(prefix.clone(), e))?;
     let npm_bin = resolve_npm_bin();
     // npm is typically a #!/usr/bin/env node script — ensure the same
     // prefix's bin/ is first on PATH so we never mix global node + bundled npm.
@@ -248,9 +239,7 @@ async fn prefetch_npx_package(
         if let Some(p) = path_for_npm {
             cmd.env("PATH", p);
         }
-        cmd.status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        cmd.status().map(|status| status.success()).unwrap_or(false)
     });
     // Nested Result: timeout Elapsed vs join/panic vs exit status — all
     // collapse to PackageFetchFailed (operator re-runs install; no retry
@@ -266,8 +255,7 @@ async fn prefetch_npx_package(
             agent_id,
             method: "npx",
             package: package.to_string(),
-            detail: "npm install --prefix <adapters/id> <package> failed or timed out"
-                .to_string(),
+            detail: "npm install --prefix <adapters/id> <package> failed or timed out".to_string(),
         })
     }
 }
@@ -375,9 +363,7 @@ async fn check_runtime(
         if let Some(p) = path_for_bin {
             cmd.env("PATH", p);
         }
-        cmd.status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        cmd.status().map(|status| status.success()).unwrap_or(false)
     });
     let ok = match tokio::time::timeout(RUNTIME_PROBE_TIMEOUT, probe).await {
         Ok(Ok(success)) => success,

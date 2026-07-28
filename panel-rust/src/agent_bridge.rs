@@ -70,8 +70,8 @@ use crate::protocol_types::{
     AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
     TerminalCreatedEvent, TerminalOutputEvent,
 };
-use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -407,7 +407,8 @@ pub struct AgentBridge {
     // snapshotd address changed, ...) triggers `set_mcp_servers` +
     // `refresh_key`/`refresh_all`, while an unchanged value is a no-op
     // (never refreshes/drops warm sessions needlessly).
-    project_pools: Arc<Mutex<std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>>>,
+    project_pools:
+        Arc<Mutex<std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>>>,
     /// Background-filled gateway catalog (profiles/mcp/agents/sessions).
     /// Frame poll clones this with `try_lock` only — never waits on the
     /// background publisher and never performs RPC on the UI thread.
@@ -470,8 +471,7 @@ pub struct AgentBridge {
 /// strong reference here lets the C++ project switch recreate the panel's
 /// project-local bridge without tearing down the multiplexed ACPX connection
 /// that can still serve background sessions from another project.
-fn shared_gateway_cache(
-) -> &'static Mutex<HashMap<String, Arc<acpx_client::Gateway>>> {
+fn shared_gateway_cache() -> &'static Mutex<HashMap<String, Arc<acpx_client::Gateway>>> {
     static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Arc<acpx_client::Gateway>>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -519,7 +519,11 @@ async fn open_session_maybe_profiled(
 /// own doc comment on why this is a full rebuild rather than an
 /// incremental merge.
 fn refresh_transcript(slot: &ThreadSlot) {
-    let history = slot.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let history = slot
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let rebuilt = crate::conversation::rebuild_from_chat_messages(&slot.thread_id, &history);
     *slot.transcript.lock().unwrap_or_else(|e| e.into_inner()) = rebuilt;
 }
@@ -660,10 +664,7 @@ fn evict_exited_terminals_over_cap_in(
 fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
     match ev {
         AgentEvent::SessionModes(modes) => {
-            *slot
-                .session_modes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(modes.clone());
+            *slot.session_modes.lock().unwrap_or_else(|e| e.into_inner()) = Some(modes.clone());
         }
         AgentEvent::CurrentModeChanged(mode_id) => {
             if let Some(modes) = slot
@@ -699,10 +700,7 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
             // it" apart -- clearing a live title on an ambiguous signal
             // would be worse than leaving a stale one showing.
             if let Some(title) = title {
-                *slot
-                    .session_title
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(title.clone());
+                *slot.session_title.lock().unwrap_or_else(|e| e.into_inner()) = Some(title.clone());
             }
         }
         _ => {}
@@ -1230,8 +1228,7 @@ fn snapflowd_mcp_servers_entry(
 static SNAPSHOTD_MCP_STATUS: Mutex<Option<String>> = Mutex::new(None);
 static SNAPSHOTD_WATCHER_STARTED: std::sync::Once = std::sync::Once::new();
 
-const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
+const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn snapshotd_control_socket_path() -> PathBuf {
     admin_token_dir().join("control.sock")
@@ -2238,7 +2235,12 @@ fn login_shell_path_entries() -> Vec<String> {
         .output();
     match output {
         Ok(out) if out.status.success() => String::from_utf8(out.stdout)
-            .map(|s| s.split(':').map(str::to_owned).filter(|s| !s.is_empty()).collect())
+            .map(|s| {
+                s.split(':')
+                    .map(str::to_owned)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default(),
         _ => Vec::new(),
     }
@@ -2328,7 +2330,8 @@ fn cwd_for_session(
 ) -> PathBuf {
     thread_project_path
         .and_then(|path| {
-            let identity = crate::model::ProjectIdentity::Saved(path.to_string_lossy().into_owned());
+            let identity =
+                crate::model::ProjectIdentity::Saved(path.to_string_lossy().into_owned());
             crate::project_store::project_store_dir(&identity, &resolve_cache_dir())
         })
         .or_else(|| {
@@ -2358,15 +2361,16 @@ fn thread_project_dir(
 ) -> Option<PathBuf> {
     thread_project_path
         .and_then(|path| {
-            let identity = crate::model::ProjectIdentity::Saved(path.to_string_lossy().into_owned());
+            let identity =
+                crate::model::ProjectIdentity::Saved(path.to_string_lossy().into_owned());
             crate::project_store::project_store_dir(&identity, &resolve_cache_dir())
         })
         .or_else(|| {
-        session_cwd_override
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    })
+            session_cwd_override
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
 }
 
 fn replay_matches_cached_position(
@@ -2577,7 +2581,8 @@ fn spawn_background_attachment(
     // site risked three different answers for one thread (PISO-4). See
     // `thread_project_dir`'s own doc comment for the fallback shape.
     let slot_project_path = slot.project_path_snapshot();
-    let thread_project_dir = thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
+    let thread_project_dir =
+        thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
     // `snapflowd_mcp_servers_entry` turns `thread_project_dir` into the
     // skills MCP server's `--project-dir <parent of the project file>`
     // argument (see `snapflowd_mcp_servers_entry_adds_project_dir_from_
@@ -3270,9 +3275,11 @@ impl AgentBridge {
     /// NOT retroactively move already-open sessions -- ACP has no
     /// "change an existing session's cwd" operation.
     pub fn set_active_project_path(&self, path: Option<PathBuf>) {
-        let identity = path.as_ref().map_or(crate::model::ProjectIdentity::None, |raw| {
-            crate::model::ProjectIdentity::Saved(raw.to_string_lossy().into_owned())
-        });
+        let identity = path
+            .as_ref()
+            .map_or(crate::model::ProjectIdentity::None, |raw| {
+                crate::model::ProjectIdentity::Saved(raw.to_string_lossy().into_owned())
+            });
         self.set_active_project_identity(&identity);
     }
 
@@ -3328,10 +3335,7 @@ impl AgentBridge {
         let old_path = std::path::Path::new(old);
         let new_path = PathBuf::from(new);
         for slot in &self.slots {
-            let mut guard = slot
-                .project_path
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = slot.project_path.lock().unwrap_or_else(|e| e.into_inner());
             if guard.as_deref() == Some(old_path) {
                 *guard = Some(new_path.clone());
             }
@@ -3424,7 +3428,8 @@ impl AgentBridge {
         // the real ACP `cwd` this thread will attach with, so `pool_for`
         // uses the same resolution `cwd_for_session` (below, at attach
         // time) will use -- computed here, once, so both agree.
-        let pool_cwd = cwd_for_session(project_path_for_slot.as_deref(), &self.session_cwd_override);
+        let pool_cwd =
+            cwd_for_session(project_path_for_slot.as_deref(), &self.session_cwd_override);
         let mcp_servers = snapflowd_mcp_servers_entry(
             thread_project_dir(project_path_for_slot.as_deref(), &self.session_cwd_override)
                 .as_deref(),
@@ -3563,7 +3568,10 @@ impl AgentBridge {
     /// rather than an index-based guess. A bridge that started with zero
     /// threads has no such default; [`NO_PROVIDER_REQUESTED_FALLBACK`]
     /// is the one explicit, documented last resort for that case.
-    fn resolve_provider_for(&mut self, preferred_provider: Option<&str>) -> Result<String, BridgeError> {
+    fn resolve_provider_for(
+        &mut self,
+        preferred_provider: Option<&str>,
+    ) -> Result<String, BridgeError> {
         let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
             Some(requested) => requested.to_string(),
             None => self
@@ -3859,7 +3867,8 @@ impl AgentBridge {
         // re-read of the global that could have moved since.
         let slot_project_path = slot.project_path_snapshot();
         let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
-        let project_dir = thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
+        let project_dir =
+            thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
         let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), provider);
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
@@ -4428,15 +4437,17 @@ impl AgentBridge {
         &self,
         stale_fallback: crate::msg::SettingsGatewaySnapshot,
     ) -> crate::msg::SettingsGatewaySnapshot {
-        self.gateway_catalog.try_lock().ok().map(|cache| {
-            crate::msg::SettingsGatewaySnapshot {
+        self.gateway_catalog
+            .try_lock()
+            .ok()
+            .map(|cache| crate::msg::SettingsGatewaySnapshot {
                 profiles: cache.profiles.clone(),
                 mcp_servers: cache.mcp_servers.clone(),
                 agents: cache.agents.clone(),
                 recoverable_sessions: cache.recoverable_sessions.clone(),
                 recovery_provider: cache.recovery_provider.clone(),
-            }
-        }).unwrap_or(stale_fallback)
+            })
+            .unwrap_or(stale_fallback)
     }
 
     /// Whether the catalog has never been successfully filled (cold start).
@@ -4467,10 +4478,7 @@ impl AgentBridge {
                 }
             }
         }
-        if self
-            .gateway_catalog_refreshing
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.gateway_catalog_refreshing.swap(true, Ordering::SeqCst) {
             return;
         }
         let Some(slot) = self.slots.get(idx) else {
@@ -4498,8 +4506,7 @@ impl AgentBridge {
             let mcp_servers = handle.list_mcp_servers().await.unwrap_or_default();
             let mut agents = handle.list_agents().await.unwrap_or_default();
             if let Some((admin_url, admin_token)) = admin_creds {
-                let client =
-                    acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+                let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
                 if let Ok(entries) = client.list_agents().await {
                     let enablement: std::collections::HashMap<String, bool> = entries
                         .into_iter()
@@ -4744,11 +4751,7 @@ impl AgentBridge {
     pub fn has_older_page(&self, idx: usize) -> bool {
         self.slots
             .get(idx)
-            .map(|s| {
-                *s.older_available
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-            })
+            .map(|s| *s.older_available.lock().unwrap_or_else(|e| e.into_inner()))
             .unwrap_or(false)
     }
 
@@ -5409,8 +5412,7 @@ mod tests {
     #[test]
     fn cwd_for_session_falls_back_to_the_process_cwd_when_nothing_is_known() {
         let session_cwd_override: Mutex<Option<PathBuf>> = Mutex::new(None);
-        let expected =
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let expected = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         assert_eq!(cwd_for_session(None, &session_cwd_override), expected);
     }
 
@@ -5425,8 +5427,7 @@ mod tests {
     /// global end to end through that real MCP-entry builder, not just at
     /// the resolver in isolation.
     #[test]
-    fn thread_project_dir_feeds_the_threads_own_project_into_the_mcp_project_dir_not_the_globals(
-    ) {
+    fn thread_project_dir_feeds_the_threads_own_project_into_the_mcp_project_dir_not_the_globals() {
         let session_cwd_override: Mutex<Option<PathBuf>> =
             Mutex::new(Some(PathBuf::from("/projects/b/timeline.mlt")));
         let thread_a_project = PathBuf::from("/projects/a/timeline.mlt");
@@ -5607,7 +5608,11 @@ mod tests {
             .cloned()
             .enumerate()
             .map(|(i, id)| {
-                let buffer = if i < 2 { exited_buffer() } else { running_buffer() };
+                let buffer = if i < 2 {
+                    exited_buffer()
+                } else {
+                    running_buffer()
+                };
                 (id, buffer)
             })
             .collect();
@@ -6050,11 +6055,8 @@ mod tests {
     fn close_thread_background_flag_reaches_the_real_acpx_bg_override() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let event_log = tempfile::NamedTempFile::new().expect("event log tempfile");
-        let gateway = TestGateway::spawn_with_persona_db_and_event_log(
-            "test",
-            None,
-            event_log.path(),
-        );
+        let gateway =
+            TestGateway::spawn_with_persona_db_and_event_log("test", None, event_log.path());
         let names = ["background-thread", "normal-thread"];
         let bridge =
             bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
@@ -6249,10 +6251,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        assert!(
-            ended,
-            "real {provider}-acp turn did not finish within 60s"
-        );
+        assert!(ended, "real {provider}-acp turn did not finish within 60s");
 
         // Bridge-layer check: proves the real backend round-trip alone
         // works.
@@ -6299,7 +6298,7 @@ mod tests {
             pending_request: crate::PendingRequestItem::default(),
             terminals: vec![],
             expanded_terminal: None,
-                    open_terminals: vec![],
+            open_terminals: vec![],
             local_terminal: crate::LocalTerminalItem::default(),
             connection_status: bridge.transport_status(index),
             session_modes: bridge.session_modes(index),
@@ -6886,7 +6885,11 @@ mod tests {
 
         // Force the free/local model before prompting, same as
         // add_thread_after_empty_cold_start_reaches_a_real_codex_backend.
-        bridge.set_config_option(index, "model".to_owned(), serde_json::json!("ollama/qwen2.5:0.5b"));
+        bridge.set_config_option(
+            index,
+            "model".to_owned(),
+            serde_json::json!("ollama/qwen2.5:0.5b"),
+        );
         let config_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < config_deadline
             && !bridge
@@ -6989,8 +6992,7 @@ mod tests {
     #[test]
     fn archive_thread_on_out_of_range_index_returns_false() {
         let gateway = TestGateway::spawn();
-        let bridge =
-            bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
+        let bridge = bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
         assert!(!bridge.archive_thread(5));
         assert!(!bridge.thread_archived(5));
     }
@@ -7017,8 +7019,7 @@ mod tests {
         std::env::remove_var("RUI_ACPX_ADMIN_TOKEN");
 
         let gateway = TestGateway::spawn();
-        let bridge =
-            bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
+        let bridge = bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
         let result = bridge.set_agent_enabled("codex-acp", false);
 
         match prior_home {
@@ -7034,7 +7035,10 @@ mod tests {
             None => std::env::remove_var("RUI_ACPX_ADMIN_TOKEN"),
         }
 
-        assert!(!result, "expected false (no admin plane reachable), not a panic");
+        assert!(
+            !result,
+            "expected false (no admin plane reachable), not a panic"
+        );
     }
 
     #[test]
@@ -9459,7 +9463,8 @@ done
     /// all -- snapshotd's entry (if a live daemon answers) is unaffected,
     /// this is skills-specific.
     #[test]
-    fn snapflowd_mcp_servers_entry_omits_the_skills_server_for_live_verified_filesystem_providers() {
+    fn snapflowd_mcp_servers_entry_omits_the_skills_server_for_live_verified_filesystem_providers()
+    {
         for provider in ["codex", "codex-acp"] {
             let entries = snapflowd_mcp_servers_entry(None, provider);
             assert!(
@@ -9496,7 +9501,11 @@ done
         let addr = "127.0.0.1:43210";
         let entries = snapshotd_mcp_server_entry_for_addr(Some(addr));
 
-        assert_eq!(entries.len(), 1, "a live-answering daemon must produce exactly one entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "a live-answering daemon must produce exactly one entry"
+        );
         assert_eq!(
             entries[0]["url"],
             serde_json::Value::String(format!("http://{addr}/mcp")),
@@ -9522,7 +9531,9 @@ done
             let (stream, _) = listener.accept().expect("accept control client");
             let mut reader = BufReader::new(stream.try_clone().expect("clone control stream"));
             let mut request = String::new();
-            reader.read_line(&mut request).expect("read JSON-RPC request");
+            reader
+                .read_line(&mut request)
+                .expect("read JSON-RPC request");
             let request: serde_json::Value =
                 serde_json::from_str(&request).expect("valid JSON-RPC request");
             assert_eq!(request["method"], "daemon.mcpStatus");
@@ -9587,8 +9598,7 @@ done
     fn parse_daemon_list_and_projects_threads_the_headless_flag_through() {
         let list_jsonl =
             r#"{"ID":"inst-a","ProjectID":"proj-a","Status":"ready","Headless":false}"#;
-        let projects_jsonl =
-            r#"{"ID":"proj-a","RootDir":"/p","MltFileName":"project.mlt"}"#;
+        let projects_jsonl = r#"{"ID":"proj-a","RootDir":"/p","MltFileName":"project.mlt"}"#;
         let live = parse_daemon_list_and_projects(list_jsonl, projects_jsonl);
         assert_eq!(live.len(), 1);
         assert!(
@@ -9662,7 +9672,11 @@ fn persist_thread_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot, update
     let Some(store) = store else {
         return;
     };
-    let history = slot.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let history = slot
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let session_id = slot
         .acp_session_id
         .lock()

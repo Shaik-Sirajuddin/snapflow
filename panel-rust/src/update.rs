@@ -3646,7 +3646,10 @@ mod tests {
         let mut model = Model::default();
 
         let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
-        assert!(matches!(effects.as_slice(), [Effect::NewThreadDeferred { .. }]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::NewThreadDeferred { .. }]
+        ));
         assert!(!dirty.is_empty());
         assert_eq!(model.threads.len(), 1);
 

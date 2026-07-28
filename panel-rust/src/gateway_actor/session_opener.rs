@@ -132,7 +132,11 @@ impl SessionOpener for GatewaySessionOpener {
     fn create<'a>(
         &'a self,
         key: &'a PoolKey,
-    ) -> Pin<Box<dyn Future<Output = Result<String, OpenError>> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(String, Option<serde_json::Value>), OpenError>> + Send + 'a,
+        >,
+    > {
         Box::pin(async move {
             // Cloned and the guard dropped before the call below -- a std
             // RwLock guard must never cross an `.await`.
@@ -150,13 +154,14 @@ impl SessionOpener for GatewaySessionOpener {
                 .call("session/new", params, profile_from_key(key))
                 .await
                 .map_err(classify)?;
-            value
+            let session_id = value
                 .get("sessionId")
                 .and_then(|s| s.as_str())
                 .map(str::to_string)
                 .ok_or_else(|| {
                     OpenError::retryable("session/new response had no sessionId field")
-                })
+                })?;
+            Ok((session_id, Some(value)))
         })
     }
 }
@@ -170,7 +175,8 @@ mod tests {
         assert_eq!(provider_profile_key(Some("codex")), "codex");
         assert_eq!(provider_profile_key(None), NO_PROFILE_SENTINEL);
 
-        let key_with_profile = PoolKey::new("/proj", "agent-1", provider_profile_key(Some("codex")));
+        let key_with_profile =
+            PoolKey::new("/proj", "agent-1", provider_profile_key(Some("codex")));
         assert_eq!(profile_from_key(&key_with_profile), Some("codex"));
 
         let key_without_profile = PoolKey::new("/proj", "agent-1", provider_profile_key(None));

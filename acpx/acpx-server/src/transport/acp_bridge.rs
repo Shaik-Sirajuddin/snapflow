@@ -350,8 +350,11 @@ impl BridgeRuntime {
             return;
         }
         let mut models = self.models.write().await;
-        let static_ids: HashSet<&str> =
-            static_config.models.iter().map(|model| model.id.as_str()).collect();
+        let static_ids: HashSet<&str> = static_config
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
         Self::merge_discovered_models(&mut models, &static_ids, &succeeded_agent_ids, discovered);
         drop(models);
         let mut options = self.config_options.write().await;
@@ -386,8 +389,7 @@ impl BridgeRuntime {
         discovered: Vec<BridgeModel>,
     ) {
         models.retain(|model| {
-            static_ids.contains(model.id.as_str())
-                || !succeeded_agent_ids.contains(&model.agent_id)
+            static_ids.contains(model.id.as_str()) || !succeeded_agent_ids.contains(&model.agent_id)
         });
         let mut seen: HashSet<String> = models.iter().map(|model| model.id.clone()).collect();
         models.extend(
@@ -827,10 +829,7 @@ async fn set_config_option(
         BridgeSessionState::Failed => Err(BridgeDispatchError::BindingFailed),
         BridgeSessionState::Bound => {
             let current_alias_owned;
-            let current_alias = match session
-                .selected_public_model_alias
-                .as_deref()
-            {
+            let current_alias = match session.selected_public_model_alias.as_deref() {
                 Some(alias) => alias,
                 None => {
                     current_alias_owned = runtime.effective_default_model().await;
@@ -984,7 +983,8 @@ async fn close_or_delete(
     reject_acpx_extension_except_bg(&request)?;
     let is_delete = request.get("method").and_then(Value::as_str) == Some("session/delete");
     let session_id = request_session_id(&request)?;
-    let session = resolve_or_recover_bridge_session(router, runtime, tenant_id, &session_id).await?;
+    let session =
+        resolve_or_recover_bridge_session(router, runtime, tenant_id, &session_id).await?;
     if session.state == BridgeSessionState::Unbound {
         runtime.sessions.remove(tenant_id, &session_id);
         return Ok(success(&request, json!({})));
@@ -1037,7 +1037,8 @@ async fn forward_bound(
 ) -> Result<Value, BridgeDispatchError> {
     reject_acpx_extension(&request)?;
     let session_id = request_session_id(&request)?;
-    let session = resolve_or_recover_bridge_session(router, runtime, tenant_id, &session_id).await?;
+    let session =
+        resolve_or_recover_bridge_session(router, runtime, tenant_id, &session_id).await?;
     let session = match session.state {
         BridgeSessionState::Unbound => {
             bind(router, runtime, tenant_id, &session_id, session).await?
@@ -1145,10 +1146,7 @@ async fn bind(
     }
 
     let model_alias_owned;
-    let model_alias = match session
-        .selected_public_model_alias
-        .as_deref()
-    {
+    let model_alias = match session.selected_public_model_alias.as_deref() {
         Some(alias) => alias,
         None => {
             model_alias_owned = runtime.effective_default_model().await;
@@ -1485,12 +1483,11 @@ while IFS= read -r line; do
 done
 "#;
 
-        let mut router = Router::new("stand-in-agent".to_string()).with_lifecycle_config(
-            LifecycleConfig {
+        let mut router =
+            Router::new("stand-in-agent".to_string()).with_lifecycle_config(LifecycleConfig {
                 background_mode: true,
                 ..LifecycleConfig::default()
-            },
-        );
+            });
         router.register_agent(
             "stand-in-agent",
             acpx_conductor::SpawnSpec::new(
@@ -1520,7 +1517,10 @@ done
         )
         .await
         .expect("session/new");
-        let sid = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+        let sid = new_response["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Binds for real (lazy binding happens on the first prompt).
         dispatch(
@@ -1633,8 +1633,7 @@ done
             .await
             .expect("mark the row durably closed");
 
-        let mut router =
-            Router::new("stand-in-agent".to_string()).with_persistence(store.clone());
+        let mut router = Router::new("stand-in-agent".to_string()).with_persistence(store.clone());
         router.register_agent(
             "stand-in-agent",
             acpx_conductor::SpawnSpec::new(
@@ -1714,8 +1713,7 @@ done
             .await
             .expect("seed a startup-recovery-failed but still-open session row");
 
-        let mut router =
-            Router::new("stand-in-agent".to_string()).with_persistence(store.clone());
+        let mut router = Router::new("stand-in-agent".to_string()).with_persistence(store.clone());
         router.register_agent(
             "stand-in-agent",
             acpx_conductor::SpawnSpec::new(
@@ -1762,7 +1760,10 @@ done
         assert!(
             runtime
                 .sessions
-                .get(&tenant_id, &BridgeSessionId("virtual-on-demand".to_string()))
+                .get(
+                    &tenant_id,
+                    &BridgeSessionId("virtual-on-demand".to_string())
+                )
                 .is_some(),
             "on-demand recovery must actually populate BridgeSessionStore, not just answer once"
         );
@@ -1989,7 +1990,10 @@ done
         )
         .await
         .expect("session/new");
-        let sid = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+        let sid = new_response["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // The first prompt triggers `bind()`, which claims `Binding`
         // ownership and then blocks inside `ensure_backend_initialized`
@@ -2052,10 +2056,9 @@ done
         assert!(
             matches!(
                 first_outcome,
-                Err(BridgeDispatchError::Router(RouterError::BackendHandshakeTimeout(
-                    "initialize",
-                    _
-                )))
+                Err(BridgeDispatchError::Router(
+                    RouterError::BackendHandshakeTimeout("initialize", _)
+                ))
             ),
             "expected the original call to fail with the backend's own handshake timeout, \
              got {first_outcome:?}"
@@ -2205,7 +2208,10 @@ done
             !ids.contains(&"claude/claude-fable-5[1m]".to_string()),
             "a model its agent no longer reports must be pruned, got {ids:?}"
         );
-        assert!(ids.contains(&"claude/sonnet".to_string()), "still-reported model must remain");
+        assert!(
+            ids.contains(&"claude/sonnet".to_string()),
+            "still-reported model must remain"
+        );
         assert!(
             ids.contains(&"pinned/model".to_string()),
             "a static/pinned model from a different, un-probed agent must never be pruned"

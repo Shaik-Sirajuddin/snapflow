@@ -3,8 +3,8 @@
 //! is ordinary bearer-authenticated HTTP, not an ACP JSON-RPC surface.
 
 pub mod admin;
-pub mod profiles;
 pub mod mcp_servers;
+pub mod profiles;
 pub mod prompt;
 pub mod registry;
 pub mod sessions;

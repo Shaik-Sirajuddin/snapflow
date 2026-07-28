@@ -30,10 +30,10 @@ type Project struct {
 	// asset directory (clips/audio/photos); file-type is a standalone .mlt.
 	// Authoritative value is the in-.mlt kSnapflowProjectFolder flag after
 	// open; creation-time value is the caller's request (default folder).
-	ProjectType    string    `json:"projectType"`
-	CreatedAt      time.Time `json:"createdAt"`
-	LastOpenedAt   time.Time `json:"lastOpenedAt"`
-	Status         string    `json:"status"` // "active" | "archived"
+	ProjectType  string    `json:"projectType"`
+	CreatedAt    time.Time `json:"createdAt"`
+	LastOpenedAt time.Time `json:"lastOpenedAt"`
+	Status       string    `json:"status"` // "active" | "archived"
 	// Path is RootDir for folder-type list rows, or RootDir/MltFileName for
 	// file-type; filled by list helpers (not persisted).
 	Path string `gorm:"-" json:"path"`
@@ -101,6 +101,7 @@ type ExternalInstance struct {
 	ProcessStart     string    `json:"processStart"`
 	ProjectPath      string    `json:"projectPath,omitempty"`
 	SAPSocketPath    string    `json:"sapSocketPath,omitempty"`
+	Token            string    `json:"-"`
 	CapabilitiesJSON string    `json:"capabilities,omitempty"`
 	Status           string    `json:"status"`
 	Source           string    `json:"source"`

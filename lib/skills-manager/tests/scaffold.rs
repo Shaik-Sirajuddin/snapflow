@@ -39,7 +39,10 @@ fn default_snapflow_dirs_resolves_project_and_global_scope() {
             // project's own human-readable skills directory -- otherwise
             // this crate's opaque-id-keyed copies would show up as
             // spurious entries in a caller's own directory listing.
-            assert_ne!(central_store_dir, project_root.join(".snapflow").join("skills"));
+            assert_ne!(
+                central_store_dir,
+                project_root.join(".snapflow").join("skills")
+            );
         }
         _ => panic!("expected AtPath"),
     }

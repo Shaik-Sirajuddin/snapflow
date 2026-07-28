@@ -1277,7 +1277,11 @@ mod tests {
             .list_recoverable_sessions(None)
             .await
             .expect("unbounded list");
-        assert_eq!(unbounded.len(), 2, "None must preserve the original unbounded behavior");
+        assert_eq!(
+            unbounded.len(),
+            2,
+            "None must preserve the original unbounded behavior"
+        );
 
         // Bounded to 24h: the 2-day-old row must be excluded, the
         // 5-minute-old row must still be included.

@@ -1737,8 +1737,7 @@ async fn run_thread_actor(
                     }
                 };
                 let sid = lease.session_id.clone();
-                let result: Result<AttachedSession, AcpxThreadError> = if lease.resumed_from_saved
-                {
+                let result: Result<AttachedSession, AcpxThreadError> = if lease.resumed_from_saved {
                     // Same wire behavior as `Command::ReattachSession`
                     // above (no history replay, `session/resume`) --
                     // duplicated rather than factored out because it
@@ -1909,8 +1908,7 @@ async fn run_thread_actor(
                             .and_then(|s| s.as_str())
                             .unwrap_or("end_turn")
                             .to_string();
-                        if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref())
-                        {
+                        if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref()) {
                             if let Err(pool_error) = pool.mark_turn_finished(lease).await {
                                 eprintln!(
                                     "panel-rust: pool.mark_turn_finished for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"
@@ -1921,8 +1919,7 @@ async fn run_thread_actor(
                         let _ = resp.send(Ok(()));
                     }
                     Err(e) => {
-                        if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref())
-                        {
+                        if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref()) {
                             if let Err(pool_error) = pool.mark_turn_finished(lease).await {
                                 eprintln!(
                                     "panel-rust: pool.mark_turn_finished (after prompt error) for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"

@@ -26,7 +26,9 @@ fn now_secs() -> i64 {
 /// actual filesystem swap happens after the lock is released (see
 /// `swap_central_path`).
 enum UpdateSwap {
-    Swap { old_central_path: std::path::PathBuf },
+    Swap {
+        old_central_path: std::path::PathBuf,
+    },
     Unchanged,
 }
 
@@ -320,7 +322,8 @@ impl SkillManager {
             let plain_leaf_taken = existing_targets.iter().any(|t| {
                 t.skill_id != skill_id
                     && t.target_path.parent() == Some(target_dir)
-                    && t.target_path.file_name().and_then(|n| n.to_str()) == Some(skill.name.as_str())
+                    && t.target_path.file_name().and_then(|n| n.to_str())
+                        == Some(skill.name.as_str())
             });
             let leaf = if plain_leaf_taken {
                 format!("{}__{}", skill.name, vendor_id)
@@ -481,7 +484,10 @@ mod swap_central_path_tests {
         let nonexistent_staging = dir.path().join("staging-that-does-not-exist");
 
         let result = swap_central_path(&central_path, &nonexistent_staging);
-        assert!(result.is_err(), "must report the failure, not silently succeed");
+        assert!(
+            result.is_err(),
+            "must report the failure, not silently succeed"
+        );
         assert!(
             central_path.exists(),
             "central_path must be rolled back, not left missing, after a failed swap"

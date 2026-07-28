@@ -39,6 +39,8 @@ pub struct ExternalInstanceRegistration {
     pub project_path: Option<String>,
     #[serde(rename = "sapSocketPath", skip_serializing_if = "Option::is_none")]
     pub sap_socket_path: Option<String>,
+    #[serde(rename = "sapToken", skip_serializing_if = "Option::is_none")]
+    pub sap_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Value>,
 }
@@ -114,7 +116,10 @@ impl DiscoveryEndpoint {
         use std::os::unix::net::UnixListener;
         let apps = home.join("apps");
         if let Err(error) = std::fs::create_dir_all(&apps) {
-            eprintln!("panel-rust: snapshotd discovery create_dir_all({}) failed: {error}", apps.display());
+            eprintln!(
+                "panel-rust: snapshotd discovery create_dir_all({}) failed: {error}",
+                apps.display()
+            );
             return None;
         }
         // AF_UNIX socket paths are limited to roughly 108 bytes on Linux.
@@ -128,7 +133,10 @@ impl DiscoveryEndpoint {
         let listener = match UnixListener::bind(&socket) {
             Ok(listener) => listener,
             Err(error) => {
-                eprintln!("panel-rust: snapshotd discovery bind({}) failed: {error}", socket.display());
+                eprintln!(
+                    "panel-rust: snapshotd discovery bind({}) failed: {error}",
+                    socket.display()
+                );
                 return None;
             }
         };
@@ -150,12 +158,17 @@ impl DiscoveryEndpoint {
         let descriptor_bytes = match serde_json::to_vec(&descriptor_value) {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("panel-rust: snapshotd discovery descriptor serialization failed: {error}");
+                eprintln!(
+                    "panel-rust: snapshotd discovery descriptor serialization failed: {error}"
+                );
                 return None;
             }
         };
         if let Err(error) = std::fs::write(&descriptor, descriptor_bytes) {
-            eprintln!("panel-rust: snapshotd discovery write({}) failed: {error}", descriptor.display());
+            eprintln!(
+                "panel-rust: snapshotd discovery write({}) failed: {error}",
+                descriptor.display()
+            );
             return None;
         }
         let (stop, stop_rx) = mpsc::channel();
@@ -188,6 +201,8 @@ impl DiscoveryEndpoint {
                                             "pid": std::process::id(),
                                             "processStart": process_start,
                                             "projectPath": project,
+                                            "sapSocketPath": std::env::var("SNAPSHOT_SAP_SOCKET").ok(),
+                                            "sapToken": std::env::var("SNAPSHOT_SAP_TOKEN").ok(),
                                             "challenge": challenge,
                                         }
                                     });
@@ -253,6 +268,13 @@ pub struct SnapshotdRegistration {
 
 impl SnapshotdRegistration {
     pub fn start(initial_project_path: Option<String>) -> Option<Self> {
+        // Daemon-owned Snapflow children already have authoritative
+        // process-instance rows in snapshotd. They must not also register as
+        // external GUI owners, or a cold project.open can observe two owners
+        // and fail to drain the headless child deterministically.
+        if std::env::var("SNAPSHOTD_MANAGED").ok().as_deref() == Some("1") {
+            return None;
+        }
         #[cfg(not(unix))]
         {
             let _ = initial_project_path;
@@ -271,16 +293,17 @@ impl SnapshotdRegistration {
                 })?;
             let client = SnapshotdControlClient::new(home.join("control.sock"));
             let nonce = uuid::Uuid::new_v4().to_string();
-            let discovery = match DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone()) {
-                Some(discovery) => discovery,
-                None => {
-                    eprintln!(
-                        "panel-rust: snapshotd discovery endpoint failed (home={})",
-                        home.display()
-                    );
-                    return None;
-                }
-            };
+            let discovery =
+                match DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone()) {
+                    Some(discovery) => discovery,
+                    None => {
+                        eprintln!(
+                            "panel-rust: snapshotd discovery endpoint failed (home={})",
+                            home.display()
+                        );
+                        return None;
+                    }
+                };
             let (commands, receiver) = mpsc::channel();
             let instance_id = Arc::new(Mutex::new(None));
             let project_inventory = Arc::new(Mutex::new(None));
@@ -358,7 +381,8 @@ impl SnapshotdRegistration {
                         pid: std::process::id(),
                         process_start: process_start_identity(),
                         project_path: initial_project_path.clone(),
-                        sap_socket_path: None,
+                        sap_socket_path: std::env::var("SNAPSHOT_SAP_SOCKET").ok(),
+                        sap_token: std::env::var("SNAPSHOT_SAP_TOKEN").ok(),
                         capabilities: Some(json!({"lifecycle": true, "mcpContexts": true})),
                     };
                     let mut current_project_path = initial_project_path.clone();
@@ -907,6 +931,7 @@ mod tests {
             process_start: "start".into(),
             project_path: None,
             sap_socket_path: None,
+            sap_token: None,
             capabilities: None,
         };
         let registered = client

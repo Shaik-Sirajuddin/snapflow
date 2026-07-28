@@ -108,13 +108,11 @@ impl Gateway {
     pub async fn connect(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         let http = GatewayClient::new(base_url.clone());
-        let websocket = tokio::time::timeout(
-            INITIAL_CONNECT_TIMEOUT,
-            GatewayWsClient::connect(&base_url),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
+        let websocket =
+            tokio::time::timeout(INITIAL_CONNECT_TIMEOUT, GatewayWsClient::connect(&base_url))
+                .await
+                .ok()
+                .and_then(Result::ok);
         Self {
             base_url,
             http,

@@ -7,10 +7,10 @@
 //! real binary, don't fake the boundary" testing discipline (see
 //! `panel-rust`'s own headless smoke-test methodology).
 
+use acpx_client::Gateway;
 use panel_rust::gateway_actor::{spawn_acpx_thread, spawn_acpx_thread_with_gateway};
 use panel_rust::jsonl_store::JsonlStore;
 use panel_rust::protocol_types::{AgentEvent, ChatMessage, MessageKind};
-use acpx_client::Gateway;
 use std::collections::BTreeMap;
 use std::process::Child;
 use std::sync::Arc;
@@ -19,7 +19,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 mod common;
 #[allow(unused_imports)]
-use common::{acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile, spawn_acpx_server_with_retry};
+use common::{
+    acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile,
+    spawn_acpx_server_with_retry,
+};
 
 struct GatewayProcess {
     child: Child,
@@ -179,8 +182,12 @@ async fn two_shared_gateway_actors_keep_interleaved_events_and_jsonl_isolated() 
         raw_input: None,
         raw_output: None,
     };
-    store.append("thread-one", &user_one).expect("write thread one user");
-    store.append("thread-two", &user_two).expect("write thread two user");
+    store
+        .append("thread-one", &user_one)
+        .expect("write thread one user");
+    store
+        .append("thread-two", &user_two)
+        .expect("write thread two user");
     let (send_one, send_two) = tokio::join!(
         thread_one.send_prompt("thread one only"),
         thread_two.send_prompt("thread two only"),
@@ -212,13 +219,27 @@ async fn two_shared_gateway_actors_keep_interleaved_events_and_jsonl_isolated() 
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
-    assert!(one_reply.is_some(), "thread one did not receive its own reply");
-    assert!(two_reply.is_some(), "thread two did not receive its own reply");
+    assert!(
+        one_reply.is_some(),
+        "thread one did not receive its own reply"
+    );
+    assert!(
+        two_reply.is_some(),
+        "thread two did not receive its own reply"
+    );
 
     let one = store.load("thread-one").expect("load thread one jsonl");
     let two = store.load("thread-two").expect("load thread two jsonl");
-    let one_text: String = one.messages.iter().map(|message| message.text.as_str()).collect();
-    let two_text: String = two.messages.iter().map(|message| message.text.as_str()).collect();
+    let one_text: String = one
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
+    let two_text: String = two
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
     assert!(one_text.contains("THREAD ONE ONLY"));
     assert!(!one_text.contains("THREAD TWO ONLY"));
     assert!(two_text.contains("THREAD TWO ONLY"));
@@ -447,7 +468,11 @@ async fn resume_session_retries_after_transient_gateway_errors() {
 
     let handle = spawn_acpx_thread(format!("http://127.0.0.1:{port}"));
     handle
-        .resume_session("persisted-session", std::env::current_dir().unwrap(), Vec::new())
+        .resume_session(
+            "persisted-session",
+            std::env::current_dir().unwrap(),
+            Vec::new(),
+        )
         .await
         .expect("resume_session should retry transient gateway errors");
     handle
@@ -642,8 +667,12 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
     // method-name match is unambiguous; a real regression (the relay
     // silently no-op'ing instead of reaching the backend) would leave
     // these lines entirely absent, not merely mis-attributed.
-    let close_line = events.lines().find(|line| line.contains("\"session/close\""));
-    let delete_line = events.lines().find(|line| line.contains("\"session/delete\""));
+    let close_line = events
+        .lines()
+        .find(|line| line.contains("\"session/close\""));
+    let delete_line = events
+        .lines()
+        .find(|line| line.contains("\"session/delete\""));
     assert!(
         close_line.is_some(),
         "expected a real session/close request to reach the backend for {session_id}; log:\n{events}"
@@ -732,7 +761,9 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
         let mut prompt_seen = false;
         while std::time::Instant::now() < deadline && !prompt_seen {
             let events = std::fs::read_to_string(&event_log).unwrap_or_default();
-            prompt_seen = events.lines().any(|line| line.contains("\"session/prompt\""));
+            prompt_seen = events
+                .lines()
+                .any(|line| line.contains("\"session/prompt\""));
             if !prompt_seen {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

@@ -51,7 +51,9 @@ impl GatewayProcess {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let mut child = command.spawn().expect("spawn real acpx-server binary for test");
+            let mut child = command
+                .spawn()
+                .expect("spawn real acpx-server binary for test");
 
             let deadline = std::time::Instant::now() + Duration::from_millis(3000);
             let mut reachable = false;

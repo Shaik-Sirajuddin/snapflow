@@ -33,8 +33,10 @@ type Descriptor struct {
 
 type Candidate struct {
 	Descriptor
-	ProjectPath string `json:"projectPath,omitempty"`
-	Verified    bool   `json:"verified"`
+	ProjectPath   string `json:"projectPath,omitempty"`
+	SAPSocketPath string `json:"sapSocketPath,omitempty"`
+	SAPToken      string `json:"sapToken,omitempty"`
+	Verified      bool   `json:"verified"`
 }
 
 type pingRequest struct {
@@ -50,6 +52,8 @@ type pingResponse struct {
 		PID           int    `json:"pid"`
 		ProcessStart  string `json:"processStart"`
 		ProjectPath   string `json:"projectPath"`
+		SAPSocketPath string `json:"sapSocketPath"`
+		SAPToken      string `json:"sapToken"`
 		Challenge     string `json:"challenge"`
 	} `json:"result"`
 }
@@ -86,7 +90,7 @@ func ScanAndPing(runtimeDir string) ([]Candidate, error) {
 		if err != nil || response.InstanceNonce != descriptor.InstanceNonce || response.PID != descriptor.PID || response.ProcessStart != descriptor.ProcessStart || response.Challenge != challenge {
 			continue
 		}
-		candidates = append(candidates, Candidate{Descriptor: descriptor, ProjectPath: response.ProjectPath, Verified: true})
+		candidates = append(candidates, Candidate{Descriptor: descriptor, ProjectPath: response.ProjectPath, SAPSocketPath: response.SAPSocketPath, SAPToken: response.SAPToken, Verified: true})
 	}
 	return candidates, nil
 }
@@ -121,7 +125,7 @@ func ping(descriptor Descriptor, challenge string) (pingResponseResult, error) {
 	if response.Result == nil {
 		return pingResponseResult{}, fmt.Errorf("discovery response has no result")
 	}
-	return pingResponseResult{InstanceNonce: response.Result.InstanceNonce, PID: response.Result.PID, ProcessStart: response.Result.ProcessStart, ProjectPath: response.Result.ProjectPath, Challenge: response.Result.Challenge}, nil
+	return pingResponseResult{InstanceNonce: response.Result.InstanceNonce, PID: response.Result.PID, ProcessStart: response.Result.ProcessStart, ProjectPath: response.Result.ProjectPath, SAPSocketPath: response.Result.SAPSocketPath, SAPToken: response.Result.SAPToken, Challenge: response.Result.Challenge}, nil
 }
 
 type pingResponseResult struct {
@@ -129,6 +133,8 @@ type pingResponseResult struct {
 	PID           int
 	ProcessStart  string
 	ProjectPath   string
+	SAPSocketPath string
+	SAPToken      string
 	Challenge     string
 }
 

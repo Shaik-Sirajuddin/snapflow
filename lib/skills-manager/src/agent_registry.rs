@@ -136,7 +136,10 @@ mod tests {
             None,
             "gemini has no researched directory convention -- must be None, not a guess"
         );
-        assert_eq!(native_target_dir("totally-unknown-agent", Some(project_root)), None);
+        assert_eq!(
+            native_target_dir("totally-unknown-agent", Some(project_root)),
+            None
+        );
     }
 
     #[test]

@@ -406,7 +406,7 @@ impl ServerConfig {
         let session_process_isolation = std::env::var("ACPX_SESSION_PROCESS_ISOLATION")
             .map(|value| value == "1")
             .unwrap_or(false);
-    let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
+        let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
             .map(|value| value == "1")
             .unwrap_or(true);
         let bridge = acpx_bridge::BridgeConfig::from_env()
@@ -438,7 +438,6 @@ impl ServerConfig {
         }
     }
 }
-
 
 /// PROF-14: when neither `ACPX_DEFAULT_ACP_COMMAND` nor legacy
 /// `ACPX_BACKEND_CMD` is set, pick a native-mode backend spawn from the
@@ -538,7 +537,11 @@ fn read_codex_api_key_from_auth_file() -> Option<String> {
     let path = std::env::var_os("ACPX_CODEX_AUTH_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex").join("auth.json"))
+            std::env::var_os("HOME").map(|home| {
+                std::path::PathBuf::from(home)
+                    .join(".codex")
+                    .join("auth.json")
+            })
         })?;
     let contents = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
@@ -618,7 +621,11 @@ mod tests {
                 .iter()
                 .map(|&key| (key, std::env::var(key).ok()))
                 .collect();
-            Self { _lock: lock, vars, temp_dir }
+            Self {
+                _lock: lock,
+                vars,
+                temp_dir,
+            }
         }
     }
 
@@ -677,8 +684,7 @@ mod tests {
         std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-test-key"}"#)
             .expect("write temp auth file");
 
-        let _guard =
-            EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
             std::env::remove_var("CODEX_API_KEY");
@@ -686,7 +692,10 @@ mod tests {
 
         let result = default_codex_native_auth_method(
             "npx",
-            &["-y".to_string(), "@agentclientprotocol/codex-acp@1.1.2".to_string()],
+            &[
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+            ],
         );
 
         assert_eq!(result.as_deref(), Some("api-key"));

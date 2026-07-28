@@ -16,7 +16,9 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), SkillErro
         let entry = entry.map_err(|e| SkillError::io(src, e))?;
         let entry_path = entry.path();
         let dest_path = dst.join(entry.file_name());
-        let file_type = entry.file_type().map_err(|e| SkillError::io(&entry_path, e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| SkillError::io(&entry_path, e))?;
         if file_type.is_dir() {
             copy_dir_recursive(&entry_path, &dest_path)?;
         } else if file_type.is_file() {

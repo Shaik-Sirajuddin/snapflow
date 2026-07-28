@@ -168,13 +168,16 @@ async fn real_binary_applies_a_provisioning_file_at_startup() {
     );
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .env("ACPX_CONFIG_FILE", config_path.display().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_CONFIG_FILE", config_path.display().to_string())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let child = cmd.spawn().expect("spawn real acpx-server binary");
     let mut guard = ServerGuard {
         child,
@@ -257,13 +260,16 @@ async fn real_binary_refuses_to_start_with_an_invalid_provisioning_file() {
     );
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .env("ACPX_CONFIG_FILE", config_path.display().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_CONFIG_FILE", config_path.display().to_string())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let mut child = cmd.spawn().expect("spawn real acpx-server binary");
 
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())

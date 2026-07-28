@@ -96,6 +96,118 @@ func TestGUIMatrix_GUIRegistrationPreventsHeadlessDuplicateOnProjectOpen(t *test
 	}
 }
 
+func TestGUIMatrix_MCPOpenPromotesDiscoveryBeforeHeadlessLaunch(t *testing.T) {
+	// Cold-start race: panel-rust has published its discovery descriptor, but
+	// its asynchronous control registration has not reached snapshotd yet.
+	// project.open must promote that descriptor before Proc.Launch is allowed.
+	d := newTestDaemon(t, buildFixture(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	projectDir := filepath.Join(t.TempDir(), "cold-start-project")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(projectDir, registry.DefaultMltFileName)
+	if err := os.WriteFile(projectPath, []byte("<mlt/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	project, err := d.resolveOrRegisterProjectByPath(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	apps := filepath.Join(d.Cfg.HomeDir, "apps")
+	if err := os.MkdirAll(apps, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	discoverySocket := "/tmp/snapflow-cold-discovery.sock"
+	_ = os.Remove(discoverySocket)
+	discoveryListener, err := net.Listen("unix", discoverySocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = discoveryListener.Close(); _ = os.Remove(discoverySocket) })
+	sapSocket := "/tmp/snapflow-cold-start.sap.sock"
+	_ = os.Remove(sapSocket)
+	sapListener, err := net.Listen("unix", sapSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sapListener.Close(); _ = os.Remove(sapSocket) })
+	go answerDiscoverOnceWithSAP(t, discoveryListener, "cold-start-nonce", mustProcessStart(t), projectPath, sapSocket)
+	descriptor, _ := json.Marshal(map[string]any{
+		"endpoint": discoverySocket, "pid": os.Getpid(), "processStart": mustProcessStart(t),
+		"instanceNonce": "cold-start-nonce", "protocolVersion": 1,
+	})
+	if err := os.WriteFile(filepath.Join(apps, "cold-start.json"), descriptor, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fake SAP listener intentionally does not complete project.select;
+	// the invariant under test is checked before SAP bind completes.
+	_, _ = d.ForwardSAP(ctx, "cold-start-mcp", &fanoutSink{}, "project.open", mustJSON(t, map[string]any{
+		"projectId": project.ID,
+	}))
+	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("cold-start MCP open launched a headless duplicate: %+v", instances)
+	}
+	external, err := d.Reg.GetExternalInstanceByNonce("cold-start-nonce")
+	if err != nil {
+		t.Fatalf("discovery was not promoted: %v", err)
+	}
+	if external.SAPSocketPath != sapSocket || external.ProjectPath != projectPath {
+		t.Fatalf("promoted discovery lost GUI ownership data: %+v", external)
+	}
+}
+
+func TestGUIMatrix_MCPWaitsForGuiSAPAfterDiscovery(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "sap-ready-race"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project.RootDir, project.MltFileName)
+	sapSocket := "/tmp/snapflow-sap-ready-race.sock"
+	_ = os.Remove(sapSocket)
+	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "sap-ready-race-nonce",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   path,
+		SAPSocketPath: sapSocket,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := d.awaitLiveExternalProject(ctx, project.ID)
+		result <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+	listener, err := net.Listen("unix", sapSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = listener.Close()
+		_ = os.Remove(sapSocket)
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("awaitLiveExternalProject returned early: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("awaitLiveExternalProject did not wait for SAP readiness")
+	}
+}
+
 func TestGUIMatrix_DaemonFirstGUIRegistrationDrainsHeadlessBeforeLease(t *testing.T) {
 	d := newSapFixtureDaemon(t, buildSapFixture(t))
 	d.Proc.RunDir = filepath.Join("/tmp", "gui-matrix-handoff-run")
@@ -587,6 +699,10 @@ func TestGUIMatrix_LegacyNoEndpoint_NeverFalselyOpen(t *testing.T) {
 }
 
 func answerDiscoverOnce(t *testing.T, listener net.Listener, nonce, processStart, projectPath string) {
+	answerDiscoverOnceWithSAP(t, listener, nonce, processStart, projectPath, "")
+}
+
+func answerDiscoverOnceWithSAP(t *testing.T, listener net.Listener, nonce, processStart, projectPath, sapSocket string) {
 	t.Helper()
 	conn, err := listener.Accept()
 	if err != nil {
@@ -606,6 +722,7 @@ func answerDiscoverOnce(t *testing.T, listener net.Listener, nonce, processStart
 		"pid":           os.Getpid(),
 		"processStart":  processStart,
 		"projectPath":   projectPath,
+		"sapSocketPath": sapSocket,
 		"challenge":     request.Params.Challenge,
 	}})
 }

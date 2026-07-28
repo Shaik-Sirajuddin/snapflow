@@ -355,6 +355,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"HOME="+qtHomeDir,
 		"SNAPSHOT_SAP_SOCKET="+sockPath,
 		"SNAPSHOT_SAP_TOKEN="+token,
+		"SNAPSHOTD_MANAGED=1",
 		"SNAPSHOT_HEADLESS="+headlessVal,
 		"SNAPSHOT_PROJECT_ROOT="+opts.ProjectRoot,
 		"SNAPSHOT_PROJECT_MLT_FILENAME="+opts.MltFileName,

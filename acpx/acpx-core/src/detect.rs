@@ -331,7 +331,10 @@ mod tests {
             cache_entry_for_test("node").is_none(),
             "test bug: another test in this binary already cached \"node\""
         );
-        assert!(which("node"), "expected \"node\" to be found on PATH in this dev environment");
+        assert!(
+            which("node"),
+            "expected \"node\" to be found on PATH in this dev environment"
+        );
         let (cached_found, cached_since) =
             cache_entry_for_test("node").expect("which(\"node\") must populate the cache");
         assert!(cached_found, "cached result for \"node\" must be true");

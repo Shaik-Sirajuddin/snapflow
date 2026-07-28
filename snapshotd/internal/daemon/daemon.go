@@ -33,6 +33,8 @@ import (
 )
 
 const externalInstanceLease = 30 * time.Second
+const externalSAPReadyTimeout = 5 * time.Second
+const externalDiscoveryGrace = 1500 * time.Millisecond
 
 // Daemon is the shared core described above.
 type Daemon struct {
@@ -73,6 +75,7 @@ type RegisterExternalInstanceParams struct {
 	ProcessStart  string         `json:"processStart"`
 	ProjectPath   string         `json:"projectPath,omitempty"`
 	SAPSocketPath string         `json:"sapSocketPath,omitempty"`
+	SAPToken      string         `json:"sapToken,omitempty"`
 	Capabilities  map[string]any `json:"capabilities,omitempty"`
 }
 
@@ -130,6 +133,7 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	instance.ProcessStart = p.ProcessStart
 	instance.ProjectPath = projectPath
 	instance.SAPSocketPath = p.SAPSocketPath
+	instance.Token = p.SAPToken
 	instance.CapabilitiesJSON = string(capabilities)
 	instance.Status = registry.ExternalStatusOpen
 	instance.Source = "external_registered"
@@ -322,6 +326,8 @@ func (d *Daemon) DiscoverExternalInstances(ctx context.Context) ([]discovery.Can
 			PID:           candidate.PID,
 			ProcessStart:  candidate.ProcessStart,
 			ProjectPath:   candidate.ProjectPath,
+			SAPSocketPath: candidate.SAPSocketPath,
+			SAPToken:      candidate.SAPToken,
 			Capabilities:  map[string]any{"discovery": true, "protocolVersion": candidate.ProtocolVersion},
 		})
 		if err != nil {
@@ -516,7 +522,7 @@ func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error
 		}
 		// External registrations use their own local SAP endpoint and do not
 		// have a daemon-generated per-launch hello token.
-		return in.SAPSocketPath, "", nil
+		return in.SAPSocketPath, in.Token, nil
 	}
 	return "", "", fmt.Errorf("daemon: no running (ready) process instance for project %s; call daemon.launch first", projectID)
 }
@@ -1073,12 +1079,19 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
 		}
+		// A panel publishes its discovery descriptor before the asynchronous
+		// registration worker necessarily reaches snapshotd. Promote that
+		// verified descriptor here, before the launch decision, so an MCP
+		// project.open cannot win the startup race and create a headless copy.
+		if _, err := d.DiscoverExternalInstances(ctx); err != nil {
+			d.Log.Warn("project.open external discovery failed", "projectId", p.ProjectID, "error", err)
+		}
 		// Launch-or-reuse before Bind so project.select / project.open do not
 		// require a separate daemon.launch. A live external GUI registration
 		// is already the project's authoritative process and must be reused;
 		// calling Proc.Launch first would create a second headless child before
 		// resolveProjectInstance gets a chance to select the GUI socket.
-		externalGUI, err := d.hasLiveExternalProject(ctx, p.ProjectID)
+		externalGUI, err := d.awaitLiveExternalProject(ctx, p.ProjectID)
 		if err != nil {
 			err = fmt.Errorf("daemon: project.select: external ownership: %w", err)
 			logMethod(err, "projectId", p.ProjectID)
@@ -1137,6 +1150,79 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 	result, err := d.SAP.Call(ctx, sessionID, method, params)
 	logMethod(err)
 	return result, err
+}
+
+// awaitLiveExternalProject closes the remaining GUI-start race: panel-rust's
+// discovery descriptor can be verified before C++ has finished binding its
+// SAP socket. Treat that registration as a pending GUI owner and wait briefly
+// for its endpoint instead of either launching a duplicate headless process
+// or attempting a connection that can only fail with ENOENT.
+func (d *Daemon) awaitLiveExternalProject(ctx context.Context, projectID string) (bool, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, externalSAPReadyTimeout)
+	defer cancel()
+	noCandidateUntil := time.Now().Add(externalDiscoveryGrace)
+	for {
+		candidates, err := d.DiscoverExternalInstances(ctx)
+		if err != nil {
+			return false, err
+		}
+		project, err := d.Reg.GetProject(projectID)
+		if err != nil {
+			return false, err
+		}
+		instances, err := d.Reg.ListExternalInstances()
+		if err != nil {
+			return false, err
+		}
+		pendingGUI := false
+		for _, instance := range instances {
+			if instance.Status != registry.ExternalStatusOpen ||
+				(!instance.LeaseExpiresAt.IsZero() && !instance.LeaseExpiresAt.After(time.Now().UTC())) ||
+				!health.PIDAlive(instance.PID) ||
+				externalProjectRoot(instance.ProjectPath) != filepath.Clean(project.RootDir) {
+				continue
+			}
+			if instance.SAPSocketPath == "" {
+				return false, fmt.Errorf("daemon: external GUI owns project %s but has no SAP socket", projectID)
+			}
+			if health.SocketResponsive(instance.SAPSocketPath, 100*time.Millisecond) {
+				return d.hasLiveExternalProject(ctx, projectID)
+			}
+			pendingGUI = true
+		}
+		if !pendingGUI {
+			// A verified panel descriptor can briefly report an empty project
+			// while the C++ open notification is crossing into panel-rust. If it
+			// already exposes an SAP endpoint, wait for that path update instead
+			// of allowing MCP to launch headless in the gap.
+			for _, candidate := range candidates {
+				if candidate.Verified && candidate.ProjectPath == "" && candidate.SAPSocketPath != "" {
+					pendingGUI = true
+					break
+				}
+			}
+		}
+		if !pendingGUI {
+			if time.Now().Before(noCandidateUntil) {
+				timer := time.NewTimer(50 * time.Millisecond)
+				select {
+				case <-waitCtx.Done():
+					timer.Stop()
+					return false, waitCtx.Err()
+				case <-timer.C:
+				}
+				continue
+			}
+			return false, nil
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			return false, fmt.Errorf("daemon: external GUI SAP socket did not become ready for project %s: %w", projectID, waitCtx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // hasLiveExternalProject reports whether an external GUI currently owns the

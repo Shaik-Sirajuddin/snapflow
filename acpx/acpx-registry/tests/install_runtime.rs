@@ -3,9 +3,7 @@
 //! real package pre-fetch into a temp adapters root (writes `.ready`).
 
 use acpx_registry::index::{Distribution, NpxDist};
-use acpx_registry::{
-    install, install_into, is_package_ready, Agent, InstallError, InstallOutcome,
-};
+use acpx_registry::{install, install_into, is_package_ready, Agent, InstallError, InstallOutcome};
 
 fn agent_with(id: &str, distribution: Distribution) -> Agent {
     Agent {
@@ -111,7 +109,11 @@ async fn uvx_install_prefetches_when_uv_present() {
 
     let dest = tempfile::tempdir().unwrap();
     match install_into(&agent, dest.path()).await {
-        Ok(InstallOutcome::PackageReady { runtime, package, marker }) => {
+        Ok(InstallOutcome::PackageReady {
+            runtime,
+            package,
+            marker,
+        }) => {
             assert_eq!(runtime, "uv");
             assert_eq!(package, "ruff");
             assert!(marker.is_file());

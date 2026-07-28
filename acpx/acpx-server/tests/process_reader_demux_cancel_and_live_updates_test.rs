@@ -167,7 +167,8 @@ async fn rpc(client: &reqwest::Client, addr: SocketAddr, body: Value) -> Value {
         .expect("json body")
 }
 
-type WsSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn ws_send(socket: &mut WsSocket, body: Value) {
     socket
@@ -290,7 +291,10 @@ async fn cancelling_one_session_does_not_disturb_a_concurrent_sessions_live_upda
     // Give B's prompt time to genuinely register/be in flight, then
     // cancel it -- well before its own TURN_DELAY_SECS would elapse.
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(!b_prompt.is_finished(), "B's prompt should still be in flight when cancelled");
+    assert!(
+        !b_prompt.is_finished(),
+        "B's prompt should still be in flight when cancelled"
+    );
     let cancel_started = tokio::time::Instant::now();
     let cancel_reply = rpc(
         &http,
@@ -330,11 +334,13 @@ async fn cancelling_one_session_does_not_disturb_a_concurrent_sessions_live_upda
             break frame;
         }
         assert_eq!(
-            frame["method"], json!("session/update"),
+            frame["method"],
+            json!("session/update"),
             "unexpected frame on A's socket while waiting for its prompt reply: {frame:?}"
         );
         assert_eq!(
-            frame["params"]["sessionId"], json!(sid_a),
+            frame["params"]["sessionId"],
+            json!(sid_a),
             "A's socket must never see a live update for another session: {frame:?}"
         );
         a_update_count += 1;
@@ -441,7 +447,10 @@ async fn demux_off_a_second_sessions_launch_and_live_updates_stall_behind_first_
     // Give A's turn time to genuinely register/hold the shared process's
     // lock before B ever tries to touch it.
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(!a_prompt.is_finished(), "A's prompt should still be in flight when B connects");
+    assert!(
+        !a_prompt.is_finished(),
+        "A's prompt should still be in flight when B connects"
+    );
 
     let (mut ws_b, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -481,7 +490,11 @@ async fn demux_off_a_second_sessions_launch_and_live_updates_stall_behind_first_
     loop {
         let frame = ws_recv(&mut ws_b).await;
         if frame.get("id") == Some(&json!(4)) {
-            assert_eq!(frame["result"]["stopReason"], json!("end_turn"), "{frame:?}");
+            assert_eq!(
+                frame["result"]["stopReason"],
+                json!("end_turn"),
+                "{frame:?}"
+            );
             break;
         }
         assert_eq!(frame["method"], json!("session/update"), "{frame:?}");
@@ -530,7 +543,10 @@ async fn demux_on_a_second_sessions_launch_and_live_updates_do_not_stall_behind_
     });
 
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(!a_prompt.is_finished(), "A's prompt should still be in flight when B connects");
+    assert!(
+        !a_prompt.is_finished(),
+        "A's prompt should still be in flight when B connects"
+    );
 
     let (mut ws_b, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -562,7 +578,8 @@ async fn demux_on_a_second_sessions_launch_and_live_updates_do_not_stall_behind_
     let first_b_frame = ws_recv(&mut ws_b).await;
     let b_first_update_elapsed = b_first_update_started.elapsed();
     assert_eq!(
-        first_b_frame["method"], json!("session/update"),
+        first_b_frame["method"],
+        json!("session/update"),
         "expected B's first frame after its own prompt to be a live update, got {first_b_frame:?}"
     );
     assert!(

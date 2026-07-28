@@ -111,10 +111,7 @@ pub enum ConversationEvent {
         exit_code: i32,
     },
     #[allow(dead_code)]
-    Notice {
-        thread_id: String,
-        text: String,
-    },
+    Notice { thread_id: String, text: String },
 }
 
 impl ConversationEvent {

@@ -100,7 +100,8 @@ mod tests {
         .is_authentication_or_capacity());
         assert!(ClientError::Rpc {
             code: -32000,
-            message: "session capacity reached for tenant default: 512/512 live gateway sessions".into(),
+            message: "session capacity reached for tenant default: 512/512 live gateway sessions"
+                .into(),
         }
         .is_authentication_or_capacity());
     }

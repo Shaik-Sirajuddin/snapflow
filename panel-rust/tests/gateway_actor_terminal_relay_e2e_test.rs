@@ -48,8 +48,13 @@ impl GatewayProcess {
                 .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
-        register_stand_in_backend(admin_port, &admin_token, "terminal-relay-agent", &script_path)
-            .await;
+        register_stand_in_backend(
+            admin_port,
+            &admin_token,
+            "terminal-relay-agent",
+            &script_path,
+        )
+        .await;
         GatewayProcess { child, base_url }
     }
 }
@@ -105,7 +110,11 @@ async fn terminal_create_relay_and_live_output_reach_the_thread_actor() {
     let mut handle = spawn_acpx_thread(gateway.base_url.clone());
     let mut events = handle.take_events();
     handle
-        .open_session_with_profile(std::env::current_dir().unwrap(), "terminal-enabled", Vec::new())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            "terminal-enabled",
+            Vec::new(),
+        )
         .await
         .expect("open_session_with_profile");
 
@@ -127,15 +136,17 @@ async fn terminal_create_relay_and_live_output_reach_the_thread_actor() {
 
     while tokio::time::Instant::now() < deadline && !exited {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining.min(Duration::from_millis(200)), events.recv()).await
-        {
+        match tokio::time::timeout(remaining.min(Duration::from_millis(200)), events.recv()).await {
             Ok(Some(AgentEvent::PermissionRequest(req))) if !relay_answered => {
                 assert_eq!(req.method, "terminal/create");
                 let delivered = responder
                     .respond_agent_request(&req.relay_id, serde_json::json!({"approved": true}))
                     .await
                     .expect("respond_agent_request");
-                assert!(delivered, "relay hub had no pending request for this relay_id");
+                assert!(
+                    delivered,
+                    "relay hub had no pending request for this relay_id"
+                );
                 relay_answered = true;
             }
             Ok(Some(AgentEvent::TerminalOutput(ev))) => {
@@ -148,8 +159,14 @@ async fn terminal_create_relay_and_live_output_reach_the_thread_actor() {
     }
 
     assert!(relay_answered, "terminal/create relay never surfaced");
-    assert!(exited, "never observed a final TerminalOutput with an exit status");
-    assert!(terminal_id.is_some(), "expected a real terminalId on the live push");
+    assert!(
+        exited,
+        "never observed a final TerminalOutput with an exit status"
+    );
+    assert!(
+        terminal_id.is_some(),
+        "expected a real terminalId on the live push"
+    );
     assert!(
         last_output.contains("sdk-terminal-output"),
         "expected the live-streamed output to contain the real command's stdout, got {last_output:?}"

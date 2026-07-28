@@ -92,7 +92,11 @@ fn find_violations(path_label: &str, contents: &str) -> Vec<String> {
     let pattern = write_pattern();
     pattern
         .find_iter(contents)
-        .filter(|m| !allowed.iter().any(|(start, end)| *start <= m.start() && m.end() <= *end))
+        .filter(|m| {
+            !allowed
+                .iter()
+                .any(|(start, end)| *start <= m.start() && m.end() <= *end)
+        })
         .map(|m| {
             let line_no = line_number_at(contents, m.start());
             format!("{path_label}:{line_no}: {}", m.as_str())
@@ -145,7 +149,11 @@ fn acpx_backend_cmd_env_writes_appear_only_in_the_one_documented_exemption() {
         let allowed = allow_block_ranges(&contents);
         allowed_write_count += write_pattern()
             .find_iter(&contents)
-            .filter(|m| allowed.iter().any(|(start, end)| *start <= m.start() && m.end() <= *end))
+            .filter(|m| {
+                allowed
+                    .iter()
+                    .any(|(start, end)| *start <= m.start() && m.end() <= *end)
+            })
             .count();
     }
 

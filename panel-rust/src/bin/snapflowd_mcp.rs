@@ -57,9 +57,7 @@ fn context_skills(args: &Args) -> Vec<SkillEntry> {
     let project_skills = args
         .project_dir
         .as_ref()
-        .map(|project_dir| {
-            scan_skills_dir(&project_skills_dir(project_dir), SkillScope::Project)
-        })
+        .map(|project_dir| scan_skills_dir(&project_skills_dir(project_dir), SkillScope::Project))
         .unwrap_or_default();
     merge_skills_for_context(global_skills, project_skills)
 }
@@ -297,7 +295,11 @@ fn tools_list_result() -> Value {
     })
 }
 
-fn handle_request(args: &Args, method: &str, params: Option<&Value>) -> Result<Value, (i64, String)> {
+fn handle_request(
+    args: &Args,
+    method: &str,
+    params: Option<&Value>,
+) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",

@@ -105,7 +105,14 @@ impl LiveUiHarness {
         let display = free_x_display();
         let display_str = format!(":{display}");
         let xvfb = Command::new("Xvfb")
-            .args([&display_str, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+            .args([
+                &display_str,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -203,7 +210,11 @@ impl LiveUiHarness {
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())
-            .args(["--appdata", state_dir.join("shotcut").to_str().unwrap(), "--noupgrade"])
+            .args([
+                "--appdata",
+                state_dir.join("shotcut").to_str().unwrap(),
+                "--noupgrade",
+            ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
             .env("SLINT_MCP_PORT", mcp_port.to_string())
@@ -302,7 +313,10 @@ impl LiveUiHarness {
     /// (200) truncates well before this UI's real size.
     async fn element_tree(&self, window_handle: &Value) -> Vec<Value> {
         let root_handle = self
-            .tool_call("get_window_properties", json!({"windowHandle": window_handle}))
+            .tool_call(
+                "get_window_properties",
+                json!({"windowHandle": window_handle}),
+            )
             .await["rootElementHandle"]
             .clone();
         let tree = self
@@ -311,10 +325,7 @@ impl LiveUiHarness {
                 json!({"elementHandle": root_handle, "maxElements": 4000}),
             )
             .await;
-        tree["elements"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        tree["elements"].as_array().cloned().unwrap_or_default()
     }
 
     async fn find_by_label_prefix(&self, window_handle: &Value, prefix: &str) -> Option<Value> {
@@ -435,7 +446,9 @@ async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
     );
     // Also present: rename + archive arms for the same selected row.
     let rename = wait_for(Duration::from_secs(5), || async {
-        harness.find_by_label_prefix(&window, "Rename thread ").await
+        harness
+            .find_by_label_prefix(&window, "Rename thread ")
+            .await
     })
     .await;
     assert!(
@@ -445,7 +458,9 @@ async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
         "selected seed thread must also expose a Rename thread control"
     );
     let archive = wait_for(Duration::from_secs(5), || async {
-        harness.find_by_label_prefix(&window, "Archive thread ").await
+        harness
+            .find_by_label_prefix(&window, "Archive thread ")
+            .await
     })
     .await;
     assert!(
@@ -467,8 +482,13 @@ async fn debug_watch_thread_row_churn() {
     // isolates whether churn happens purely from background/poll activity.
     for i in 0..10 {
         let tree = harness.element_tree(&window).await;
-        let row = tree.iter().find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
-        log.push_str(&format!("phase1 tick {i}: handle={:?}\n", row.map(|e| e["handle"].clone())));
+        let row = tree
+            .iter()
+            .find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
+        log.push_str(&format!(
+            "phase1 tick {i}: handle={:?}\n",
+            row.map(|e| e["handle"].clone())
+        ));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -480,8 +500,13 @@ async fn debug_watch_thread_row_churn() {
     // Phase 2: 20 polls right after expanding, still no thread-row click.
     for i in 0..20 {
         let tree = harness.element_tree(&window).await;
-        let row = tree.iter().find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
-        log.push_str(&format!("phase2 tick {i}: handle={:?}\n", row.map(|e| e["handle"].clone())));
+        let row = tree
+            .iter()
+            .find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
+        log.push_str(&format!(
+            "phase2 tick {i}: handle={:?}\n",
+            row.map(|e| e["handle"].clone())
+        ));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     std::fs::write("/tmp/mcp_thread_row_churn_log.txt", log).unwrap();
