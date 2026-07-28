@@ -76,6 +76,24 @@ pub struct ThreadRecord {
     pub project_path: Option<String>,
 }
 
+/// A durable candidate for `acpx_client::pool::ProjectSessionPool`'s idle
+/// key (`project_dir` + `agent_id` + `provider_profile`). `pool_status`
+/// and `leased_thread_id` mirror the plan's diagnostic/recovery hint
+/// fields -- SQL is never the runtime source of truth for lease ownership,
+/// only for which session ids are worth trying to `session/resume` after a
+/// restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolBindingRecord {
+    pub project_dir: String,
+    pub agent_id: String,
+    pub provider_profile: String,
+    pub session_id: String,
+    pub desired_config_options: Option<String>,
+    pub pool_status: Option<String>,
+    pub leased_thread_id: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateStoreError {
     #[error("SQLite panel-state error: {0}")]
@@ -146,7 +164,31 @@ impl PanelStateStore {
         // doc comment for why that is the correct, permanent state for
         // those rows rather than a value to backfill).
         Self::add_column_if_missing(&connection, "project_path", "TEXT")?;
-        connection.execute_batch("PRAGMA user_version = 4;")?;
+        // acpx-client-session-lease-pool plan: durable project/agent/
+        // provider -> session binding for the client-side lease pool.
+        // `pool_status`/`leased_thread_id` are diagnostic/recovery hints
+        // only -- the in-process `ProjectSessionPool` is authoritative
+        // while panel-rust is running; on restart these rows are the
+        // candidates the pool validates with `session/resume` before
+        // reuse. Distinct from `thread_settings` (per-thread presentation
+        // state): a pool binding is keyed by project+agent+provider, never
+        // by thread_id, matching the plan's idle-pool key.
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS project_session_pool_bindings (
+                project_dir TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                provider_profile TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                desired_config_options TEXT,
+                pool_status TEXT,
+                leased_thread_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (project_dir, agent_id, provider_profile, session_id)
+            );
+            ",
+        )?;
+        connection.execute_batch("PRAGMA user_version = 5;")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -418,6 +460,93 @@ impl PanelStateStore {
         Ok(())
     }
 
+    /// Upserts one durable project/agent/provider -> session candidate for
+    /// the client-side lease pool. `desired_config_options` is caller-
+    /// serialized (e.g. JSON) opaque text; this store does not interpret
+    /// it. Keyed by `(project_dir, agent_id, provider_profile, session_id)`
+    /// so a provider that has cycled through multiple session ids over
+    /// time (e.g. after invalidation) keeps its prior rows as history
+    /// rather than clobbering them -- callers wanting "the" binding should
+    /// use [`Self::pool_bindings_for_project`] and prefer the most
+    /// recently `updated_at`.
+    pub fn save_pool_binding(&self, binding: &PoolBindingRecord) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "INSERT INTO project_session_pool_bindings
+                (project_dir, agent_id, provider_profile, session_id,
+                 desired_config_options, pool_status, leased_thread_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(project_dir, agent_id, provider_profile, session_id) DO UPDATE SET
+                desired_config_options = excluded.desired_config_options,
+                pool_status = excluded.pool_status,
+                leased_thread_id = excluded.leased_thread_id,
+                updated_at = excluded.updated_at",
+            params![
+                binding.project_dir,
+                binding.agent_id,
+                binding.provider_profile,
+                binding.session_id,
+                binding.desired_config_options,
+                binding.pool_status,
+                binding.leased_thread_id,
+                binding.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted pool-binding candidates for one project, newest
+    /// `updated_at` first. Restart hydration reads this to find prior
+    /// activated providers; each candidate must still be proven usable
+    /// with `session/resume` before the in-memory pool treats it as idle.
+    pub fn pool_bindings_for_project(
+        &self,
+        project_dir: &str,
+    ) -> Result<Vec<PoolBindingRecord>, StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT project_dir, agent_id, provider_profile, session_id,
+                    desired_config_options, pool_status, leased_thread_id, updated_at
+             FROM project_session_pool_bindings
+             WHERE project_dir = ?1
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = statement
+            .query_map(params![project_dir], |row| {
+                Ok(PoolBindingRecord {
+                    project_dir: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    provider_profile: row.get(2)?,
+                    session_id: row.get(3)?,
+                    desired_config_options: row.get(4)?,
+                    pool_status: row.get(5)?,
+                    leased_thread_id: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Removes one binding row -- called when the pool invalidates a
+    /// session (stale/closed/auth-failed), so a restart never re-offers a
+    /// candidate already confirmed unusable.
+    pub fn delete_pool_binding(
+        &self,
+        project_dir: &str,
+        agent_id: &str,
+        provider_profile: &str,
+        session_id: &str,
+    ) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "DELETE FROM project_session_pool_bindings
+             WHERE project_dir = ?1 AND agent_id = ?2 AND provider_profile = ?3 AND session_id = ?4",
+            params![project_dir, agent_id, provider_profile, session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_background_override(
         &self,
         thread_id: &str,
@@ -486,6 +615,71 @@ impl PanelStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_binding_upsert_updates_status_without_duplicating_rows() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let mut binding = PoolBindingRecord {
+            project_dir: "/proj".to_string(),
+            agent_id: "agent-1".to_string(),
+            provider_profile: "codex/default".to_string(),
+            session_id: "sess-1".to_string(),
+            desired_config_options: Some("{}".to_string()),
+            pool_status: Some("idle".to_string()),
+            leased_thread_id: None,
+            updated_at: "1".to_string(),
+        };
+        store.save_pool_binding(&binding).unwrap();
+        binding.pool_status = Some("leased".to_string());
+        binding.leased_thread_id = Some("thread-1".to_string());
+        binding.updated_at = "2".to_string();
+        store.save_pool_binding(&binding).unwrap();
+
+        let rows = store.pool_bindings_for_project("/proj").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pool_status.as_deref(), Some("leased"));
+        assert_eq!(rows[0].leased_thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn pool_bindings_are_isolated_per_project() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let make = |project_dir: &str| PoolBindingRecord {
+            project_dir: project_dir.to_string(),
+            agent_id: "agent-1".to_string(),
+            provider_profile: "codex/default".to_string(),
+            session_id: "sess-1".to_string(),
+            desired_config_options: None,
+            pool_status: None,
+            leased_thread_id: None,
+            updated_at: "1".to_string(),
+        };
+        store.save_pool_binding(&make("/proj-a")).unwrap();
+        store.save_pool_binding(&make("/proj-b")).unwrap();
+
+        assert_eq!(store.pool_bindings_for_project("/proj-a").unwrap().len(), 1);
+        assert_eq!(store.pool_bindings_for_project("/proj-c").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_pool_binding_removes_only_the_matching_row() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let binding = PoolBindingRecord {
+            project_dir: "/proj".to_string(),
+            agent_id: "agent-1".to_string(),
+            provider_profile: "codex/default".to_string(),
+            session_id: "sess-stale".to_string(),
+            desired_config_options: None,
+            pool_status: Some("invalid".to_string()),
+            leased_thread_id: None,
+            updated_at: "1".to_string(),
+        };
+        store.save_pool_binding(&binding).unwrap();
+        store
+            .delete_pool_binding("/proj", "agent-1", "codex/default", "sess-stale")
+            .unwrap();
+        assert!(store.pool_bindings_for_project("/proj").unwrap().is_empty());
+    }
 
     /// mutex_poison_convention_unification: a panic in one caller while
     /// holding `connection`'s lock must not permanently wedge every future
