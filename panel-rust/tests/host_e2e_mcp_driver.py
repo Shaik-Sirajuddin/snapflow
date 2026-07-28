@@ -615,6 +615,160 @@ def session_id_for_prompt_text(event_log, prompt_text, timeout=15):
     raise RuntimeError(f"no session/prompt with text {prompt_text!r} observed within {timeout}s")
 
 
+def panel_cache_dir(args):
+    """acpx-client-session-lease-pool: the panel-rust jsonl/runtime-state
+    cache dir (`RUI_ACP_CACHE_DIR`, set by host_e2e_mcp_smoke.sh to
+    `$state_dir/panel`). Reading `*.trailer.json`/`*.runtime.json` here is
+    the same non-visual, ground-truth mechanism used to diagnose the
+    "config options never populate for a pool-created thread" bug in the
+    first place -- deliberately not a screenshot/element-tree guess about
+    what text a dropdown shows, but the literal persisted state ChatInput's
+    dropdowns are bound from.
+    """
+    if args.state_dir is None:
+        raise RuntimeError("this scenario requires --state-dir (set by host_e2e_mcp_smoke.sh)")
+    return args.state_dir / "panel"
+
+
+def known_trailer_files(args):
+    return set(panel_cache_dir(args).glob("*.trailer.json"))
+
+
+def wait_for_new_thread_state_files(args, before, timeout=15):
+    """Returns the (trailer_path, runtime_path) pair for whichever thread's
+    `*.trailer.json` appeared in the panel cache dir after `before` was
+    snapshotted -- the file-system analogue of `host_e2e_driver.py`'s own
+    `known_thread_indices` "snapshot then diff" pattern, so a slow/racy
+    write can't be mistaken for "no new thread".
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        new_files = known_trailer_files(args) - before
+        if new_files:
+            trailer_path = sorted(new_files)[0]
+            runtime_path = trailer_path.parent / trailer_path.name.replace(
+                ".trailer.json", ".runtime.json"
+            )
+            return trailer_path, runtime_path
+        time.sleep(0.2)
+    raise RuntimeError(f"no new *.trailer.json appeared in {panel_cache_dir(args)} within {timeout}s")
+
+
+def wait_for_non_empty_config_options(runtime_path, timeout=15):
+    """Polls one thread's `*.runtime.json` for a non-empty `configOptions`
+    array -- the exact field ChatInputLayout's mode/config(model)/reasoning
+    `SearchableDropdown`s gate their own visibility on (`visible: root.
+    config-dropdown-entries.length > 0` in chat_input_layout.slint). Empty
+    here is exactly the observed bug: the dropdowns silently never render,
+    while the plain current-value label elsewhere still shows *something*
+    (the "just the input field value changes, other values are not
+    available" symptom).
+    """
+    deadline = time.monotonic() + timeout
+    last_seen = None
+    while time.monotonic() < deadline:
+        if runtime_path.exists():
+            try:
+                data = json.loads(runtime_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                data = None
+            if data is not None:
+                last_seen = data
+                if data.get("configOptions"):
+                    return data
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"{runtime_path} never reported a non-empty configOptions within {timeout}s "
+        f"(last seen: {last_seen!r})"
+    )
+
+
+def scenario_pool_new_thread_config_options_populate(args):
+    """acpx-client-session-lease-pool regression test for the "switching
+    the field just changes its value, but the other values needed are not
+    available" bug: a thread created through the pool cutover
+    (Command::AcquireAndAttach's freshly-created branch) must still end up
+    with real configOptions (model/mode/effort/agent), not a permanently
+    empty list. Before the fix, GatewaySessionOpener::create() discarded
+    the session/new response after extracting only sessionId, so no
+    capability event was ever emitted for a freshly pool-created session --
+    every new thread's model/mode dropdowns silently never rendered.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    before = known_trailer_files(args)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    send_message_in_active_thread(client, window_handle, "pool config options scenario")
+
+    _trailer_path, runtime_path = wait_for_new_thread_state_files(args, before, timeout=args.timeout)
+    runtime_state = wait_for_non_empty_config_options(runtime_path, timeout=args.timeout)
+
+    option_ids = {opt.get("id") for opt in runtime_state["configOptions"]}
+    if "model" not in option_ids:
+        raise RuntimeError(
+            f"configOptions populated but missing the expected 'model' entry: "
+            f"{runtime_state['configOptions']!r}"
+        )
+    print(
+        f"PASS pool_new_thread_config_options_populate: a freshly pool-created thread's "
+        f"configOptions populated with {sorted(option_ids)!r} (was permanently [] before the fix)"
+    )
+
+
+def scenario_pool_two_new_threads_both_populate_config_options(args):
+    """Broader case: not just the first thread ever created in a run (which
+    could coincidentally warm-reuse a session another test already
+    populated capabilities for) -- TWO independently created threads must
+    each end up with their own non-empty configOptions, proving the fix
+    applies to the general pool-acquire path, not one lucky session.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    seen_runtime_paths = []
+    for i in range(2):
+        before = known_trailer_files(args)
+        open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+        send_message_in_active_thread(
+            client, window_handle, f"pool config options scenario thread {i}"
+        )
+        try:
+            _trailer_path, runtime_path = wait_for_new_thread_state_files(
+                args, before, timeout=args.timeout
+            )
+        except RuntimeError:
+            # Back-to-back "New thread" clicks can race the previous
+            # thread's own still-settling attach/UI state (same class of
+            # timing sensitivity `pool_switch_between_threads_preserves_
+            # session_routing` needed a settle-and-retry for) -- one retry
+            # with a real settle pause before re-clicking is enough in
+            # practice and keeps this scenario from being flaky over a
+            # UI-timing artifact unrelated to the capability fix itself.
+            time.sleep(1.0)
+            open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+            send_message_in_active_thread(
+                client, window_handle, f"pool config options scenario thread {i} retry"
+            )
+            _trailer_path, runtime_path = wait_for_new_thread_state_files(
+                args, before, timeout=args.timeout
+            )
+        seen_runtime_paths.append(runtime_path)
+        time.sleep(0.5)
+
+    for runtime_path in seen_runtime_paths:
+        runtime_state = wait_for_non_empty_config_options(runtime_path, timeout=args.timeout)
+        if not runtime_state.get("configOptions"):
+            raise RuntimeError(f"{runtime_path} has empty configOptions")
+
+    print(
+        "PASS pool_two_new_threads_both_populate_config_options: both independently "
+        f"created threads populated configOptions ({[p.name for p in seen_runtime_paths]!r})"
+    )
+
+
 def scenario_pool_two_new_threads_distinct_sessions(args):
     """acpx-client-session-lease-pool verification-matrix row "Cold first
     provider" / "Concurrent + threads": two "New thread" clicks (same
@@ -784,6 +938,8 @@ SCENARIOS = {
     "pool-rapid-concurrent-new-threads": scenario_pool_rapid_concurrent_new_threads,
     "pool-send-immediately-after-new-thread": scenario_pool_send_immediately_after_new_thread,
     "pool-switch-between-threads-preserves-session-routing": scenario_pool_switch_between_threads_preserves_session_routing,
+    "pool-new-thread-config-options-populate": scenario_pool_new_thread_config_options_populate,
+    "pool-two-new-threads-both-populate-config-options": scenario_pool_two_new_threads_both_populate_config_options,
 }
 
 

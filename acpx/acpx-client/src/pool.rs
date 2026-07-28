@@ -100,6 +100,15 @@ struct Entry {
     /// point an entry would otherwise re-enter the idle pool (`release`,
     /// `resume_recovering`) -- see [`ProjectSessionPool::refresh_key`].
     generation: u64,
+    /// The raw `session/new` response captured at `create()` time (`None`
+    /// for a warm entry the caller's `SessionOpener` didn't report
+    /// capabilities for). Carried into `SessionLease::capabilities` so a
+    /// thread that acquires a freshly-created or previously-warmed session
+    /// -- which was never itself `session/resume`d, so has no independent
+    /// resume response to read capabilities from -- can still populate its
+    /// model/mode/agent config options instead of leaving them permanently
+    /// empty.
+    capabilities: Option<serde_json::Value>,
 }
 
 /// A successfully acquired session, exclusively owned by `thread_id` until
@@ -115,6 +124,13 @@ pub struct SessionLease {
     /// created (`session/new`) session. Panel-rust's capability-loading
     /// precedence uses this to decide whether to trust cached capabilities.
     pub resumed_from_saved: bool,
+    /// The `session/new` response captured when this session was created
+    /// (by this `acquire()` call or an earlier warmup pass), if the
+    /// `SessionOpener` reported one. `None` when `resumed_from_saved` is
+    /// `true` (the caller performs its own `session/resume` and reads
+    /// capabilities from that response instead) or when the opener simply
+    /// didn't supply one.
+    pub capabilities: Option<serde_json::Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,11 +199,18 @@ pub trait SessionOpener: Send + Sync + 'static {
         saved_session_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, OpenError>> + Send + 'a>>;
 
-    /// Create a brand new session for this key.
+    /// Create a brand new session for this key. The second element of a
+    /// successful result is the raw `session/new` response, if the
+    /// implementation has one worth keeping -- see `SessionLease::
+    /// capabilities`'s doc comment for why this matters (a freshly-created
+    /// session is never independently `session/resume`d by any other code
+    /// path, so this is the only chance to capture its capabilities).
     fn create<'a>(
         &'a self,
         key: &'a PoolKey,
-    ) -> Pin<Box<dyn Future<Output = Result<String, OpenError>> + Send + 'a>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(String, Option<serde_json::Value>), OpenError>> + Send + 'a>,
+    >;
 }
 
 /// What to try when opening a session for a key: prefer resuming a saved
@@ -310,6 +333,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
             session_id: entry.session_id,
             thread_id,
             resumed_from_saved,
+            capabilities: entry.capabilities,
         }
     }
 
@@ -357,7 +381,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                 .or_insert_with(KeyPool::new)
                 .generation
         };
-        let (session_id, resumed_from_saved) =
+        let (session_id, capabilities, resumed_from_saved) =
             self.open_session(&key, &open_spec).await?;
 
         let lease_id = next_lease_id();
@@ -372,6 +396,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                     turn: TurnState::NotStarted,
                 },
                 generation: generation_at_open,
+                capabilities: capabilities.clone(),
             });
         }
         Ok(SessionLease {
@@ -380,6 +405,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
             session_id,
             thread_id,
             resumed_from_saved,
+            capabilities,
         })
     }
 
@@ -392,11 +418,11 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
         &self,
         key: &PoolKey,
         open_spec: &OpenSpec,
-    ) -> Result<(String, bool), PoolError> {
+    ) -> Result<(String, Option<serde_json::Value>, bool), PoolError> {
         let attempt = async {
             if let Some(saved_id) = &open_spec.saved_session_id {
                 match self.opener.resume(key, saved_id).await {
-                    Ok(session_id) => return Ok((session_id, true)),
+                    Ok(session_id) => return Ok((session_id, None, true)),
                     // Authentication/capacity failures are a stable
                     // server-side condition: falling back to `create()`
                     // here would just repeat the same failure (or worse,
@@ -412,7 +438,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
             self.opener
                 .create(key)
                 .await
-                .map(|session_id| (session_id, false))
+                .map(|(session_id, capabilities)| (session_id, capabilities, false))
                 .map_err(|err| PoolError::OpenFailed(err.message))
         };
         tokio::time::timeout(ACQUIRE_OPEN_TIMEOUT, attempt)
@@ -668,7 +694,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                     .await
                     .ok()
                     .and_then(Result::ok);
-                let Some(session_id) = opened else {
+                let Some((session_id, capabilities)) = opened else {
                     // Bounded: one failed attempt per deficit slot, no
                     // retry storm. A future `acquire`/warmup pass will
                     // try again.
@@ -680,6 +706,7 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                         session_id,
                         state: EntryState::Idle,
                         generation: generation_at_open,
+                        capabilities,
                     });
                 }
             }
@@ -733,6 +760,10 @@ mod tests {
         /// `create()`) or an ordinary retryable failure (falls back).
         resume_failure_terminal: bool,
         create_delay: Duration,
+        /// What `create()` reports as the raw `session/new` response --
+        /// `None` by default (most tests don't care), settable per test to
+        /// verify capability threading through `acquire()`/warmup.
+        create_capabilities: Option<serde_json::Value>,
     }
 
     impl CountingOpener {
@@ -743,6 +774,7 @@ mod tests {
                 fail_resume: false,
                 resume_failure_terminal: false,
                 create_delay: Duration::from_millis(0),
+                create_capabilities: None,
             }
         }
     }
@@ -770,13 +802,15 @@ mod tests {
         fn create<'a>(
             &'a self,
             _key: &'a PoolKey,
-        ) -> Pin<Box<dyn Future<Output = Result<String, OpenError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<(String, Option<serde_json::Value>), OpenError>> + Send + 'a>,
+        > {
             Box::pin(async move {
                 if !self.create_delay.is_zero() {
                     tokio::time::sleep(self.create_delay).await;
                 }
                 let n = self.creates.fetch_add(1, Ordering::SeqCst);
-                Ok(format!("session-{n}"))
+                Ok((format!("session-{n}"), self.create_capabilities.clone()))
             })
         }
     }
@@ -860,6 +894,62 @@ mod tests {
         assert!(lease.resumed_from_saved);
         assert_eq!(pool.opener.creates.load(Ordering::SeqCst), 0);
         assert_eq!(pool.opener.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_create_carries_session_new_response_into_the_lease() {
+        // Regression test: a freshly pool-created session (never itself
+        // `session/resume`d by anyone) previously had no way to surface its
+        // `session/new` response's capabilities (configOptions/
+        // sessionModes) to the caller -- ChatInput's model/mode/agent
+        // dropdowns stayed permanently empty for every thread the pool
+        // created, since acpx's own capability-event emission only ran for
+        // the resumed branch. `SessionLease::capabilities` closes that gap.
+        let mut opener = CountingOpener::new();
+        opener.create_capabilities = Some(serde_json::json!({
+            "sessionId": "ignored-here",
+            "configOptions": [{"id": "model", "currentValue": "sonnet"}],
+        }));
+        let pool = Arc::new(ProjectSessionPool::new(opener));
+        let key = test_key();
+        let lease = pool
+            .acquire(key, "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire");
+        assert!(!lease.resumed_from_saved);
+        let capabilities = lease
+            .capabilities
+            .expect("a freshly created session must carry its session/new response");
+        assert_eq!(capabilities["configOptions"][0]["id"], "model");
+    }
+
+    #[tokio::test]
+    async fn a_warmed_idle_entry_still_carries_its_capabilities_when_later_leased() {
+        // Same gap, different path: the fast "reuse an already-idle entry"
+        // branch of acquire() must not silently drop the capabilities that
+        // were captured when that entry was originally created (by an
+        // earlier acquire() or by background warmup).
+        let mut opener = CountingOpener::new();
+        opener.create_capabilities = Some(serde_json::json!({"configOptions": []}));
+        let pool = Arc::new(ProjectSessionPool::new(opener));
+        let key = test_key();
+        let lease = pool
+            .clone()
+            .acquire(key.clone(), "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire");
+        pool.mark_turn_finished(&lease).await.ok();
+        pool.release(&lease).await.expect("release");
+        assert_eq!(pool.idle_for_key(&key).await, 1);
+
+        let lease2 = pool
+            .acquire(key, "thread-b".to_string(), OpenSpec::default())
+            .await
+            .expect("reacquire idle entry");
+        assert!(
+            lease2.capabilities.is_some(),
+            "reusing an idle entry must not drop its captured capabilities"
+        );
     }
 
     #[tokio::test]
