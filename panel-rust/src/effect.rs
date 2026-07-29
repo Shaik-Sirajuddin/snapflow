@@ -128,8 +128,11 @@ pub enum Effect {
     },
     McpServerCreate {
         real_index: usize,
-        name: String,
-        command: String,
+        entry: crate::protocol_types::McpServerEntry,
+    },
+    McpServerUpdate {
+        real_index: usize,
+        entry: crate::protocol_types::McpServerEntry,
     },
     McpServerDelete {
         real_index: usize,
@@ -141,6 +144,10 @@ pub enum Effect {
         enabled: bool,
     },
     McpServerAuthenticate {
+        real_index: usize,
+        name: String,
+    },
+    McpServerLogout {
         real_index: usize,
         name: String,
     },

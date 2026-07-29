@@ -11,6 +11,11 @@
 /.DS_Store
 /.idea/
 /.vscode/
+
+# live_oauth_browser_e2e.sh's Playwright dependency -- installed on
+# demand by that script, not vendored (package.json/package-lock.json
+# are committed, node_modules itself is not).
+/panel-rust/tests/node_modules/
 acpx/target/
 /snapshotd/snapshotd
 

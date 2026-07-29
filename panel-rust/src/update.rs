@@ -1104,11 +1104,17 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.dev_mode = enabled;
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
         }
-        SettingsMsg::McpServerCreate { name, command } => (
+        SettingsMsg::McpServerCreate { entry } => (
             vec![Effect::McpServerCreate {
                 real_index: idx,
-                name,
-                command,
+                entry,
+            }],
+            vec![Dirty::Settings],
+        ),
+        SettingsMsg::McpServerUpdate { entry } => (
+            vec![Effect::McpServerUpdate {
+                real_index: idx,
+                entry,
             }],
             vec![Dirty::Settings],
         ),
@@ -1129,6 +1135,13 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
         ),
         SettingsMsg::McpServerAuthenticate { name } => (
             vec![Effect::McpServerAuthenticate {
+                real_index: idx,
+                name,
+            }],
+            vec![Dirty::Settings],
+        ),
+        SettingsMsg::McpServerLogout { name } => (
+            vec![Effect::McpServerLogout {
                 real_index: idx,
                 name,
             }],

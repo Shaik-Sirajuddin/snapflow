@@ -103,3 +103,17 @@ CREATE TABLE IF NOT EXISTS mcp_server_configs (
     name TEXT PRIMARY KEY,
     json TEXT NOT NULL
 );
+
+-- MCP OAuth 2.1 tokens (`src/oauth.rs`), one row per MCP server name.
+-- Same AES-256-GCM-encrypted-at-rest shape as `secrets` (`crate::
+-- keystore::MasterKeyring`) rather than the plaintext `mcp_server_configs`
+-- pattern, since a stolen access/refresh token is directly usable against
+-- the MCP server it was issued for.
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    server_name TEXT PRIMARY KEY,
+    ciphertext BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    key_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);

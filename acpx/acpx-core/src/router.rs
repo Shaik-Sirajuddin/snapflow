@@ -158,9 +158,12 @@ pub fn classify(method: &str) -> MethodClass {
         "profiles/create" | "profiles/list" | "profiles/update" | "profiles/delete" => {
             MethodClass::GatewayNative
         }
-        "mcp_servers/create" | "mcp_servers/list" | "mcp_servers/update" | "mcp_servers/delete" => {
-            MethodClass::GatewayNative
-        }
+        "mcp_servers/create"
+        | "mcp_servers/list"
+        | "mcp_servers/update"
+        | "mcp_servers/delete"
+        | "mcp_servers/authenticate"
+        | "mcp_servers/logout" => MethodClass::GatewayNative,
         // `retention_administration` (`acpx-session-lifecycle`). Not a
         // real ACP method -- an acpx-only extension namespace, same
         // category as `profiles/*`/`mcp_servers/*` above. Tenant-scoped
@@ -339,6 +342,16 @@ pub struct Router {
     /// client entries always win on collision, see
     /// `crate::mcp_servers::merge_mcp_servers`.
     mcp_servers: McpServerStore,
+    /// In-memory MCP OAuth 2.1 access/refresh tokens (`crate::oauth`),
+    /// keyed by MCP server name -- consulted by `inject_oauth_headers` at
+    /// `session/new` to attach a live `Authorization: Bearer <token>`
+    /// header to an HTTP-transport server's entry without ever writing
+    /// the raw token into `mcp_servers`' plaintext-JSON config row.
+    /// Cheaply `Clone` (an `Arc` internally) for the same reason
+    /// `McpServerStore` is -- `authenticate_mcp_server`'s completion runs
+    /// in a detached background task, well past the original RPC call's
+    /// `&mut Router` borrow.
+    oauth_tokens: crate::oauth::OAuthTokenCache,
     /// **Phase 14 addition.** Live `session/update` fan-out to whichever
     /// persistent transport connection (stdio/WS) currently owns a given
     /// gateway session -- see `crate::notify`'s module doc comment for
@@ -806,6 +819,10 @@ pub enum RouterError {
     RotationRequiresDurableConfig,
     #[error("master keyring I/O error: {0}")]
     KeyringIo(String),
+    #[error("mcp_servers/authenticate: {0}")]
+    OAuth(#[from] crate::oauth::OAuthError),
+    #[error("mcp_servers/authenticate: server {0} has no \"url\" field -- OAuth only applies to HTTP-transport MCP servers")]
+    OAuthRequiresHttpTransport(String),
     #[error(
         "session/retention/pin: tenant {tenant_id} already has {current} of at most {limit} \
          pinned sessions"
@@ -1018,6 +1035,7 @@ impl Router {
             keystore: Keystore::new(),
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
+            oauth_tokens: crate::oauth::OAuthTokenCache::new(),
             secret_keyring: None,
             keyring_path: None,
             notification_hub: NotificationHub::new(),
@@ -1153,6 +1171,22 @@ impl Router {
         for raw in persistence.load_profiles().await? {
             if let Ok(profile) = serde_json::from_value::<Profile>(raw) {
                 self.profiles.create(profile)?;
+            }
+        }
+
+        for (server_name, ciphertext, nonce, key_version) in
+            persistence.load_all_oauth_tokens().await?
+        {
+            match keyring
+                .decrypt(key_version, &nonce, &ciphertext)
+                .ok()
+                .and_then(|plaintext| serde_json::from_slice::<crate::oauth::OAuthTokens>(&plaintext).ok())
+            {
+                Some(tokens) => self.oauth_tokens.insert(server_name, tokens),
+                None => tracing::warn!(
+                    server = %server_name,
+                    "failed to decrypt persisted oauth tokens, this MCP server will need re-authentication"
+                ),
             }
         }
 
@@ -1293,6 +1327,305 @@ impl Router {
             return Ok(());
         };
         persistence.delete_mcp_server(name).await?;
+        Ok(())
+    }
+
+    /// Attaches a live `Authorization: Bearer <token>` header to any
+    /// `entries` this router holds a current OAuth access token for
+    /// (`self.oauth_tokens`, keyed by the entry's `"name"`). Called on
+    /// the `central` MCP server list right before `merge_mcp_servers` at
+    /// `session/new`, so the raw access token is only ever attached to
+    /// the copy handed to a backend process -- it never gets written back
+    /// into `mcp_servers`' own plaintext-JSON persisted config row (see
+    /// `oauth_tokens`'s own doc comment).
+    ///
+    /// Deliberately synchronous and does no I/O, including no refresh
+    /// check: both call sites (`dispatch_session_new`/
+    /// `dispatch_session_new_shared`) run this while holding this
+    /// router's single global `Arc<Mutex<Router>>` lock (`SharedRouter`
+    /// in `acpx-server`), so any real network call here -- a refresh is
+    /// exactly that -- would block every other in-flight request on this
+    /// gateway for as long as the HTTP round trip takes. See
+    /// `spawn_oauth_refresh_loop`'s doc comment for where refresh
+    /// actually happens instead: entirely off-lock, on a timer, so by the
+    /// time `session/new` reads `oauth_tokens` here the token is already
+    /// current (or refresh is failing loudly in the logs, in which case
+    /// this still injects whatever's cached and lets the backend's own
+    /// 401 handling surface the problem).
+    fn inject_oauth_headers(&self, entries: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        entries
+            .into_iter()
+            .map(|mut entry| {
+                let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+                    return entry;
+                };
+                let Some(tokens) = self.oauth_tokens.get(name) else {
+                    return entry;
+                };
+                if let Some(obj) = entry.as_object_mut() {
+                    let headers = obj
+                        .entry("headers")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(headers_obj) = headers.as_object_mut() {
+                        headers_obj.insert(
+                            "Authorization".to_string(),
+                            serde_json::json!(format!("Bearer {}", tokens.access_token)),
+                        );
+                    }
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// Spawns a detached background loop that periodically refreshes any
+    /// cached OAuth token past `OAuthTokens::needs_refresh`'s threshold.
+    /// Intended call site: once, at startup, right alongside
+    /// `warm_default_profiles` -- like that method, this must never run
+    /// lazily inside a request's own critical section (see `inject_oauth_
+    /// headers`'s doc comment for exactly why: this router's single
+    /// global lock must never be held across the real network I/O a
+    /// refresh requires). Uses only the cheap-clone `oauth_tokens`/
+    /// `mcp_servers`/`persistence`/`secret_keyring`/`http` handles this
+    /// method captures up front, the same "detached task, no `&Router`
+    /// borrow" shape `authenticate_mcp_server`'s own completion task
+    /// already uses -- this loop never touches `self` again after
+    /// spawning.
+    pub fn spawn_oauth_refresh_loop(&self, interval: std::time::Duration) {
+        let oauth_tokens = self.oauth_tokens.clone();
+        let mcp_servers = self.mcp_servers.clone();
+        let persistence = self.persistence.clone();
+        let keyring = self.secret_keyring.clone();
+        let http = self.http.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first `tick()` fires immediately; skip it so a
+            // freshly-started gateway doesn't try to refresh every
+            // just-loaded token before anything has had a chance to
+            // actually expire.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                for entry in mcp_servers.list() {
+                    let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+                        continue;
+                    };
+                    let Some(tokens) = oauth_tokens.get(name) else {
+                        continue;
+                    };
+                    if !tokens.needs_refresh() {
+                        continue;
+                    }
+                    let Some(refresh_token) = tokens.refresh_token.clone() else {
+                        continue;
+                    };
+                    let Some(url) = entry.get("url").and_then(|u| u.as_str()) else {
+                        continue;
+                    };
+
+                    let metadata = match crate::oauth::discover(&http, url).await {
+                        Ok(metadata) => metadata,
+                        Err(err) => {
+                            tracing::warn!(%err, server = %name, "oauth discovery failed during background refresh");
+                            continue;
+                        }
+                    };
+                    let refreshed = match crate::oauth::refresh(
+                        &http,
+                        &metadata,
+                        &tokens.client_id,
+                        tokens.client_secret.as_deref(),
+                        &refresh_token,
+                    )
+                    .await
+                    {
+                        Ok(refreshed) => refreshed,
+                        Err(err) => {
+                            tracing::warn!(%err, server = %name, "oauth token refresh failed, will retry next tick");
+                            continue;
+                        }
+                    };
+
+                    oauth_tokens.insert(name.to_string(), refreshed.clone());
+                    if let (Some(persistence), Some(keyring_lock)) = (&persistence, &keyring) {
+                        let plaintext =
+                            serde_json::to_vec(&refreshed).expect("OAuthTokens always serializes");
+                        let (version, nonce, ciphertext) = {
+                            let keyring = keyring_lock
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            keyring.encrypt(&plaintext)
+                        };
+                        let now = now_rfc3339();
+                        if let Err(err) = persistence
+                            .upsert_oauth_tokens(name.to_string(), ciphertext, nonce, version, now.clone(), now)
+                            .await
+                        {
+                            tracing::warn!(%err, server = %name, "failed to persist refreshed oauth tokens");
+                        }
+                    }
+                    tracing::info!(server = %name, "mcp server oauth token refreshed (background loop)");
+                }
+            }
+        });
+    }
+
+    /// Begins the MCP OAuth 2.1 flow for the HTTP-transport server named
+    /// `name` (RFC 9728/8414 discovery, RFC 7591 dynamic client
+    /// registration unless the entry already names an `oauth.client_id`,
+    /// PKCE). Returns the `authorization_url` the caller must have the
+    /// user open in a browser; the rest of the flow (waiting for the
+    /// loopback redirect, exchanging the code, persisting tokens) runs in
+    /// a detached background task, since this RPC has to return the URL
+    /// well before the user finishes signing in. See `McpServerStore` and
+    /// `oauth_tokens`'s doc comments for why both are cheap-clone/
+    /// interior-mutable types -- that's what lets this background task
+    /// safely patch server/token state after `&self` here has long since
+    /// returned.
+    pub async fn authenticate_mcp_server(&self, name: &str) -> Result<String, RouterError> {
+        let entry = self
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| crate::mcp_servers::McpServerStoreError::NotFound(name.to_string()))?;
+        let url = entry
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| RouterError::OAuthRequiresHttpTransport(name.to_string()))?
+            .to_string();
+        let client_id_override = entry
+            .get("oauth")
+            .and_then(|o| o.get("client_id"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+
+        let http_client = self.http.clone();
+        let metadata = crate::oauth::discover(&http_client, &url).await?;
+        let (redirect_uri, listener_handle) = crate::oauth::start_loopback_listener().await?;
+
+        let registration = if let Some(client_id) = client_id_override {
+            crate::oauth::ClientRegistration {
+                client_id,
+                client_secret: None,
+            }
+        } else {
+            crate::oauth::register_client(&http_client, &metadata, &redirect_uri).await?
+        };
+
+        let pkce = crate::oauth::generate_pkce_pair();
+        let state = uuid::Uuid::new_v4().to_string();
+        let authorization_url = crate::oauth::build_authorization_url(
+            &metadata,
+            &registration.client_id,
+            &redirect_uri,
+            &state,
+            &pkce,
+        )?;
+
+        let server_name = name.to_string();
+        let mcp_servers = self.mcp_servers.clone();
+        let oauth_tokens_cache = self.oauth_tokens.clone();
+        let persistence = self.persistence.clone();
+        let keyring = self.secret_keyring.clone();
+        let expected_state = state.clone();
+        let pkce_verifier = pkce.verifier.clone();
+
+        tokio::spawn(async move {
+            let callback = match listener_handle.await {
+                Ok(Ok(callback)) => callback,
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, server = %server_name, "oauth loopback callback failed");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, server = %server_name, "oauth loopback task panicked");
+                    return;
+                }
+            };
+            if crate::oauth::verify_state(&expected_state, &callback.state).is_err() {
+                tracing::warn!(server = %server_name, "oauth callback state mismatch, discarding");
+                return;
+            }
+
+            let tokens = match crate::oauth::exchange_code(
+                &http_client,
+                &metadata,
+                &registration.client_id,
+                registration.client_secret.as_deref(),
+                &callback.code,
+                &redirect_uri,
+                &pkce_verifier,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    tracing::warn!(%err, server = %server_name, "oauth token exchange failed");
+                    return;
+                }
+            };
+
+            oauth_tokens_cache.insert(server_name.clone(), tokens.clone());
+
+            if let Some(mut entry) = mcp_servers.get(&server_name) {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("auth_status".to_string(), serde_json::json!("authenticated"));
+                    obj.insert("needs_auth".to_string(), serde_json::json!(false));
+                }
+                if mcp_servers.update(entry.clone()).is_ok() {
+                    if let Some(persistence) = &persistence {
+                        if let Err(err) = persistence.upsert_mcp_server(server_name.clone(), entry).await {
+                            tracing::warn!(%err, server = %server_name, "failed to persist mcp server auth_status");
+                        }
+                    }
+                }
+            }
+
+            if let (Some(persistence), Some(keyring_lock)) = (&persistence, &keyring) {
+                let plaintext =
+                    serde_json::to_vec(&tokens).expect("OAuthTokens always serializes");
+                let (version, nonce, ciphertext) = {
+                    let keyring = keyring_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    keyring.encrypt(&plaintext)
+                };
+                let now = now_rfc3339();
+                if let Err(err) = persistence
+                    .upsert_oauth_tokens(server_name.clone(), ciphertext, nonce, version, now.clone(), now)
+                    .await
+                {
+                    tracing::warn!(%err, server = %server_name, "failed to persist oauth tokens");
+                }
+            }
+
+            tracing::info!(server = %server_name, "mcp server oauth flow completed");
+        });
+
+        Ok(authorization_url)
+    }
+
+    /// Forgets any live OAuth token for `name` (in-memory and, if durable
+    /// config is enabled, on disk) and marks the server as needing
+    /// authentication again. No-op (not an error) if the server was never
+    /// authenticated -- matches `Self::authenticate_mcp_server`'s own
+    /// "safe to call unconditionally" shape.
+    pub async fn logout_mcp_server(&self, name: &str) -> Result<(), RouterError> {
+        self.oauth_tokens.remove(name);
+        if let Some(mut entry) = self.mcp_servers.get(name) {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("auth_status".to_string(), serde_json::json!("unauthenticated"));
+                obj.insert("needs_auth".to_string(), serde_json::json!(true));
+            }
+            if self.mcp_servers.update(entry.clone()).is_ok() {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    persistence.upsert_mcp_server(name, entry).await?;
+                }
+            }
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_oauth_tokens(name).await?;
+        }
         Ok(())
     }
 
@@ -2874,7 +3207,8 @@ impl Router {
         // never see an `mcpServers` field appear out of nowhere.
         if let Some(profile) = &profile {
             if !profile.mcp_servers.is_empty() {
-                let central = self.mcp_servers.list_named(&profile.mcp_servers);
+                let central =
+                    self.inject_oauth_headers(self.mcp_servers.list_named(&profile.mcp_servers));
                 let params = request
                     .get_mut("params")
                     .ok_or(RouterError::MissingParams)?;
@@ -4429,6 +4763,26 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                 self.mcp_servers.delete(&name)?;
                 self.delete_persisted_mcp_server_if_durable(&name).await?;
                 serde_json::json!({ "name": name, "deleted": true })
+            }
+            "mcp_servers/authenticate" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                let authorization_url = self.authenticate_mcp_server(&name).await?;
+                serde_json::json!({ "name": name, "authorizationUrl": authorization_url })
+            }
+            "mcp_servers/logout" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                self.logout_mcp_server(&name).await?;
+                serde_json::json!({ "name": name, "loggedOut": true })
             }
             "session/retention/get" => {
                 let gateway_session_id = request
@@ -7870,7 +8224,7 @@ async fn dispatch_session_new_shared(
 
         if let Some(profile) = &profile {
             if !profile.mcp_servers.is_empty() {
-                let central = r.mcp_servers.list_named(&profile.mcp_servers);
+                let central = r.inject_oauth_headers(r.mcp_servers.list_named(&profile.mcp_servers));
                 let params = request
                     .get_mut("params")
                     .ok_or(RouterError::MissingParams)?;
@@ -8597,5 +8951,185 @@ mod tests {
              or ACPX_CONFIG_FILE) should widen what the bridge probes"
         );
         assert_eq!(seeded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticate_mcp_server_errors_on_unknown_name() {
+        let router = Router::new("default");
+        let result = router.authenticate_mcp_server("does-not-exist").await;
+        assert!(matches!(
+            result,
+            Err(RouterError::McpServer(
+                crate::mcp_servers::McpServerStoreError::NotFound(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticate_mcp_server_requires_http_transport() {
+        let router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({"name": "fs", "command": "mcp-fs"}))
+            .expect("create stdio server");
+        let result = router.authenticate_mcp_server("fs").await;
+        assert!(matches!(
+            result,
+            Err(RouterError::OAuthRequiresHttpTransport(name)) if name == "fs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn logout_mcp_server_is_a_safe_no_op_when_never_authenticated() {
+        let router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({"name": "remote", "url": "https://example.com/mcp"}))
+            .expect("create http server");
+        assert!(router.logout_mcp_server("remote").await.is_ok());
+        assert!(router.logout_mcp_server("never-existed").await.is_ok());
+    }
+
+    #[test]
+    fn inject_oauth_headers_attaches_bearer_token_only_when_known() {
+        let router = Router::new("default");
+        router.oauth_tokens.insert(
+            "remote",
+            crate::oauth::OAuthTokens {
+                access_token: "tok-123".to_string(),
+                refresh_token: None,
+                expires_in: None,
+                obtained_at_unix: 0,
+                client_id: String::new(),
+                client_secret: None,
+            },
+        );
+        let entries = vec![
+            serde_json::json!({"name": "remote", "url": "https://example.com/mcp"}),
+            serde_json::json!({"name": "fs", "command": "mcp-fs"}),
+        ];
+        let injected = router.inject_oauth_headers(entries);
+        assert_eq!(
+            injected[0]["headers"]["Authorization"],
+            "Bearer tok-123"
+        );
+        assert!(injected[1].get("headers").is_none());
+    }
+
+    /// Real end-to-end proof of `spawn_oauth_refresh_loop`: a manufactured
+    /// already-expiring token gets refreshed against a real (stub) token
+    /// endpoint on the loop's own timer, with no caller triggering it
+    /// directly -- proving the loop itself observes `needs_refresh`,
+    /// posts a real `grant_type=refresh_token` request, and writes the
+    /// result back into `oauth_tokens`.
+    #[tokio::test]
+    async fn spawn_oauth_refresh_loop_refreshes_an_expiring_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub token server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let origin_for_task = origin.clone();
+        let refresh_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let refresh_calls_for_task = refresh_calls.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let origin = origin_for_task.clone();
+                let refresh_calls = refresh_calls_for_task.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let request_line = request.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                    let (status, resp_body) = match (method, path) {
+                        ("GET", "/.well-known/oauth-protected-resource") => {
+                            ("404 Not Found", String::new())
+                        }
+                        ("GET", "/.well-known/oauth-authorization-server") => (
+                            "200 OK",
+                            format!(
+                                r#"{{"authorization_endpoint":"{origin}/authorize","token_endpoint":"{origin}/token"}}"#
+                            ),
+                        ),
+                        ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                            refresh_calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                r#"{"access_token":"refreshed-access-token","refresh_token":"same-refresh-token","expires_in":3600}"#
+                                    .to_string(),
+                            )
+                        }
+                        _ => ("404 Not Found", String::new()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({
+                "name": "remote",
+                "type": "http",
+                "url": format!("{origin}/mcp"),
+            }))
+            .expect("create http server");
+        // Already past its expiry (obtained at unix epoch, 10-second
+        // lifetime) -- `needs_refresh()` must read this as refresh-eligible
+        // the moment the loop's first tick lands.
+        router.oauth_tokens.insert(
+            "remote",
+            crate::oauth::OAuthTokens {
+                access_token: "stale-access-token".to_string(),
+                refresh_token: Some("original-refresh-token".to_string()),
+                expires_in: Some(10),
+                obtained_at_unix: 0,
+                client_id: "test-client".to_string(),
+                client_secret: None,
+            },
+        );
+
+        router.spawn_oauth_refresh_loop(std::time::Duration::from_millis(50));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut refreshed = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(tokens) = router.oauth_tokens.get("remote") {
+                if tokens.access_token == "refreshed-access-token" {
+                    refreshed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            refreshed,
+            "expected the background loop to refresh the expiring token within the timeout"
+        );
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) >= 1,
+            "expected at least one real grant_type=refresh_token request to reach the stub token endpoint"
+        );
     }
 }

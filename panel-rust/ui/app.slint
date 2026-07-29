@@ -1,5 +1,5 @@
 import { Theme } from "tokens/theme.slint";
-import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, McpServerFormData, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
@@ -244,10 +244,11 @@ export component ChatPanel inherits Window {
     callback settings-scope-changed(string);
     callback settings-save();
     callback settings-close();
-    callback mcp-server-create(string, string);
+    callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
     callback mcp-server-authenticate(string);
+    callback mcp-server-logout(string);
     // Phase 17: host opens files/URLs from markdown Ctrl+Click.
     callback md-link-activated(string);
     // Phase 19: section counters computed Rust-side.
@@ -751,12 +752,13 @@ export component ChatPanel inherits Window {
                 settings-close();
                 chat-area.restore-compose-focus();
             }
-            mcp-server-create(name, command) => { mcp-server-create(name, command); }
+            mcp-server-submit(data) => { mcp-server-submit(data); }
             mcp-server-delete(name) => { mcp-server-delete(name); }
             mcp-server-enabled-changed(name, enabled) => {
                 mcp-server-enabled-changed(name, enabled);
             }
             mcp-server-authenticate(name) => { mcp-server-authenticate(name); }
+            mcp-server-logout(name) => { mcp-server-logout(name); }
             mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
                 mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
             }

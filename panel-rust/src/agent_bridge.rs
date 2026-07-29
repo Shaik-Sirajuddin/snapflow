@@ -3363,7 +3363,11 @@ impl AgentBridge {
     /// [`Self::list_mcp_servers`] afterward to refresh the UI list from
     /// the gateway's own state, same "don't optimistically mutate
     /// client-side state" posture the mode/config selector uses.
-    pub fn create_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+    pub fn create_mcp_server(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> bool {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
@@ -3375,7 +3379,11 @@ impl AgentBridge {
 
     /// `mcp_servers/update` -- same payload shape as [`Self::
     /// create_mcp_server`].
-    pub fn update_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+    pub fn update_mcp_server(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> bool {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
@@ -3393,6 +3401,28 @@ impl AgentBridge {
         let handle = slot.handle.clone();
         self.runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
+            .is_ok()
+    }
+
+    /// `mcp_servers/authenticate`. Returns the authorization URL to open
+    /// in a browser on success, `None` on any error (server not found,
+    /// stdio transport, discovery failure, etc.).
+    pub fn authenticate_mcp_server(&self, idx: usize, name: &str) -> Option<String> {
+        let slot = self.slots.get(idx)?;
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.authenticate_mcp_server(name.to_string()))
+            .ok()
+    }
+
+    /// `mcp_servers/logout`.
+    pub fn logout_mcp_server(&self, idx: usize, name: &str) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.logout_mcp_server(name.to_string()))
             .is_ok()
     }
 
@@ -4577,16 +4607,38 @@ mod tests {
             persona: &str,
             db_path: Option<&std::path::Path>,
         ) -> Self {
+            // `acpx-server` now defaults `ACPX_DB_PATH` to a fixed
+            // `~/.acpx/acpx.db` when unset (durable-persistence-by-
+            // default, see `main.rs::default_db_path`'s doc comment) --
+            // every test spawn that used to rely on "no ACPX_DB_PATH ==
+            // no persistence, fully isolated in-memory state" would
+            // otherwise silently share and lock-contend on that one real
+            // file across every parallel test process. When the caller
+            // doesn't ask for a specific `db_path`, mint a fresh one-off
+            // sqlite file per spawn instead (leaked via `into_path`, not
+            // cleaned up -- same tradeoff any throwaway test tempfile
+            // makes; a locked/shared default file across dozens of
+            // concurrent `cargo test` processes is the far worse
+            // failure mode this avoids).
+            let owned_db_path;
+            let db_path = match db_path {
+                Some(path) => path,
+                None => {
+                    owned_db_path = tempfile::tempdir()
+                        .expect("tempdir for isolated test ACPX_DB_PATH")
+                        .into_path()
+                        .join("acpx-test.db");
+                    owned_db_path.as_path()
+                }
+            };
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
                     .env("ACPX_BACKEND_CMD", backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
-                    .env("RUST_LOG", "error");
-                if let Some(db_path) = db_path {
-                    command.env("ACPX_DB_PATH", db_path);
-                }
+                    .env("RUST_LOG", "error")
+                    .env("ACPX_DB_PATH", db_path);
             });
             TestGateway { child, base_url }
         }
@@ -6962,11 +7014,21 @@ done
         .expect("write stand-in backend script");
 
         let port = free_port();
+        // Explicit isolated `ACPX_DB_PATH`, same reasoning as
+        // `spawn_with_backend_cmd`'s doc comment: `acpx-server` now
+        // defaults to a shared `~/.acpx/acpx.db` when this is unset,
+        // which this test (registering a fixed-name "picker-enabled"
+        // profile) would otherwise collide on across repeated runs.
+        let test_db_path = tempfile::tempdir()
+            .expect("tempdir for isolated test ACPX_DB_PATH")
+            .into_path()
+            .join("acpx-test.db");
         let mut command = std::process::Command::new(acpx_server_bin());
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
             .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
             .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
+            .env("ACPX_DB_PATH", &test_db_path)
             .env("RUST_LOG", "error")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -7261,21 +7323,26 @@ done
             bridge.list_mcp_servers(0).is_empty(),
             "expected no MCP servers on a fresh gateway"
         );
-        assert!(bridge.create_mcp_server(
-            0,
-            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs" })
-        ));
+        let stdio_entry = |command: &str| {
+            crate::protocol_types::McpServerEntry::new(
+                "bridge-fs",
+                crate::protocol_types::McpServerConfig::Stdio {
+                    command: command.to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    timeout: None,
+                },
+            )
+        };
+        assert!(bridge.create_mcp_server(0, stdio_entry("mcp-bridge-fs")));
         let after_create = bridge.list_mcp_servers(0);
         assert_eq!(after_create.len(), 1);
         assert_eq!(after_create[0].name, "bridge-fs");
 
-        assert!(bridge.update_mcp_server(
-            0,
-            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs-v2" })
-        ));
+        assert!(bridge.update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2")));
         let after_update = bridge.list_mcp_servers(0);
         assert_eq!(after_update.len(), 1);
-        assert_eq!(after_update[0].command.as_deref(), Some("mcp-bridge-fs-v2"));
+        assert_eq!(after_update[0].command(), Some("mcp-bridge-fs-v2"));
 
         assert!(bridge.delete_mcp_server(0, "bridge-fs"));
         assert!(

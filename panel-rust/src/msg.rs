@@ -155,9 +155,16 @@ pub enum SettingsMsg {
     // moving a live session to a different backend.
     ProfileSelected(String),
     DevModeToggled(bool),
+    /// Full typed create, from the settings form's transport-picker/args/
+    /// env/headers/timeout/oauth fields (`mcp_servers_view.slint`'s
+    /// `mcp-server-submit` callback with `is_edit: false`).
     McpServerCreate {
-        name: String,
-        command: String,
+        entry: crate::protocol_types::McpServerEntry,
+    },
+    /// Same form, `is_edit: true` -- updates the already-existing entry
+    /// named `entry.name` instead of creating a new one.
+    McpServerUpdate {
+        entry: crate::protocol_types::McpServerEntry,
     },
     McpServerDelete {
         name: String,
@@ -166,9 +173,14 @@ pub enum SettingsMsg {
         name: String,
         enabled: bool,
     },
-    /// OAuth / auth Connect for a remote MCP server. Persists registry-side
-    /// auth flags via `mcp_servers/update` (no separate authenticate RPC).
+    /// Begins the real MCP OAuth 2.1 flow (`mcp_servers/authenticate`)
+    /// and opens the returned authorization URL in a browser -- see
+    /// `PanelSingleton::dispatch_mcp_server_authenticate`'s doc comment.
     McpServerAuthenticate {
+        name: String,
+    },
+    /// Forgets a server's OAuth token (`mcp_servers/logout`).
+    McpServerLogout {
         name: String,
     },
     /// Per-tool enable toggle on one MCP server entry (persisted in the

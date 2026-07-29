@@ -306,22 +306,24 @@ export struct McpToolOption {
     token-usage: int,
 }
 
-// `transport`/`url`/`enabled`/`status`/`needs-auth`/`auth-status`/`tools`
-// are **UI-only for now** (settings-pane-redesign "shell phase, UI ahead
-// of backend" posture -- same convention `harness_view.slint` documents
-// for its own toggles). The real backend (`src/agent_bridge.rs`
-// `mcp_servers/*`) only supports create/delete by name+command today:
-// `models::to_mcp_server_options` default-fills these fields (`""`,
-// `false`, empty tool list) via `..Default::default()`. They mirror the
-// *set of real per-server config options* established coding agents
-// expose -- benchmarked here against opencode's `mcp` config schema
-// (https://opencode.ai/docs/mcp-servers): a `type` of `"local"`
-// (command child process) vs `"remote"` (a `url`, optional `oauth`), an
-// `enabled` flag, and -- via opencode's global `tools` glob config plus
-// its experimental `mcp_lazy`/`mcp_search` deferred-loading -- per-tool
-// enable/disable and lazy ("deferred") tool loading. Wiring these to a
-// real `mcp_servers/update` RPC, a live status feed, and a `tools/list`
-// round trip is a later phase.
+// Full round-trip data model as of the MCP-server-settings data/
+// persistence/OAuth rebuild -- `transport`/`url`/`enabled`/`needs-auth`/
+// `auth-status`/`args`/`env`/`headers`/`timeout`/`oauth-client-id` are all
+// backed by real typed fields on `acpx_client::mcp::McpServerEntry`
+// (`panel-rust::models::to_mcp_server_option_rows` populates them from
+// there, not by guessing at an opaque JSON blob's inconsistently-named
+// keys the way this struct's fields used to be filled). `status`/`tools`
+// remain best-effort passthrough from the entry's opaque `extra` map --
+// acpx has no live per-connection health probe or `tools/list` round trip
+// yet, so those two are still commonly empty. `env`/`headers` are
+// rendered/edited as `KEY=VALUE`/`Header: value` newline-separated text
+// rather than a dynamic add/remove row list: this Slint version has no
+// array push/slice/concat available in `.slint` code (confirmed
+// elsewhere, see `chat_area.slint`'s `full-view` doc comment), so a real
+// per-row editor would need new Rust-side `VecModel` plumbing for what is
+// otherwise small, rarely-edited transient form state -- the multi-line
+// text convention (the same one many `.env`-style editors use) covers the
+// same need without it.
 export struct McpServerOption {
     name: string,
     command: string,
@@ -371,6 +373,61 @@ export struct McpServerOption {
     // default for every acpx-registry row) means the user added it and may
     // remove it.
     removable: bool,
+    // Stdio-transport fields, "" / empty for an http server.
+    args: string,
+    env: string,
+    // Http-transport fields, "" / empty for a stdio server.
+    headers: string,
+    // Shared: "" means unset for either transport.
+    timeout: string,
+    // Set only for an http server with `oauth.client_id` configured --
+    // gates whether the OAuth "Connect"/"Logout" actions in
+    // `mcp_servers_view.slint` are even reachable, independent of
+    // `needs-auth` (which additionally requires not-yet-authenticated).
+    oauth-client-id: string,
+}
+
+// One `KEY=VALUE`/`Header: value` line, parsed/formatted entirely on the
+// Rust side (`models.rs`'s `format_env_lines`/`parse_env_lines` and their
+// header equivalents) -- kept as a struct here only so a future real
+// per-row editor (if this Slint version ever gains array mutation
+// support) has a ready-made element type; today's
+// `KeyValueListEditor` renders/edits the newline-joined `string` form
+// directly, no `[KeyValueEntry]` model involved yet.
+export struct KeyValueEntry {
+    key: string,
+    value: string,
+}
+
+// Add/edit-server form submission (`mcp_servers_view.slint`'s single
+// combined callback, `mcp-server-submit`) -- carries every field either
+// transport needs so `PanelSingleton::dispatch_mcp_server_submit` (Rust)
+// can build a full typed `McpServerEntry` and call `mcp_servers/create`
+// or `mcp_servers/update` in one shot, instead of the old two-string
+// `mcp-server-create(name, command)` shortcut that silently dropped
+// everything else.
+export struct McpServerFormData {
+    name: string,
+    // "stdio" | "http".
+    transport: string,
+    command: string,
+    // Whitespace-separated (parsed with Rust's `str::split_whitespace`,
+    // so quoting/escaping is not supported -- matches the level of a
+    // single plain-text field, not a real shell parser).
+    args: string,
+    // `KEY=VALUE` per line.
+    env: string,
+    url: string,
+    // `Header-Name: value` per line.
+    headers: string,
+    // Decimal seconds; "" means unset.
+    timeout: string,
+    oauth-client-id: string,
+    // True when this submission should `mcp_servers/update` the
+    // already-existing entry named `name` instead of `mcp_servers/create`
+    // a new one -- set by `mcp_servers_view.slint` when the form was
+    // opened via a row's "Edit" action.
+    is-edit: bool,
 }
 
 // Skill-manager sidebar/settings row -- `skill_discovery_backend` phase of

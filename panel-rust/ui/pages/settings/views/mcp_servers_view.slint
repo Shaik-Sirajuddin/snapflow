@@ -1,57 +1,133 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 import { Button } from "../../../base/button.slint";
 import { Toggle } from "../../../base/toggle.slint";
 import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
-import { McpServerOption, McpToolOption } from "../../../types.slint";
+import { McpServerOption, McpToolOption, McpServerFormData } from "../../../types.slint";
 import { TextUtil } from "../../../base/text_util.slint";
 
-// MCP Servers left-tab view. Started as a phase-1 shell that only re-hosted
-// the former `components/settings_sheet.slint` list unchanged (name +
-// command + Remove, plus a name/command add row). This pass fills the row
-// out to match the *set of per-server config options* established coding
-// agents expose for MCP management -- benchmarked against opencode's `mcp`
-// config schema (https://opencode.ai/docs/mcp-servers): a `type` of
-// `"local"` (a `command`) vs `"remote"` (a `url`, optional `oauth`), an
-// `enabled` flag, per-tool enable/disable (opencode's global `tools` glob
-// config), and deferred/lazy tool loading (opencode's experimental
-// `mcp_lazy`/`mcp_search`, mirroring Claude Code's ToolSearch). Cross-checked
-// against Zed's `context_servers` and Codex's `mcp_servers`, and the MCP
-// spec's `tools/list` (per-server tool catalog) + stdio/Streamable-HTTP
-// transports.
+// Multi-line text box for the env-var/header editors below (`KEY=VALUE`/
+// `Header: value` one per line, parsed Rust-side -- see
+// `McpServerOption`'s doc comment in types.slint for why this is a plain
+// multi-line text convention rather than a dynamic per-row add/remove
+// list: this Slint version has no array push/slice/concat available in
+// `.slint` code). Not exported -- local to this file only. Same visual
+// shape as `TextField` (can't just override its fixed 26px `height`/
+// single-line `TextInput`, so this is a small hand-rolled sibling rather
+// than a `TextField` variant), `single-line: false` + `wrap: word-wrap`
+// is the same multi-line idiom `chat_input_layout.slint`'s compose box
+// already uses.
+component MultilineField inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> field-accessible-label: "";
+    out property <bool> has-focus: input.has-focus;
+
+    height: 64px;
+    background: Theme.bg-sidebar;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+    clip: true;
+
+    input := TextInput {
+        accessible-label: root.field-accessible-label;
+        color: Theme.text-primary;
+        font-family: Theme.font-mono;
+        font-size: 10px * Theme.font-scale;
+        x: Metrics.pad-md;
+        y: Metrics.pad-xs;
+        width: parent.width - 2 * Metrics.pad-md;
+        height: parent.height - 2 * Metrics.pad-xs;
+        single-line: false;
+        wrap: word-wrap;
+        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
+    }
+}
+
+// MCP Servers left-tab view. Rebuilt (MCP-servers-settings-data-
+// persistence-oauth plan) into a Zed-style structured form: a Stdio/HTTP
+// transport picker plus the fields each transport actually needs
+// (args/env/timeout for stdio; headers/timeout/oauth-client-id for
+// http), replacing the earlier "shell phase" 2-field name+command-or-url
+// form that silently dropped everything else. List rows keep the
+// existing `SettingsRow` shape but gain a real per-row "Edit" action
+// (there was previously no edit path at all, only create/delete) and a
+// "Disconnect" action for an OAuth-authenticated server, alongside the
+// existing "Connect"/enable-toggle/Remove/Tools controls.
 //
-// Layout: each server is a header row (`SettingsRow`: name, command-or-url
-// hint, transport tag, auth status, connection status, OAuth "Connect",
-// enable toggle, Remove) plus, when it advertises tools, an expand/collapse
-// nested list of per-tool rows (name, "deferred" tag, enable toggle).
-//
-// Backend reality: acpx's central registry is opaque JSON via
-// `mcp_servers/{create,update,delete,list}` -- there is no separate
-// `mcp_servers/authenticate` or live `tools/list` RPC on the panel
-// gateway. Connect and per-tool toggles therefore persist registry-side
-// fields (`auth_status`/`needs_auth`/`tools[]`) through `mcp_servers/update`,
-// same as the per-server `enabled` toggle. Live OAuth browser flows and
-// discovery of tools from a running MCP process remain out of band.
+// Backend reality: `acpx_client::mcp::McpServerEntry` (re-exported as
+// `crate::protocol_types::McpServerEntry`) is now a fully typed round
+// trip through `mcp_servers/{create,update,delete,list}`, and
+// `mcp_servers/authenticate`/`mcp_servers/logout` are real RPCs backing
+// a genuine MCP OAuth 2.1 flow (`acpx_core::router::Router::
+// authenticate_mcp_server`) -- Connect opens a real browser authorization
+// page via `opener`, not a client-side JSON patch. Per-tool toggles still
+// persist into the entry's opaque `tools` JSON array (MCP has no static
+// per-tool config in its own schema -- tools are a runtime-discovered
+// capability of a connected server) and live connection health/tool
+// discovery remain out of band (acpx has no `tools/list` round trip or
+// per-connection health probe yet).
 export component McpServersView inherits Rectangle {
     in property <[McpServerOption]> servers: [];
     // settings_page_search_filter: page-level query filters this list.
     in property <string> page-search-query: "";
-    callback mcp-server-create(string, string);
+    callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
     callback mcp-server-authenticate(string);
+    callback mcp-server-logout(string);
     callback mcp-server-tool-enabled-changed(string, string, bool);
     // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
-    // own doc comment: this view's add-server name/command fields never had
-    // any focus state to aggregate up into settings_page.slint's OR-chain,
-    // so every keystroke typed into either field was silently dropped.
+    // own doc comment: this view's form fields never had any focus state
+    // aggregated up into settings_page.slint's OR-chain, so every
+    // keystroke typed into any of them was silently dropped.
+    //
+    // The stdio-only/http-only fields live inside a conditional (`if
+    // root.form-transport == ...`) branch, so their element ids aren't
+    // reachable from this outer binding (a Slint element declared inside
+    // an `if` only exists -- and is only nameable -- within that block).
+    // `stdio-fields-focused`/`http-fields-focused` are the two branches'
+    // own local aggregates, kept updated by each field's own `changed
+    // has-focus` handler below, and folded in here instead.
     out property <bool> search-has-focus:
-        new-mcp-name-field.has-focus || new-mcp-command-field.has-focus;
+        name-field.has-focus
+        || timeout-field.has-focus
+        || root.stdio-fields-focused
+        || root.http-fields-focused;
 
-    property <string> new-mcp-name: "";
-    property <string> new-mcp-command: "";
+    property <bool> stdio-fields-focused: false;
+    property <bool> http-fields-focused: false;
+
+    property <string> form-name: "";
+    // "stdio" | "http".
+    property <string> form-transport: "stdio";
+    property <string> form-command: "";
+    property <string> form-args: "";
+    property <string> form-env: "";
+    property <string> form-url: "";
+    property <string> form-headers: "";
+    property <string> form-timeout: "";
+    property <string> form-oauth-client-id: "";
+    // "" means "add new server"; non-empty means "editing this existing
+    // server" (the Add button becomes Save, and submission sets
+    // `McpServerFormData.is-edit`).
+    property <string> editing-name: "";
+
+    function reset-form() {
+        root.form-name = "";
+        root.form-transport = "stdio";
+        root.form-command = "";
+        root.form-args = "";
+        root.form-env = "";
+        root.form-url = "";
+        root.form-headers = "";
+        root.form-timeout = "";
+        root.form-oauth-client-id = "";
+        root.editing-name = "";
+    }
 
     background: transparent;
 
@@ -66,9 +142,14 @@ export component McpServersView inherits Rectangle {
             for server in root.servers : server-block := VerticalLayout {
                 width: parent.width;
                 // Hide non-matching servers when page search is active.
+                // Matches across every real field a server carries now
+                // (not just name/command/url) -- e.g. finding a server by
+                // an env var name, a header, or its OAuth client id.
                 visible: root.page-search-query == ""
                     || TextUtil.matches-filter(
-                        server.name + "\n" + server.command + "\n" + server.url,
+                        server.name + "\n" + server.command + "\n" + server.url + "\n"
+                            + server.args + "\n" + server.env + "\n" + server.headers + "\n"
+                            + server.oauth-client-id,
                         root.page-search-query,
                     );
                 // `pad-xs` (4px) -- the compact pre-reveal gap between a
@@ -84,15 +165,6 @@ export component McpServersView inherits Rectangle {
                 // Pre-formatted in Rust (`McpServerOption.status-line`).
                 property <string> status-line: server.status-line;
 
-                // Header row -- consolidated to 4 trailing controls (was 7:
-                // transport tag, auth-status, status and Connect were each
-                // their own item, competing with Tools/enable-Toggle/Remove
-                // for the same cramped trailing slot at 9-10px font sizes).
-                // Transport/auth/status now collapse into one combined
-                // subtitle line via `status-line` below; Connect only shows
-                // when actually relevant. This is also why the enable toggle
-                // read as "missing" -- it was there, just visually lost among
-                // too many same-sized neighbors.
                 SettingsRow {
                     width: parent.width;
                     label: server.name;
@@ -100,11 +172,8 @@ export component McpServersView inherits Rectangle {
                     hint: server.transport == "http" ? server.url : server.command;
                     hint-font-family: Theme.font-mono;
 
-                    // Phase 15 (mcp_skills_control_surface): live
-                    // connection dot -- green connected, red error/
+                    // Live connection dot -- green connected, red error/
                     // disconnected, yellow otherwise (auth required...).
-                    // Explicit user direction; supersedes the earlier
-                    // no-status-color convention for MCP surfaces.
                     if server.status != "" : Rectangle {
                         width: 8px;
                         height: 8px;
@@ -114,24 +183,42 @@ export component McpServersView inherits Rectangle {
                             : #eab308;
                     }
                     // Transport + auth + connection status, combined into one
-                    // muted subtitle as before (dot above carries the color).
+                    // muted subtitle (dot above carries the color).
                     if server-block.status-line != "" : Text {
                         text: server-block.status-line;
                         color: Theme.text-muted;
                         font-size: 9px * Theme.font-scale;
                         vertical-alignment: center;
-                        // Capped + elided -- unbounded, this could still
-                        // overflow the row for a server with several
-                        // combined status segments (e.g. "http ·
-                        // not authenticated · auth required"), the same
-                        // class of overflow bug hit repeatedly earlier
-                        // this session.
                         max-width: 120px;
                         overflow: elide;
                     }
 
-                    // OAuth "Connect" -- remote servers advertising auth.
-                    // Persists registry-side auth flags via mcp_servers/update.
+                    // Edit -- pre-fills the form below with this server's
+                    // full current config (only for user-added rows; the
+                    // built-in snapshotd row is not editable).
+                    if server.removable : Button {
+                        label: "Edit";
+                        button-accessible-label: "Edit MCP server " + server.name;
+                        btn-width: 48px;
+                        btn-height: 24px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        clicked => {
+                            root.form-name = server.name;
+                            root.form-transport = server.transport == "http" ? "http" : "stdio";
+                            root.form-command = server.command;
+                            root.form-args = server.args;
+                            root.form-env = server.env;
+                            root.form-url = server.url;
+                            root.form-headers = server.headers;
+                            root.form-timeout = server.timeout;
+                            root.form-oauth-client-id = server.oauth-client-id;
+                            root.editing-name = server.name;
+                        }
+                    }
+
+                    // OAuth "Connect" -- opens a real authorization URL in
+                    // the user's browser (mcp_servers/authenticate).
                     if server.transport == "http" && server.needs-auth : Button {
                         label: "Connect";
                         button-accessible-label: "Connect (authenticate) MCP server " + server.name;
@@ -140,6 +227,19 @@ export component McpServersView inherits Rectangle {
                         font-size: 9px;
                         font-weight: 400;
                         clicked => { root.mcp-server-authenticate(server.name); }
+                    }
+
+                    // Forget this server's OAuth token (mcp_servers/logout
+                    // RPC/callback name kept as-is -- only the user-facing
+                    // label changed to "Disconnect").
+                    if server.auth-status == "authenticated" : Button {
+                        label: "Disconnect";
+                        button-accessible-label: "Disconnect MCP server " + server.name;
+                        btn-width: 56px;
+                        btn-height: 24px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        clicked => { root.mcp-server-logout(server.name); }
                     }
 
                     // Expand/collapse the per-tool list (when tools are present).
@@ -155,27 +255,28 @@ export component McpServersView inherits Rectangle {
                         clicked => { server-block.tools-expanded = !server-block.tools-expanded; }
                     }
 
-                    // Enable/disable without removing the entry (opencode/Codex
-                    // per-server `enabled`) is registry-backed and immediately
-                    // re-listed by the Rust host after update.
+                    // Enable/disable without removing the entry -- registry-
+                    // backed and immediately re-listed by the Rust host after
+                    // update.
                     Toggle {
                         checked: server.enabled;
                         toggle-accessible-label: "Toggle MCP server " + server.name;
                         toggled(enabled) => { root.mcp-server-enabled-changed(server.name, enabled); }
                     }
 
-                    Button {
+                    if server.removable : Button {
                         label: "Remove";
                         button-accessible-label: "Remove MCP server " + server.name;
-                        // Bumped from 44x20 -- `Button` has no separate
-                        // padding concept (fixed btn-width/btn-height with
-                        // centered text), so more breathing room around
-                        // the label means a larger box.
                         btn-width: 56px;
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
-                        clicked => { root.mcp-server-delete(server.name); }
+                        clicked => {
+                            if (root.editing-name == server.name) {
+                                root.reset-form();
+                            }
+                            root.mcp-server-delete(server.name);
+                        }
                     }
                 }
 
@@ -237,34 +338,152 @@ export component McpServersView inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
-            // `gap-sm` (6px) -- gap between the two add-server fields and
-            // the Add button.
+        VerticalLayout {
             spacing: Metrics.gap-sm;
-            new-mcp-name-field := TextField {
-                horizontal-stretch: 1;
-                text <=> root.new-mcp-name;
-                field-accessible-label: "New MCP server name";
+            padding-top: Metrics.pad-sm;
+
+            if root.editing-name != "" : Text {
+                text: "Editing \"" + root.editing-name + "\"";
+                color: Theme.text-muted;
+                font-size: 9px * Theme.font-scale;
             }
-            new-mcp-command-field := TextField {
-                horizontal-stretch: 1;
-                text <=> root.new-mcp-command;
-                field-accessible-label: "New MCP server command or URL";
+
+            HorizontalLayout {
+                spacing: Metrics.gap-sm;
+                name-field := TextField {
+                    horizontal-stretch: 1;
+                    text <=> root.form-name;
+                    field-accessible-label: "MCP server name";
+                }
+                Button {
+                    label: "Stdio";
+                    button-accessible-label: "Stdio transport";
+                    primary: root.form-transport == "stdio";
+                    btn-width: 52px;
+                    btn-height: 26px;
+                    font-size: 9px;
+                    font-weight: 400;
+                    clicked => { root.form-transport = "stdio"; }
+                }
+                Button {
+                    label: "HTTP";
+                    button-accessible-label: "HTTP transport";
+                    primary: root.form-transport == "http";
+                    btn-width: 52px;
+                    btn-height: 26px;
+                    font-size: 9px;
+                    font-weight: 400;
+                    clicked => { root.form-transport = "http"; }
+                }
             }
-            Button {
-                label: "Add";
-                button-accessible-label: "Add MCP server";
-                primary: true;
-                btn-width: 56px;
-                btn-height: 26px;
-                font-size: 11px;
-                font-weight: 400;
-                clicked => {
-                    if (root.new-mcp-name != "") {
-                        root.mcp-server-create(root.new-mcp-name, root.new-mcp-command);
-                        root.new-mcp-name = "";
-                        root.new-mcp-command = "";
+
+            if root.form-transport == "stdio" : VerticalLayout {
+                spacing: Metrics.gap-sm;
+                command-field := TextField {
+                    text <=> root.form-command;
+                    field-accessible-label: "Command";
+                    changed has-focus => {
+                        root.stdio-fields-focused = self.has-focus
+                            || args-field.has-focus || env-field.has-focus;
                     }
+                }
+                args-field := TextField {
+                    text <=> root.form-args;
+                    field-accessible-label: "Arguments, space-separated";
+                    changed has-focus => {
+                        root.stdio-fields-focused = self.has-focus
+                            || command-field.has-focus || env-field.has-focus;
+                    }
+                }
+                Text {
+                    text: "Environment variables (KEY=VALUE per line)";
+                    color: Theme.text-muted;
+                    font-size: 9px * Theme.font-scale;
+                }
+                env-field := MultilineField {
+                    text <=> root.form-env;
+                    field-accessible-label: "Environment variables, one KEY=VALUE per line";
+                    changed has-focus => {
+                        root.stdio-fields-focused = self.has-focus
+                            || command-field.has-focus || args-field.has-focus;
+                    }
+                }
+            }
+
+            if root.form-transport == "http" : VerticalLayout {
+                spacing: Metrics.gap-sm;
+                url-field := TextField {
+                    text <=> root.form-url;
+                    field-accessible-label: "URL";
+                    changed has-focus => {
+                        root.http-fields-focused = self.has-focus
+                            || headers-field.has-focus || oauth-field.has-focus;
+                    }
+                }
+                Text {
+                    text: "Headers (Header-Name: value per line)";
+                    color: Theme.text-muted;
+                    font-size: 9px * Theme.font-scale;
+                }
+                headers-field := MultilineField {
+                    text <=> root.form-headers;
+                    field-accessible-label: "Headers, one Header-Name: value per line";
+                    changed has-focus => {
+                        root.http-fields-focused = self.has-focus
+                            || url-field.has-focus || oauth-field.has-focus;
+                    }
+                }
+                oauth-field := TextField {
+                    text <=> root.form-oauth-client-id;
+                    field-accessible-label: "OAuth client id (optional -- leave blank to use dynamic client registration)";
+                    changed has-focus => {
+                        root.http-fields-focused = self.has-focus
+                            || url-field.has-focus || headers-field.has-focus;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Metrics.gap-sm;
+                timeout-field := TextField {
+                    horizontal-stretch: 1;
+                    text <=> root.form-timeout;
+                    field-accessible-label: "Timeout in seconds (optional)";
+                }
+                Button {
+                    label: root.editing-name == "" ? "Add" : "Save";
+                    button-accessible-label: root.editing-name == "" ? "Add MCP server" : "Save MCP server";
+                    primary: true;
+                    btn-width: 56px;
+                    btn-height: 26px;
+                    font-size: 11px;
+                    font-weight: 400;
+                    clicked => {
+                        if (root.form-name != "") {
+                            root.mcp-server-submit({
+                                name: root.form-name,
+                                transport: root.form-transport,
+                                command: root.form-command,
+                                args: root.form-args,
+                                env: root.form-env,
+                                url: root.form-url,
+                                headers: root.form-headers,
+                                timeout: root.form-timeout,
+                                oauth-client-id: root.form-oauth-client-id,
+                                is-edit: root.editing-name != "",
+                            });
+                            root.reset-form();
+                        }
+                    }
+                }
+                if root.editing-name != "" : Button {
+                    label: "Cancel";
+                    button-accessible-label: "Cancel editing MCP server";
+                    btn-width: 56px;
+                    btn-height: 26px;
+                    font-size: 11px;
+                    font-weight: 400;
+                    clicked => { root.reset-form(); }
                 }
             }
         }

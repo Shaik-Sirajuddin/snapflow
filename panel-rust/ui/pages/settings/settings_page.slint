@@ -26,7 +26,7 @@ import { McpServersView } from "views/mcp_servers_view.slint";
 import { AgentsView } from "views/agents_view.slint";
 import { HarnessView } from "views/harness_view.slint";
 import { SkillsView } from "views/skills_view.slint";
-import { ProfileOption, McpServerOption, AgentCatalogEntry, RemoteSessionOption, SkillOption } from "../../types.slint";
+import { ProfileOption, McpServerOption, McpServerFormData, AgentCatalogEntry, RemoteSessionOption, SkillOption } from "../../types.slint";
 
 export component SettingsPage inherits Rectangle {
     // New shell-only state (settings-pane-redesign plan, phase 1).
@@ -78,10 +78,11 @@ export component SettingsPage inherits Rectangle {
     callback save();
     callback close();
     callback scope-changed(string);
-    callback mcp-server-create(string, string);
+    callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
     callback mcp-server-authenticate(string);
+    callback mcp-server-logout(string);
     callback mcp-server-tool-enabled-changed(string, string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
@@ -249,13 +250,16 @@ export component SettingsPage inherits Rectangle {
                             width: parent.width;
                             servers: root.available-mcp-servers;
                             page-search-query: root.search-query;
-                            mcp-server-create(name, command) => { root.mcp-server-create(name, command); }
+                            mcp-server-submit(data) => { root.mcp-server-submit(data); }
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
                             mcp-server-enabled-changed(name, enabled) => {
                                 root.mcp-server-enabled-changed(name, enabled);
                             }
                             mcp-server-authenticate(name) => {
                                 root.mcp-server-authenticate(name);
+                            }
+                            mcp-server-logout(name) => {
+                                root.mcp-server-logout(name);
                             }
                             mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
                                 root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);

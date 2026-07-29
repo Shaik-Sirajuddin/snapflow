@@ -911,16 +911,21 @@ pub(crate) fn dispatch_settings_close(panel: &PanelSingleton, _component: &ChatP
 pub(crate) fn dispatch_mcp_server_create(
     panel: &PanelSingleton,
     component: &ChatPanel,
-    name: String,
-    command: String,
+    entry: crate::protocol_types::McpServerEntry,
 ) {
-    let (effects, _) = update_persistent(
-        panel,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
-            name: name.clone(),
-            command: command.clone(),
-        })),
-    );
+    let (effects, _) =
+        update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate { entry })));
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_update(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    entry: crate::protocol_types::McpServerEntry,
+) {
+    let (effects, _) =
+        update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerUpdate { entry })));
     let _ = component;
     execute_effects(panel, effects);
 }
@@ -967,6 +972,15 @@ pub(crate) fn dispatch_mcp_server_authenticate(
         Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerAuthenticate {
             name: name.clone(),
         })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_logout(panel: &PanelSingleton, component: &ChatPanel, name: String) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerLogout { name })),
     );
     let _ = component;
     execute_effects(panel, effects);

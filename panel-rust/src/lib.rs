@@ -833,17 +833,31 @@ impl PanelSingleton {
     pub(crate) fn dispatch_mcp_server_create(
         &self,
         _component: &ChatPanel,
-        name: &str,
-        command: &str,
+        entry: crate::protocol_types::McpServerEntry,
     ) {
         let Some(bridge) = &self.bridge else { return };
-        let entry = if command.is_empty() {
-            serde_json::json!({ "name": name })
-        } else {
-            serde_json::json!({ "name": name, "command": command })
-        };
         let gw = self.settings_gateway_index();
-        bridge.create_mcp_server(gw, entry);
+        if !bridge.create_mcp_server(gw, entry.clone()) {
+            eprintln!("panel-rust: failed to create MCP server {:?}", entry.name);
+        }
+    }
+
+    /// Full typed create/update, for a richer settings form (transport
+    /// picker, args/env/headers/timeout/oauth editors) to call directly
+    /// once it exists -- not yet wired to any Slint callback.
+    pub(crate) fn dispatch_mcp_server_update(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        if !bridge.update_mcp_server(gw, entry.clone()) {
+            eprintln!(
+                "panel-rust: failed to update MCP server {:?}",
+                entry.name
+            );
+        }
     }
 
     pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
@@ -871,8 +885,8 @@ impl PanelSingleton {
             );
             return;
         };
-        entry.extra["enabled"] = serde_json::Value::Bool(enabled);
-        if !bridge.update_mcp_server(gw, entry.extra) {
+        entry.enabled = enabled;
+        if !bridge.update_mcp_server(gw, entry) {
             eprintln!(
                 "panel-rust: failed to update enabled state for MCP server {:?}",
                 name
@@ -880,41 +894,55 @@ impl PanelSingleton {
         }
     }
 
-    /// Registry-side "Connect" for remote MCP servers. There is no
-    /// `mcp_servers/authenticate` RPC on acpx; this persists
-    /// `auth_status`/`needs_auth` on the entry via `mcp_servers/update`
-    /// so the Connect button can clear and the status line updates on
-    /// the next settings gateway snapshot.
-    pub(crate) fn dispatch_mcp_server_authenticate(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-    ) {
+    /// Begins the real MCP OAuth 2.1 flow (`acpx_core::router::Router::
+    /// authenticate_mcp_server`'s doc comment has the full RFC 9728/8414/
+    /// 7591 discovery + PKCE shape) and opens the returned authorization
+    /// URL in the user's default browser via `opener` (already a dep,
+    /// same crate `editor_detect.rs` uses to open a file in an external
+    /// editor). The rest of the flow -- waiting for the browser redirect,
+    /// exchanging the code, persisting tokens -- completes server-side in
+    /// a detached background task; this call only kicks it off. The
+    /// resulting `auth_status` change is picked up on the next `mcp_
+    /// servers/list` refresh, same as any other server-side state change
+    /// (no separate push channel for this yet).
+    pub(crate) fn dispatch_mcp_server_authenticate(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == name)
-        else {
+        let Some(authorization_url) = bridge.authenticate_mcp_server(gw, name) else {
             eprintln!(
-                "panel-rust: MCP server {:?} disappeared before authenticate could run",
+                "panel-rust: mcp_servers/authenticate failed for MCP server {:?}",
                 name
             );
             return;
         };
-        entry.extra["auth_status"] = serde_json::Value::String("authenticated".to_owned());
-        entry.extra["needs_auth"] = serde_json::Value::Bool(false);
-        if !bridge.update_mcp_server(gw, entry.extra) {
+        if let Err(error) = opener::open(&authorization_url) {
             eprintln!(
-                "panel-rust: failed to persist auth state for MCP server {:?}",
+                "panel-rust: failed to open OAuth authorization URL for MCP server {:?}: {error}",
+                name
+            );
+        }
+    }
+
+    /// Forgets a server's OAuth token, reverting it to `AuthRequired`.
+    pub(crate) fn dispatch_mcp_server_logout(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        if !bridge.logout_mcp_server(gw, name) {
+            eprintln!(
+                "panel-rust: mcp_servers/logout failed for MCP server {:?}",
                 name
             );
         }
     }
 
     /// Per-tool enable flag on one MCP server entry. Persists into the
-    /// entry's opaque `tools` JSON array via `mcp_servers/update`.
+    /// entry's opaque `tools` JSON array via `mcp_servers/update` -- MCP
+    /// tool-level enablement isn't part of the typed `McpServerConfig`
+    /// (tools are a runtime-discovered capability of a connected server,
+    /// not part of its static config), so this still goes through
+    /// `entry.extra` same as before, just as a `Map` now instead of a
+    /// `Value` (no `IndexMut`, hence `.insert` instead of `entry.extra[..]
+    /// = ..`).
     pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
         &self,
         _component: &ChatPanel,
@@ -955,12 +983,15 @@ impl PanelSingleton {
                 }));
             }
         } else {
-            entry.extra["tools"] = serde_json::json!([{
-                "name": tool_name,
-                "enabled": enabled,
-            }]);
+            entry.extra.insert(
+                "tools".to_string(),
+                serde_json::json!([{
+                    "name": tool_name,
+                    "enabled": enabled,
+                }]),
+            );
         }
-        if !bridge.update_mcp_server(gw, entry.extra) {
+        if !bridge.update_mcp_server(gw, entry) {
             eprintln!(
                 "panel-rust: failed to update tool {:?} on MCP server {:?}",
                 tool_name, server_name
@@ -1748,18 +1779,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
 
         let component_weak = panel.component.as_weak();
-        panel.component.on_mcp_server_create(move |name, command| {
+        panel.component.on_mcp_server_submit(move |data| {
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
+            let entry = models::mcp_server_entry_from_form(&data);
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_mcp_server_create(
-                        panel,
-                        &component,
-                        name.to_string(),
-                        command.to_string(),
-                    );
+                    if data.is_edit {
+                        dispatch::dispatch_mcp_server_update(panel, &component, entry);
+                    } else {
+                        dispatch::dispatch_mcp_server_create(panel, &component, entry);
+                    }
                 }
             });
         });
@@ -1818,6 +1849,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     }
                 });
             });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_logout(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_mcp_server_logout(panel, &component, name.to_string());
+                }
+            });
+        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_tool_enabled_changed(

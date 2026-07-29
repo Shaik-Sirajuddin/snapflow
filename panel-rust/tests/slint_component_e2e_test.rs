@@ -472,10 +472,10 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     }
     {
         let created_mcp = created_mcp.clone();
-        panel.on_mcp_server_create(move |name, command| {
+        panel.on_mcp_server_submit(move |data| {
             created_mcp
                 .borrow_mut()
-                .push((name.to_string(), command.to_string()));
+                .push((data.name.to_string(), data.command.to_string()));
         });
     }
     {
@@ -589,6 +589,12 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         needs_auth: false,
         auth_status: "".into(),
         tools: Default::default(),
+        removable: true,
+        args: "".into(),
+        env: "".into(),
+        headers: "".into(),
+        timeout: "".into(),
+        oauth_client_id: "".into(),
     }])));
     panel.set_agent_catalog(ModelRc::new(VecModel::from(vec![AgentCatalogEntry {
         id: "claude".into(),

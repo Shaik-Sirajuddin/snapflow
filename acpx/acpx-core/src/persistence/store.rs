@@ -867,6 +867,91 @@ impl PersistenceStore {
         .await
     }
 
+    /// MCP OAuth 2.1 token storage (`crate::oauth`) -- same encrypted-row
+    /// shape as `record_secret`/`load_all_secrets`/`delete_secret` above,
+    /// just keyed by `server_name` instead of an opaque `KeyRef` (one MCP
+    /// server has at most one live OAuth token set, so the server name
+    /// itself is a stable, meaningful primary key).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_oauth_tokens(
+        &self,
+        server_name: impl Into<String>,
+        ciphertext: Vec<u8>,
+        nonce: Vec<u8>,
+        key_version: u32,
+        created_at: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let server_name = server_name.into();
+        let created_at = created_at.into();
+        let updated_at = updated_at.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO oauth_tokens \
+                 (server_name, ciphertext, nonce, key_version, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(server_name) DO UPDATE SET \
+                     ciphertext = excluded.ciphertext, \
+                     nonce = excluded.nonce, \
+                     key_version = excluded.key_version, \
+                     updated_at = excluded.updated_at",
+                params![server_name, ciphertext, nonce, key_version, created_at, updated_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every persisted OAuth token row, for startup reload -- mirrors
+    /// `load_all_secrets`'s shape (`(server_name, ciphertext, nonce,
+    /// key_version)`) so `Router::enable_durable_config` can decrypt each
+    /// one the same way it already decrypts secrets.
+    pub async fn load_all_oauth_tokens(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>, Vec<u8>, u32)>, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement = conn.prepare(
+                "SELECT server_name, ciphertext, nonce, key_version \
+                 FROM oauth_tokens ORDER BY server_name ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    let key_version: i64 = row.get(3)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        key_version as u32,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PersistenceError::from)?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn delete_oauth_tokens(
+        &self,
+        server_name: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let server_name = server_name.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "DELETE FROM oauth_tokens WHERE server_name = ?1",
+                params![server_name],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Best-effort mirror of `Router::register_provider`'s in-memory
     /// create-or-update -- see that method's doc comment for why this is
     /// fire-and-forget from the caller's perspective (no JSON-RPC
@@ -1147,6 +1232,63 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn oauth_tokens_round_trip_upsert_load_and_delete() {
+        let store = PersistenceStore::open_in_memory().expect("in-memory store");
+        assert!(store
+            .load_all_oauth_tokens()
+            .await
+            .expect("empty load")
+            .is_empty());
+
+        store
+            .upsert_oauth_tokens(
+                "remote-mcp",
+                b"ciphertext-v1".to_vec(),
+                b"nonce-v1".to_vec(),
+                1,
+                "2026-07-16T00:00:00Z",
+                "2026-07-16T00:00:00Z",
+            )
+            .await
+            .expect("insert");
+        let rows = store.load_all_oauth_tokens().await.expect("load after insert");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "remote-mcp");
+        assert_eq!(rows[0].1, b"ciphertext-v1");
+        assert_eq!(rows[0].2, b"nonce-v1");
+        assert_eq!(rows[0].3, 1);
+
+        // Upsert on an existing server_name replaces, not duplicates --
+        // the same "re-authenticate refreshes the same row" contract
+        // `mcp_server_configs`'s `upsert_mcp_server` already has.
+        store
+            .upsert_oauth_tokens(
+                "remote-mcp",
+                b"ciphertext-v2".to_vec(),
+                b"nonce-v2".to_vec(),
+                2,
+                "2026-07-16T00:00:00Z",
+                "2026-07-16T01:00:00Z",
+            )
+            .await
+            .expect("update");
+        let rows = store.load_all_oauth_tokens().await.expect("load after update");
+        assert_eq!(rows.len(), 1, "update must replace, not append, a second row");
+        assert_eq!(rows[0].1, b"ciphertext-v2");
+        assert_eq!(rows[0].3, 2);
+
+        store
+            .delete_oauth_tokens("remote-mcp")
+            .await
+            .expect("delete");
+        assert!(store
+            .load_all_oauth_tokens()
+            .await
+            .expect("load after delete")
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn transcript_state_detects_an_out_of_band_database_write() {

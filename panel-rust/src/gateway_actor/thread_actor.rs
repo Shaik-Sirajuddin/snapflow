@@ -157,19 +157,31 @@ enum Command {
     ListMcpServers {
         resp: oneshot::Sender<Result<Vec<crate::protocol_types::McpServerEntry>, AcpxThreadError>>,
     },
-    /// `mcp_servers/create`. `entry` must include a `"name"` field (the
-    /// merge key `acpx-core::mcp_servers::McpServerStore` uses).
+    /// `mcp_servers/create`.
     CreateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/update` -- same payload shape as create.
     UpdateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/delete`.
     DeleteMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/authenticate` -- begins the MCP OAuth 2.1 flow server
+    /// side (see `acpx_core::router::Router::authenticate_mcp_server`'s
+    /// doc comment) and returns the `authorizationUrl` the caller must
+    /// open in a browser.
+    AuthenticateMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<String, AcpxThreadError>>,
+    },
+    /// `mcp_servers/logout`.
+    LogoutMcpServer {
         name: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
@@ -470,11 +482,11 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListMcpServers { resp }).await
     }
 
-    /// `mcp_servers/create`. `entry` must include a `"name"` field.
+    /// `mcp_servers/create`.
     pub async fn create_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::CreateMcpServer { entry, resp })
             .await
     }
@@ -482,8 +494,8 @@ impl AcpxThreadHandle {
     /// `mcp_servers/update` -- same payload shape as `create_mcp_server`.
     pub async fn update_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::UpdateMcpServer { entry, resp })
             .await
     }
@@ -492,6 +504,24 @@ impl AcpxThreadHandle {
     pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
         self.call(|resp| Command::DeleteMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/authenticate` -- returns the authorization URL to open
+    /// in a browser. See `Command::AuthenticateMcpServer`'s doc comment.
+    pub async fn authenticate_mcp_server(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<String, AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::AuthenticateMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/logout`.
+    pub async fn logout_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::LogoutMcpServer { name, resp })
             .await
     }
 
@@ -1530,47 +1560,35 @@ async fn run_thread_actor(
             }
             Command::Shutdown => break,
             Command::ListMcpServers { resp } => {
-                // Deliberately `client.call(...)` (the transport-neutral
-                // `Gateway` facade this actor already holds), not
-                // `acpx_client::ext::mcp_servers::list` -- that helper is
-                // typed against the raw HTTP-only `GatewayClient`, which
-                // would silently drop this actor onto HTTP even in a live
-                // WS session. Same reasoning `ListProfiles`/`ListSessions`
-                // above already follow.
-                let result = client
-                    .call("mcp_servers/list", serde_json::json!({}), None)
-                    .await
-                    .map(|value| {
-                        value
-                            .get("servers")
-                            .and_then(|s| s.as_array())
-                            .map(|entries| {
-                                entries
-                                    .iter()
-                                    .filter_map(crate::protocol_types::McpServerEntry::from_json)
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    });
+                // Deliberately `client.list_mcp_servers()` (a typed method
+                // on the transport-neutral `Gateway` facade this actor
+                // already holds, `acpx_client::mcp`), not `acpx_client::
+                // ext::mcp_servers::list` -- that helper is typed against
+                // the raw HTTP-only `GatewayClient`, which would silently
+                // drop this actor onto HTTP even in a live WS session.
+                // Same reasoning `ListProfiles`/`ListSessions` above
+                // already follow.
+                let result = client.list_mcp_servers().await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/create", entry, None).await;
+                let result = client.create_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::UpdateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/update", entry, None).await;
+                let result = client.update_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::DeleteMcpServer { name, resp } => {
-                let result = client
-                    .call(
-                        "mcp_servers/delete",
-                        serde_json::json!({ "name": name }),
-                        None,
-                    )
-                    .await
-                    .map(|_| ());
+                let result = client.delete_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::AuthenticateMcpServer { name, resp } => {
+                let result = client.authenticate_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::LogoutMcpServer { name, resp } => {
+                let result = client.logout_mcp_server(&name).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateProfile { entry, resp } => {

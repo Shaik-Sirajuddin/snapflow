@@ -544,11 +544,17 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             Effect::SaveDevMode { enabled } => {
                 panel.dispatch_dev_mode_toggled(enabled);
             }
-            Effect::McpServerCreate { name, command, .. } => {
+            Effect::McpServerCreate { entry, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_create(&component, &name, &command);
+                panel.dispatch_mcp_server_create(&component, entry);
+            }
+            Effect::McpServerUpdate { entry, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_update(&component, entry);
             }
             Effect::McpServerDelete { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
@@ -567,6 +573,12 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     continue;
                 };
                 panel.dispatch_mcp_server_authenticate(&component, &name);
+            }
+            Effect::McpServerLogout { name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_logout(&component, &name);
             }
             Effect::McpServerToolEnabledChanged {
                 server_name,

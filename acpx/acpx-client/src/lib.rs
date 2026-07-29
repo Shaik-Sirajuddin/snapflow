@@ -12,6 +12,7 @@
 
 pub mod ext;
 pub mod gateway;
+pub mod mcp;
 pub mod raw;
 pub mod ws;
 

@@ -13,8 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption, TerminalItem,
-    ThreadItem,
+    McpServerFormData, McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption,
+    TerminalItem, ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -1288,13 +1288,12 @@ pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile
 }
 
 /// Builds the settings sheet's MCP-server list row model from a real
-/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`). Each
-/// entry is an opaque JSON object on the Rust side (`acpx-core::
-/// McpServerStore` never interprets more than `"name"`) -- this only
-/// extracts the two fields the list view shows, `"command"` falling
-/// back to an empty string for an entry that omits it (still a valid
-/// MCP server entry per ACP's own schema, e.g. a URL-based server with
-/// no `command` field at all).
+/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`), now typed
+/// end to end (`crate::protocol_types::McpServerEntry`, re-exported from
+/// `acpx_client::mcp`) -- `transport`/`command`/`url`/`needs_auth`/
+/// `auth_status` below are read from real struct fields, not guessed out
+/// of an opaque JSON blob's inconsistently-named keys the way this used
+/// to work.
 pub fn to_mcp_server_options(
     servers: Vec<crate::protocol_types::McpServerEntry>,
 ) -> ModelRc<McpServerOption> {
@@ -1304,65 +1303,60 @@ pub fn to_mcp_server_options(
 pub fn to_mcp_server_option_rows(
     servers: Vec<crate::protocol_types::McpServerEntry>,
 ) -> Vec<McpServerOption> {
+    use crate::protocol_types::{McpAuthStatus, McpServerConfig};
+
     servers
         .into_iter()
         .map(|entry| {
-            let enabled = entry
-                .extra
-                .get("enabled")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true);
-            let url = entry
-                .extra
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            // Prefer explicit transport; fall back to type: remote/http or
-            // presence of a url field (opencode remote servers).
-            let transport = entry
-                .extra
-                .get("transport")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .or_else(|| {
-                    entry
-                        .extra
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|t| match t {
-                            "remote" | "http" | "sse" | "streamable_http" => "http".to_owned(),
-                            "local" | "stdio" => "stdio".to_owned(),
-                            other => other.to_owned(),
-                        })
-                })
-                .unwrap_or_else(|| {
-                    if !url.is_empty() {
-                        "http".to_owned()
-                    } else {
-                        String::new()
-                    }
-                });
+            let enabled = entry.enabled;
+            let transport = entry.config.transport_name().to_owned();
+            let command = entry.command().unwrap_or("").to_owned();
+            let url = entry.url().unwrap_or("").to_owned();
+            let needs_auth = entry.needs_auth();
+            let auth = match entry.auth_status {
+                Some(McpAuthStatus::Authenticated) => "authenticated",
+                Some(McpAuthStatus::Unauthenticated) => "unauthenticated",
+                None => "",
+            }
+            .to_owned();
+            let (args, env, headers, timeout, oauth_client_id) = match &entry.config {
+                McpServerConfig::Stdio {
+                    args, env, timeout, ..
+                } => (
+                    args.join(" "),
+                    format_kv_lines(env, "="),
+                    String::new(),
+                    timeout.map(|t| t.to_string()).unwrap_or_default(),
+                    String::new(),
+                ),
+                McpServerConfig::Http {
+                    headers,
+                    timeout,
+                    oauth,
+                    ..
+                } => (
+                    String::new(),
+                    String::new(),
+                    format_kv_lines(headers, ": "),
+                    timeout.map(|t| t.to_string()).unwrap_or_default(),
+                    oauth
+                        .as_ref()
+                        .map(|o| o.client_id.clone())
+                        .unwrap_or_default(),
+                ),
+            };
+            // `status` (live connection health -- Stopped/Starting/Running/
+            // Error) isn't part of the typed model yet (acpx has no
+            // per-connection health probe today, see `McpAuthStatus`'s doc
+            // comment) -- still read as a best-effort passthrough from
+            // `extra` so a future gateway addition surfaces immediately
+            // without another round of plumbing changes here.
             let status = entry
                 .extra
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
-            let auth = entry
-                .extra
-                .get("auth_status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let needs_auth = entry
-                .extra
-                .get("needs_auth")
-                .and_then(|v| v.as_bool())
-                .unwrap_or_else(|| {
-                    // Remote HTTP servers that are not yet authenticated.
-                    transport == "http" && auth != "authenticated"
-                });
             let tools = mcp_tools_from_extra(&entry.extra);
             // Pre-format status subtitle in Rust (audit §4.3) so Slint
             // does not concatenate nested ternaries.
@@ -1382,7 +1376,7 @@ pub fn to_mcp_server_option_rows(
             let status_line = parts.join(" · ");
             McpServerOption {
                 name: entry.name.into(),
-                command: entry.command.unwrap_or_default().into(),
+                command: command.into(),
                 status_line: status_line.into(),
                 transport: transport.into(),
                 url: url.into(),
@@ -1396,9 +1390,92 @@ pub fn to_mcp_server_option_rows(
                 // snapshotd daemon) is prepended separately, see
                 // [`builtin_snapshotd_option`].
                 removable: true,
+                args: args.into(),
+                env: env.into(),
+                headers: headers.into(),
+                timeout: timeout.into(),
+                oauth_client_id: oauth_client_id.into(),
             }
         })
         .collect()
+}
+
+/// Formats a `HashMap<String, String>` (env vars or HTTP headers) as
+/// `key<sep>value` lines, one per entry, sorted by key for deterministic
+/// output (a `HashMap`'s iteration order is otherwise unspecified, which
+/// would make the form's textarea re-shuffle lines on every reload).
+fn format_kv_lines(map: &std::collections::HashMap<String, String>, sep: &str) -> String {
+    let mut pairs: Vec<(&String, &String)> = map.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}{sep}{v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parses `format_kv_lines`' inverse: one `key<sep>value` pair per
+/// non-empty line, splitting on the *first* `sep` only (so an HTTP
+/// header's value may itself contain `:` -- `Authorization: Bearer a:b`
+/// stays intact). Blank lines and lines with an empty key are silently
+/// skipped rather than erroring -- this is user-typed free text in a
+/// settings form, not a wire payload with a validation contract to
+/// enforce.
+fn parse_kv_lines(text: &str, sep: char) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (key, value) = line.split_once(sep)?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Builds a full typed [`crate::protocol_types::McpServerEntry`] from the
+/// add/edit form's submitted [`McpServerFormData`] -- the Rust-side
+/// counterpart to `mcp_servers_view.slint`'s `mcp-server-submit`
+/// callback. `args` is whitespace-split (`str::split_whitespace`, no
+/// shell-style quoting/escaping); `timeout` is parsed as whole seconds,
+/// `None` on empty/invalid input rather than erroring, since 0 is a
+/// meaningless timeout and the field is optional.
+pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_types::McpServerEntry {
+    use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
+
+    let timeout = data.timeout.trim().parse::<u64>().ok();
+    let config = if data.transport.as_str() == "http" {
+        let client_id = data.oauth_client_id.trim();
+        McpServerConfig::Http {
+            url: data.url.trim().to_string(),
+            headers: parse_kv_lines(&data.headers, ':'),
+            timeout,
+            oauth: if client_id.is_empty() {
+                None
+            } else {
+                Some(OAuthClientConfig {
+                    client_id: client_id.to_string(),
+                })
+            },
+        }
+    } else {
+        McpServerConfig::Stdio {
+            command: data.command.trim().to_string(),
+            args: data
+                .args
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            env: parse_kv_lines(&data.env, '='),
+            timeout,
+        }
+    };
+    McpServerEntry::new(data.name.trim(), config)
 }
 
 /// PUI-015: the built-in `snapshotd` daemon MCP row for the Settings list,
@@ -1428,11 +1505,16 @@ pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
         removable: false,
+        args: String::new().into(),
+        env: String::new().into(),
+        headers: String::new().into(),
+        timeout: String::new().into(),
+        oauth_client_id: String::new().into(),
     })
 }
 
 /// Parse a persisted `tools` array from an MCP server registry entry.
-fn mcp_tools_from_extra(extra: &serde_json::Value) -> Vec<McpToolOption> {
+fn mcp_tools_from_extra(extra: &serde_json::Map<String, serde_json::Value>) -> Vec<McpToolOption> {
     let Some(arr) = extra.get("tools").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -1644,14 +1726,179 @@ mod tests {
     // Registry-derived rows stay removable (only the built-in daemon is not).
     #[test]
     fn registry_mcp_rows_are_removable() {
-        let entry = crate::protocol_types::McpServerEntry {
-            name: "my-server".to_string(),
-            command: Some("do-thing".to_string()),
-            extra: serde_json::json!({}),
-        };
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "my-server",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "do-thing".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
         let rows = to_mcp_server_option_rows(vec![entry]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].removable, "user-added registry rows are removable");
+    }
+
+    #[test]
+    fn stdio_option_row_surfaces_args_and_env_as_formatted_lines() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec!["--root".to_string(), "/tmp".to_string()],
+                env: std::collections::HashMap::from([
+                    ("B_KEY".to_string(), "2".to_string()),
+                    ("A_KEY".to_string(), "1".to_string()),
+                ]),
+                timeout: Some(30),
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows[0].args.as_str(), "--root /tmp");
+        // Sorted by key for deterministic output, not HashMap iteration order.
+        assert_eq!(rows[0].env.as_str(), "A_KEY=1\nB_KEY=2");
+        assert_eq!(rows[0].timeout.as_str(), "30");
+        assert_eq!(rows[0].headers.as_str(), "");
+        assert_eq!(rows[0].oauth_client_id.as_str(), "");
+    }
+
+    #[test]
+    fn http_option_row_surfaces_headers_and_oauth_client_id() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "remote",
+            crate::protocol_types::McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer abc".to_string(),
+                )]),
+                timeout: None,
+                oauth: Some(crate::protocol_types::OAuthClientConfig {
+                    client_id: "client-123".to_string(),
+                }),
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows[0].headers.as_str(), "Authorization: Bearer abc");
+        assert_eq!(rows[0].oauth_client_id.as_str(), "client-123");
+        assert_eq!(rows[0].args.as_str(), "");
+        assert_eq!(rows[0].env.as_str(), "");
+        assert_eq!(rows[0].timeout.as_str(), "");
+    }
+
+    #[test]
+    fn parse_kv_lines_splits_on_first_separator_and_skips_malformed_lines() {
+        let parsed = parse_kv_lines(
+            "A=1\n\nB=2\nNO_SEPARATOR_HERE\n=empty-key\nC=has=equals=too",
+            '=',
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.get("A").map(String::as_str), Some("1"));
+        assert_eq!(parsed.get("B").map(String::as_str), Some("2"));
+        // Splits on the FIRST '=' only -- the value keeps any further '='s.
+        assert_eq!(parsed.get("C").map(String::as_str), Some("has=equals=too"));
+    }
+
+    #[test]
+    fn parse_kv_lines_keeps_colons_inside_a_header_value() {
+        let parsed = parse_kv_lines("Authorization: Bearer a:b:c", ':');
+        assert_eq!(
+            parsed.get("Authorization").map(String::as_str),
+            Some("Bearer a:b:c")
+        );
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_builds_a_stdio_entry() {
+        let form = McpServerFormData {
+            name: "fs".into(),
+            transport: "stdio".into(),
+            command: "mcp-fs".into(),
+            args: "--root /tmp  --verbose".into(),
+            env: "TOKEN=abc\nDEBUG=1".into(),
+            url: "".into(),
+            headers: "".into(),
+            timeout: "30".into(),
+            oauth_client_id: "".into(),
+            is_edit: false,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        assert_eq!(entry.name, "fs");
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Stdio {
+                command,
+                args,
+                env,
+                timeout,
+            } => {
+                assert_eq!(command, "mcp-fs");
+                assert_eq!(args, vec!["--root", "/tmp", "--verbose"]);
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("abc"));
+                assert_eq!(timeout, Some(30));
+            }
+            other => panic!("expected Stdio config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_builds_an_http_entry_with_oauth() {
+        let form = McpServerFormData {
+            name: "remote".into(),
+            transport: "http".into(),
+            command: "".into(),
+            args: "".into(),
+            env: "".into(),
+            url: "https://example.com/mcp".into(),
+            headers: "Authorization: Bearer xyz".into(),
+            timeout: "".into(),
+            oauth_client_id: "client-abc".into(),
+            is_edit: true,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Http {
+                url,
+                headers,
+                timeout,
+                oauth,
+            } => {
+                assert_eq!(url, "https://example.com/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer xyz")
+                );
+                assert_eq!(timeout, None, "blank timeout must parse to None, not 0");
+                assert_eq!(
+                    oauth.map(|o| o.client_id),
+                    Some("client-abc".to_string())
+                );
+            }
+            other => panic!("expected Http config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_treats_blank_oauth_client_id_as_no_oauth() {
+        let form = McpServerFormData {
+            name: "remote".into(),
+            transport: "http".into(),
+            command: "".into(),
+            args: "".into(),
+            env: "".into(),
+            url: "https://example.com/mcp".into(),
+            headers: "".into(),
+            timeout: "".into(),
+            oauth_client_id: "   ".into(),
+            is_edit: false,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Http { oauth, .. } => {
+                assert!(oauth.is_none());
+            }
+            other => panic!("expected Http config, got {other:?}"),
+        }
     }
 
     const NAMES: &[&str] = &[
@@ -1913,17 +2160,28 @@ mod tests {
 
     #[test]
     fn to_mcp_server_options_extracts_name_and_command_falling_back_to_empty() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
         let servers = vec![
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "central-fs", "command": "mcp-central-fs"
-            }))
-            .unwrap(),
-            // No "command" field at all -- still a valid MCP server
-            // entry (e.g. URL-based), must not panic or drop the row.
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "url-only"
-            }))
-            .unwrap(),
+            McpServerEntry::new(
+                "central-fs",
+                McpServerConfig::Stdio {
+                    command: "mcp-central-fs".to_string(),
+                    args: vec![],
+                    env: Default::default(),
+                    timeout: None,
+                },
+            ),
+            // A URL-based (http transport) server -- must not panic or
+            // drop the row, and must fall back to an empty `command`.
+            McpServerEntry::new(
+                "url-only",
+                McpServerConfig::Http {
+                    url: "https://example.com/mcp".to_string(),
+                    headers: Default::default(),
+                    timeout: None,
+                    oauth: None,
+                },
+            ),
         ];
         let model = to_mcp_server_options(servers);
         assert_eq!(model.row_count(), 2);
@@ -1937,20 +2195,27 @@ mod tests {
 
     #[test]
     fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
         use slint::Model;
-        let servers = vec![crate::protocol_types::McpServerEntry::from_json(
-            &serde_json::json!({
-                "name": "remote-tools",
-                "url": "https://example.com/mcp",
-                "type": "remote",
-                "auth_status": "not authenticated",
-                "tools": [
-                    { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
-                    { "name": "write", "enabled": false, "deferred": true }
-                ]
-            }),
-        )
-        .unwrap()];
+        let mut entry = McpServerEntry::new(
+            "remote-tools",
+            McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: Some(OAuthClientConfig {
+                    client_id: "client-123".to_string(),
+                }),
+            },
+        );
+        entry.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
+                { "name": "write", "enabled": false, "deferred": true }
+            ]),
+        );
+        let servers = vec![entry];
         let model = to_mcp_server_options(servers);
         let row = model.row_data(0).unwrap();
         assert_eq!(row.transport.as_str(), "http");
