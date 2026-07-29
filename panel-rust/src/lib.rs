@@ -28,6 +28,7 @@ pub mod jsonl_store;
 mod list_model;
 mod local_terminal;
 mod markdown;
+mod markdown_worker;
 mod model;
 pub mod models;
 mod msg;

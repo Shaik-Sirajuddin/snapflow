@@ -212,6 +212,122 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Plain-data mirror of [`MarkdownBlock`] with a `slint::StyledText`
+/// instead of a `ModelRc`-wrapped `[MarkdownBlock]` row -- `ModelRc`
+/// wraps a non-atomic `Rc` (never `Send`), but `StyledText` is built on
+/// `SharedVector`, which genuinely is `Send + Sync` (spike-confirmed:
+/// `slint_styledtext_spike`, `unsafe impl<T: Send + Sync> Send for
+/// SharedVector<T>` in `i-slint-core`). This type exists so
+/// `build_markdown_block_data` (below) can run on a background thread
+/// (`markdown_worker.rs`) -- the final `ModelRc<MarkdownBlock>`
+/// wrapping (cheap: no parsing, just moving already-built values into a
+/// `VecModel`) has to happen back on the UI thread, in
+/// `markdown_blocks_for` or the worker's delivery callback.
+#[derive(Clone)]
+pub struct MarkdownBlockData {
+    pub kind: &'static str,
+    pub text: slint::StyledText,
+    pub default_font_size: f32,
+    pub indent: i32,
+    pub table_cells: Vec<slint::StyledText>,
+    pub table_col_count: i32,
+    pub code_text: String,
+}
+
+/// Segments+styles `text` into [`MarkdownBlockData`] -- the `Send`-safe,
+/// `ModelRc`-free half of Architecture v2's per-block rendering. Pure
+/// function of `(text, is_streaming_tail)`, no caching, no Slint model
+/// types -- safe to call from any thread, including
+/// `markdown_worker.rs`'s background render thread. `markdown_blocks_for`
+/// (below) wraps this for the synchronous/cached UI-thread call sites;
+/// the worker calls it directly and does its own `ModelRc` wrapping in
+/// its UI-thread delivery closure.
+pub fn build_markdown_block_data(text: &str, is_streaming_tail: bool) -> Vec<MarkdownBlockData> {
+    let spans = markdown::segment_blocks(text);
+    spans
+        .into_iter()
+        .map(|span| {
+            let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
+                // `segment_blocks`' byte ranges are pulldown-cmark's own
+                // verbatim block spans -- they legitimately include a
+                // trailing newline (block ranges) or table-cell padding
+                // whitespace around `|` delimiters, neither of which is
+                // real content (see markdown.rs's segment_blocks tests).
+                let raw = text[range].trim();
+                let candidate = if is_streaming_tail {
+                    markdown::heal_open_markers(raw)
+                } else {
+                    raw.to_string()
+                };
+                slint::StyledText::from_markdown(&candidate)
+                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
+            };
+            match span.kind {
+                markdown::BlockSpanKind::Text => MarkdownBlockData {
+                    kind: "text",
+                    text: styled_text_for(span.source_range),
+                    default_font_size: heading_font_size(span.heading_level),
+                    indent: span.indent as i32,
+                    table_cells: Vec::new(),
+                    table_col_count: 0,
+                    code_text: String::new(),
+                },
+                markdown::BlockSpanKind::Code(body) => MarkdownBlockData {
+                    kind: "code",
+                    text: slint::StyledText::default(),
+                    default_font_size: 0.0_f32,
+                    indent: span.indent as i32,
+                    table_cells: Vec::new(),
+                    table_col_count: 0,
+                    code_text: body,
+                },
+                markdown::BlockSpanKind::Rule => MarkdownBlockData {
+                    kind: "rule",
+                    text: slint::StyledText::default(),
+                    default_font_size: 0.0_f32,
+                    indent: span.indent as i32,
+                    table_cells: Vec::new(),
+                    table_col_count: 0,
+                    code_text: String::new(),
+                },
+                markdown::BlockSpanKind::Table { cells, col_count } => {
+                    let cell_styled: Vec<slint::StyledText> =
+                        cells.into_iter().map(styled_text_for).collect();
+                    MarkdownBlockData {
+                        kind: "table",
+                        text: slint::StyledText::default(),
+                        default_font_size: 0.0_f32,
+                        indent: span.indent as i32,
+                        table_cells: cell_styled,
+                        table_col_count: col_count as i32,
+                        code_text: String::new(),
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+/// Wraps `Vec<MarkdownBlockData>` into the `ModelRc<MarkdownBlock>` Slint
+/// actually consumes -- purely mechanical (no parsing), so it's cheap
+/// enough to run inline on the UI thread even for a worker-delivered
+/// chunk (see `markdown_worker.rs`).
+pub fn markdown_block_data_to_model(rows: Vec<MarkdownBlockData>) -> ModelRc<MarkdownBlock> {
+    let rows: Vec<MarkdownBlock> = rows
+        .into_iter()
+        .map(|d| MarkdownBlock {
+            kind: d.kind.into(),
+            text: d.text,
+            default_font_size: d.default_font_size,
+            indent: d.indent,
+            table_cells: ModelRc::new(VecModel::from(d.table_cells)),
+            table_col_count: d.table_col_count,
+            code_text: d.code_text.into(),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
 /// Architecture v2 (markdown-thread-freeze-fix phase 3): builds one
 /// `MarkdownBlock` per top-level markdown block, each carrying a native
 /// `slint::StyledText` (or, for code/rule blocks, plain data routed
@@ -233,70 +349,7 @@ fn markdown_blocks_for(kind: &str, text: &str, is_streaming_tail: bool) -> Model
             return cached;
         }
     }
-    let spans = markdown::segment_blocks(text);
-    let rows: Vec<MarkdownBlock> = spans
-        .into_iter()
-        .map(|span| {
-            let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
-                // `segment_blocks`' byte ranges are pulldown-cmark's own
-                // verbatim block spans -- they legitimately include a
-                // trailing newline (block ranges) or table-cell padding
-                // whitespace around `|` delimiters, neither of which is
-                // real content (see markdown.rs's segment_blocks tests).
-                let raw = text[range].trim();
-                let candidate = if is_streaming_tail {
-                    markdown::heal_open_markers(raw)
-                } else {
-                    raw.to_string()
-                };
-                slint::StyledText::from_markdown(&candidate)
-                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
-            };
-            match span.kind {
-                markdown::BlockSpanKind::Text => MarkdownBlock {
-                    kind: "text".into(),
-                    text: styled_text_for(span.source_range),
-                    default_font_size: heading_font_size(span.heading_level),
-                    indent: span.indent as i32,
-                    table_cells: ModelRc::new(VecModel::from(Vec::<slint::StyledText>::new())),
-                    table_col_count: 0,
-                    code_text: String::new().into(),
-                },
-                markdown::BlockSpanKind::Code(body) => MarkdownBlock {
-                    kind: "code".into(),
-                    text: slint::StyledText::default(),
-                    default_font_size: 0.0_f32,
-                    indent: span.indent as i32,
-                    table_cells: ModelRc::new(VecModel::from(Vec::<slint::StyledText>::new())),
-                    table_col_count: 0,
-                    code_text: body.into(),
-                },
-                markdown::BlockSpanKind::Rule => MarkdownBlock {
-                    kind: "rule".into(),
-                    text: slint::StyledText::default(),
-                    default_font_size: 0.0_f32,
-                    indent: span.indent as i32,
-                    table_cells: ModelRc::new(VecModel::from(Vec::<slint::StyledText>::new())),
-                    table_col_count: 0,
-                    code_text: String::new().into(),
-                },
-                markdown::BlockSpanKind::Table { cells, col_count } => {
-                    let cell_styled: Vec<slint::StyledText> =
-                        cells.into_iter().map(styled_text_for).collect();
-                    MarkdownBlock {
-                        kind: "table".into(),
-                        text: slint::StyledText::default(),
-                        default_font_size: 0.0_f32,
-                        indent: span.indent as i32,
-                        table_cells: ModelRc::new(VecModel::from(cell_styled)),
-                        table_col_count: col_count as i32,
-                        code_text: String::new().into(),
-                    }
-                }
-            }
-        })
-        .collect();
-    let built = ModelRc::new(VecModel::from(rows));
+    let built = markdown_block_data_to_model(build_markdown_block_data(text, is_streaming_tail));
     if !is_streaming_tail {
         MARKDOWN_BLOCK_CACHE.with(|c| {
             let mut c = c.borrow_mut();
