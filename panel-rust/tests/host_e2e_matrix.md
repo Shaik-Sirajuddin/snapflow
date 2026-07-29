@@ -79,7 +79,7 @@ gateway-level path `acpx-server`'s own real-backend tests already cover.
 Makes one real, billed API call -- not run as part of any default/CI
 suite, opt-in only, same posture as this repo's other real-backend tests.
 Verified 2026-07-24: real `session/new`/`session/prompt` round-trip
-recorded in the gateway's own `transcripts` table (provider `claude-acp`,
+recorded in Panel-Rust's file-backed JSONL transcript (provider `claude-acp`,
 real session ids, real token usage -- `totalTokens: 13984`,
 `stopReason: "end_turn"`), and the reply `"OK"` genuinely rendered in the
 live host UI via the Slint MCP server.

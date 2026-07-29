@@ -105,8 +105,9 @@ Omitting `_acpx.profile` entirely stays in native/unmanaged mode against
 
 ## 5. Durable sessions and retention (optional)
 
-Set `ACPX_DB_PATH=/path/to/sessions.sqlite3` to persist session
-metadata/transcripts across restarts, and add
+Set `ACPX_DB_PATH=/path/to/sessions.sqlite3` to persist session metadata and
+state revisions across restarts; message transcripts remain in Panel-Rust's
+JSONL store. Add
 `ACPX_STARTUP_SESSION_RECOVERY_ENABLED=1` to restore load/resume-capable
 sessions automatically before either transport starts accepting
 requests. Idle sessions are safely closed by a background reaper

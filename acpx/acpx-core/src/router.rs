@@ -11,7 +11,7 @@ use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
 use crate::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    Direction, PersistenceStore,
+    PersistenceStore,
 };
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
@@ -300,7 +300,7 @@ pub struct Router {
     /// `crate::persistence`). `None` by default -- a `Router` used purely
     /// in-memory (e.g. most of this crate's own tests) never touches
     /// sqlite at all. When set via [`Router::with_persistence`], session
-    /// metadata and transcripts are written fire-and-forget via
+    /// metadata and durable state revisions are written fire-and-forget via
     /// `tokio::spawn` off the dispatch hot path, per that module's
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
@@ -317,7 +317,7 @@ pub struct Router {
     /// {agent, provider, key-ref, launch overrides, mcp servers} profiles.
     /// All in-memory only (see `crate::provider`/`crate::profile`'s doc
     /// comments for why -- not persisted to the sqlite `persistence` path
-    /// used for sessions/transcripts). `session/new`'s `_acpx.profile`
+    /// used for session metadata). `session/new`'s `_acpx.profile`
     /// resolves against `profiles`, which in turn references `providers`
     /// and `keystore`.
     providers: ProviderStore,
@@ -1097,7 +1097,7 @@ impl Router {
         tokio::spawn(backend_idle_scavenger(backend, ctx));
     }
 
-    /// Attach a [`PersistenceStore`] -- session metadata and transcripts
+    /// Attach a [`PersistenceStore`] -- session metadata and state revisions
     /// are recorded from that point on. Builder-style so callers can write
     /// `Router::new(id).with_persistence(store)`.
     pub fn with_persistence(mut self, store: PersistenceStore) -> Self {
@@ -2148,7 +2148,7 @@ impl Router {
                     Ok(Ok(())) => {}
                 }
             }
-            self.spawn_transcript(gateway_id.0.clone(), Direction::ClientToAgent, notification);
+            self.spawn_state_revision(gateway_id.0.clone());
             self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
             tracing::warn!(
                 gateway_session_id = %gateway_id.0,
@@ -2159,21 +2159,15 @@ impl Router {
         cancelled
     }
 
-    /// Fire-and-forget one transcript append, if persistence is attached.
-    /// Never awaited by the caller -- spawned onto the runtime so a slow
-    /// sqlite write can't add latency to the client-visible request path.
-    fn spawn_transcript(
-        &self,
-        gateway_session_id: impl Into<String>,
-        direction: Direction,
-        payload: serde_json::Value,
-    ) {
-        spawn_transcript_fn(
-            self.persistence.clone(),
-            gateway_session_id,
-            direction,
-            payload,
-        );
+    /// Fire-and-forget one durable session-state revision, if persistence is
+    /// attached.
+    fn spawn_state_revision(&self, gateway_session_id: impl Into<String>) {
+        spawn_state_revision_fn(self.persistence.clone(), gateway_session_id);
+    }
+
+    /// Preserve the existing event timing without retaining payloads.
+    fn spawn_state_revision_for_event(&self, gateway_session_id: impl Into<String>) {
+        self.spawn_state_revision(gateway_session_id);
     }
 
     async fn persist_session_recovery(
@@ -2991,16 +2985,8 @@ impl Router {
             return Err(error);
         }
         admission.commit();
-        self.spawn_transcript(
-            gateway_session_id_str.clone(),
-            Direction::ClientToAgent,
-            request,
-        );
-        self.spawn_transcript(
-            gateway_session_id_str,
-            Direction::AgentToClient,
-            response.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id_str.clone());
+        self.spawn_state_revision_for_event(gateway_session_id_str);
         Ok(response)
     }
 
@@ -3646,11 +3632,7 @@ impl Router {
         // in 02-architecture.md.
         params["sessionId"] = serde_json::Value::String(backend_session_id);
 
-        self.spawn_transcript(
-            gateway_session_id.clone(),
-            Direction::ClientToAgent,
-            request.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id.clone());
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let response = {
@@ -3679,11 +3661,7 @@ impl Router {
         }
         mark_successful_recovery_retry(self.persistence.clone(), &gateway_session_id, &method)
             .await?;
-        self.spawn_transcript(
-            gateway_session_id.clone(),
-            Direction::AgentToClient,
-            response.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id.clone());
         if method == "session/close" {
             if let Some(store) = self.persistence.clone() {
                 store
@@ -3809,16 +3787,10 @@ impl Router {
             result["sessionId"] = serde_json::Value::String(forked_gateway_id.0.clone());
         }
 
-        // Persisted as the *new* forked session's own inaugural
-        // transcript (client request that created it, agent's response
-        // minting it) -- mirrors `dispatch_session_new`'s own persistence
-        // exactly, since a fork is a fresh session from a persistence
-        // point of view, just one whose backend process happens to
-        // already be running (reused, not freshly spawned) and whose
-        // conversation history the backend itself carried over. Nothing
-        // is recorded against the *source* `gateway_session_id` here --
-        // `session/fork` doesn't add a message to the source session's
-        // own conversation.
+        // Persist state for the new forked session. A fork is a fresh
+        // session from a persistence point of view, even though its backend
+        // process is reused and carries the source conversation internally.
+        // Nothing is recorded against the source gateway session here.
         if let Some(entry) = self.sessions.resolve(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(forked_gateway_session_id_str.clone()),
@@ -3921,11 +3893,7 @@ impl Router {
             "method": "session/cancel",
             "params": { "sessionId": backend_session_id }
         });
-        self.spawn_transcript(
-            gateway_session_id,
-            Direction::ClientToAgent,
-            notification.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id);
 
         // `None` means this agent's process was never spawned (or was
         // `stop`ped) -- nothing is in flight to cancel, a benign no-op
@@ -6526,32 +6494,20 @@ fn attach_session_new_extras(
     response
 }
 
-/// Free-function twin of `Router::spawn_transcript`, taking an already-
-/// cloned `Option<PersistenceStore>` instead of `&self` -- shared by both
-/// the original `&mut self` dispatch path and [`dispatch_shared`]'s
-/// unlock-during-backend-I/O path below, so the two never drift apart.
-fn spawn_transcript_fn(
-    store: Option<PersistenceStore>,
-    gateway_session_id: impl Into<String>,
-    direction: Direction,
-    payload: serde_json::Value,
-) {
+/// Free-function state-revision writer shared by both dispatch paths.
+fn spawn_state_revision_fn(store: Option<PersistenceStore>, gateway_session_id: impl Into<String>) {
     let Some(store) = store else {
         return;
     };
     let gateway_session_id = gateway_session_id.into();
     tokio::spawn(async move {
-        if let Err(err) = store
-            .append_transcript(gateway_session_id, direction, payload, now_rfc3339())
-            .await
-        {
-            tracing::warn!(%err, "failed to persist transcript entry");
+        if let Err(err) = store.bump_state_revision(gateway_session_id).await {
+            tracing::warn!(%err, "failed to persist session state revision");
         }
     });
 }
 
-/// Free-function twin of `Router::spawn_session_persistence` -- see
-/// `spawn_transcript_fn`'s doc comment for why this split exists.
+/// Free-function twin of `Router::spawn_session_persistence`.
 #[allow(clippy::too_many_arguments)]
 fn spawn_session_persistence_fn(
     store: Option<PersistenceStore>,
@@ -6585,27 +6541,11 @@ fn spawn_session_persistence_fn(
             tracing::warn!(%err, "failed to persist session metadata");
             return;
         }
-        if let Err(err) = store
-            .append_transcript(
-                gateway_session_id.clone(),
-                Direction::ClientToAgent,
-                client_request,
-                now_rfc3339(),
-            )
-            .await
-        {
-            tracing::warn!(%err, "failed to persist transcript entry");
-        }
-        if let Err(err) = store
-            .append_transcript(
-                gateway_session_id,
-                Direction::AgentToClient,
-                agent_response,
-                now_rfc3339(),
-            )
-            .await
-        {
-            tracing::warn!(%err, "failed to persist transcript entry");
+        let _ = (client_request, agent_response);
+        for _ in 0..2 {
+            if let Err(err) = store.bump_state_revision(gateway_session_id.clone()).await {
+                tracing::warn!(%err, "failed to persist session state revision");
+            }
         }
     });
 }
@@ -6885,9 +6825,9 @@ pub struct StreamResumeState {
 }
 
 /// Inspect the session registry and optional persistence store without
-/// holding the router mutex across SQLite I/O. A transcript count mismatch
-/// means a non-ACPX writer changed durable history since the last observed
-/// state and must invalidate any resume cursor.
+/// holding the router mutex across SQLite I/O. A durable state-revision
+/// mismatch means a non-ACPX writer changed session state since the last
+/// observed state and must invalidate any resume cursor.
 pub async fn stream_resume_state_shared(
     router: &SharedRouterHandle,
     tenant_id: &TenantId,
@@ -6905,10 +6845,10 @@ pub async fn stream_resume_state_shared(
         )
     };
     let durable_state_changed = match persistence {
-        Some(store) => match store.transcript_state_changed(gateway_session_id).await {
+        Some(store) => match store.state_revision_changed(gateway_session_id).await {
             Ok(changed) => changed,
             Err(err) => {
-                tracing::warn!(%err, %gateway_session_id, "failed to inspect durable transcript state for stream resume");
+                tracing::warn!(%err, %gateway_session_id, "failed to inspect durable session state for stream resume");
                 false
             }
         },
@@ -7179,12 +7119,7 @@ async fn dispatch_session_cancel_shared(
         "method": "session/cancel",
         "params": { "sessionId": backend_session_id }
     });
-    spawn_transcript_fn(
-        persistence,
-        gateway_session_id,
-        Direction::ClientToAgent,
-        notification.clone(),
-    );
+    spawn_state_revision_fn(persistence, gateway_session_id);
 
     // Same "nothing running, nothing to cancel" no-op as
     // `Router::dispatch_session_cancel` -- see that method's comment.
@@ -7394,7 +7329,7 @@ async fn dispatch_session_list_real_shared(
 /// [`dispatch_shared`]'s `session/prompt`/`session/resume`/`session/load`/
 /// `session/close`/`session/set_mode`/`session/cancel` path. Mirrors
 /// `Router::dispatch_proxied` exactly (session resolution, sessionId
-/// rewrite, transcript persistence, `session/close` bookkeeping) but
+/// rewrite, state-revision persistence, `session/close` bookkeeping) but
 /// restructured to release `router`'s lock before the backend round trip.
 async fn dispatch_proxied_shared(
     router: &SharedRouterHandle,
@@ -7473,12 +7408,7 @@ async fn dispatch_proxied_shared(
         )
     };
 
-    spawn_transcript_fn(
-        persistence.clone(),
-        gateway_session_id.clone(),
-        Direction::ClientToAgent,
-        request.clone(),
-    );
+    spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
 
     let response_result = async {
         let mut proc = backend.lock().await;
@@ -7583,12 +7513,7 @@ async fn dispatch_proxied_shared(
     let response = response_result?;
     mark_successful_recovery_retry(persistence.clone(), &gateway_session_id, &method).await?;
 
-    spawn_transcript_fn(
-        persistence.clone(),
-        gateway_session_id.clone(),
-        Direction::AgentToClient,
-        response.clone(),
-    );
+    spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
 
     if method == "session/close" {
         if let Some(store) = persistence.clone() {
@@ -8126,26 +8051,15 @@ async fn dispatch_session_new_shared(
         }
     }
     admission.commit();
-    spawn_transcript_fn(
-        persistence.clone(),
-        gateway_session_id_str.clone(),
-        Direction::ClientToAgent,
-        request,
-    );
-    spawn_transcript_fn(
-        persistence,
-        gateway_session_id_str,
-        Direction::AgentToClient,
-        response.clone(),
-    );
+    spawn_state_revision_fn(persistence.clone(), gateway_session_id_str.clone());
+    spawn_state_revision_fn(persistence, gateway_session_id_str);
 
     Ok(response)
 }
 
 /// Wall-clock timestamp for persistence rows, RFC 3339 via `SystemTime` (no
 /// extra date/time crate dependency -- acpx-core doesn't otherwise need
-/// one, and this precision is more than enough for session/transcript
-/// bookkeeping).
+/// one, and this precision is more than enough for session bookkeeping).
 fn now_rfc3339() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

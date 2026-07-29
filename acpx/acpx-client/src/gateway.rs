@@ -235,9 +235,9 @@ impl Gateway {
 
     /// Re-establishes one registered session binding on the current
     /// WebSocket. Reconnects deliberately use `session/resume`, not the
-    /// originally registered `session/load`: `session/load` replays the
-    /// persisted transcript and would duplicate rows already held by the
-    /// panel. The caller must install its local `subscribe_session` receiver
+    /// originally registered `session/load`: the panel owns its local
+    /// transcript and should not ask the gateway to replay it. The caller
+    /// must install its local `subscribe_session` receiver
     /// before invoking this method.
     pub async fn rehydrate_session(&self, session_id: &str) -> Result<(), ClientError> {
         let replay = self

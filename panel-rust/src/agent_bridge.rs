@@ -1990,7 +1990,7 @@ fn spawn_gateway_process(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    // Persist session/transcript metadata to sqlite so a `session/load`
+    // Persist ACPX session metadata/state revisions to sqlite so a `session/load`
     // after this whole panel process (and even this gateway process, if
     // it's ever restarted by an operator) relaunches can still rehydrate
     // -- the concrete mechanism behind "closing and relaunching the app

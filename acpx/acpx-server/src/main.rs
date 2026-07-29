@@ -6,8 +6,8 @@
 //! (many concurrent remote clients) run concurrently against the same
 //! router, so they share one session registry and one set of supervised
 //! backend processes regardless of which transport a client used. If
-//! `ACPX_DB_PATH` is set, session metadata + transcripts are persisted to
-//! that sqlite file (see `acpx_core::persistence`); otherwise persistence
+//! `ACPX_DB_PATH` is set, session metadata is persisted to that sqlite file
+//! (see `acpx_core::persistence`); otherwise persistence
 //! is skipped entirely (`Router::with_persistence` is optional). Setting
 //! `ACPX_DB_PATH` also enables the durable secret/config store
 //! (`Router::enable_durable_config`, see `acpx_core::keystore`'s module
