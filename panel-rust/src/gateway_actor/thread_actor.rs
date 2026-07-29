@@ -1105,7 +1105,7 @@ fn parse_session_modes(modes: &serde_json::Value) -> Option<SessionModesEvent> {
 /// missing `id` is skipped (nothing usable to key a `session/set_
 /// config_option` call on) rather than failing the whole list, same
 /// per-entry tolerance `parse_session_modes` applies to `availableModes`.
-fn parse_config_options(list: &serde_json::Value) -> Option<Vec<ConfigOptionInfo>> {
+pub fn parse_config_options(list: &serde_json::Value) -> Option<Vec<ConfigOptionInfo>> {
     let entries = list.as_array()?;
     Some(
         entries

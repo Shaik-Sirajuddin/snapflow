@@ -681,13 +681,15 @@ impl<'a> ExternalSnapshotSource<'a> {
         real_idx: usize,
     ) -> Option<msg::ThreadFrameSnapshot> {
         let bridge = self.panel.bridge.as_ref()?;
-        let selected_provider = self
+        let selected_profile = self
             .panel
             .model
             .borrow()
             .threads
             .get(real_idx)
-            .and_then(|thread| thread.profile_name.as_deref())
+            .and_then(|thread| thread.profile_name.clone());
+        let selected_provider = selected_profile
+            .as_deref()
             .and_then(|profile_name| {
                 self.panel
                     .model
@@ -699,7 +701,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             })
             .or_else(|| bridge.thread_provider(real_idx))
             .unwrap_or_default();
-        bridge.ensure_models_for_provider(real_idx, &selected_provider);
+        bridge.ensure_models_for_provider(
+            real_idx,
+            &selected_provider,
+            selected_profile.as_deref(),
+        );
         let pending_request = match bridge.pending_requests(real_idx).first() {
             Some(event) => {
                 let view = crate::permission::to_pending_request_view(event);
@@ -778,7 +784,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             connection_status: bridge.transport_status(real_idx),
             session_modes: bridge.session_modes(real_idx),
             usage: bridge.thread_usage(real_idx),
-            config_options: bridge.config_options_for_provider(real_idx, &selected_provider),
+            config_options: bridge.config_options_for_provider(
+                real_idx,
+                &selected_provider,
+                selected_profile.as_deref(),
+            ),
             available_commands: bridge.available_commands(real_idx),
             plan: bridge.plan(real_idx),
             session_title: bridge.session_title(real_idx),

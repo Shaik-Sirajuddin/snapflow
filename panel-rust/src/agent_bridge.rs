@@ -3268,6 +3268,46 @@ impl AgentBridge {
         )
     }
 
+    /// Notify every pool for the settings gateway that its admin-plane MCP
+    /// configuration changed. The pool generation refresh evicts idle
+    /// sessions immediately; a currently leased session is left alive and is
+    /// discarded when its owner releases it, so an in-flight turn is never
+    /// force-closed by a Settings edit.
+    fn refresh_pools_for_gateway(&self, base_url: &str) {
+        let pools = {
+            let pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.rsplit_once('|').is_some_and(|(_, url)| url == base_url))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Immediate signal from Settings after a successful MCP registry
+    /// mutation. The settings gateway is represented by a bridge slot, so
+    /// resolve its base URL and refresh all project pools sharing that
+    /// gateway. This deliberately does not perform an RPC or wait for the
+    /// refresh on the UI thread.
+    fn notify_mcp_settings_changed(&self, settings_idx: usize) {
+        let Some(provider) = self
+            .slots
+            .get(settings_idx)
+            .map(|slot| slot.provider.clone())
+        else {
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            return;
+        };
+        self.refresh_pools_for_gateway(&base_url);
+    }
+
     /// `chat_sessions_project_path` phase: called from the FFI-driven
     /// `panel_rust_set_project_path` path whenever the active MLT project
     /// changes, so every subsequently-opened/resumed/reattached session
@@ -4257,9 +4297,14 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let success = self
+            .runtime
             .block_on(handle.create_mcp_server(entry))
-            .is_ok()
+            .is_ok();
+        if success {
+            self.notify_mcp_settings_changed(idx);
+        }
+        success
     }
 
     /// `mcp_servers/update` -- same payload shape as [`Self::
@@ -4269,9 +4314,14 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let success = self
+            .runtime
             .block_on(handle.update_mcp_server(entry))
-            .is_ok()
+            .is_ok();
+        if success {
+            self.notify_mcp_settings_changed(idx);
+        }
+        success
     }
 
     /// `mcp_servers/delete`.
@@ -4280,9 +4330,14 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let success = self
+            .runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
-            .is_ok()
+            .is_ok();
+        if success {
+            self.notify_mcp_settings_changed(idx);
+        }
+        success
     }
 
     /// `agents/list` against thread `idx`'s bound gateway -- the
@@ -4936,10 +4991,15 @@ impl AgentBridge {
             .get(idx)
             .map(|slot| slot.provider.clone())
             .unwrap_or_default();
-        self.config_options_for_provider(idx, &provider)
+        self.config_options_for_provider(idx, &provider, None)
     }
 
-    pub fn config_options_for_provider(&self, idx: usize, provider: &str) -> Vec<ConfigOptionInfo> {
+    pub fn config_options_for_provider(
+        &self,
+        idx: usize,
+        provider: &str,
+        profile_name: Option<&str>,
+    ) -> Vec<ConfigOptionInfo> {
         let Some(slot) = self.slots.get(idx) else {
             return Vec::new();
         };
@@ -4954,7 +5014,7 @@ impl AgentBridge {
         slot.pre_session_model_options
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(provider)
+            .get(&format!("{provider}\0{}", profile_name.unwrap_or_default()))
             .cloned()
             .unwrap_or_default()
     }
@@ -4963,33 +5023,135 @@ impl AgentBridge {
     /// selected in the compose bar. This is intentionally not limited to
     /// deferred threads: changing provider on any session-less thread must
     /// repopulate the model dropdown immediately.
-    pub fn ensure_models_for_provider(&self, idx: usize, provider: &str) {
+    pub fn ensure_models_for_provider(
+        &self,
+        idx: usize,
+        provider: &str,
+        profile_name: Option<&str>,
+    ) {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
         let provider = provider.to_owned();
+        let profile_name = profile_name.map(str::to_owned);
+        let cache_key = format!(
+            "{provider}\0{}",
+            profile_name.as_deref().unwrap_or_default()
+        );
         if provider.is_empty() {
+            return;
+        }
+        // An attached thread already receives its live capabilities from the
+        // session actor. A preview acquire here would create a competing
+        // lease for an active/resumed thread and could disturb its real
+        // session; previews are only needed before the first message.
+        if slot
+            .acp_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return;
         }
         let mut cached = slot
             .pre_session_model_options
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if cached.contains_key(&provider) {
+        if cached.contains_key(&cache_key) {
             return;
         }
-        cached.insert(provider.clone(), Vec::new());
+        cached.insert(cache_key.clone(), Vec::new());
         drop(cached);
 
         let handle = slot.handle.clone();
-        let agent_id = provider.clone();
         let target = slot.pre_session_model_options.clone();
+        let project_dir = thread_project_dir(
+            slot.project_path_snapshot().as_deref(),
+            &self.session_cwd_override,
+        );
+        let Some(project_dir) = project_dir else {
+            let agent_id = provider.clone();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options);
+            });
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            let agent_id = provider.clone();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options);
+            });
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            let agent_id = provider.clone();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options);
+            });
+            return;
+        };
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            provider.clone(),
+            crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
+        );
+        let preview_thread_id = format!("preview:{idx}:{provider}");
         self.runtime.spawn(async move {
-            let options = handle.list_models(agent_id).await.unwrap_or_default();
+            let options = match pool
+                .acquire(
+                    key,
+                    preview_thread_id,
+                    acpx_client::pool::OpenSpec {
+                        saved_session_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(lease) => {
+                    let options = lease
+                        .capabilities
+                        .as_ref()
+                        .and_then(|value| value.get("configOptions"))
+                        .and_then(crate::gateway_actor::parse_config_options)
+                        .unwrap_or_default();
+                    if let Err(error) = pool.release(&lease).await {
+                        eprintln!("panel-rust: capability preview release failed: {error}");
+                    }
+                    if options.is_empty() {
+                        handle
+                            .list_models(provider.clone())
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        options
+                    }
+                }
+                Err(error) => {
+                    eprintln!("panel-rust: capability preview pool acquire failed: {error}");
+                    handle
+                        .list_models(provider.clone())
+                        .await
+                        .unwrap_or_default()
+                }
+            };
             target
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(provider.to_owned(), options);
+                .insert(cache_key, options);
         });
     }
 
