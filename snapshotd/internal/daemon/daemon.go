@@ -35,6 +35,7 @@ import (
 const externalInstanceLease = 30 * time.Second
 const externalSAPReadyTimeout = 5 * time.Second
 const externalDiscoveryGrace = 1500 * time.Millisecond
+const instanceSaveTimeout = 5 * time.Second
 
 // Daemon is the shared core described above.
 type Daemon struct {
@@ -994,10 +995,39 @@ func (d *Daemon) Health(ctx context.Context, instanceID string) (HealthResult, e
 	return HealthResult{Instance: pi, Healthy: ok}, nil
 }
 
-// CloseInstance implements daemon.close: stop a running process instance.
+// saveInstanceBeforeClose persists the live in-memory project before the
+// process manager terminates its child. This is intentionally daemon-owned
+// instance cleanup only; project.close remains a session-scoped unbind because
+// other MCP/GUI leases may still use the same process.
+func (d *Daemon) saveInstanceBeforeClose(ctx context.Context, instance *registry.ProcessInstance) error {
+	saveCtx, cancel := context.WithTimeout(ctx, instanceSaveTimeout)
+	defer cancel()
+
+	sessionID := "daemon-close-save-" + instance.ID
+	if _, err := d.SAP.Bind(saveCtx, sessionID, instance.ProjectID, discardSink{}); err != nil {
+		return fmt.Errorf("bind instance %s for save: %w", instance.ID, err)
+	}
+	defer d.SAP.Unbind(sessionID)
+	if _, err := d.SAP.Call(saveCtx, sessionID, "project.save", json.RawMessage(`{}`)); err != nil {
+		return fmt.Errorf("save instance %s before close: %w", instance.ID, err)
+	}
+	return nil
+}
+
+// CloseInstance implements daemon.close: save, then stop a running process
+// instance. A ready/live instance is not killed if its final save fails.
 // (Named CloseInstance, not Close, since Daemon.Close already exists for the
 // daemon's own lifecycle/resource shutdown -- Go has no overloading.)
 func (d *Daemon) CloseInstance(ctx context.Context, instanceID string) error {
+	instance, err := d.Reg.GetProcessInstance(instanceID)
+	if err != nil {
+		return err
+	}
+	if instance.Status == registry.StatusReady && health.PIDAlive(instance.PID) {
+		if err := d.saveInstanceBeforeClose(ctx, instance); err != nil {
+			return err
+		}
+	}
 	return d.Proc.Close(instanceID)
 }
 
