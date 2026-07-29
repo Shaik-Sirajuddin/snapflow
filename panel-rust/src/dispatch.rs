@@ -477,18 +477,33 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
             .as_ref()
             .is_some_and(|bridge| bridge.is_deferred(real_idx));
         if is_deferred {
-            let (provider, profile) = {
+            let (provider, profile, desired_config_options) = {
                 let model = panel.model.borrow();
                 match model.threads.get(real_idx) {
-                    Some(thread) => (thread.provider.clone(), thread.profile_name.clone()),
-                    None => (String::new(), None),
+                    Some(thread) => (
+                        thread.provider.clone(),
+                        thread.profile_name.clone(),
+                        thread
+                            .config_options
+                            .iter()
+                            .filter_map(|option| {
+                                option.current_value.as_ref().map(|value| {
+                                    (option.id.clone(), serde_json::Value::String(value.clone()))
+                                })
+                            })
+                            .collect(),
+                    ),
+                    None => (String::new(), None, Vec::new()),
                 }
             };
             if let Some(bridge) = panel.bridge.as_mut() {
                 let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
-                if let Err(error) =
-                    bridge.attach_deferred_thread(real_idx, provider_arg, profile.as_deref())
-                {
+                if let Err(error) = bridge.attach_deferred_thread_with_config_options(
+                    real_idx,
+                    provider_arg,
+                    profile.as_deref(),
+                    desired_config_options,
+                ) {
                     // Surface attach failure the same shape a failed eager
                     // attach would: mark the thread errored via the reducer.
                     let _ = update_persistent(
@@ -1115,7 +1130,7 @@ pub(crate) fn dispatch_profile_selected(
     profile_name: String,
     agent_id: String,
 ) {
-    let (effects, _) = update_persistent(
+    let (effects, dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
             profile_name,
@@ -1123,6 +1138,13 @@ pub(crate) fn dispatch_profile_selected(
         })),
     );
     execute_effects(panel, effects);
+    let selected_thread_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_selected_thread_snapshot();
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot,
+        ..crate::msg::FrameInput::default()
+    });
+    let _ = dirty;
 }
 
 pub(crate) fn dispatch_config_option_selected(

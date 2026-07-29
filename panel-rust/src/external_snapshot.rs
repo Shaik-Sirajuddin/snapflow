@@ -165,6 +165,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .as_ref()
                     .and_then(|bridge| bridge.thread_binding(event.thread_index))
                     .map(|binding| binding.thread_id)
+                    .or_else(|| {
+                        self.panel
+                            .bridge
+                            .as_ref()
+                            .and_then(|bridge| bridge.thread_id(event.thread_index))
+                    })
                     .unwrap_or_default()
             })
             .collect();

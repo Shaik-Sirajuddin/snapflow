@@ -1222,6 +1222,35 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
     }
 }
 
+/// Restores every config option this lease changed back to the value it
+/// had when the lease was acquired, right before the session returns to
+/// the pool's idle list. `PoolKey` deliberately excludes thread identity
+/// (see its own doc comment: "sessions under the same key are compatible
+/// to reuse") -- without this, a `session/set_config_option` (e.g. a
+/// model pick) made by one panel thread would silently persist on the
+/// backend session and leak into whichever *different* thread the pool
+/// hands that same idle entry to next. Best-effort: a failed reset is
+/// logged, not propagated, since the caller (`CloseSession`/`Shutdown`)
+/// must still complete the release either way.
+async fn reset_lease_config_overrides(
+    client: &Gateway,
+    sid: &str,
+    overrides: std::collections::HashMap<String, String>,
+) {
+    for (config_id, baseline_value) in overrides {
+        let params = serde_json::json!({
+            "sessionId": sid,
+            "configId": config_id,
+            "value": baseline_value,
+        });
+        if let Err(error) = client.call("session/set_config_option", params, None).await {
+            eprintln!(
+                "panel-rust: failed to reset config option {config_id:?} to its pre-lease baseline before releasing session {sid:?} back to the pool: {error}"
+            );
+        }
+    }
+}
+
 /// Spawns a task that forwards `acpx/agent_request` and
 /// `acpx/terminal_output` notifications to `event_tx` for the entire
 /// lifetime of `client`'s connection -- **independent** of
@@ -1506,6 +1535,16 @@ async fn run_thread_actor(
     // never a concurrent `SendPrompt` racing a `CloseSession`/`Shutdown`
     // for the same lease.
     let mut current_lease: Option<SessionLease> = None;
+    // pool-capability-fix: the current lease's configOptions as reported
+    // at attach time (`session/new`/`session/resume`'s own response), and
+    // the config_ids this actor has since changed via `SetConfigOption`
+    // (config_id -> value it had *before* this lease's first change to
+    // it). Reset via `reset_lease_config_overrides` right before the
+    // lease is released back to the pool's idle list -- see that fn's
+    // doc comment for why.
+    let mut baseline_config_options: Vec<ConfigOptionInfo> = Vec::new();
+    let mut config_overrides: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // Keep forwarding live session updates even while the user is idle.
     // `session/load` is allowed to replay after its RPC response; waiting
@@ -1737,6 +1776,12 @@ async fn run_thread_actor(
                     }
                 };
                 let sid = lease.session_id.clone();
+                // pool-capability-fix: the fresh lease's own reported
+                // configOptions, captured so `config_overrides` (below)
+                // records "what to restore" relative to *this* lease's
+                // starting state, not whatever a previous tenant left
+                // behind.
+                let mut attach_config_options_raw: Option<serde_json::Value> = None;
                 let result: Result<AttachedSession, AcpxThreadError> = if lease.resumed_from_saved {
                     // Same wire behavior as `Command::ReattachSession`
                     // above (no history replay, `session/resume`) --
@@ -1759,6 +1804,7 @@ async fn run_thread_actor(
                         {
                             Ok((value, updates)) => {
                                 emit_capability_events(&value, &event_tx);
+                                attach_config_options_raw = value.get("configOptions").cloned();
                                 forward_updates(&updates, Some(&sid), &event_tx);
                                 if let Some(notifications) = early_notifications.as_mut() {
                                     if let Ok(Ok(update)) = tokio::time::timeout(
@@ -1814,6 +1860,7 @@ async fn run_thread_actor(
                     // the opener genuinely didn't report a response.
                     if let Some(value) = lease.capabilities.as_ref() {
                         emit_capability_events(value, &event_tx);
+                        attach_config_options_raw = value.get("configOptions").cloned();
                     }
                     client.register_session_replay(
                         &sid,
@@ -1836,6 +1883,11 @@ async fn run_thread_actor(
                         session_id = Some(sid.clone());
                         let _ = session_tx.send(Some(sid));
                         current_lease = Some(lease);
+                        baseline_config_options = attach_config_options_raw
+                            .as_ref()
+                            .and_then(parse_config_options)
+                            .unwrap_or_default();
+                        config_overrides.clear();
                     }
                     Err(_) => {
                         // Acquired but never usably attached -- must not
@@ -2014,6 +2066,21 @@ async fn run_thread_actor(
                 // same as delete below.
                 if let Some(lease) = current_lease.take() {
                     if let Some(pool) = pool.as_ref() {
+                        // pool-capability-fix: only a `background` close
+                        // hands the session back to the idle pool for a
+                        // *different* thread to reuse (see the comment
+                        // above) -- that's the one path that needs its
+                        // config overrides scrubbed first. A non-
+                        // background close invalidates the entry outright,
+                        // so there's nothing to leak.
+                        if background {
+                            reset_lease_config_overrides(
+                                &client,
+                                &sid,
+                                std::mem::take(&mut config_overrides),
+                            )
+                            .await;
+                        }
                         let pool_result = if background {
                             pool.release(&lease).await
                         } else {
@@ -2081,6 +2148,26 @@ async fn run_thread_actor(
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
                 };
+                // pool-capability-fix: remember the value this config_id
+                // had when the lease was acquired, the first time (this
+                // lease) it's changed -- a later change to the same id
+                // overwrites the live value but not this recorded
+                // baseline, so release restores the id to what it was
+                // *before this thread touched it*, not to an
+                // intermediate self-chosen value.
+                // No entry when the id has no known baseline `currentValue`
+                // (e.g. a config option the attach response didn't report
+                // one for) -- resetting to an empty string would be worse
+                // than leaving it as this thread set it.
+                if !config_overrides.contains_key(&config_id) {
+                    if let Some(baseline_value) = baseline_config_options
+                        .iter()
+                        .find(|option| option.id == config_id)
+                        .and_then(|option| option.current_value.clone())
+                    {
+                        config_overrides.insert(config_id.clone(), baseline_value);
+                    }
+                }
                 let params = serde_json::json!({
                     "sessionId": sid,
                     "configId": config_id,
@@ -2111,6 +2198,16 @@ async fn run_thread_actor(
                 // in-flight concurrently with this `Shutdown`; the lease's
                 // turn state is always `NotStarted` here already.
                 if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                    // pool-capability-fix: same reasoning as the
+                    // background-`CloseSession` arm above -- this session
+                    // is going back to idle for a possibly different
+                    // thread to pick up.
+                    reset_lease_config_overrides(
+                        &client,
+                        &lease.session_id,
+                        std::mem::take(&mut config_overrides),
+                    )
+                    .await;
                     if let Err(pool_error) = pool.release(&lease).await {
                         eprintln!(
                             "panel-rust: pool.release on Shutdown for session {:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent",
