@@ -33,9 +33,10 @@
 //! the test process.
 
 use crate::models::{build_markdown_block_data, MarkdownBlockData};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Render generation counter, injected rather than a module-global
 /// static. A real app has exactly one logical "what's the current
@@ -70,6 +71,52 @@ impl EpochCounter {
     /// the most recent [`Self::bump`] call on this same counter returned.
     pub fn current(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Concurrency test matrix row 4 ("rapid switch back to same thread
+/// mid-render"): tracks which `(thread_id, epoch)` renders are currently
+/// in flight so a caller that spawns a second render for the *exact
+/// same* switch (same thread, same epoch -- e.g. a rapid switch-away-
+/// then-back where the epoch counter hasn't moved between the two
+/// dispatches) doesn't pay for a fully redundant duplicate worker.
+///
+/// Deliberately scoped to `(thread_id, epoch)`, not `thread_id` alone: a
+/// genuine switch back to a thread bumps the epoch via
+/// [`EpochCounter::bump`], which is a legitimately new render request,
+/// not a duplicate -- the old (now-superseded) epoch's worker is left to
+/// notice via its own cooperative cancellation check, same as any other
+/// stale-epoch case. This module does not implement full "rejoin an
+/// in-flight render and multiplex delivery to multiple subscribers"
+/// semantics (a caller whose spawn call was de-duped gets no `on_chunk`/
+/// `on_done` of its own) -- the already-in-flight worker for that exact
+/// `(thread_id, epoch)` is assumed to be the one satisfying the original
+/// caller who started it.
+#[derive(Clone, Default)]
+pub struct InFlightRegistry(Arc<Mutex<HashSet<(String, u64)>>>);
+
+impl InFlightRegistry {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashSet::new())))
+    }
+
+    /// Marks `(thread_id, epoch)` as in flight if it wasn't already.
+    /// Returns `true` if this call actually started it (caller should
+    /// proceed to spawn); `false` if a render for this exact
+    /// `(thread_id, epoch)` was already running (caller should skip --
+    /// spawning would be a fully redundant duplicate).
+    fn try_start(&self, thread_id: &str, epoch: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((thread_id.to_string(), epoch))
+    }
+
+    fn finish(&self, thread_id: &str, epoch: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(thread_id.to_string(), epoch));
     }
 }
 
@@ -116,15 +163,33 @@ const CHUNK_MESSAGES_PER_STEP: usize = 20;
 /// `on_done(thread_id, epoch)` fires once after the last chunk (or
 /// immediately, with an empty `messages` list) via the same `deliver`
 /// mechanism, so callers can clear a `loading` flag.
+///
+/// `in_flight` de-dupes against a render already running for this exact
+/// `(thread_id, epoch)` (test matrix row 4) -- if one is already in
+/// flight, this call is a no-op: it returns immediately without spawning
+/// a thread or calling `on_chunk`/`on_done` at all (the already-running
+/// worker for that same request is assumed to satisfy the original
+/// caller). The returned `JoinHandle` still always resolves quickly in
+/// that case (a trivial no-op thread), so callers that unconditionally
+/// `.join()` the result don't need to special-case the de-duped path.
 pub fn spawn_background_render(
     thread_id: String,
     epoch: u64,
     epoch_counter: EpochCounter,
+    in_flight: InFlightRegistry,
     messages: Vec<String>,
     deliver: impl Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
     on_chunk: impl Fn(MessageBlocksChunk, Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
     on_done: impl FnOnce(String, u64) + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
+    if !in_flight.try_start(&thread_id, epoch) {
+        return std::thread::spawn(|| {});
+    }
+    let finish_thread_id = thread_id.clone();
+    let on_done = move |thread_id: String, epoch: u64| {
+        in_flight.finish(&finish_thread_id, epoch);
+        on_done(thread_id, epoch);
+    };
     let job = render_job(thread_id, epoch, epoch_counter, messages, deliver, on_chunk, on_done);
     std::thread::spawn(job)
 }
@@ -136,17 +201,27 @@ pub fn spawn_background_render(
 /// work"). Fire-and-forget: unlike the raw-spawn version there's no
 /// `JoinHandle` to return (the pool's own threads persist past any one
 /// job), so callers observe completion via `on_done`/the delivered
-/// chunks instead of joining.
+/// chunks instead of joining. Same `in_flight` de-dupe semantics as
+/// [`spawn_background_render`].
 pub fn spawn_background_render_pooled(
     pool: &RenderWorkerPool,
     thread_id: String,
     epoch: u64,
     epoch_counter: EpochCounter,
+    in_flight: InFlightRegistry,
     messages: Vec<String>,
     deliver: impl Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
     on_chunk: impl Fn(MessageBlocksChunk, Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
     on_done: impl FnOnce(String, u64) + Send + 'static,
 ) {
+    if !in_flight.try_start(&thread_id, epoch) {
+        return;
+    }
+    let finish_thread_id = thread_id.clone();
+    let on_done = move |thread_id: String, epoch: u64| {
+        in_flight.finish(&finish_thread_id, epoch);
+        on_done(thread_id, epoch);
+    };
     let job = render_job(thread_id, epoch, epoch_counter, messages, deliver, on_chunk, on_done);
     pool.submit(job);
 }
@@ -338,6 +413,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             sync_deliver(),
             move |chunk, ack| {
@@ -385,6 +461,7 @@ mod tests {
                 format!("thread-{i}"),
                 epoch,
                 epoch_counter,
+                InFlightRegistry::new(),
                 vec![format!("switch {i} message")],
                 sync_deliver(),
                 |_chunk, ack| ack(),
@@ -423,6 +500,7 @@ mod tests {
                 format!("raw-{i}"),
                 epoch,
                 epoch_counter,
+                InFlightRegistry::new(),
                 vec!["hello world".to_string()],
                 sync_deliver(),
                 move |_chunk, ack| {
@@ -448,6 +526,7 @@ mod tests {
                 format!("pooled-{i}"),
                 epoch,
                 epoch_counter,
+                InFlightRegistry::new(),
                 vec!["hello world".to_string()],
                 sync_deliver(),
                 move |_chunk, ack| {
@@ -491,6 +570,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             sync_deliver(),
             move |chunk, ack| {
@@ -523,6 +603,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             sync_deliver(),
             move |chunk, ack| {
@@ -554,6 +635,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             sync_deliver(),
             move |_chunk, ack| {
@@ -588,6 +670,7 @@ mod tests {
             "thread-a".into(),
             stale_epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             sync_deliver(),
             move |_chunk, ack| {
@@ -618,6 +701,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             // Deliver on a background thread per chunk so the ack-wait
             // doesn't block the worker's own delivery call itself --
@@ -662,6 +746,123 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_spawn_for_same_thread_and_epoch_is_a_no_op() {
+        // Matrix row 4: a second spawn_background_render call for the
+        // *exact same* (thread_id, epoch) as an already-in-flight render
+        // must not spawn a redundant duplicate worker -- its on_chunk/
+        // on_done must never fire, and its returned JoinHandle must
+        // still resolve promptly (a trivial no-op thread) so callers
+        // that unconditionally .join() it don't hang.
+        let epoch_counter = EpochCounter::new();
+        let epoch = epoch_counter.bump();
+        let in_flight = InFlightRegistry::new();
+        // Deliberately <= CHUNK_MESSAGES_PER_STEP (20): this produces
+        // exactly one chunk, so the single release_tx.send() below
+        // unblocks it. With more than one chunk, on_chunk (which blocks
+        // unconditionally, every call) would deadlock waiting for a
+        // second release that never comes.
+        let messages: Vec<String> = (0..5).map(|i| format!("message {i}")).collect();
+
+        // Keep the first render's single chunk callback blocked so its
+        // (thread_id, epoch) entry stays registered as in-flight for the
+        // whole test -- proves the *second* call's no-op-ness isn't just
+        // a timing coincidence (first one finishing before the second
+        // starts).
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let first_chunk_started = Arc::new(Mutex::new(false));
+        let started_flag = first_chunk_started.clone();
+        let first_handle = spawn_background_render(
+            "thread-a".into(),
+            epoch,
+            epoch_counter.clone(),
+            in_flight.clone(),
+            messages,
+            |f| {
+                std::thread::spawn(f);
+            },
+            move |_chunk, ack| {
+                *started_flag.lock().unwrap() = true;
+                let _ = release_rx.lock().unwrap().recv();
+                ack();
+            },
+            |_, _| {},
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*first_chunk_started.lock().unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(*first_chunk_started.lock().unwrap(), "first render's chunk callback must have started");
+
+        // Second call: identical thread_id + epoch + registry.
+        let second_on_chunk_fired = Arc::new(Mutex::new(false));
+        let second_flag = second_on_chunk_fired.clone();
+        let second_on_done_fired = Arc::new(Mutex::new(false));
+        let second_done_flag = second_on_done_fired.clone();
+        let second_handle = spawn_background_render(
+            "thread-a".into(),
+            epoch,
+            epoch_counter,
+            in_flight,
+            vec!["should never be parsed".to_string()],
+            sync_deliver(),
+            move |_chunk, _ack| {
+                *second_flag.lock().unwrap() = true;
+            },
+            move |_thread_id, _epoch| {
+                *second_done_flag.lock().unwrap() = true;
+            },
+        );
+        second_handle.join().unwrap();
+
+        assert!(!*second_on_chunk_fired.lock().unwrap(), "de-duped second spawn must never fire on_chunk");
+        assert!(!*second_on_done_fired.lock().unwrap(), "de-duped second spawn must never fire on_done");
+
+        // Unblock and confirm the *first*, real render still completes
+        // normally -- de-dupe only skips the redundant second call, it
+        // doesn't break the original.
+        release_tx.send(()).unwrap();
+        first_handle.join().unwrap();
+    }
+
+    #[test]
+    fn different_epoch_for_same_thread_is_not_de_duped() {
+        // A genuine switch back to a thread bumps the epoch -- that's a
+        // legitimately new render request, not a duplicate, so it must
+        // NOT be blocked by the in-flight registry even though the
+        // thread_id is the same as a still-registered older epoch.
+        let epoch_counter = EpochCounter::new();
+        let in_flight = InFlightRegistry::new();
+        let first_epoch = epoch_counter.bump();
+        // Manually keep `first_epoch` "in flight" in the registry without
+        // an actual running worker, to isolate exactly what's being
+        // tested: does a *different* epoch for the same thread_id get
+        // through the registry check.
+        assert!(in_flight.try_start("thread-a", first_epoch));
+
+        let second_epoch = epoch_counter.bump();
+        let on_chunk_fired = Arc::new(Mutex::new(false));
+        let fired = on_chunk_fired.clone();
+        let handle = spawn_background_render(
+            "thread-a".into(),
+            second_epoch,
+            epoch_counter,
+            in_flight,
+            vec!["hello".to_string()],
+            sync_deliver(),
+            move |_chunk, ack| {
+                *fired.lock().unwrap() = true;
+                ack();
+            },
+            |_, _| {},
+        );
+        handle.join().unwrap();
+
+        assert!(*on_chunk_fired.lock().unwrap(), "a different epoch for the same thread_id must not be de-duped");
+    }
+
+    #[test]
     fn empty_message_list_still_calls_on_done() {
         let done = Arc::new(Mutex::new(false));
         let done_flag = done.clone();
@@ -671,6 +872,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             Vec::new(),
             sync_deliver(),
             |_chunk, _ack| panic!("on_chunk must not fire for an empty message list"),
@@ -701,6 +903,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             |f| drop(f), // never runs the closure -- the "dead event loop"
             move |_chunk, _ack| {
@@ -728,6 +931,7 @@ mod tests {
             "thread-a".into(),
             epoch,
             epoch_counter,
+            InFlightRegistry::new(),
             messages,
             sync_deliver(),
             move |chunk, ack| {
