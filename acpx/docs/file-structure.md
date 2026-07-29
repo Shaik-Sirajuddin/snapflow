@@ -82,7 +82,7 @@ wire shapes can never drift apart.
   (`MethodClass`), `dispatch`/`dispatch_shared` and the `_shared`
   dispatch-function family (lock-briefly-release pattern), session
   rehydration, the idle scavenger, live-notification wiring
-  (`LiveNotifyCtx`), transcript/session persistence calls.
+  (`LiveNotifyCtx`), session metadata/state-revision persistence calls.
 - [`src/session_registry.rs`](../acpx-core/src/session_registry.rs) --
   `SessionRegistry`/`SessionEntry`/`BackendSessionId`, the gateway <->
   backend session id mapping.
@@ -113,8 +113,8 @@ wire shapes can never drift apart.
     `spawn_blocking` per query).
   - [`sessions.rs`](../acpx-core/src/persistence/sessions.rs) --
     `SessionRecord` (durable twin of `SessionEntry`).
-  - [`transcripts.rs`](../acpx-core/src/persistence/transcripts.rs) --
-    `TranscriptRecord`/`Direction`, append-only request/response log.
+  - `sessions.rs` -- durable session metadata and state-revision fields;
+    message transcripts are owned by Panel-Rust's JSONL store.
   - [`error.rs`](../acpx-core/src/persistence/error.rs) --
     `PersistenceError`.
 - `tests/` (23 files) -- one focused integration-style test file per

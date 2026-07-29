@@ -198,4 +198,7 @@ pub struct SessionRecord {
     /// startup recovery. `None` means "no override, use the deployment
     /// default" -- the migration default for every pre-existing row.
     pub custom_idle_ttl_seconds: Option<i64>,
+    /// Monotonic session-state revision used to detect durable drift for
+    /// stream resumption without storing raw transcript payloads.
+    pub state_revision: i64,
 }

@@ -121,7 +121,7 @@ holding either one across real backend I/O:
    `dispatch_session_list_real_shared`) exist to guarantee: lock, gather
    what's needed, drop the lock, `.await` the real backend call, only
    re-lock afterward to write back results (session registration,
-   persistence, transcript append).
+    persistence and state-revision updates).
 2. **Each backend's own process lock**
    (`SharedBackendProcess = Arc<Mutex<BackendProcess>>`, one per running
    child process, owned by `Supervisor`). A backend's stdin/stdout is a
@@ -227,9 +227,10 @@ blocks the async runtime) durably records:
 - **`sessions`** -- one row per session (`gateway_session_id`,
   `agent_id`/supervisor key, `backend_session_id`, `profile_name`,
   timestamps). Written fire-and-forget from `Router::record_session`.
-- **`transcripts`** -- append-only request/response log per session,
-  for audit/history (`session/list`-adjacent bookkeeping), also
-  fire-and-forget.
+- **`state_revision`** -- monotonically increasing durable session-state
+  marker used to detect out-of-band changes before stream resumption. Raw
+  message transcripts are not stored by ACPX; Panel-Rust owns its JSONL
+  transcript files.
 
 This is what survives a daemon restart -- but the OS child processes do
 not (`Command::kill_on_drop(true)` in
@@ -250,9 +251,8 @@ after a restart is therefore narrower than a live reconnect:
   (re-running `resolve_profile`, idempotent) and forwards the *same*
   backend-native session id to the fresh process. Whether the backend
   agent itself can actually recall prior conversation turns for that id
-  is delegated entirely to that backend's own persistence -- acpx's
-  `transcripts` table is descriptive/audit data, never replayed into a
-  freshly-spawned backend. Verified end-to-end (real second
+  is delegated entirely to that backend's own persistence. ACPX never stores
+  or replays message transcripts. Verified end-to-end (real second
   `acpx-server` process, real `claude-agent-acp`) by
   `ambient_claude_session_load_survives_a_real_gateway_restart` in
   [`real_ambient_multi_agent_test.rs`](../acpx-server/tests/real_ambient_multi_agent_test.rs).

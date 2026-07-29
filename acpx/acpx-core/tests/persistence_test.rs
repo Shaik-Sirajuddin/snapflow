@@ -3,7 +3,7 @@
 
 use acpx_core::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    Direction, PersistenceStore,
+    PersistenceStore,
 };
 use serde_json::json;
 
@@ -379,74 +379,6 @@ async fn list_sessions_returns_every_recorded_session() {
     assert_eq!(all.len(), 2);
     assert!(all.iter().any(|s| s.gateway_session_id == "gw-1"));
     assert!(all.iter().any(|s| s.gateway_session_id == "gw-2"));
-}
-
-#[tokio::test]
-async fn transcript_append_and_read_back_round_trips_in_order() {
-    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
-    store
-        .record_session(
-            "gw-1",
-            "codex-acp",
-            "backend-1",
-            None,
-            "2026-07-12T00:00:00Z",
-            "default",
-        )
-        .await
-        .expect("record session");
-
-    let first_id = store
-        .append_transcript(
-            "gw-1",
-            Direction::ClientToAgent,
-            json!({"method": "session/prompt", "id": 1}),
-            "2026-07-12T00:00:01Z",
-        )
-        .await
-        .expect("append first transcript");
-    let second_id = store
-        .append_transcript(
-            "gw-1",
-            Direction::AgentToClient,
-            json!({"result": {"stopReason": "end_turn"}, "id": 1}),
-            "2026-07-12T00:00:02Z",
-        )
-        .await
-        .expect("append second transcript");
-    assert!(second_id > first_id);
-
-    let records = store
-        .list_transcripts("gw-1")
-        .await
-        .expect("list_transcripts");
-    assert_eq!(records.len(), 2);
-
-    assert_eq!(records[0].id, Some(first_id));
-    assert_eq!(records[0].gateway_session_id, "gw-1");
-    assert_eq!(records[0].direction, Direction::ClientToAgent);
-    assert_eq!(
-        records[0].payload,
-        json!({"method": "session/prompt", "id": 1})
-    );
-    assert_eq!(records[0].recorded_at, "2026-07-12T00:00:01Z");
-
-    assert_eq!(records[1].id, Some(second_id));
-    assert_eq!(records[1].direction, Direction::AgentToClient);
-    assert_eq!(
-        records[1].payload,
-        json!({"result": {"stopReason": "end_turn"}, "id": 1})
-    );
-}
-
-#[tokio::test]
-async fn transcripts_for_unknown_session_are_empty_not_an_error() {
-    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
-    let records = store
-        .list_transcripts("never-existed")
-        .await
-        .expect("list_transcripts");
-    assert!(records.is_empty());
 }
 
 #[tokio::test]

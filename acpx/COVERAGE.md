@@ -39,7 +39,7 @@ processes by design, not run by default). `cargo build --workspace` and
 | 7 | `agents/list`/`agents/status` gateway-native API; `agents/install` | `router.rs`'s `dispatch_native`, `acpx-registry/src/install.rs` | `agents_gateway_native_test.rs`; `acpx-registry` unit tests (8) covering npx/uvx runtime checks and binary archive sniff/extract | Done |
 | 8 | Session registry (gateway session id -> agent + backend session id), `session/list` aggregation | `acpx-core/src/session_registry.rs` | `session_registry`'s own unit tests (2) + `router_dispatch_test.rs`'s `session_list_aggregates_registered_sessions` | Done |
 | 9 | Router for `session/new`/`session/prompt`/`session/resume`/`session/load`/`session/close`/`session/set_mode`/`session/cancel` -- transparent passthrough | `acpx-core/src/router.rs` (`dispatch_session_new`, `dispatch_proxied`) | `router_dispatch_test.rs` (4), `router_test.rs` (3, classification) | Done |
-| 10 | Sqlite-backed persistence for session metadata + transcripts, written off the hot path | `acpx-core/src/persistence/{store,sessions,transcripts,error}.rs` | `persistence_test.rs` (6, CRUD); `router_persistence_test.rs` (1, full `session/new` -> sqlite round trip -- previously flaky due to a `FOREIGN KEY` write-ordering race between three independent `tokio::spawn` tasks, fixed by serializing session+transcript writes into one task, see `router.rs`'s `spawn_session_persistence` doc comment; verified with 40 back-to-back isolated runs, 0 failures) | Done |
+| 10 | Sqlite-backed persistence for session metadata and durable state revisions, written off the hot path | `acpx-core/src/persistence/{store,sessions,error}.rs` | `persistence_test.rs` (session/recovery CRUD and migrations); `router_persistence_test.rs` (session metadata + state-revision round trip); `store` unit test (out-of-band revision drift detection) | Done |
 | 11 | HTTP/WebSocket transport alongside stdio | `acpx-server/src/transport/{http,ws,mod}.rs`, `main.rs` (stdio + HTTP/WS run concurrently against one shared `Router`) | `acpx-server/tests/http_ws_transport_test.rs` (3): POST /rpc round-trip, WS round-trip, `X-Acpx-Profile` header routing (now resolves through the real `ProfileStore`, see Phase 3) | Done |
 
 ## Phase 3 -- provider/key management + profiles
@@ -3174,15 +3174,15 @@ per-daemon nonce, so tokens from a prior daemon lifetime cannot resume a
 new stream accidentally.
 
 Before stdio or WebSocket attaches a resume subscriber, ACPX compares the
-SQLite transcript count against the count written through its own
+SQLite session `state_revision` against the revision written through its own
 `PersistenceStore`. A direct durable-state change bumps the epoch,
 clears replay history, and returns JSON-RPC error `-32051` with
 `error.data.reason = "resync_required"` plus the current `epoch` and
 `seq` baseline. Clients must perform a full `session/load` refresh
 before retaining a new cursor.
 
-`transcript_state_detects_an_out_of_band_database_write` performs a raw
-SQLite transcript insert after an ACPX-managed write and verifies the
+`state_revision_detects_an_out_of_band_database_write` performs a raw
+SQLite session-revision update after an ACPX-managed write and verifies the
 drift detector trips. `durable_drift_invalidates_the_epoch_and_requires_
 a_resync` verifies the hub returns the new epoch instead of replaying a
 stale stream. Verified with `cargo test --workspace --no-fail-fast`;
