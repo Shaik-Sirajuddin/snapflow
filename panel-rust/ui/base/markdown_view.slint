@@ -1,7 +1,8 @@
 import { Theme } from "../tokens/theme.slint";
 import { SelectionFocus } from "../tokens/selection_focus.slint";
 import { Metrics } from "../tokens/metrics.slint";
-import { MarkdownLine, MarkdownRun } from "../types.slint";
+import { MarkdownLine, MarkdownRun, MarkdownBlock } from "../types.slint";
+import { TerminalLogBlock } from "terminal_log_block.slint";
 
 // Renders `MessageItem.markdown-lines` (see `src/markdown.rs` / `types.
 // slint`'s doc comments). Each `MarkdownLine` is already a fully wrapped
@@ -37,9 +38,19 @@ export component MarkdownView inherits VerticalLayout {
     // Phase 17: emitted with the link target on click (host applies
     // the Ctrl requirement + opens file/URL).
     callback link-activated(string);
+    // Architecture v2 (markdown-thread-freeze-fix phase 3): when
+    // non-empty, preferred over `lines` below -- one native `StyledText`
+    // per block instead of Rust-computed wrap. See markdown.rs's
+    // `segment_blocks` doc comment and
+    // memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+    // "Architecture v2" section for why this coexists with `lines`
+    // rather than replacing it outright: `MessageItem.markdown-blocks`
+    // is populated at every current call site, but keeping `lines` live
+    // too means nothing else in this file has to change shape yet.
+    in property <[MarkdownBlock]> blocks: [];
     in property <[MarkdownLine]> lines: [];
-    // Shown as plain wrapped text when `lines` is empty -- covers a
-    // "agent" row cached before `markdown-lines` existed (see
+    // Shown as plain wrapped text when both `blocks` and `lines` are
+    // empty -- covers a "agent" row cached before either existed (see
     // `MessageItem.markdown-lines`'s doc comment) and any non-agent
     // caller that hasn't bothered to markdown-parse its body.
     in property <string> fallback-text: "";
@@ -69,7 +80,7 @@ export component MarkdownView inherits VerticalLayout {
         }
     }
 
-    if lines.length == 0 : TextInput {
+    if blocks.length == 0 && lines.length == 0 : TextInput {
         text: fallback-text;
         font-family: Theme.font-sans;
         font-size: 12px * Theme.font-scale;
@@ -91,7 +102,74 @@ export component MarkdownView inherits VerticalLayout {
         selection-background-color: Theme.selection-bg;
     }
 
-    for line[i] in lines : VerticalLayout {
+    // Architecture v2 block path -- takes over entirely when `blocks` is
+    // non-empty (the `lines` loop below is gated to skip in that case,
+    // not run alongside it).
+    if blocks.length > 0 : VerticalLayout {
+        spacing: 0px;
+        alignment: stretch;
+
+        for block[i] in blocks : VerticalLayout {
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            alignment: stretch;
+
+            if i > 0 : Rectangle { height: Metrics.space-2; }
+
+            if block.kind == "text" : StyledText {
+                text: block.text;
+                default-font-size: block.default-font-size > 0px
+                    ? block.default-font-size * Theme.font-scale
+                    : 12px * Theme.font-scale;
+                default-font-family: Theme.font-sans;
+                link-color: Theme.md-link;
+                horizontal-alignment: left;
+                x: block.indent * 14px;
+                width: max(0px, parent.width - self.x);
+                link-clicked(link) => { root.link-activated(link); }
+            }
+
+            if block.kind == "code" : TerminalLogBlock {
+                text: block.code-text;
+                scrollable: false;
+                font-size: 11px;
+            }
+
+            if block.kind == "rule" : Rectangle {
+                height: 1px;
+                background: Theme.border-default;
+            }
+
+            if block.kind == "table" : Flickable {
+                height: table-grid.preferred-height;
+                viewport-width: table-grid.preferred-width;
+                viewport-height: table-grid.preferred-height;
+
+                table-grid := VerticalLayout {
+                    spacing: 1px;
+                    // Row-major flat cell list -> rows of table-col-count
+                    // cells each. Slint has no dynamic GridLayout (its
+                    // rows/cols are fixed at compile time -- see the
+                    // Slint skill's GridLayout note), so a table with a
+                    // runtime-known row/column count has to be hand-rolled
+                    // as `for`-generated HorizontalLayout rows instead.
+                    for row-start[ri] in block.table-cells.length / max(1, block.table-col-count) : HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        for col[ci] in block.table-col-count : StyledText {
+                            text: block.table-cells[row-start * block.table-col-count + col];
+                            default-font-size: 12px * Theme.font-scale;
+                            default-font-family: Theme.font-sans;
+                            min-width: 80px;
+                            horizontal-alignment: left;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for line[i] in blocks.length == 0 ? lines : [] : VerticalLayout {
         property <bool> is-code: line.kind == "code";
         property <bool> is-quote: line.kind == "quote";
         property <bool> is-hr: line.kind == "hr";
