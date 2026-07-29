@@ -167,14 +167,22 @@ pub fn spawn_background_render(
             // Block until the UI thread has actually drained this
             // chunk before parsing the next one -- paces this worker to
             // the UI thread's real drain rate rather than this thread's
-            // raw parse speed. If the UI thread never acks (e.g. it was
-            // torn down), this thread stays parked forever on this
-            // recv; that's acceptable for a detached worker thread (no
-            // resources held besides its own stack) but is exactly why
-            // production wiring should ack from inside a `panel_rust_
-            // poll`-driven closure that always eventually runs, not one
-            // that can be silently dropped.
-            let _ = ack_rx.recv();
+            // raw parse speed.
+            //
+            // `recv()` returning `Err` means `ack_tx` was dropped
+            // without ever sending -- the delivery closure was dropped
+            // instead of run (e.g. `deliver`'s target event loop already
+            // shut down; test matrix case 8, "app/window closed while
+            // worker active"). Stop here rather than silently proceeding
+            // to the next chunk: continuing would burn CPU parsing
+            // output nobody will ever see, and the original version of
+            // this code swallowed the error (`let _ = ack_rx.recv();`),
+            // which rust-audit's "silently swallowed Results on
+            // anything connection-/lock-related" rule flags as exactly
+            // this class of bug -- caught in review, not by a test.
+            if ack_rx.recv().is_err() {
+                return;
+            }
 
             index = end;
         }
@@ -403,6 +411,41 @@ mod tests {
         );
         handle.join().unwrap();
         assert!(*done.lock().unwrap());
+    }
+
+    #[test]
+    fn dropped_delivery_stops_the_worker_instead_of_hanging_or_churning_silently() {
+        // Simulates a dead event loop (test matrix case 8): `deliver`
+        // drops the closure instead of running it, so the ack channel's
+        // sender is dropped without ever sending. The worker must stop
+        // -- not hang forever on ack_rx.recv(), and not silently keep
+        // parsing further chunks nobody will ever see.
+        let messages: Vec<String> = (0..40).map(|i| format!("message {i}")).collect();
+        let epoch_counter = EpochCounter::new();
+        let epoch = epoch_counter.bump();
+        let on_chunk_calls = Arc::new(Mutex::new(0usize));
+        let on_done_calls = Arc::new(Mutex::new(0usize));
+
+        let calls = on_chunk_calls.clone();
+        let done_calls = on_done_calls.clone();
+        let handle = spawn_background_render(
+            "thread-a".into(),
+            epoch,
+            epoch_counter,
+            messages,
+            |f| drop(f), // never runs the closure -- the "dead event loop"
+            move |_chunk, _ack| {
+                *calls.lock().unwrap() += 1;
+            },
+            move |_thread_id, _epoch| {
+                *done_calls.lock().unwrap() += 1;
+            },
+        );
+        // Must terminate (not hang) within a bounded time.
+        handle.join().unwrap();
+
+        assert_eq!(*on_chunk_calls.lock().unwrap(), 0, "on_chunk never runs since deliver drops the closure");
+        assert_eq!(*on_done_calls.lock().unwrap(), 0, "worker stopped before reaching on_done, not after silently finishing");
     }
 
     #[test]

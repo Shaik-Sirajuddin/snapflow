@@ -117,17 +117,24 @@ export component MarkdownView inherits VerticalLayout {
 
             if i > 0 : Rectangle { height: Metrics.space-2; }
 
-            if block.kind == "text" : StyledText {
-                text: block.text;
-                default-font-size: block.default-font-size > 0px
-                    ? block.default-font-size * Theme.font-scale
-                    : 12px * Theme.font-scale;
-                default-font-family: Theme.font-sans;
-                link-color: Theme.md-link;
-                horizontal-alignment: left;
-                x: block.indent * 14px;
-                width: max(0px, parent.width - self.x);
-                link-clicked(link) => { root.link-activated(link); }
+            // `x`/explicit positioning on a StyledText here would fight
+            // the enclosing VerticalLayout, which owns this child's
+            // geometry (Slint's "layout computes x/y for you" rule --
+            // any indent has to go through `padding-left` on a
+            // wrapping layout instead, same as the `lines` path above
+            // already does for its own indent handling).
+            if block.kind == "text" : HorizontalLayout {
+                padding-left: block.indent * 14px;
+                StyledText {
+                    text: block.text;
+                    default-font-size: block.default-font-size > 0px
+                        ? block.default-font-size * Theme.font-scale
+                        : 12px * Theme.font-scale;
+                    default-font-family: Theme.font-sans;
+                    link-color: Theme.md-link;
+                    horizontal-alignment: left;
+                    link-clicked(link) => { root.link-activated(link); }
+                }
             }
 
             if block.kind == "code" : TerminalLogBlock {
