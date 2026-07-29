@@ -202,8 +202,9 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             // empty at startup would never pick up the real list once it
             // arrived until some unrelated capability change or thread
             // switch happened to also fire.
-            let real_idx = crate::update::selected_real_index(model);
-            if let Some(thread) = model.threads.get(real_idx) {
+            if let Some(thread) = crate::update::selected_real_index(model)
+                .and_then(|real_idx| model.threads.get(real_idx))
+            {
                 sync_profile_picker(model, component, thread);
             }
         }
@@ -846,8 +847,9 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
             // it) never does -- sync the profile picker here too so its
             // enabled/current state is correct immediately on switching,
             // not just eventually via the next capability event.
-            let real_idx = crate::update::selected_real_index(model);
-            if let Some(thread) = model.threads.get(real_idx) {
+            if let Some(thread) = crate::update::selected_real_index(model)
+                .and_then(|real_idx| model.threads.get(real_idx))
+            {
                 sync_profile_picker(model, component, thread);
             }
         }

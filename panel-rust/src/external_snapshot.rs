@@ -30,6 +30,33 @@ fn skills_rescan_due() -> bool {
     })
 }
 
+/// Throttle for the settings-gateway catalog fetch (profiles/agents/mcp/
+/// recoverable-sessions), mirroring `skills_rescan_due`'s reasoning: the
+/// frame poll runs per repaint (60-90x/sec), but each of these calls is a
+/// synchronous `runtime.block_on` gateway RPC (see `AgentBridge::list_agents`
+/// et al.) executed inline on this UI-thread poll. Without a throttle, every
+/// tick while Settings is open pays a full network round trip per RPC before
+/// the frame can repaint -- the exact UI-thread-blocking-call anti-pattern
+/// `effect_executor.rs`'s `enabled_vendor_ids` doc comment already describes
+/// fixing for its own (different) caller. Thread-local because the poll only
+/// ever runs on the UI thread.
+fn settings_gateway_fetch_due() -> bool {
+    thread_local! {
+        static LAST_GATEWAY_FETCH: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_GATEWAY_FETCH.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -104,7 +131,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             selected_thread_snapshot: self.collect_selected_thread_snapshot(),
             settings_preferences_snapshot: (settings_open || settings_reload_pending)
                 .then(|| self.collect_settings_preferences_snapshot(None)),
-            settings_gateway_snapshot: need_gateway_catalog
+            settings_gateway_snapshot: (need_gateway_catalog && settings_gateway_fetch_due())
                 .then(|| self.collect_settings_gateway_snapshot()),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold

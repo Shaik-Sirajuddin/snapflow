@@ -1187,7 +1187,16 @@ pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
         panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::ErrorBannerDismissed)),
     );
-    debug_assert!(dirty.iter().any(|item| matches!(item, Dirty::Error { .. })));
+    // `ChromeMsg::ErrorBannerDismissed`'s reducer arm legitimately returns
+    // empty dirty when there is no genuinely selected/visible thread right
+    // now (see `selected_real_index`'s doc comment) -- this used to assert
+    // unconditionally, which the same "search filter hides the selection"
+    // state that once crashed Send (dispatch_compose_send's debug_assert)
+    // would have hit here too now that selected_real_index no longer
+    // fabricates an index in that case.
+    debug_assert!(
+        dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. }))
+    );
 }
 
 pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
@@ -1275,9 +1284,15 @@ pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
         panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))),
     );
-    debug_assert!(dirty
-        .iter()
-        .any(|item| matches!(item, Dirty::MessagesDiff { .. })));
+    // `ChromeMsg::ToggleExpanded`'s reducer arm already bails out to empty
+    // dirty (no assert to violate) whenever `model.displayed_thread` is
+    // `None` or `index` isn't a valid `model.expanded` slot -- both
+    // reachable in ordinary use (e.g. right after a thread switch, before
+    // `displayed_thread` settles), so this must tolerate empty too, same
+    // fix as `dispatch_error_banner_dismissed` just above.
+    debug_assert!(
+        dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::MessagesDiff { .. }))
+    );
 }
 
 pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
@@ -1344,8 +1359,14 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
     // terminals, error) alongside the selection scalar -- the invariant
     // worth keeping is that a switch command MARKS the selection dirty,
     // not that it marks nothing else.
+    // `ThreadMsg::NavigateDelta` (behind previous-thread/next-thread) bails
+    // out to empty dirty when there are zero threads to navigate among --
+    // legitimately reachable (a cold-start panel with no threads yet), so
+    // this must tolerate empty too, same as the other reducer-shape
+    // asserts above.
     debug_assert!(
         command == crate::PANEL_COMMAND_OPEN_THREAD_SEARCH
+            || dirty.is_empty()
             || dirty
                 .iter()
                 .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))

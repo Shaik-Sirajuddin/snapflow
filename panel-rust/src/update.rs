@@ -103,11 +103,29 @@ pub(crate) fn show_toast(model: &mut Model, kind: &str, message: impl Into<Strin
     Dirty::Toast
 }
 
-pub(crate) fn selected_real_index(model: &Model) -> usize {
+/// The real (storage) index of whichever thread is genuinely visible and
+/// selected right now, or `None` if `model.selected_thread` does not
+/// currently resolve to a visible row at all (e.g. an active thread-search
+/// filter matches nothing, or momentarily matches fewer rows than the
+/// stale selection position).
+///
+/// This used to fall back to `.unwrap_or(model.selected_thread)` on a
+/// lookup miss -- reinterpreting a *filtered-list position* as if it were
+/// already a *real storage index* whenever the two spaces happened to
+/// overlap in range. That silently pointed every caller (compose send,
+/// terminal kill, settings mode/profile/MCP changes, agent-request
+/// approve/reject, ...) at whatever thread happened to occupy that real
+/// slot -- not the thread actually selected/visible in the UI -- and in
+/// `dispatch_compose_send`'s case (the one call site that cross-checks
+/// this against a second, independently-computed real index) that
+/// disagreement tripped a `debug_assert!` and aborted the whole process
+/// (a live-reproduced crash: type a thread-search query that filters the
+/// selected thread out of view, then Send). Returning `None` here instead
+/// lets every caller degrade to "nothing to do" rather than guess.
+pub(crate) fn selected_real_index(model: &Model) -> Option<usize> {
     current_visible_indices(model)
         .get(model.selected_thread)
         .copied()
-        .unwrap_or(model.selected_thread)
 }
 
 // setup-followups plan, archive_thread_backend_verify: pub(crate) so a
@@ -233,7 +251,7 @@ fn thread_list_dirty_with_keys(model: &mut Model, old_keys: Vec<String>) -> Dirt
 fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>) {
     let real_idx = selected_real_index(model);
     let prev_displayed = model.displayed_thread;
-    let switched = prev_displayed != Some(real_idx);
+    let switched = prev_displayed != real_idx;
 
     let mut dirty = vec![Dirty::Scalar(ScalarField::SelectedThread)];
 
@@ -247,9 +265,8 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
             // No prior displayed thread but global compose has text — keep
             // it on the newly selected thread only after switch.
         }
-        model.compose_text = model
-            .threads
-            .get(real_idx)
+        model.compose_text = real_idx
+            .and_then(|idx| model.threads.get(idx))
             .map(|thread| thread.compose_draft.clone())
             .unwrap_or_default();
         dirty.push(Dirty::Scalar(ScalarField::ComposeText));
@@ -284,9 +301,8 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
         dirty.push(Dirty::LocalTerminal);
     }
 
-    let thread_id = model
-        .threads
-        .get(real_idx)
+    let thread_id = real_idx
+        .and_then(|idx| model.threads.get(idx))
         .map(|thread| thread.thread_id.clone());
     (
         thread_id
@@ -633,7 +649,17 @@ fn queue_entry_id_at(
 }
 
 fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Every arm below that actually uses `idx` already immediately bails
+    // out via its own `model.threads.get(idx)`/`get_mut(idx)` guard, and
+    // the handful that don't (MentionToken*/WordBoundaryBefore/ContainsCi)
+    // already unconditionally return `(vec![], vec![])` regardless of
+    // `idx` -- so bailing here whenever nothing is genuinely selected/
+    // visible changes nothing for those, and fixes every other arm at
+    // once (see `selected_real_index`'s doc comment for the bug this
+    // closes).
+    let Some(idx) = selected_real_index(model) else {
+        return (vec![], vec![]);
+    };
     match msg {
         ComposeMsg::SendRequested(text) => {
             model.compose_text.clear();
@@ -893,7 +919,14 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
 }
 
 fn update_request(model: &mut Model, msg: RequestMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Every arm targets whichever thread `idx` names with no bail-out of
+    // its own (unlike `update_compose`) -- previously this fired an effect
+    // at a possibly-wrong real index whenever `idx` was unsound (see
+    // `selected_real_index`'s doc comment); now it's a clean no-op when
+    // nothing is genuinely selected/visible.
+    let Some(idx) = selected_real_index(model) else {
+        return (vec![], vec![]);
+    };
     match msg {
         RequestMsg::Approve(request_id) => (
             vec![Effect::RespondAgentRequest {
@@ -942,7 +975,10 @@ fn update_request(model: &mut Model, msg: RequestMsg) -> (Vec<Effect>, Vec<Dirty
 }
 
 fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Only `Kill` below needs a real thread index -- the rest operate on
+    // the terminal overlay/local-terminal state independent of thread
+    // selection, so (unlike `update_compose`/`update_request`) the guard
+    // stays local to that one arm rather than gating the whole function.
     match msg {
         TerminalMsg::Expand(id) => {
             // Opens (if not already open) AND activates -- the popup row
@@ -1000,6 +1036,9 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
         TerminalMsg::LocalClose => (vec![Effect::LocalTerminalKill], vec![Dirty::LocalTerminal]),
         TerminalMsg::LocalKeyInput(bytes) => (vec![Effect::LocalTerminalWrite { bytes }], vec![]),
         TerminalMsg::Kill(terminal_id) => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             // No model mutation here -- the real exit is observed the
             // same way any other terminal exit is, via the next
             // `AgentEvent::TerminalOutput` carrying a non-null
@@ -1017,7 +1056,12 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
 }
 
 fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Open/Close/Save/ScopeChanged/DevModeToggled are global settings
+    // actions that must still work with no thread genuinely selected/
+    // visible (e.g. Settings should still open while a thread search
+    // filters the list to nothing) -- so unlike `update_compose`/
+    // `update_request`, `idx` is resolved per-arm below, only where an
+    // arm actually targets a specific thread's gateway/session.
     match msg {
         SettingsMsg::Open => {
             model.settings_open = true;
@@ -1063,22 +1107,35 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 vec![Dirty::Scalar(ScalarField::SettingsScope), Dirty::Settings],
             )
         }
-        SettingsMsg::ConfigOptionSelected { key, value } => (
-            vec![Effect::SetConfigOption {
-                real_index: idx,
-                key,
-                value,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::ModeSelected(mode) => (
-            vec![Effect::SetMode {
-                real_index: idx,
-                mode,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::ConfigOptionSelected { key, value } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::SetConfigOption {
+                    real_index: idx,
+                    key,
+                    value,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::ModeSelected(mode) => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::SetMode {
+                    real_index: idx,
+                    mode,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::ProfileSelected(profile_name) => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
             };
@@ -1104,86 +1161,131 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.dev_mode = enabled;
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
         }
-        SettingsMsg::McpServerCreate { name, command } => (
-            vec![Effect::McpServerCreate {
-                real_index: idx,
-                name,
-                command,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::McpServerDelete { name } => (
-            vec![Effect::McpServerDelete {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::McpServerEnabledChanged { name, enabled } => (
-            vec![Effect::McpServerEnabledChanged {
-                real_index: idx,
-                name,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::McpServerAuthenticate { name } => (
-            vec![Effect::McpServerAuthenticate {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::McpServerCreate { name, command } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerCreate {
+                    real_index: idx,
+                    name,
+                    command,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerDelete { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerDelete {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerEnabledChanged { name, enabled } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerEnabledChanged {
+                    real_index: idx,
+                    name,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerAuthenticate { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerAuthenticate {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerToolEnabledChanged {
             server_name,
             tool_name,
             enabled,
-        } => (
-            vec![Effect::McpServerToolEnabledChanged {
-                real_index: idx,
-                server_name,
-                tool_name,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerToolEnabledChanged {
+                    real_index: idx,
+                    server_name,
+                    tool_name,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::ProfileCreate {
             name,
             agent_id,
             terminal_enabled,
             fs_enabled,
-        } => (
-            vec![Effect::ProfileCreate {
-                real_index: idx,
-                name,
-                agent_id,
-                terminal_enabled,
-                fs_enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::ProfileDelete { name } => (
-            vec![Effect::ProfileDelete {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::AgentInstallRequested { agent_id } => (
-            vec![Effect::AgentInstallRequested {
-                real_index: idx,
-                agent_id,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::AgentSetEnabled { agent_id, enabled } => (
-            vec![Effect::AgentSetEnabled {
-                real_index: idx,
-                agent_id,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::ProfileCreate {
+                    real_index: idx,
+                    name,
+                    agent_id,
+                    terminal_enabled,
+                    fs_enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::ProfileDelete { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::ProfileDelete {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::AgentInstallRequested { agent_id } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::AgentInstallRequested {
+                    real_index: idx,
+                    agent_id,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::AgentSetEnabled { agent_id, enabled } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::AgentSetEnabled {
+                    real_index: idx,
+                    agent_id,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
     }
 }
 
@@ -1299,7 +1401,9 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
             vec![],
         ),
         ChromeMsg::ErrorBannerDismissed => {
-            let real_idx = selected_real_index(model);
+            let Some(real_idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             let Some(thread) = model.threads.get_mut(real_idx) else {
                 return (vec![], vec![]);
             };
@@ -2040,7 +2144,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         // switch the display when the snapshot is for the thread the user
         // actually has selected -- otherwise leave the display alone and
         // let the next tick collect the right thread's snapshot.
-        let selection_matches = target_index == selected_real_index(model);
+        let selection_matches = Some(target_index) == selected_real_index(model);
         let switched_thread = selection_matches && model.displayed_thread != Some(target_index);
         if switched_thread {
             model.expanded.clear();
@@ -2777,6 +2881,46 @@ mod tests {
         );
         assert_eq!(model.threads[2].state, ThreadState::Loading);
         assert_eq!(model.threads[1].state, ThreadState::Idle);
+    }
+
+    /// Live-reproduced crash, root-caused and fixed here: typing a
+    /// thread-search query that matches nothing filters the currently
+    /// selected thread out of the visible list (`visible_indices` becomes
+    /// genuinely empty, not just "not yet synced" -- see
+    /// `current_visible_indices`'s own fallback condition). Before this
+    /// fix, `selected_real_index` papered over that with
+    /// `.unwrap_or(model.selected_thread)`, treating the *filtered-list
+    /// position* number as if it were already a *real storage index* --
+    /// which happened to still be in-bounds here (`threads.len() == 1`),
+    /// so `update_compose` built a `SendPrompt { real_index: 0, .. }`
+    /// effect anyway. Meanwhile `dispatch.rs`'s `dispatch_compose_send`
+    /// independently computes the caller's own real index via
+    /// `panel.real_index(filtered_idx)`, which reads raw
+    /// `visible_indices` with no such fallback and correctly got `None`
+    /// for the same empty list. The two disagreed, and
+    /// `dispatch_compose_send`'s `debug_assert!("send effect must target
+    /// the selected filtered index")` aborted the whole process --
+    /// Rust panics can't unwind across the Slint/Qt host boundary here,
+    /// so a hard `abort()`, not a graceful error. This is the actual
+    /// unit-level proof that Send is now a clean no-op instead, whatever
+    /// the caller-side index bookkeeping does.
+    #[test]
+    fn compose_send_requested_is_a_no_op_when_the_search_filter_hides_the_selection() {
+        let mut model = model_with_threads(&["only thread"]);
+        model.visible_list_synced = true;
+        model.visible_indices = vec![]; // search query matched nothing
+        model.selected_thread = 0;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("hi".to_owned()))),
+        );
+        assert_eq!(effects, vec![], "no thread is genuinely selected/visible right now");
+        assert_eq!(dirty, vec![]);
+        assert_eq!(
+            model.threads[0].state,
+            ThreadState::Idle,
+            "must not silently start a turn on a thread that isn't the visible selection"
+        );
     }
 
     #[test]
@@ -4023,7 +4167,7 @@ mod tests {
             model.selected_thread, 2,
             "selection must follow thread-1 to its new visible slot"
         );
-        assert_eq!(selected_real_index(&model), 1);
+        assert_eq!(selected_real_index(&model), Some(1));
         assert!(dirty
             .iter()
             .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));

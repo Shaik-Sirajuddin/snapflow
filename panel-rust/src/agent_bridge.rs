@@ -6655,6 +6655,126 @@ done
         );
     }
 
+    /// Provider-routing matrix (verification for the "codex/grok conversations
+    /// don't go through" live report): exercises all three real registry ids
+    /// this machine has an installed adapter for --
+    /// `~/.acpx/adapters/{codex-acp,claude-acp,grok-build}` -- through the
+    /// exact same `add_thread_with_profile_and_provider` entry point the
+    /// compose bar's Provider dropdown calls in production.
+    ///
+    /// `codex-acp` and `claude-acp` normalize onto the two real gateway
+    /// keys `resolve_provider_for`/[`normalize_provider`] knows about, so
+    /// each reaches its own persona's mock backend and gets that persona's
+    /// `available_commands` back -- same shape as
+    /// `two_threads_show_only_their_own_providers_available_commands` above.
+    ///
+    /// `grok-build` is the important, previously-unverified third row:
+    /// [`normalize_provider`] only ever recognizes "claude" by substring
+    /// match and falls through to `"codex"` for everything else --
+    /// `gateway_urls` itself is hard-seeded with exactly `["codex",
+    /// "claude"]` (see `new_with_thread_specs_and_gateway_resolver_and_cache_
+    /// dir`'s own comment) and has no third slot at all. So a thread whose
+    /// preferred provider is the real registry id `grok-build` is not
+    /// rejected and does not get its own gateway -- it silently attaches to
+    /// the *codex* gateway/session instead. This test proves that
+    /// end-to-end (not just via the pure classifier assertion in
+    /// `normalize_provider_maps_registry_ids_onto_gateway_keys`): the
+    /// grok-build thread's `available_commands` come back tagged with the
+    /// codex persona's command names, i.e. it is genuinely talking to the
+    /// codex backend under a different label, not to any distinct Grok
+    /// backend (which this repo's registry does not actually provide --
+    /// there is no "grok-acp" entry in `acpx-registry/registry.fallback.
+    /// json` at all; the only real installed Grok-adapter id observed live
+    /// is `grok-build`).
+    #[test]
+    fn grok_build_thread_silently_shares_the_codex_gateway_not_a_distinct_backend() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[] as &[&str],
+            move |provider| {
+                if provider == "codex" {
+                    Ok(codex_url.clone())
+                } else if provider == "claude" {
+                    Ok(claude_url.clone())
+                } else {
+                    panic!("resolver asked for an unnormalized provider: {provider:?}");
+                }
+            },
+            None,
+        )
+        .expect("bridge with two distinct gateways");
+
+        let codex_idx = bridge
+            .add_thread_with_profile_and_provider("Codex Thread", None, Some("codex-acp"))
+            .expect("codex-acp thread");
+        let claude_idx = bridge
+            .add_thread_with_profile_and_provider("Claude Thread", None, Some("claude-acp"))
+            .expect("claude-acp thread");
+        let grok_idx = bridge
+            .add_thread_with_profile_and_provider("Grok Thread", None, Some("grok-build"))
+            .expect(
+                "grok-build is not rejected -- this is the bug: it should either get its own \
+                 gateway or a clear error, not silently succeed onto someone else's",
+            );
+
+        // thread_provider records the NORMALIZED key actually bound, not the
+        // requested registry id -- this is the first, cheapest proof the
+        // grok-build request never reached a "grok" gateway at all.
+        assert_eq!(bridge.thread_provider(codex_idx).as_deref(), Some("codex"));
+        assert_eq!(bridge.thread_provider(claude_idx).as_deref(), Some("claude"));
+        assert_eq!(
+            bridge.thread_provider(grok_idx).as_deref(),
+            Some("codex"),
+            "requesting grok-build should not silently normalize onto the codex gateway key"
+        );
+
+        bridge.send_prompt(codex_idx, "ping".into());
+        bridge.send_prompt(claude_idx, "ping".into());
+        bridge.send_prompt(grok_idx, "ping".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut commands = [Vec::new(), Vec::new(), Vec::new()];
+        while std::time::Instant::now() < deadline
+            && (commands[0].is_empty() || commands[1].is_empty() || commands[2].is_empty())
+        {
+            for _ in bridge.poll() {}
+            commands[0] = bridge.available_commands(codex_idx);
+            commands[1] = bridge.available_commands(claude_idx);
+            commands[2] = bridge.available_commands(grok_idx);
+            if commands[0].is_empty() || commands[1].is_empty() || commands[2].is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        let codex_names: Vec<&str> = commands[0].iter().map(|c| c.name.as_str()).collect();
+        let claude_names: Vec<&str> = commands[1].iter().map(|c| c.name.as_str()).collect();
+        let grok_names: Vec<&str> = commands[2].iter().map(|c| c.name.as_str()).collect();
+
+        assert!(
+            codex_names.contains(&"codex_plan"),
+            "codex-acp thread missing codex persona commands, got: {codex_names:?}"
+        );
+        assert!(
+            claude_names.contains(&"claude_plan"),
+            "claude-acp thread missing claude persona commands, got: {claude_names:?}"
+        );
+        // The actual bug, proven live: grok-build's thread gets the CODEX
+        // persona's commands back, not its own -- because it IS the codex
+        // gateway/session under the hood. If this ever starts failing
+        // (grok_names stops containing codex_plan, or starts containing a
+        // real grok-only command), the routing has changed and this test's
+        // premise -- and this doc comment -- need to be revisited together.
+        assert!(
+            grok_names.contains(&"codex_plan"),
+            "expected grok-build to be silently aliased to codex (this is the bug this test \
+             documents) but it did not receive codex's persona commands: {grok_names:?}"
+        );
+    }
+
     /// Same real stand-in-backend shell-script technique
     /// `acpx-server/tests/agent_request_relay_test.rs` uses, one layer up
     /// the stack: proves the interactive `session/request_permission`
