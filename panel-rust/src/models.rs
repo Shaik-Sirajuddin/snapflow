@@ -18,6 +18,8 @@ use crate::{
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Same taxonomy as `chat_area.slint`'s `is-tool-kind` -- kept in sync by
 /// hand since the Slint side can't import a Rust constant list.
@@ -99,6 +101,30 @@ fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
     ModelRc::new(VecModel::from(rows))
 }
 
+// `markdown_lines_for` is a pure function of `text` (once `kind == "agent"`
+// is established -- every other kind short-circuits before touching the
+// cache), so memoizing purely on text content is safe regardless of which
+// message/thread/call site it came from. This is the fix for the
+// thread-switch/poll-tick freeze (see
+// memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md): today
+// `update.rs`'s snapshot handler calls `message_rows_for_thread_with_state`
+// -> here on *every* poll tick for the selected thread, not just on an
+// actual switch, so an unchanged historical message was being re-parsed by
+// `pulldown-cmark` and re-wrapped dozens of times a second. `ModelRc` wraps
+// a non-atomic `Rc`, so this cache is `thread_local`, not a shared static --
+// it must never be touched off the Slint UI thread.
+//
+// Bound: cleared wholesale once it exceeds `MARKDOWN_CACHE_CAP` entries
+// rather than true LRU eviction -- simple and sufficient to stop unbounded
+// growth across a very long-lived session; a real LRU can replace this if
+// the wholesale-clear cadence turns out to matter in practice.
+const MARKDOWN_CACHE_CAP: usize = 4000;
+
+thread_local! {
+    static MARKDOWN_CACHE: RefCell<HashMap<String, ModelRc<MarkdownLine>>> =
+        RefCell::new(HashMap::new());
+}
+
 /// Agent rows get full markdown parse; other kinds leave lines empty so
 /// MarkdownView falls back to plain `text`.
 fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
@@ -114,7 +140,18 @@ fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
     if agent_text_skips_markdown(text) {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
-    lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
+    MARKDOWN_CACHE.with(|cache| {
+        if let Some(cached) = cache.borrow().get(text) {
+            return cached.clone();
+        }
+        let built = lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS));
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MARKDOWN_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(text.to_string(), built.clone());
+        built
+    })
 }
 
 /// True for agent text that is only status/reconnect/hard-error noise --
@@ -2528,6 +2565,32 @@ mod transcript_model_tests {
     fn non_agent_rows_skip_markdown_parse() {
         assert_eq!(markdown_lines_for("user", "# not parsed").row_count(), 0);
         assert!(markdown_lines_for("agent", "# Title").row_count() > 0);
+    }
+
+    #[test]
+    fn markdown_lines_for_cache_hit_returns_equivalent_content_for_repeated_text() {
+        // Same call repeated for identical text -- the case that fires on
+        // every poll tick for an already-rendered historical message (see
+        // memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md).
+        // Correctness matters more than proving cache-hit-ness here: a
+        // wrong cached value would be a worse bug than a slow one.
+        let text = "Hello **world**, this is *italic* and `code`.";
+        let first = markdown_lines_for("agent", text);
+        let second = markdown_lines_for("agent", text);
+        assert_eq!(first.row_count(), second.row_count());
+        for i in 0..first.row_count() {
+            let a = first.row_data(i).unwrap();
+            let b = second.row_data(i).unwrap();
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.plain_text, b.plain_text);
+        }
+    }
+
+    #[test]
+    fn markdown_lines_for_distinguishes_different_text() {
+        let a = markdown_lines_for("agent", "# First");
+        let b = markdown_lines_for("agent", "# Second");
+        assert_ne!(a.row_data(0).unwrap().plain_text, b.row_data(0).unwrap().plain_text);
     }
 
     #[test]
