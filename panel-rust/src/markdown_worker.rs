@@ -168,17 +168,43 @@ fn render_job(
     let deliver = std::sync::Arc::new(deliver);
     let on_chunk = std::sync::Arc::new(on_chunk);
     move || {
+        let mut on_done = Some(on_done);
         let mut index = 0usize;
         while index < messages.len() {
             if epoch_counter.current() != epoch {
                 return;
             }
             let end = (index + CHUNK_MESSAGES_PER_STEP).min(messages.len());
-            let chunk_messages: Vec<(usize, Vec<MarkdownBlockData>)> = messages[index..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, text)| (index + offset, build_markdown_block_data(text, false)))
-                .collect();
+            // Test matrix case 6, "worker panics mid-parse": a malformed
+            // or pathological message could in principle panic somewhere
+            // inside pulldown-cmark/StyledText parsing. Without this,
+            // that panic would just unwind the worker thread silently --
+            // `on_done` never fires, so a UI-side `loading` flag this is
+            // wired to (once the deferred update.rs/dispatch.rs
+            // integration lands) would stay stuck forever with no
+            // indication anything went wrong. Catch it here, stop the
+            // render, and still fire `on_done` through the normal
+            // `deliver` mechanism so the caller's cleanup path runs the
+            // same way it would on a clean finish.
+            let chunk_messages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                messages[index..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, text)| (index + offset, build_markdown_block_data(text, false)))
+                    .collect::<Vec<(usize, Vec<MarkdownBlockData>)>>()
+            }));
+            let chunk_messages = match chunk_messages {
+                Ok(chunk_messages) => chunk_messages,
+                Err(_panic) => {
+                    if let Some(on_done) = on_done.take() {
+                        let done_closure = Box::new(move || {
+                            on_done(thread_id, epoch);
+                        }) as Box<dyn FnOnce() + Send>;
+                        deliver(done_closure);
+                    }
+                    return;
+                }
+            };
             let chunk = MessageBlocksChunk {
                 thread_id: thread_id.clone(),
                 epoch,
@@ -227,10 +253,12 @@ fn render_job(
             index = end;
         }
 
-        let done_closure = Box::new(move || {
-            on_done(thread_id, epoch);
-        }) as Box<dyn FnOnce() + Send>;
-        deliver(done_closure);
+        if let Some(on_done) = on_done.take() {
+            let done_closure = Box::new(move || {
+                on_done(thread_id, epoch);
+            }) as Box<dyn FnOnce() + Send>;
+            deliver(done_closure);
+        }
     }
 }
 
