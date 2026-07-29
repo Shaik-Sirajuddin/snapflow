@@ -125,9 +125,49 @@ pub fn spawn_background_render(
     on_chunk: impl Fn(MessageBlocksChunk, Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
     on_done: impl FnOnce(String, u64) + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
+    let job = render_job(thread_id, epoch, epoch_counter, messages, deliver, on_chunk, on_done);
+    std::thread::spawn(job)
+}
+
+/// Same as [`spawn_background_render`], but submits the render job to a
+/// [`RenderWorkerPool`] instead of paying `std::thread::spawn`'s OS
+/// thread-creation cost on every single call -- see the plan doc's test
+/// matrix row 5 ("thread reuse instead of spawning each time to delay
+/// work"). Fire-and-forget: unlike the raw-spawn version there's no
+/// `JoinHandle` to return (the pool's own threads persist past any one
+/// job), so callers observe completion via `on_done`/the delivered
+/// chunks instead of joining.
+pub fn spawn_background_render_pooled(
+    pool: &RenderWorkerPool,
+    thread_id: String,
+    epoch: u64,
+    epoch_counter: EpochCounter,
+    messages: Vec<String>,
+    deliver: impl Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
+    on_chunk: impl Fn(MessageBlocksChunk, Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
+    on_done: impl FnOnce(String, u64) + Send + 'static,
+) {
+    let job = render_job(thread_id, epoch, epoch_counter, messages, deliver, on_chunk, on_done);
+    pool.submit(job);
+}
+
+/// The actual chunking/cancellation/backpressure loop, factored out so
+/// both [`spawn_background_render`] (raw `std::thread::spawn`, one OS
+/// thread per call) and [`spawn_background_render_pooled`] (a shared,
+/// persistent [`RenderWorkerPool`]) run identical logic -- only *how*
+/// the resulting closure gets a thread to run on differs.
+fn render_job(
+    thread_id: String,
+    epoch: u64,
+    epoch_counter: EpochCounter,
+    messages: Vec<String>,
+    deliver: impl Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
+    on_chunk: impl Fn(MessageBlocksChunk, Box<dyn FnOnce() + Send>) + Send + Sync + 'static,
+    on_done: impl FnOnce(String, u64) + Send + 'static,
+) -> impl FnOnce() + Send + 'static {
     let deliver = std::sync::Arc::new(deliver);
     let on_chunk = std::sync::Arc::new(on_chunk);
-    std::thread::spawn(move || {
+    move || {
         let mut index = 0usize;
         while index < messages.len() {
             if epoch_counter.current() != epoch {
@@ -191,7 +231,50 @@ pub fn spawn_background_render(
             on_done(thread_id, epoch);
         }) as Box<dyn FnOnce() + Send>;
         deliver(done_closure);
-    })
+    }
+}
+
+/// A small, fixed-size pool of persistent OS threads pulling render jobs
+/// from a shared queue, instead of `std::thread::spawn` paying OS
+/// thread-creation cost on every single thread-switch (plan doc test
+/// matrix row 5). Threads run until the pool itself is dropped (closing
+/// the job channel, which ends each worker thread's receive loop).
+pub struct RenderWorkerPool {
+    sender: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+    _threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl RenderWorkerPool {
+    pub fn new(size: usize) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let threads = (0..size)
+            .map(|_| {
+                let receiver = receiver.clone();
+                std::thread::spawn(move || loop {
+                    let job = {
+                        // Lock held only long enough to pull one job off
+                        // the queue, never across running it -- matches
+                        // the "never hold a lock across the actual work"
+                        // rule (rust-audit / the slint skill's poll-thread
+                        // anti-pattern section), even though this isn't
+                        // the UI poll thread itself.
+                        let receiver = receiver.lock().unwrap_or_else(|e| e.into_inner());
+                        receiver.recv()
+                    };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => break, // pool dropped, channel closed
+                    }
+                })
+            })
+            .collect();
+        Self { sender, _threads: threads }
+    }
+
+    pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.sender.send(Box::new(job));
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +289,164 @@ mod tests {
     /// doesn't care which thread `on_chunk` actually executes on.
     fn sync_deliver() -> impl Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static {
         |f| f()
+    }
+
+    #[test]
+    fn pooled_render_delivers_all_messages_same_as_raw_spawn() {
+        // Functional parity check: render_job's behavior must be
+        // identical regardless of which mechanism (raw std::thread::spawn
+        // vs a shared RenderWorkerPool) actually runs it.
+        let pool = RenderWorkerPool::new(2);
+        let messages: Vec<String> = (0..45).map(|i| format!("message {i}")).collect();
+        let epoch_counter = EpochCounter::new();
+        let epoch = epoch_counter.bump();
+        let delivered_indices: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(Mutex::new(false));
+
+        let di = delivered_indices.clone();
+        let done_flag = done.clone();
+        spawn_background_render_pooled(
+            &pool,
+            "thread-a".into(),
+            epoch,
+            epoch_counter,
+            messages,
+            sync_deliver(),
+            move |chunk, ack| {
+                for (idx, _blocks) in &chunk.messages {
+                    di.lock().unwrap().push(*idx);
+                }
+                ack();
+            },
+            move |_thread_id, _epoch| {
+                *done_flag.lock().unwrap() = true;
+            },
+        );
+
+        // No JoinHandle from the pooled variant (fire-and-forget, matching
+        // production usage) -- poll for completion instead, bounded so a
+        // real hang still fails the test rather than blocking forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*done.lock().unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(*done.lock().unwrap(), "pooled render must complete within the deadline");
+        let indices = delivered_indices.lock().unwrap();
+        let expected: Vec<usize> = (0..45).collect();
+        assert_eq!(*indices, expected, "pooled dispatch delivers every message index exactly once, in order");
+    }
+
+    #[test]
+    fn pool_handles_many_rapid_submissions_without_dropping_or_hanging() {
+        // Test matrix row 5's core functional claim: a bounded pool can
+        // absorb many rapid consecutive thread-switch renders (the
+        // scenario a `std::thread::spawn`-per-switch design pays OS
+        // thread-creation cost for on every single one) without losing
+        // work or deadlocking.
+        let pool = RenderWorkerPool::new(4);
+        const SWITCHES: usize = 50;
+        let completed = Arc::new(Mutex::new(0usize));
+
+        for i in 0..SWITCHES {
+            let epoch_counter = EpochCounter::new();
+            let epoch = epoch_counter.bump();
+            let done = completed.clone();
+            spawn_background_render_pooled(
+                &pool,
+                format!("thread-{i}"),
+                epoch,
+                epoch_counter,
+                vec![format!("switch {i} message")],
+                sync_deliver(),
+                |_chunk, ack| ack(),
+                move |_thread_id, _epoch| {
+                    *done.lock().unwrap() += 1;
+                },
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while *completed.lock().unwrap() < SWITCHES && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(*completed.lock().unwrap(), SWITCHES, "every rapid submission completes, none dropped or hung");
+    }
+
+    #[test]
+    fn pooled_dispatch_has_no_spawn_cost_tail_vs_raw_spawn_per_switch() {
+        // Best-effort timing comparison (loose bound, not a strict
+        // pass/fail on exact numbers, to avoid flakiness from OS thread
+        // scheduling variance): time-to-first-chunk across many rapid
+        // switches, raw std::thread::spawn-per-switch vs a shared pool.
+        // Asserts the pooled p95 isn't *worse* than raw's median by more
+        // than a generous margin -- pooling should never make this worse,
+        // even if the exact speedup varies by machine/load.
+        const SAMPLES: usize = 30;
+
+        let mut raw_latencies = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES {
+            let epoch_counter = EpochCounter::new();
+            let epoch = epoch_counter.bump();
+            let start = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let handle = spawn_background_render(
+                format!("raw-{i}"),
+                epoch,
+                epoch_counter,
+                vec!["hello world".to_string()],
+                sync_deliver(),
+                move |_chunk, ack| {
+                    let _ = tx.send(());
+                    ack();
+                },
+                |_, _| {},
+            );
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("raw chunk delivered");
+            raw_latencies.push(start.elapsed());
+            handle.join().unwrap();
+        }
+
+        let pool = RenderWorkerPool::new(4);
+        let mut pooled_latencies = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES {
+            let epoch_counter = EpochCounter::new();
+            let epoch = epoch_counter.bump();
+            let start = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            spawn_background_render_pooled(
+                &pool,
+                format!("pooled-{i}"),
+                epoch,
+                epoch_counter,
+                vec!["hello world".to_string()],
+                sync_deliver(),
+                move |_chunk, ack| {
+                    let _ = tx.send(());
+                    ack();
+                },
+                |_, _| {},
+            );
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("pooled chunk delivered");
+            pooled_latencies.push(start.elapsed());
+        }
+
+        raw_latencies.sort();
+        pooled_latencies.sort();
+        let raw_median = raw_latencies[SAMPLES / 2];
+        let pooled_p95 = pooled_latencies[(SAMPLES * 95 / 100).min(SAMPLES - 1)];
+
+        // Generous margin (10x raw's median) -- the point isn't to prove
+        // an exact speedup number (machine/load-dependent, would be
+        // flaky), it's to catch a pool that's pathologically *worse* than
+        // raw spawn-per-switch, which would mean the pool itself is
+        // broken (e.g. contended lock serializing all jobs onto one
+        // thread) rather than just "not obviously faster."
+        assert!(
+            pooled_p95 <= raw_median * 10,
+            "pooled p95 ({pooled_p95:?}) should not be pathologically worse than raw spawn-per-switch median ({raw_median:?})"
+        );
     }
 
     #[test]
