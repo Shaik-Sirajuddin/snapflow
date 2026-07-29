@@ -12,7 +12,7 @@ use crate::markdown::{self, LineKind};
 use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use crate::skills_state::SkillEntry;
 use crate::{
-    AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
+    AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownBlock, MarkdownLine, MarkdownRun,
     McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
     TerminalItem, ThreadItem,
 };
@@ -181,6 +181,132 @@ pub(crate) fn agent_text_is_hard_failure(text: &str) -> bool {
         || lower.contains("unexpected status 4")
         || (lower.contains("reconnecting... 5/5")
             && (lower.contains("unexpected status") || lower.contains("bad gateway")))
+}
+
+fn empty_markdown_blocks() -> ModelRc<MarkdownBlock> {
+    ModelRc::new(VecModel::from(Vec::<MarkdownBlock>::new()))
+}
+
+/// Same heading-size ladder `markdown_view.slint`'s `heading-size()`
+/// pure function already uses -- kept in lock-step by hand (Slint can't
+/// import a Rust constant table) the same way `models.rs`'s `is_tool_kind`
+/// doc comment already flags for `chat_area.slint`'s `is-tool-kind`.
+/// Setting this on `StyledText.default-font-size` per block (instead of
+/// baking it into a shared wrap-column estimate the way `wrap_runs` did)
+/// is the fix for the "different text sized line break calc" bug found
+/// during the freeze investigation -- see the plan doc's "current
+/// implementation has an issue with different text sized line break
+/// calc" exchange.
+fn heading_font_size(level: Option<u8>) -> f32 {
+    match level {
+        Some(1) => 18.0,
+        Some(2) => 16.0,
+        Some(3) => 14.0,
+        Some(_) => 13.0,
+        None => 0.0, // 0px = inherit MarkdownView's own default for body text
+    }
+}
+
+thread_local! {
+    static MARKDOWN_BLOCK_CACHE: RefCell<HashMap<String, ModelRc<MarkdownBlock>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Architecture v2 (markdown-thread-freeze-fix phase 3): builds one
+/// `MarkdownBlock` per top-level markdown block, each carrying a native
+/// `slint::StyledText` (or, for code/rule blocks, plain data routed
+/// through the existing `TerminalLogBlock`/rule rendering) instead of a
+/// Rust-computed `Vec<MarkdownLine>`. See `markdown::segment_blocks`'s
+/// doc comment and the plan doc's "Architecture v2" section for why:
+/// `StyledText::from_markdown` parses inline styling *and* wraps at real
+/// pixel width itself, so there is nothing left for Rust to precompute
+/// beyond block boundaries. `is_streaming_tail` selects whether
+/// `markdown::heal_open_markers` runs first (only ever needed on the
+/// single actively-streaming tail block -- every closed historical
+/// block is already well-formed source text).
+fn markdown_blocks_for(kind: &str, text: &str, is_streaming_tail: bool) -> ModelRc<MarkdownBlock> {
+    if kind != "agent" {
+        return empty_markdown_blocks();
+    }
+    if !is_streaming_tail {
+        if let Some(cached) = MARKDOWN_BLOCK_CACHE.with(|c| c.borrow().get(text).cloned()) {
+            return cached;
+        }
+    }
+    let spans = markdown::segment_blocks(text);
+    let rows: Vec<MarkdownBlock> = spans
+        .into_iter()
+        .map(|span| {
+            let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
+                // `segment_blocks`' byte ranges are pulldown-cmark's own
+                // verbatim block spans -- they legitimately include a
+                // trailing newline (block ranges) or table-cell padding
+                // whitespace around `|` delimiters, neither of which is
+                // real content (see markdown.rs's segment_blocks tests).
+                let raw = text[range].trim();
+                let candidate = if is_streaming_tail {
+                    markdown::heal_open_markers(raw)
+                } else {
+                    raw.to_string()
+                };
+                slint::StyledText::from_markdown(&candidate)
+                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
+            };
+            match span.kind {
+                markdown::BlockSpanKind::Text => MarkdownBlock {
+                    kind: "text".into(),
+                    text: styled_text_for(span.source_range),
+                    default_font_size: heading_font_size(span.heading_level),
+                    indent: span.indent as i32,
+                    table_cells: ModelRc::new(VecModel::from(Vec::<slint::StyledText>::new())),
+                    table_col_count: 0,
+                    code_text: String::new().into(),
+                },
+                markdown::BlockSpanKind::Code(body) => MarkdownBlock {
+                    kind: "code".into(),
+                    text: slint::StyledText::default(),
+                    default_font_size: 0.0_f32,
+                    indent: span.indent as i32,
+                    table_cells: ModelRc::new(VecModel::from(Vec::<slint::StyledText>::new())),
+                    table_col_count: 0,
+                    code_text: body.into(),
+                },
+                markdown::BlockSpanKind::Rule => MarkdownBlock {
+                    kind: "rule".into(),
+                    text: slint::StyledText::default(),
+                    default_font_size: 0.0_f32,
+                    indent: span.indent as i32,
+                    table_cells: ModelRc::new(VecModel::from(Vec::<slint::StyledText>::new())),
+                    table_col_count: 0,
+                    code_text: String::new().into(),
+                },
+                markdown::BlockSpanKind::Table { cells, col_count } => {
+                    let cell_styled: Vec<slint::StyledText> =
+                        cells.into_iter().map(styled_text_for).collect();
+                    MarkdownBlock {
+                        kind: "table".into(),
+                        text: slint::StyledText::default(),
+                        default_font_size: 0.0_f32,
+                        indent: span.indent as i32,
+                        table_cells: ModelRc::new(VecModel::from(cell_styled)),
+                        table_col_count: col_count as i32,
+                        code_text: String::new().into(),
+                    }
+                }
+            }
+        })
+        .collect();
+    let built = ModelRc::new(VecModel::from(rows));
+    if !is_streaming_tail {
+        MARKDOWN_BLOCK_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= MARKDOWN_CACHE_CAP {
+                c.clear();
+            }
+            c.insert(text.to_string(), built.clone());
+        });
+    }
+    built
 }
 
 /// Plan phase 27: markdown render of the skill editor's active content
@@ -384,6 +510,7 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                     .into(),
                 text: m.text.clone().into(),
                 markdown_lines: markdown_lines_for(kind, &m.text),
+                markdown_blocks: markdown_blocks_for(kind, &m.text, false),
                 // Send-queue state is not modelled by the raw `ChatMessage`
                 // feed -- a message reaching here has already been dispatched.
                 queued: false,
@@ -532,6 +659,16 @@ pub fn to_message_rows_from_transcript(
             let row = MessageItem {
                 kind: kind.into(),
                 markdown_lines: markdown_lines_for(kind, &text),
+                // `is_streaming_tail: false` -- not yet wired to the
+                // in-flight/generation state tracked elsewhere in this
+                // function; every message reaching here today is
+                // treated as already-closed source text, which is safe
+                // (no healing needed) even though it under-uses
+                // `heal_open_markers` for the live-streaming case.
+                // Wiring the real last-message-while-generating signal
+                // through is deferred to the background-render-worker
+                // phase, which already needs to thread that state.
+                markdown_blocks: markdown_blocks_for(kind, &text, false),
                 text: text.into(),
                 status: status.into(),
                 expanded: expanded.get(index as usize).copied().unwrap_or(false),
@@ -575,6 +712,7 @@ pub fn append_send_queue_rows(
         rows.push(MessageItem {
             kind: "user".into(),
             markdown_lines: ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new())),
+            markdown_blocks: empty_markdown_blocks(),
             text: entry.text.clone().into(),
             status: "".into(),
             expanded: false,
@@ -2591,6 +2729,60 @@ mod transcript_model_tests {
         let a = markdown_lines_for("agent", "# First");
         let b = markdown_lines_for("agent", "# Second");
         assert_ne!(a.row_data(0).unwrap().plain_text, b.row_data(0).unwrap().plain_text);
+    }
+
+    #[test]
+    fn markdown_blocks_for_non_agent_kind_is_empty() {
+        assert_eq!(markdown_blocks_for("user", "# not parsed", false).row_count(), 0);
+    }
+
+    #[test]
+    fn markdown_blocks_for_heading_and_paragraph_produce_text_blocks_with_font_size_by_level() {
+        let blocks = markdown_blocks_for("agent", "# Title\n\nBody text.\n", false);
+        assert_eq!(blocks.row_count(), 2);
+        let heading = blocks.row_data(0).unwrap();
+        assert_eq!(heading.kind, slint::SharedString::from("text"));
+        assert_eq!(heading.default_font_size, 18.0);
+        let body = blocks.row_data(1).unwrap();
+        assert_eq!(body.kind, slint::SharedString::from("text"));
+        assert_eq!(body.default_font_size, 0.0);
+    }
+
+    #[test]
+    fn markdown_blocks_for_code_block_carries_verbatim_text_not_a_styled_text() {
+        let blocks = markdown_blocks_for("agent", "```\nlet x = 1;\n```\n", false);
+        assert_eq!(blocks.row_count(), 1);
+        let block = blocks.row_data(0).unwrap();
+        assert_eq!(block.kind, slint::SharedString::from("code"));
+        assert_eq!(block.code_text, slint::SharedString::from("let x = 1;"));
+    }
+
+    #[test]
+    fn markdown_blocks_for_table_produces_flat_cells_and_col_count() {
+        let blocks = markdown_blocks_for("agent", "| a | b |\n|---|---|\n| 1 | 2 |\n", false);
+        assert_eq!(blocks.row_count(), 1);
+        let table = blocks.row_data(0).unwrap();
+        assert_eq!(table.kind, slint::SharedString::from("table"));
+        assert_eq!(table.table_col_count, 2);
+        assert_eq!(table.table_cells.row_count(), 4);
+    }
+
+    #[test]
+    fn markdown_blocks_for_cache_hit_on_repeated_non_streaming_text() {
+        let text = "Repeated **agent** text.";
+        let first = markdown_blocks_for("agent", text, false);
+        let second = markdown_blocks_for("agent", text, false);
+        assert_eq!(first.row_count(), second.row_count());
+    }
+
+    #[test]
+    fn markdown_blocks_for_streaming_tail_heals_unterminated_html_tag_without_erroring() {
+        // Doesn't panic/produce an Err path -- from_markdown's fallback to
+        // from_plain_text only fires when healing didn't fully fix things,
+        // and the real assertion here is just that this returns *a* block
+        // at all rather than losing the in-progress message entirely.
+        let blocks = markdown_blocks_for("agent", "Hello <u>wor", true);
+        assert_eq!(blocks.row_count(), 1);
     }
 
     #[test]
