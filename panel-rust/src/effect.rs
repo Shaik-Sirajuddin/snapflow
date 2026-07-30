@@ -252,6 +252,32 @@ pub enum EffectResultMsg {
     ExternalEditorOpened(Result<(), EffectError>),
     OsDefaultOpened(Result<(), EffectError>),
     SkillEditorLoaded(Result<crate::model::SkillEditorState, EffectError>),
+    /// markdown-render-cache-layer plan Phase 2. Deliberate exception to
+    /// this enum's "one variant per `Effect` above" rule: the background
+    /// render worker (`markdown_worker.rs`) is spawned directly (its own
+    /// `spawn_background_render`/`_pooled` + `deliver`/`on_chunk`
+    /// callbacks), not via a `Vec<Effect>` `update()` returns for
+    /// `execute_effects` to run -- there is no matching `Effect::X`
+    /// variant to add above, and adding an `Effect` nothing ever
+    /// constructs would be misleading in the other direction. This is
+    /// still the right bucket semantically (an async operation's result
+    /// feeding back into the reducer), so it lives here rather than
+    /// inventing a fifth top-level `Msg` source (see `msg.rs`'s "four
+    /// sources" doc comment).
+    ///
+    /// `source_hash` must be produced by the exact same algorithm
+    /// `ThreadMessageIndex::content_hash_for` compares against
+    /// (`thread_message_index::hash_content`) -- see that function's
+    /// doc comment. `message_key` is a durable message key
+    /// (`models::transcript_row_key`'s format), resolved against the
+    /// target thread's own `ThreadMessageIndex` at apply time, never a
+    /// positional row index captured at spawn time.
+    MarkdownBlocksReady {
+        thread_id: String,
+        message_key: String,
+        source_hash: u64,
+        blocks: Vec<crate::models::MarkdownBlockData>,
+    },
     /// One of the 6 reactive-sync trigger call sites (create/promote/
     /// edit/agent-enable/agent-disable/thread-start) failed to propagate
     /// a skill to an attached agent -- see memory/acpx/gen/plans/

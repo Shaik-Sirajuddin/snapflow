@@ -1261,6 +1261,46 @@ mod tests {
         assert!(segment_blocks("").is_empty());
     }
 
+    #[test]
+    fn segment_blocks_matches_dev_fixture_checklist_shape() {
+        // Mirrors panel-rust/tests/dev_root.slint.template's "Markdown
+        // renderer checklist" agent message verbatim -- this proves the
+        // hand-authored markdown-blocks in that .slint fixture (which
+        // slint-viewer's --auto-reload can render but cannot compute,
+        // since it has no Rust behind it) actually matches what the
+        // real segment_blocks -> markdown_blocks_for pipeline produces
+        // for the same source text, not just something plausible-looking.
+        let source = "### Markdown renderer checklist\n\nBold **works**, italic *works*, and `inline code` works.\n\n1. ordered item\n2. second item\n\n| Col A | Col B |\n| --- | --- |\n| left | right |\n\nSee also [Slint docs](https://docs.slint.dev).";
+        let spans = segment_blocks(source);
+        let kinds: Vec<&str> = spans
+            .iter()
+            .map(|s| match &s.kind {
+                BlockSpanKind::Text => "text",
+                BlockSpanKind::Code(_) => "code",
+                BlockSpanKind::Table { .. } => "table",
+                BlockSpanKind::Rule => "rule",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["text", "text", "text", "text", "table", "text"],
+            "real segment_blocks output shape for the dev fixture's checklist source: {spans:?}"
+        );
+        assert_eq!(spans[0].heading_level, Some(3));
+        assert_eq!(source[spans[2].source_range.clone()].trim_end(), "ordered item");
+        assert_eq!(spans[2].indent, 1);
+        assert_eq!(source[spans[3].source_range.clone()].trim_end(), "second item");
+        assert_eq!(spans[3].indent, 1);
+        match &spans[4].kind {
+            BlockSpanKind::Table { cells, col_count } => {
+                assert_eq!(*col_count, 2);
+                let texts: Vec<&str> = cells.iter().map(|r| source[r.clone()].trim()).collect();
+                assert_eq!(texts, vec!["Col A", "Col B", "left", "right"]);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
     // -- heal_open_markers --
 
     #[test]

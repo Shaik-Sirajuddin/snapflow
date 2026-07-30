@@ -131,6 +131,13 @@ export component MarkdownView inherits VerticalLayout {
                         ? block.default-font-size * Theme.font-scale
                         : 12px * Theme.font-scale;
                     default-font-family: Theme.font-sans;
+                    // StyledText's `default-color` defaults to the Slint
+                    // library's own built-in palette, not this app's
+                    // Theme -- left unset it renders with colors that
+                    // don't match (and can look inverted against) every
+                    // other text element in the panel, which all read
+                    // Theme.text-primary explicitly.
+                    default-color: Theme.text-primary;
                     link-color: Theme.md-link;
                     horizontal-alignment: left;
                     link-clicked(link) => { root.link-activated(link); }
@@ -167,6 +174,8 @@ export component MarkdownView inherits VerticalLayout {
                             text: block.table-cells[row-start * block.table-col-count + col];
                             default-font-size: 12px * Theme.font-scale;
                             default-font-family: Theme.font-sans;
+                            default-color: Theme.text-primary;
+                            link-color: Theme.md-link;
                             min-width: 80px;
                             horizontal-alignment: left;
                         }
@@ -348,14 +357,22 @@ export component MarkdownView inherits VerticalLayout {
                             - (is-code ? Metrics.space-4 * 2 : 0px)
                             - (is-quote ? 2px + Metrics.space-2 : 0px)
                             - (is-li ? 14px + Metrics.space-2 : 0px));
-                        // Ctrl+Click opens the target.
+                        // Click or Ctrl+Click both open the target -- kept
+                        // in sync with the Architecture v2 `blocks` path
+                        // below, where StyledText's own built-in
+                        // link-clicked fires on a plain click with no way
+                        // to gate it on a modifier (the widget owns its
+                        // own hit-testing, no raw pointer-event access).
+                        // A drag that ends its release over the link's own
+                        // small run TouchArea still counts as a click here
+                        // (no drag-distance threshold) -- same limitation
+                        // StyledText's native handling already has, so
+                        // this is no worse than the new path, not a
+                        // regression introduced by removing the Ctrl gate.
                         if run.link != "" : TouchArea {
                             mouse-cursor: pointer;
                             pointer-event(ev) => {
-                                // Ctrl+Click only (plain click stays inert
-                                // so text selection/scroll is unaffected).
-                                if (ev.kind == PointerEventKind.up
-                                    && ev.modifiers.control) {
+                                if (ev.kind == PointerEventKind.up) {
                                     root.link-activated(run.link);
                                 }
                             }

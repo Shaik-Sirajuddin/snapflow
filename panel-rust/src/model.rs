@@ -128,6 +128,29 @@ pub struct ThreadModel {
     /// the pre-migration shared-list reducer. Production rows live in the
     /// durable-ID keyed `ThreadViewModels` registry.
     pub message_rows: Vec<crate::MessageItem>,
+    /// markdown-render-cache-layer plan, Phase 1/3: this thread's own
+    /// message-key -> {row_index, content_hash, rendered markdown} cache
+    /// (`panel-rust/src/thread_message_index.rs`), replacing the old
+    /// global, text-keyed `MARKDOWN_CACHE`/`MARKDOWN_BLOCK_CACHE`
+    /// thread_locals in `models.rs`. Per-thread (not global) so a
+    /// worker-delivered background render has somewhere durable and
+    /// correctly-scoped to land regardless of which thread is currently
+    /// displayed -- see that plan's "Chosen state shape".
+    pub markdown_render_index: crate::thread_message_index::ThreadMessageIndex,
+    /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: this
+    /// thread's own render generation counter. Deliberately per-thread,
+    /// not one shared global counter -- bumping it invalidates any
+    /// in-flight background render for THIS thread only (e.g. because
+    /// its transcript changed again before the previous render
+    /// finished), without touching unrelated background pre-renders for
+    /// other threads. See `markdown_worker::EpochCounter`'s own doc
+    /// comment for why a shared/global counter caused real cross-test
+    /// interference in this exact module.
+    pub markdown_epoch: crate::markdown_worker::EpochCounter,
+    /// Companion to `markdown_epoch`: de-dupes a redundant background
+    /// render spawn for the exact same `(thread_id, epoch)` this thread
+    /// already has in flight.
+    pub markdown_in_flight: crate::markdown_worker::InFlightRegistry,
     pub has_older_messages: bool,
     pub pending_request: crate::PendingRequestItem,
     pub terminals: Vec<crate::TerminalItem>,
@@ -455,6 +478,9 @@ impl Default for ThreadModel {
             transcript_keys: Vec::new(),
             #[cfg(test)]
             message_rows: Vec::new(),
+            markdown_render_index: crate::thread_message_index::ThreadMessageIndex::default(),
+            markdown_epoch: crate::markdown_worker::EpochCounter::new(),
+            markdown_in_flight: crate::markdown_worker::InFlightRegistry::new(),
             has_older_messages: false,
             pending_request: crate::PendingRequestItem::default(),
             terminals: Vec::new(),

@@ -70,6 +70,7 @@ pub mod test_support {
     pub use crate::agent_bridge::{fetch_daemon_project_instances, DaemonProjectInstance};
 }
 mod theme;
+mod thread_message_index;
 mod update;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec, NO_PROVIDER_REQUESTED_FALLBACK};
@@ -709,6 +710,17 @@ struct PanelSingleton {
     settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
     _settings_watcher: Option<settings_file::SettingsWatcher>,
     snapshotd_registration: Option<snapshotd_client::SnapshotdRegistration>,
+    /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: shared
+    /// across every thread's background markdown render (unlike
+    /// `ThreadModel::markdown_epoch`/`markdown_in_flight`, which are
+    /// deliberately per-thread) -- a fixed-size worker pool has no
+    /// notion of which thread a job belongs to, so nothing about sharing
+    /// it risks cross-thread interference the way a shared epoch counter
+    /// would. Lives on `PanelSingleton`, not `Model`: it spawns real OS
+    /// threads, which is infrastructure this crate's own TEA doc comment
+    /// (see `model.rs`'s module doc) reserves for outside the pure
+    /// reducer, alongside `bridge`/`panel_state`.
+    markdown_render_pool: markdown_worker::RenderWorkerPool,
 }
 
 impl PanelSingleton {
@@ -1870,6 +1882,13 @@ fn panel_rust_create_with_initial_identity(
                     .as_ref()
                     .and_then(|identity| identity.saved_path().map(str::to_owned)),
             ),
+            // Small fixed pool -- markdown rendering is not the only thing
+            // competing for CPU, and this is background pre-render work,
+            // not latency-critical (the synchronous path already shows
+            // correct content the same frame; this pool exists to warm
+            // the per-thread cache for a later switch, not to gate any
+            // visible render).
+            markdown_render_pool: markdown_worker::RenderWorkerPool::new(2),
         };
         // Gateway availability is panel-scoped, independent of project-open.
         // This enables the first `+` thread on the empty-project screen.
