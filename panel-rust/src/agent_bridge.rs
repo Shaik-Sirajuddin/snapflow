@@ -2481,6 +2481,7 @@ fn spawn_event_forwarder(
                     store_terminal_created(&slot_for_task, created_ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
+                AgentEvent::QueueChanged { .. } => {}
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_)
