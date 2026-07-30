@@ -8,7 +8,7 @@
 
 use crate::gateway_actor::classify_raw_update;
 use crate::gateway_actor::session_opener::GatewaySessionOpener;
-use crate::protocol_types::AgentEvent;
+use crate::protocol_types::{AgentEvent, QueueItemInfo};
 use crate::protocol_types::{
     AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
     TerminalCreatedEvent, TerminalOutputEvent,
@@ -918,6 +918,33 @@ fn forward_updates(
         {
             continue;
         }
+        if update.get("method").and_then(|method| method.as_str()) == Some("acpx/session/queue") {
+            let params = update.get("params");
+            let items = params
+                .and_then(|params| params.get("queue"))
+                .and_then(|queue| queue.as_array())
+                .map(|queue| {
+                    queue
+                        .iter()
+                        .filter_map(|item| {
+                            Some(QueueItemInfo {
+                                queue_entry_id: item.get("queueEntryId")?.as_str()?.to_owned(),
+                                idempotency_key: item.get("idempotencyKey")?.as_str()?.to_owned(),
+                                text: item.get("text")?.as_str()?.to_owned(),
+                                state: item.get("state")?.as_str()?.to_owned(),
+                                position: item.get("position")?.as_u64()? as u32,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let paused = params
+                .and_then(|params| params.get("paused"))
+                .and_then(|paused| paused.as_bool())
+                .unwrap_or(false);
+            let _ = event_tx.send(AgentEvent::QueueChanged { items, paused });
+            continue;
+        }
         if let Some(msg) = classify_raw_update(update) {
             let _ = event_tx.send(AgentEvent::Message(msg));
         } else if let Some(event) = parse_capability_update(update) {
@@ -1444,6 +1471,17 @@ fn spawn_session_live_forwarder(
                 }
                 continue;
             };
+            // Keep queue state on its own server stream. Session updates and
+            // queue notifications share the local demultiplexer, but the
+            // server watch is explicitly established through the queue
+            // extension rather than piggybacking on session/resume.
+            let _ = client
+                .call(
+                    "acpx/sessions/queue/subscribe",
+                    serde_json::json!({ "sessionIds": [session_id.clone()] }),
+                    None,
+                )
+                .await;
             if rehydrate_after_connect {
                 if let Err(error) = client.rehydrate_session(&session_id).await {
                     eprintln!("panel-rust: session rehydration failed for {session_id}: {error}");

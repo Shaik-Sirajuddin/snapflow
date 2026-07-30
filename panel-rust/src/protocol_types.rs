@@ -69,11 +69,25 @@ pub struct ChatMessage {
     pub raw_output: Option<serde_json::Value>,
 }
 
+/// Server-owned queue snapshot delivered on the separate ACPX queue stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItemInfo {
+    pub queue_entry_id: String,
+    pub idempotency_key: String,
+    pub text: String,
+    pub state: String,
+    pub position: u32,
+}
+
 /// Events flowing out of a bound thread's gateway actor, consumed from
 /// `AcpxThreadHandle::take_events`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Message(ChatMessage),
+    QueueChanged {
+        items: Vec<QueueItemInfo>,
+        paused: bool,
+    },
     /// A prompt turn finished; carries the ACP stop reason as a
     /// human-readable tag (`"end_turn"`, `"cancelled"`, etc.) rather
     /// than re-exporting the wire enum.

@@ -2223,6 +2223,18 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     dirty.push(Dirty::MessageAppended { thread_id });
                 }
             }
+            crate::protocol_types::AgentEvent::QueueChanged { items, paused } => {
+                thread
+                    .send_queue
+                    .replace_remote(items.iter().map(|item| item.text.clone()), *paused);
+                dirty.push(Dirty::ThreadRow {
+                    thread_id: thread.thread_id.clone(),
+                });
+                dirty.push(Dirty::MessagesDiff {
+                    thread_id: thread.thread_id.clone(),
+                    ops: Vec::new(),
+                });
+            }
             crate::protocol_types::AgentEvent::TurnEnded(reason) => {
                 // Captured BEFORE the Idle reset below: only a turn this
                 // session itself was generating on (Loading, and a

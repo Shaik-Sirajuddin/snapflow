@@ -48,8 +48,8 @@ mod session_opener;
 mod thread_actor;
 
 pub use crate::protocol_types::{
-    AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
-    SessionModesEvent,
+    AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, QueueItemInfo,
+    SessionModeInfo, SessionModesEvent,
 };
 pub use session_opener::{provider_profile_key, GatewaySessionOpener, NO_PROFILE_SENTINEL};
 pub use thread_actor::{

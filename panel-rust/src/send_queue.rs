@@ -84,6 +84,31 @@ pub fn send_queue_path(cache_dir: &Path, thread_id: &str) -> PathBuf {
 }
 
 impl SendQueue {
+    /// Replace the UI projection from the ACPX server-owned queue stream.
+    /// This deliberately does not call `persist`: the server JSONL is the
+    /// durable source of truth after the ACPX migration.
+    pub fn replace_remote<I>(&mut self, entries: I, paused: bool)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.entries.clear();
+        self.next_id = 0;
+        for text in entries {
+            let id = self.next_id();
+            self.entries.push_back(QueueEntry {
+                id,
+                text,
+                steer: false,
+            });
+        }
+        self.processing_state = if paused {
+            ProcessingState::Paused
+        } else {
+            ProcessingState::AutoProcess
+        };
+        self.can_fast_track = false;
+    }
+
     /// In-memory only, no restart survival -- used by callers that manage
     /// their own persistence path (or tests).
     pub fn new() -> Self {
