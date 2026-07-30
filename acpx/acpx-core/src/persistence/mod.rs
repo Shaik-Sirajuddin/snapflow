@@ -19,11 +19,13 @@
 //!    file I/O.
 
 pub mod error;
+pub mod queue;
 pub mod sessions;
 pub mod store;
 pub mod transcripts;
 
 pub use error::PersistenceError;
+pub use queue::{QueueHub, QueueStateEvent, QueueStore};
 pub use sessions::{RecoveryStatusCounts, SessionRecord};
 pub use store::PersistenceStore;
 pub use transcripts::{TranscriptError, TranscriptStore};

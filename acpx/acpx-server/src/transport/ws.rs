@@ -679,6 +679,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
+    let queue_hub = { router.lock().await.queue_hub() };
     let agent_relay = { router.lock().await.agent_request_hub() };
     let interaction_hub = { router.lock().await.interaction_hub() };
     let (interaction_tx, mut interaction_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
@@ -707,6 +708,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     });
     background_tasks.lock().await.push(handle);
     let mut watched: HashSet<String> = HashSet::new();
+    let mut queue_watched: HashSet<String> = HashSet::new();
     let interaction_bindings =
         Arc::new(AsyncMutex::new(HashMap::<String, InteractionBinding>::new()));
     let deferred_watches = Arc::new(AsyncMutex::new(HashSet::<String>::new()));
@@ -1005,7 +1007,104 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             .get("method")
             .and_then(|m| m.as_str())
             .unwrap_or_default();
-        if let Some(forget) = session_id_to_forget(&request, &response, method) {
+        if method == "acpx/sessions/queue/subscribe" && response.get("error").is_none() {
+            if let Some(session_ids) = response.get("sessionIds").and_then(|v| v.as_array()) {
+                for session_id in session_ids.iter().filter_map(|v| v.as_str()) {
+                    let session_id = session_id.to_string();
+                    if !queue_watched.insert(session_id.clone()) {
+                        continue;
+                    }
+                    let mut rx = queue_hub.subscribe(&session_id).await;
+                    let forwarder_sink = Arc::clone(&sink);
+                    let handle = tokio::spawn(async move {
+                        loop {
+                            let update = match rx.recv().await {
+                                Ok(update) => update,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    tracing::warn!(%skipped, "ACPX queue subscriber lagged");
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            let Ok(payload) = serde_json::to_string(&update) else {
+                                continue;
+                            };
+                            if !send_frame_bounded(&forwarder_sink, Message::Text(payload)).await {
+                                break;
+                            }
+                        }
+                    });
+                    background_tasks.lock().await.push(handle);
+                }
+            }
+        } else if method == "acpx/sessions/subscribe" && response.get("error").is_none() {
+            let background = response
+                .get("background")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            if background {
+                if let Some(session_ids) = response.get("sessionIds").and_then(|v| v.as_array()) {
+                    for session_id in session_ids.iter().filter_map(|v| v.as_str()) {
+                        let session_id = session_id.to_string();
+                        if !watched.insert(session_id.clone()) {
+                            continue;
+                        }
+                        let state =
+                            stream_resume_state_shared(&router, &tenant_id, &session_id).await;
+                        match hub
+                            .subscribe_resuming(
+                                &tenant_id,
+                                session_id.clone(),
+                                None,
+                                StreamResumeState {
+                                    backend_session_id: state.backend_session_id,
+                                    durable_state_changed: state.durable_state_changed,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(mut rx) => {
+                                let forwarder_sink = Arc::clone(&sink);
+                                let handle = tokio::spawn(async move {
+                                    loop {
+                                        let update = match rx.recv().await {
+                                            Ok(update) => update.into_value(),
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Lagged(
+                                                    skipped,
+                                                ),
+                                            ) => {
+                                                tracing::warn!(%skipped, "ACPX session subscription lagged");
+                                                continue;
+                                            }
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Closed,
+                                            ) => break,
+                                        };
+                                        let Ok(payload) = serde_json::to_string(&update) else {
+                                            continue;
+                                        };
+                                        if !send_frame_bounded(
+                                            &forwarder_sink,
+                                            Message::Text(payload),
+                                        )
+                                        .await
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+                                background_tasks.lock().await.push(handle);
+                            }
+                            Err(error) => {
+                                watched.remove(&session_id);
+                                tracing::warn!(%error, %session_id, "failed to attach explicit session subscription");
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(forget) = session_id_to_forget(&request, &response, method) {
             if watched.remove(&forget) {
                 hub.remove_stream(&tenant_id, &forget).await;
                 agent_relay.unsubscribe(&forget).await;

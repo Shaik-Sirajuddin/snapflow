@@ -85,6 +85,9 @@ async fn main() -> anyhow::Result<()> {
         .with_transcript_store(acpx_core::TranscriptStore::new(
             config.storage_dir.join("transcripts"),
         ))
+        .with_queue_store(acpx_core::QueueStore::new(
+            config.storage_dir.join("queues"),
+        ))
         .with_notification_hub(NotificationHub::with_stream_retention(
             256,
             config.max_subscribers_per_session,

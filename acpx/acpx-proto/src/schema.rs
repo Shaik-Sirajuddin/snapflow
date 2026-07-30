@@ -19,9 +19,9 @@ use crate::gateway::{
 use crate::jsonrpc::{Request, RequestId, Response, RpcError};
 use crate::session::{AcpxExt, GatewaySessionId, NewSessionParams};
 use crate::session_stream::{
-    QueueMutationParams, QueueMutationResult, QueueSubscribeParams, QueueSubscribeResult,
-    SessionPageResult, SessionPaginateParams, SessionSyncParams, SessionSyncResult,
-    SessionsSubscribeParams, SessionsSubscribeResult,
+    QueueItem, QueueMutationParams, QueueMutationResult, QueueSubscribeParams,
+    QueueSubscribeResult, SessionPageResult, SessionPaginateParams, SessionSyncParams,
+    SessionSyncResult, SessionsSubscribeParams, SessionsSubscribeResult,
 };
 
 // Upstream raw-ACP types referenced by `methods.rs`'s `SchemaRef::
@@ -88,6 +88,7 @@ pub(crate) fn register_all_defs(generator: &mut SchemaGenerator) {
     generator.subschema_for::<QueueSubscribeResult>();
     generator.subschema_for::<QueueMutationParams>();
     generator.subschema_for::<QueueMutationResult>();
+    generator.subschema_for::<QueueItem>();
 
     // Upstream raw-ACP types (`SchemaRef::UpstreamAcp` in `methods.rs`).
     // Never re-authored -- these calls pull in `agent_client_protocol`'s
@@ -184,6 +185,7 @@ pub fn build_wire_schema_document() -> Value {
     generator.subschema_for::<QueueSubscribeResult>();
     generator.subschema_for::<QueueMutationParams>();
     generator.subschema_for::<QueueMutationResult>();
+    generator.subschema_for::<QueueItem>();
 
     let defs = generator.take_definitions(true);
 

@@ -36,7 +36,8 @@ pub use interaction::{
 pub use lifecycle::LifecycleConfig;
 pub use notify::{NotificationHub, ResumeCursor, StreamResumeState, SubscribeError};
 pub use persistence::{
-    PersistenceError, PersistenceStore, RecoveryStatusCounts, SessionRecord, TranscriptStore,
+    PersistenceError, PersistenceStore, QueueHub, QueueStore, RecoveryStatusCounts, SessionRecord,
+    TranscriptStore,
 };
 pub use router::{
     recover_open_sessions_shared, LifecycleReapReport, MethodClass, Router, StartupRecoveryPolicy,

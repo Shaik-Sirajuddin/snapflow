@@ -139,6 +139,18 @@ pub struct QueueMutationResult {
     pub accepted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_entry_id: Option<String>,
+    pub queue: Vec<QueueItem>,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueItem {
+    pub queue_entry_id: String,
+    pub idempotency_key: String,
+    pub text: String,
+    pub state: String,
+    pub position: u32,
 }
 
 #[cfg(test)]

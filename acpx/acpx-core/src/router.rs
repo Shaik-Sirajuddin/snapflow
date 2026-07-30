@@ -11,7 +11,7 @@ use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
 use crate::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    PersistenceStore, TranscriptStore,
+    PersistenceStore, QueueHub, QueueStore, TranscriptStore,
 };
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
@@ -314,6 +314,8 @@ pub struct Router {
     /// write never delays or fails the client's actual request.
     persistence: Option<PersistenceStore>,
     transcripts: Option<TranscriptStore>,
+    queue_store: Option<QueueStore>,
+    queue_hub: QueueHub,
     /// Durable admin-plane read stores. They remain absent for
     /// in-memory-only routers, preserving the legacy default behavior.
     agent_enablement: Option<AgentEnablement>,
@@ -1025,6 +1027,8 @@ impl Router {
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
             transcripts: None,
+            queue_store: None,
+            queue_hub: QueueHub::default(),
             agent_enablement: None,
             custom_agents: None,
             materialized_custom_agents: HashSet::new(),
@@ -1365,6 +1369,19 @@ impl Router {
 
     pub fn transcript_store(&self) -> Option<TranscriptStore> {
         self.transcripts.clone()
+    }
+
+    pub fn with_queue_store(mut self, queue_store: QueueStore) -> Self {
+        self.queue_store = Some(queue_store);
+        self
+    }
+
+    pub fn queue_store(&self) -> Option<QueueStore> {
+        self.queue_store.clone()
+    }
+
+    pub fn queue_hub(&self) -> QueueHub {
+        self.queue_hub.clone()
     }
 
     pub fn with_transcript_store(mut self, transcripts: TranscriptStore) -> Self {
@@ -4237,6 +4254,52 @@ impl Router {
                     };
                     return Ok(serde_json::to_value(result)?);
                 }
+                if method == "acpx/sessions/subscribe" {
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::SessionsSubscribeParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    return Ok(serde_json::to_value(
+                        acpx_proto::session_stream::SessionsSubscribeResult {
+                            session_ids: typed.session_ids,
+                            background: typed.background,
+                            cursor: typed.cursor,
+                        },
+                    )?);
+                }
+                if method == "acpx/sessions/queue/subscribe" {
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::QueueSubscribeParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    return Ok(serde_json::to_value(
+                        acpx_proto::session_stream::QueueSubscribeResult {
+                            session_ids: typed.session_ids,
+                            cursor: typed.cursor,
+                        },
+                    )?);
+                }
+                if method == "session/queue" {
+                    let store = self
+                        .queue_store
+                        .as_ref()
+                        .ok_or(RouterError::NotImplemented("server queue storage"))?
+                        .clone();
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::QueueMutationParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    let session_id = typed.session_id.clone();
+                    let (result, event) = store.mutate(session_id, typed).await?;
+                    self.queue_hub.publish(event).await;
+                    return Ok(serde_json::to_value(result)?);
+                }
                 return Err(RouterError::NotImplemented("session stream extensions"));
             }
             "agents/list" => {
@@ -7088,6 +7151,14 @@ pub async fn dispatch_shared_for_tenant(
         MethodClass::GatewayNative if method == "acpx/sessions/sync" => {
             dispatch_session_sync_shared(router, tenant_id, request).await
         }
+        MethodClass::GatewayNative if method == "session/queue" => {
+            dispatch_queue_mutation_shared(router, request).await
+        }
+        MethodClass::GatewayNative
+            if method == "acpx/sessions/subscribe" || method == "acpx/sessions/queue/subscribe" =>
+        {
+            dispatch_session_stream_subscribe_shared(&method, request).await
+        }
         // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
         // plan.** `agents/install` is a genuine (potentially many-second,
         // real network/filesystem) download+extract, not the cheap/local
@@ -7190,6 +7261,57 @@ async fn dispatch_session_sync_shared(
             cursor: None,
         },
     )?)
+}
+
+async fn dispatch_session_stream_subscribe_shared(
+    method: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    if method == "acpx/sessions/subscribe" {
+        let typed: acpx_proto::session_stream::SessionsSubscribeParams =
+            serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+        return Ok(serde_json::to_value(
+            acpx_proto::session_stream::SessionsSubscribeResult {
+                session_ids: typed.session_ids,
+                background: typed.background,
+                cursor: typed.cursor,
+            },
+        )?);
+    }
+    let typed: acpx_proto::session_stream::QueueSubscribeParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    Ok(serde_json::to_value(
+        acpx_proto::session_stream::QueueSubscribeResult {
+            session_ids: typed.session_ids,
+            cursor: typed.cursor,
+        },
+    )?)
+}
+
+async fn dispatch_queue_mutation_shared(
+    router: &SharedRouterHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let store = router
+        .lock()
+        .await
+        .queue_store()
+        .ok_or(RouterError::NotImplemented("server queue storage"))?;
+    let hub = { router.lock().await.queue_hub() };
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::QueueMutationParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let session_id = typed.session_id.clone();
+    let (result, event) = store.mutate(session_id, typed).await?;
+    hub.publish(event).await;
+    Ok(serde_json::to_value(result)?)
 }
 
 /// [`dispatch_shared_for_tenant`]'s `agents/install` path -- resolves the

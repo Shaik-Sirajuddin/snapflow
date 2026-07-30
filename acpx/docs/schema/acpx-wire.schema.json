@@ -717,12 +717,52 @@
             "string",
             "null"
           ]
+        },
+        "queue": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QueueItem"
+          }
+        },
+        "paused": {
+          "type": "boolean"
         }
       },
       "required": [
         "sessionId",
         "idempotencyKey",
-        "accepted"
+        "accepted",
+        "queue",
+        "paused"
+      ]
+    },
+    "QueueItem": {
+      "type": "object",
+      "properties": {
+        "queueEntryId": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "position": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "queueEntryId",
+        "idempotencyKey",
+        "text",
+        "state",
+        "position"
       ]
     }
   }

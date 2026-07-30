@@ -1,5 +1,5 @@
 use acpx_conductor::SpawnSpec;
-use acpx_core::{Router, TranscriptStore};
+use acpx_core::{QueueStore, Router, TranscriptStore};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -97,4 +97,46 @@ async fn sync_calls_native_load_and_returns_only_the_unmatched_suffix() {
         response["patch"]["messages"][0]["params"]["update"]["content"]["text"],
         "new"
     );
+}
+
+#[tokio::test]
+async fn queue_endpoint_is_fifo_and_deduplicates_client_retries() {
+    let directory = tempdir().unwrap();
+    let mut router = Router::new("default").with_queue_store(QueueStore::new(directory.path()));
+    let first = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/queue",
+            "params": {
+                "sessionId": "session-1", "operation": "enqueue",
+                "text": "first", "idempotencyKey": "client-1"
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(first["queue"].as_array().unwrap().len(), 1);
+
+    let retry = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/queue",
+            "params": {
+                "sessionId": "session-1", "operation": "enqueue",
+                "text": "first", "idempotencyKey": "client-1"
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(retry["queue"].as_array().unwrap().len(), 1);
+
+    let second = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/queue",
+            "params": {
+                "sessionId": "session-1", "operation": "enqueue",
+                "text": "second", "idempotencyKey": "client-2"
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(second["queue"][0]["text"], "first");
+    assert_eq!(second["queue"][1]["text"], "second");
 }
