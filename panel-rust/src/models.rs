@@ -764,6 +764,14 @@ pub fn is_reasoning_option_id(id: &str) -> bool {
     )
 }
 
+/// Backend-native permission policy selector (`permissionMode`).
+pub fn is_permission_mode_option_id(id: &str) -> bool {
+    matches!(
+        option_id_norm(id).as_str(),
+        "permissionmode" | "permission_mode" | "permission"
+    )
+}
+
 fn option_id_norm(id: &str) -> String {
     id.to_ascii_lowercase().replace('-', "_")
 }
@@ -886,6 +894,34 @@ pub fn to_reasoning_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<
         }
     }
     ModelRc::new(VecModel::from(items))
+}
+
+pub fn to_permission_mode_dropdown_entries(
+    options: Vec<ConfigOptionInfo>,
+) -> ModelRc<DropdownEntry> {
+    let mut items = Vec::new();
+    for option in options {
+        if is_permission_mode_option_id(&option.id) {
+            append_option_entries(&mut items, option);
+        }
+    }
+    ModelRc::new(VecModel::from(items))
+}
+
+pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> String {
+    for option in options
+        .iter()
+        .filter(|option| is_permission_mode_option_id(&option.id))
+    {
+        let Some(current) = option.current_value.as_ref() else {
+            continue;
+        };
+        if let Some(value) = option.options.iter().find(|value| &value.value == current) {
+            return value.name.clone();
+        }
+        return current.clone();
+    }
+    String::new()
 }
 
 /// Trigger label for the reasoning dropdown (current value name, or "").
@@ -2652,6 +2688,36 @@ mod transcript_model_tests {
         assert_eq!(
             filtered.row_data(2).unwrap().value.as_str(),
             "claude-acp/sonnet"
+        );
+    }
+
+    #[test]
+    fn permission_mode_is_a_dedicated_backend_config_dropdown() {
+        let options = vec![ConfigOptionInfo {
+            id: "permissionMode".into(),
+            name: "Permission mode".into(),
+            description: None,
+            category: None,
+            kind: "select".into(),
+            current_value: Some("acceptEdits".into()),
+            options: vec![
+                ConfigOptionValue {
+                    value: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                ConfigOptionValue {
+                    value: "acceptEdits".into(),
+                    name: "Accept edits".into(),
+                    description: None,
+                },
+            ],
+        }];
+        let entries = to_permission_mode_dropdown_entries(options.clone());
+        assert_eq!(entries.row_count(), 3);
+        assert_eq!(
+            current_permission_mode_trigger_label(&options),
+            "Accept edits"
         );
     }
 

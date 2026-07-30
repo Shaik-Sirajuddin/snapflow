@@ -140,6 +140,10 @@ export component ChatArea inherits Rectangle {
     // Reasoning effort (dedicated dropdown; empty hides it).
     in property <[DropdownEntry]> reasoning-dropdown-entries: [];
     in property <string> reasoning-trigger-label: "";
+    // Backend-native permissionMode selector; distinct from the panel's
+    // profile/approval setting and written through session/set_config_option.
+    in property <[DropdownEntry]> permission-mode-dropdown-entries: [];
+    in property <string> permission-mode-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence.
     in property <[DropdownEntry]> profile-dropdown-entries: [];
     in property <string> profile-trigger-label: "";
@@ -1450,6 +1454,8 @@ export component ChatArea inherits Rectangle {
             config-trigger-label: config-trigger-label;
             reasoning-dropdown-entries: reasoning-dropdown-entries;
             reasoning-trigger-label: reasoning-trigger-label;
+            permission-mode-dropdown-entries: permission-mode-dropdown-entries;
+            permission-mode-trigger-label: permission-mode-trigger-label;
             profile-dropdown-entries: profile-dropdown-entries;
             profile-trigger-label: profile-trigger-label;
             active-thread-has-session: active-thread-has-session;
