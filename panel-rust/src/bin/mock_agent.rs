@@ -11,6 +11,10 @@
 //!   then one `agent_message_chunk` echoing the prompt text back
 //!   uppercased (so tests can assert on a known transformation instead of
 //!   just "some string arrived"), then responds `StopReason::EndTurn`.
+//!   A `"stream "`-prefixed prompt instead sends its body as several
+//!   partial `agent_message_chunk`s (fixed-size, mid-token splits
+//!   included) with a real delay between each -- see the prompt handler's
+//!   `"stream "` marker branch.
 //! - `session/list`: returns every session created so far, with a
 //!   `title`/`updated_at` that changes each time a prompt completes on it
 //!   (so cache-staleness tests have something real to diff against).
@@ -378,6 +382,53 @@ async fn main() -> Result<()> {
                                     .respond(PromptResponse::new(StopReason::EndTurn));
                             }
                         }
+                    });
+                    return Ok(());
+                }
+                // markdown-render-cache-layer MCP-04 coverage: a
+                // `"stream "`-prefixed prompt sends its markdown body as
+                // several partial `agent_message_chunk`s (mid-token splits
+                // included) with a real delay between each, instead of the
+                // usual single complete chunk `send_replay` sends below --
+                // the only way a live e2e test can observe a genuinely
+                // unterminated trailing block (e.g. `"**bol"` before
+                // `"d**"` arrives) and confirm `heal_open_markers` +
+                // `markdown_worker`'s epoch/dedupe machinery behave the
+                // same live as they do against the synthetic partial
+                // strings the unit tests use. Chunk boundaries are fixed
+                // (every 6 bytes) rather than word-aligned so runs land
+                // mid-marker often, not just between words.
+                if let Some(marker_text) = text.strip_prefix("stream ") {
+                    let body = format!("{}{}", persona_prefix(), marker_text);
+                    let connection_for_stream = connection.clone();
+                    let session_id_for_stream = session_id.clone();
+                    tokio::spawn(async move {
+                        let bytes = body.as_bytes();
+                        const CHUNK_LEN: usize = 6;
+                        let mut sent = 0usize;
+                        while sent < bytes.len() {
+                            let end = (sent + CHUNK_LEN).min(bytes.len());
+                            // `body` is UTF-8; fall back to the next char
+                            // boundary if a fixed byte cut lands mid-codepoint.
+                            let mut end = end;
+                            while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                                end += 1;
+                            }
+                            let piece = String::from_utf8_lossy(&bytes[sent..end]).into_owned();
+                            let _ = connection_for_stream.send_notification(
+                                SessionNotification::new(
+                                    session_id_for_stream.clone(),
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(piece)),
+                                    )),
+                                ),
+                            );
+                            sent = end;
+                            if sent < bytes.len() {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                        }
+                        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                     });
                     return Ok(());
                 }
