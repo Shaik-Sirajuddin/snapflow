@@ -136,7 +136,15 @@ pub struct ThreadModel {
     /// worker-delivered background render has somewhere durable and
     /// correctly-scoped to land regardless of which thread is currently
     /// displayed -- see that plan's "Chosen state shape".
-    pub markdown_render_index: crate::thread_message_index::ThreadMessageIndex,
+    /// `RefCell`-wrapped (not a plain field): main's retained per-thread
+    /// ChatView architecture rebuilds rows via `sync.rs`'s
+    /// `projected_thread_rows`, which only ever holds `&Model`/
+    /// `&ThreadModel` (rows now live in the Slint-side `thread_view_models`
+    /// registry, not a mutable Rust row cache) -- so this cache needs
+    /// interior mutability to stay writable from that shared-reference
+    /// context, the same shape `thread_view_models`'s own Slint models
+    /// already use for the identical reason.
+    pub markdown_render_index: RefCell<crate::thread_message_index::ThreadMessageIndex>,
     /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: this
     /// thread's own render generation counter. Deliberately per-thread,
     /// not one shared global counter -- bumping it invalidates any
@@ -478,7 +486,7 @@ impl Default for ThreadModel {
             transcript_keys: Vec::new(),
             #[cfg(test)]
             message_rows: Vec::new(),
-            markdown_render_index: crate::thread_message_index::ThreadMessageIndex::default(),
+            markdown_render_index: RefCell::new(crate::thread_message_index::ThreadMessageIndex::default()),
             markdown_epoch: crate::markdown_worker::EpochCounter::new(),
             markdown_in_flight: crate::markdown_worker::InFlightRegistry::new(),
             has_older_messages: false,

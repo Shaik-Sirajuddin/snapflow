@@ -213,13 +213,22 @@ fn spawn_markdown_prewarm_for_other_threads(panel: &PanelSingleton, just_selecte
 /// result means "nothing to prewarm," the caller's cue to skip spawning
 /// entirely rather than pay for an OS-thread-pool submission that would
 /// immediately call `on_done` with zero chunks.
-fn messages_needing_prewarm(thread: &crate::model::ThreadModel) -> Vec<(String, String)> {
+///
+/// `rows` is taken explicitly rather than read off `thread.message_rows`:
+/// that field is test-only now (main's retained-per-thread-ChatView
+/// architecture -- production rows live in `Model::thread_view_models`'s
+/// Slint-side `VecModel`, not a Rust-side row cache). The caller resolves
+/// the real rows from there; tests pass `&thread.message_rows` directly.
+fn messages_needing_prewarm(
+    thread: &crate::model::ThreadModel,
+    rows: &[crate::MessageItem],
+) -> Vec<(String, String)> {
     thread
         .transcript_keys
         .iter()
-        .zip(thread.message_rows.iter())
+        .zip(rows.iter())
         .filter(|(_, row)| row.kind.as_str() == "agent")
-        .filter(|(key, _)| thread.markdown_render_index.rendered_blocks_for(key).is_none())
+        .filter(|(key, _)| thread.markdown_render_index.borrow().rendered_blocks_for(key).is_none())
         .map(|(key, row)| (key.clone(), row.text.to_string()))
         .collect()
 }
@@ -241,7 +250,16 @@ fn spawn_markdown_prewarm_for_thread(panel: &PanelSingleton, thread_id: &str) {
         let Some(thread) = model.threads.iter().find(|t| t.thread_id == thread_id) else {
             return;
         };
-        let messages = messages_needing_prewarm(thread);
+        let Some(view_model) = model.thread_view_models.get(thread_id) else {
+            return;
+        };
+        let rows: Vec<crate::MessageItem> = {
+            use slint::Model;
+            (0..view_model.row_count())
+                .filter_map(|i| view_model.row_data(i))
+                .collect()
+        };
+        let messages = messages_needing_prewarm(thread, &rows);
         if messages.is_empty() {
             return;
         }
@@ -1710,7 +1728,7 @@ mod tests {
             ("assistant:1", "agent", "hello"),
             ("tool:1", "tool_use", "ran a command"),
         ]);
-        let result = messages_needing_prewarm(&thread);
+        let result = messages_needing_prewarm(&thread, &thread.message_rows);
         assert_eq!(result, vec![("assistant:1".to_string(), "hello".to_string())]);
     }
 
@@ -1718,15 +1736,15 @@ mod tests {
     fn messages_needing_prewarm_skips_already_cached_agent_messages() {
         let thread = {
             let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello")]);
-            thread.markdown_render_index.record("assistant:1", 0, "hello");
-            thread.markdown_render_index.set_rendered_blocks(
+            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello");
+            thread.markdown_render_index.borrow_mut().set_rendered_blocks(
                 "assistant:1",
                 slint::ModelRc::new(slint::VecModel::from(vec![crate::MarkdownBlock::default()])),
             );
             thread
         };
         assert!(
-            messages_needing_prewarm(&thread).is_empty(),
+            messages_needing_prewarm(&thread, &thread.message_rows).is_empty(),
             "an already-rendered message must not be re-queued for prewarm"
         );
     }
@@ -1739,11 +1757,11 @@ mod tests {
         // updated, but no cached ModelRc yet for the new text.
         let thread = {
             let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello again")]);
-            thread.markdown_render_index.record("assistant:1", 0, "hello again");
+            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello again");
             thread
         };
         assert_eq!(
-            messages_needing_prewarm(&thread),
+            messages_needing_prewarm(&thread, &thread.message_rows),
             vec![("assistant:1".to_string(), "hello again".to_string())]
         );
     }
@@ -1751,12 +1769,12 @@ mod tests {
     #[test]
     fn messages_needing_prewarm_is_empty_for_a_thread_with_no_agent_messages() {
         let thread = thread_with_rows(&[("user:1", "user", "hi"), ("tool:1", "tool_use", "ran")]);
-        assert!(messages_needing_prewarm(&thread).is_empty());
+        assert!(messages_needing_prewarm(&thread, &thread.message_rows).is_empty());
     }
 
     #[test]
     fn messages_needing_prewarm_is_empty_for_an_empty_thread() {
         let thread = ThreadModel::default();
-        assert!(messages_needing_prewarm(&thread).is_empty());
+        assert!(messages_needing_prewarm(&thread, &thread.message_rows).is_empty());
     }
 }
