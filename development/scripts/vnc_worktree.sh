@@ -371,9 +371,21 @@ PY
     local shotcut_pid=$!
 
     if [ "${VNC_SHARED:-0}" = "1" ]; then
-        DISPLAY="$vnc_display" "$SHARED_VNC" workspace-place \
-            "$worktree_dir" "$shotcut_pid" "$workspace_id" \
-            || die "could not place Snapflow pid $shotcut_pid on workspace $workspace_id"
+        if ! DISPLAY="$vnc_display" "$SHARED_VNC" workspace-place \
+            "$worktree_dir" "$shotcut_pid" "$workspace_id"; then
+            # Do not leave an untracked live editor behind when placement
+            # fails.  The old path exited before connect.env was written,
+            # making the next clean unable to discover this process.
+            kill_process_group "$shotcut_pid"
+            kill_process_group "$server_pid"
+            kill_process_group "$fifo_keeper_pid"
+            python3 "$SNAPSHOTD_TEST_INSTANCE" teardown-worktree "$label" \
+                >/dev/null 2>&1 || true
+            "$SHARED_VNC" workspace-release "$worktree_dir" \
+                >/dev/null 2>&1 || true
+            "$REG" release "$gateway_port" >/dev/null 2>&1 || true
+            die "could not place Snapflow pid $shotcut_pid on workspace $workspace_id"
+        fi
     fi
 
     cat > "$state_dir/connect.env" <<EOF

@@ -173,33 +173,45 @@ client_list_atom = d.intern_atom("_NET_CLIENT_LIST")
 pid_atom = d.intern_atom("_NET_WM_PID")
 desktop_atom = d.intern_atom("_NET_WM_DESKTOP")
 target = None
+stable = 0
 for _ in range(600):
-    prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
-    window_ids = [] if prop is None else prop.value
-    for window_id in window_ids:
-        window = d.create_resource_object("window", int(window_id))
-        try:
-            pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
-            if pid_prop is not None and int(pid_prop.value[0]) == target_pid:
-                target = window
-                break
-        except Exception:
-            continue
+    if target is None:
+        prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
+        window_ids = [] if prop is None else prop.value
+        for window_id in window_ids:
+            window = d.create_resource_object("window", int(window_id))
+            try:
+                pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
+                if pid_prop is not None and int(pid_prop.value[0]) == target_pid:
+                    target = window
+                    break
+            except Exception:
+                continue
     if target is not None:
-        break
+        try:
+            root.send_event(
+                event.ClientMessage(
+                    window=target,
+                    client_type=desktop_atom,
+                    data=(32, [target_desktop, X.CurrentTime, 0, 0, 0]),
+                ),
+                event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+            )
+            d.sync()
+            desktop = target.get_full_property(desktop_atom, X.AnyPropertyType)
+            if desktop is not None and int(desktop.value[0]) == target_desktop:
+                stable += 1
+                if stable >= 10:
+                    print(f"placed pid {target_pid} on workspace {target_desktop}")
+                    break
+            else:
+                stable = 0
+        except Exception:
+            target = None
+            stable = 0
     time.sleep(0.1)
-if target is None:
-    raise SystemExit(f"could not locate X11 window for pid {target_pid}")
-root.send_event(
-    event.ClientMessage(
-        window=target,
-        client_type=desktop_atom,
-        data=(32, [target_desktop, X.CurrentTime, 0, 0, 0]),
-    ),
-    event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
-)
-d.sync()
-print(f"placed pid {target_pid} on workspace {target_desktop}")
+else:
+    raise SystemExit(f"window for pid {target_pid} did not settle on workspace {target_desktop}")
 PY
       ;;
     *) die "unknown workspace action: $action" ;;
