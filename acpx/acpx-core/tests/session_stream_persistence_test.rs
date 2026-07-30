@@ -1,7 +1,10 @@
 use acpx_conductor::SpawnSpec;
-use acpx_core::{QueueStore, Router, TranscriptStore};
+use acpx_core::router::dispatch_shared_for_tenant;
+use acpx_core::{QueueStore, Router, TenantId, TranscriptStore};
 use serde_json::json;
+use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::sync::Mutex;
 
 const LOAD_REPLAY_BACKEND: &str = r#"
 while IFS= read -r line; do
@@ -139,4 +142,113 @@ async fn queue_endpoint_is_fifo_and_deduplicates_client_retries() {
         .unwrap();
     assert_eq!(second["queue"][0]["text"], "first");
     assert_eq!(second["queue"][1]["text"], "second");
+}
+
+const QUEUE_DISPATCH_BACKEND: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}\n' "$id"
+  elif printf '%s' "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-queue"}}\n' "$id"
+  elif printf '%s' "$line" | grep -q '"method":"session/prompt"'; then
+    text=$(printf '%s' "$line" | sed -n 's/.*"prompt":\[.*"text":"\([^"]*\)".*$/\1/p')
+    printf '%s\n' "$text" >> "$ACPX_QUEUE_CAPTURE"
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  fi
+done
+"#;
+
+#[tokio::test]
+async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
+    let directory = tempdir().unwrap();
+    let capture = directory.path().join("prompts.txt");
+    let backend =
+        QUEUE_DISPATCH_BACKEND.replace("$ACPX_QUEUE_CAPTURE", &capture.display().to_string());
+    let mut router = Router::new("queue-agent").with_queue_store(QueueStore::new(directory.path()));
+    router.register_agent(
+        "queue-agent",
+        SpawnSpec::new("sh", vec!["-c".into(), backend]),
+    );
+    let router = Arc::new(Mutex::new(router));
+    let tenant = TenantId::default_tenant();
+
+    let created = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"session/new",
+            "params":{"cwd":"/tmp"}
+        }),
+    )
+    .await
+    .unwrap();
+    let session_id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+
+    let queue_hub = { router.lock().await.queue_hub() };
+    let mut client_a = queue_hub.subscribe(&session_id).await;
+    let mut client_b = queue_hub.subscribe(&session_id).await;
+
+    let first = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"session/queue",
+            "params":{"sessionId":session_id,"operation":"enqueue",
+                      "text":"first","idempotencyKey":"client-a-1"}
+        }),
+    );
+    let second = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":3, "method":"session/queue",
+            "params":{"sessionId":session_id,"operation":"enqueue",
+                      "text":"second","idempotencyKey":"client-b-1"}
+        }),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert!(first.unwrap()["accepted"].as_bool().unwrap());
+    assert!(second.unwrap()["accepted"].as_bool().unwrap());
+
+    for receiver in [&mut client_a, &mut client_b] {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["method"], "acpx/session/queue");
+        assert_eq!(event["params"]["sessionId"], session_id);
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let lines = loop {
+        if let Ok(content) = std::fs::read_to_string(&capture) {
+            let lines = content
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if lines.len() >= 2 {
+                break lines;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queued prompts were not dispatched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(&lines[..2], ["first", "second"]);
+    assert!(router
+        .lock()
+        .await
+        .queue_store()
+        .unwrap()
+        .snapshot(session_id)
+        .await
+        .unwrap()
+        .queue
+        .is_empty());
 }
