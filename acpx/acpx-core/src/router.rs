@@ -316,6 +316,7 @@ pub struct Router {
     transcripts: Option<TranscriptStore>,
     queue_store: Option<QueueStore>,
     queue_hub: QueueHub,
+    queue_active: Arc<Mutex<HashSet<String>>>,
     /// Durable admin-plane read stores. They remain absent for
     /// in-memory-only routers, preserving the legacy default behavior.
     agent_enablement: Option<AgentEnablement>,
@@ -1029,6 +1030,7 @@ impl Router {
             transcripts: None,
             queue_store: None,
             queue_hub: QueueHub::default(),
+            queue_active: Arc::new(Mutex::new(HashSet::new())),
             agent_enablement: None,
             custom_agents: None,
             materialized_custom_agents: HashSet::new(),
@@ -1382,6 +1384,10 @@ impl Router {
 
     pub fn queue_hub(&self) -> QueueHub {
         self.queue_hub.clone()
+    }
+
+    fn queue_dispatch_active(&self) -> Arc<Mutex<HashSet<String>>> {
+        self.queue_active.clone()
     }
 
     pub fn with_transcript_store(mut self, transcripts: TranscriptStore) -> Self {
@@ -7152,7 +7158,7 @@ pub async fn dispatch_shared_for_tenant(
             dispatch_session_sync_shared(router, tenant_id, request).await
         }
         MethodClass::GatewayNative if method == "session/queue" => {
-            dispatch_queue_mutation_shared(router, request).await
+            dispatch_queue_mutation_shared(router, tenant_id, request).await
         }
         MethodClass::GatewayNative
             if method == "acpx/sessions/subscribe" || method == "acpx/sessions/queue/subscribe" =>
@@ -7294,6 +7300,7 @@ async fn dispatch_session_stream_subscribe_shared(
 
 async fn dispatch_queue_mutation_shared(
     router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
     let store = router
@@ -7309,9 +7316,68 @@ async fn dispatch_queue_mutation_shared(
     let typed: acpx_proto::session_stream::QueueMutationParams =
         serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
     let session_id = typed.session_id.clone();
+    let operation = typed.operation;
     let (result, event) = store.mutate(session_id, typed).await?;
     hub.publish(event).await;
+    if matches!(
+        operation,
+        acpx_proto::session_stream::QueueOperation::Enqueue
+            | acpx_proto::session_stream::QueueOperation::SendNow
+    ) {
+        spawn_queue_dispatcher(router.clone(), tenant_id.clone(), result.session_id.clone());
+    }
     Ok(serde_json::to_value(result)?)
+}
+
+fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, session_id: String) {
+    tokio::spawn(async move {
+        let active = { router.lock().await.queue_dispatch_active() };
+        {
+            let mut active_sessions = active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !active_sessions.insert(session_id.clone()) {
+                return;
+            }
+        }
+        loop {
+            let (store, hub) = {
+                let router = router.lock().await;
+                let Some(store) = router.queue_store() else {
+                    break;
+                };
+                (store, router.queue_hub())
+            };
+            let Some((item, event)) = (match store.take_next(&session_id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "queue dispatch claim failed");
+                    break;
+                }
+            }) else {
+                break;
+            };
+            hub.publish(event).await;
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": format!("queue:{}", item.queue_entry_id),
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": item.text}],
+                    "_acpx": {"queueEntryId": item.queue_entry_id, "idempotencyKey": item.idempotency_key}
+                }
+            });
+            if let Err(error) = dispatch_proxied_shared(&router, &tenant_id, request).await {
+                tracing::warn!(%session_id, %error, "queued prompt failed");
+                break;
+            }
+        }
+        let mut active_sessions = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active_sessions.remove(&session_id);
+    });
 }
 
 /// [`dispatch_shared_for_tenant`]'s `agents/install` path -- resolves the

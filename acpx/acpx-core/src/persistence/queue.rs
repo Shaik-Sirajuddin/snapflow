@@ -180,6 +180,56 @@ impl QueueStore {
         };
         Ok((response, event))
     }
+
+    /// Atomically claim the FIFO head for the server dispatcher. The entry
+    /// is removed from the queued projection before the backend prompt is
+    /// sent, so concurrent clients cannot promote it twice.
+    pub async fn take_next(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<Option<(QueueItem, QueueStateEvent)>, TranscriptError> {
+        let session_id = session_id.into();
+        let actor = self.actor(&session_id).await;
+        let _guard = actor.lock().await;
+        let path = self.path(&session_id)?;
+        let root = Arc::clone(&self.root);
+        let result = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(root.as_path())?;
+            let records = read_records(&path)?;
+            let (mut queue, paused) = replay_records(records);
+            if paused || queue.is_empty() {
+                return Ok::<_, TranscriptError>(None);
+            }
+            let item = queue.remove(0);
+            for (position, item) in queue.iter_mut().enumerate() {
+                item.position = position as u32;
+            }
+            append_record(
+                &path,
+                &QueueRecord {
+                    operation: QueueOperation::Cancel,
+                    item: None,
+                    idempotency_key: format!("dispatch:{}", item.idempotency_key),
+                    queue_entry_id: Some(item.queue_entry_id.clone()),
+                },
+            )?;
+            Ok(Some((item, queue, paused)))
+        })
+        .await
+        .map_err(|error| TranscriptError::Task(error.to_string()))??;
+        let Some((item, queue, paused)) = result else {
+            return Ok(None);
+        };
+        Ok(Some((
+            item,
+            QueueStateEvent {
+                session_id,
+                queue,
+                paused,
+                idempotency_key: String::new(),
+            },
+        )))
+    }
 }
 
 #[derive(Clone)]
@@ -232,6 +282,40 @@ fn read_records(path: &std::path::Path) -> Result<Vec<QueueRecord>, TranscriptEr
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).map_err(TranscriptError::from))
         .collect()
+}
+
+fn replay_records(records: Vec<QueueRecord>) -> (Vec<QueueItem>, bool) {
+    let mut queue = Vec::new();
+    let mut paused = false;
+    for record in records {
+        match record.operation {
+            QueueOperation::Enqueue | QueueOperation::SendNow => {
+                if let Some(item) = record.item {
+                    if !queue
+                        .iter()
+                        .any(|current: &QueueItem| current.idempotency_key == item.idempotency_key)
+                    {
+                        if matches!(record.operation, QueueOperation::SendNow) {
+                            queue.insert(0, item);
+                        } else {
+                            queue.push(item);
+                        }
+                    }
+                }
+            }
+            QueueOperation::Cancel => {
+                if let Some(entry_id) = record.queue_entry_id {
+                    queue.retain(|item| item.queue_entry_id != entry_id);
+                }
+            }
+            QueueOperation::Pause => paused = true,
+            QueueOperation::Resume => paused = false,
+        }
+    }
+    for (position, item) in queue.iter_mut().enumerate() {
+        item.position = position as u32;
+    }
+    (queue, paused)
 }
 
 fn append_record(path: &std::path::Path, record: &QueueRecord) -> Result<(), TranscriptError> {
