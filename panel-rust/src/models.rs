@@ -764,6 +764,19 @@ pub fn is_reasoning_option_id(id: &str) -> bool {
     )
 }
 
+/// True when this config option is the native ACP `permissionMode`
+/// (dedicated compose dropdown, not mixed into the model selector) --
+/// see `acpx-core::bridge_sessions`'s own `"permissionMode"` `configId`
+/// convention (e.g. its `select_adapter_config_option(..., "permissionMode",
+/// "acceptEdits")` call), same normalized-id-matching shape as
+/// `is_reasoning_option_id`.
+pub fn is_permission_mode_option_id(id: &str) -> bool {
+    matches!(
+        id.to_ascii_lowercase().replace('-', "_").as_str(),
+        "permissionmode" | "permission_mode" | "permission"
+    )
+}
+
 fn option_id_norm(id: &str) -> String {
     id.to_ascii_lowercase().replace('-', "_")
 }
@@ -891,6 +904,34 @@ pub fn to_reasoning_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<
 /// Trigger label for the reasoning dropdown (current value name, or "").
 pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
     for option in options.iter().filter(|o| is_reasoning_option_id(&o.id)) {
+        let Some(cur) = option.current_value.as_ref() else {
+            continue;
+        };
+        if let Some(v) = option.options.iter().find(|v| &v.value == cur) {
+            return v.name.clone();
+        }
+        return cur.clone();
+    }
+    String::new()
+}
+
+/// Permission-mode selector rows (dedicated compose dropdown) -- same
+/// shape as [`to_reasoning_dropdown_entries`], filtering on
+/// [`is_permission_mode_option_id`] instead.
+pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+    let mut items: Vec<DropdownEntry> = Vec::new();
+    for option in options {
+        if is_permission_mode_option_id(&option.id) {
+            append_option_entries(&mut items, option);
+        }
+    }
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Trigger label for the permission-mode dropdown (current value name, or
+/// ""), same shape as [`current_reasoning_trigger_label`].
+pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> String {
+    for option in options.iter().filter(|o| is_permission_mode_option_id(&o.id)) {
         let Some(cur) = option.current_value.as_ref() else {
             continue;
         };

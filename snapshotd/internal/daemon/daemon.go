@@ -66,8 +66,9 @@ type Daemon struct {
 	// gracefully -- (*os.Process).Signal on Windows supports neither
 	// SIGTERM nor any other POSIX signal delivered from a separate process,
 	// so a PID+signal-based `stop` command can never work there.
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	projectLocks sync.Map // canonical project root -> *sync.Mutex
 }
 
 type RegisterExternalInstanceParams struct {
@@ -1465,6 +1466,20 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return d.Launch(ctx, p)
+
+	// daemon.clientRegister/clientHeartbeat/clientUnregister/projectOpen/
+	// projectClose/projectSwitch: a client-lease-pool RPC surface that
+	// was scaffolded (these dispatcher cases plus the ClientLease registry
+	// rows) but never got its params types or Daemon methods implemented.
+	// Stubbed to a clean error rather than silently dropped, so a caller
+	// that hits one of these gets a clear "not implemented" instead of the
+	// dispatcher's generic unknown-method error, until the feature is
+	// actually finished.
+	case "daemon.clientRegister", "daemon.clientHeartbeat", "daemon.clientUnregister",
+		"daemon.projectOpen", "daemon.processEnsure",
+		"daemon.projectClose", "daemon.processRelease",
+		"daemon.projectSwitch":
+		return nil, fmt.Errorf("daemon: %s: not implemented", method)
 
 	case "daemon.list":
 		return d.List(ctx)

@@ -306,11 +306,6 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_skill_path(model.active_skill_path.clone().into());
     component.set_active_skill_md_path(model.active_skill_md_path.clone().into());
     component.set_active_skill_content(model.active_skill_content.clone().into());
-    // Phase 27: markdown preview of the active content for the editor's
-    // Preview toggle.
-    component.set_active_skill_markdown(crate::models::skill_markdown_preview(
-        &model.active_skill_content,
-    ));
     component.set_skill_saving(model.skill_saving);
     let editors = model
         .detected_editors
@@ -904,6 +899,12 @@ fn sync_model_dropdown_for_provider(
     ));
     component.set_config_trigger_label(
         crate::models::current_config_trigger_label(&thread.config_options).into(),
+    );
+    component.set_permission_mode_dropdown_entries(
+        crate::models::to_permission_mode_dropdown_entries(thread.config_options.clone()),
+    );
+    component.set_permission_mode_trigger_label(
+        crate::models::current_permission_mode_trigger_label(&thread.config_options).into(),
     );
     sync_commands_model(model, thread);
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));

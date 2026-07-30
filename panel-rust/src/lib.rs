@@ -44,6 +44,7 @@ mod skills_manager_adapter;
 pub mod skills_state;
 mod state_store;
 mod sync;
+mod snapshotd_lifecycle;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
 // crates from this one, unable to see anything less than `pub` -- can
 // reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
@@ -3424,6 +3425,7 @@ pub extern "C" fn panel_rust_apply_host_appearance(
 /// `panel_rust_render` + trigger a Qt repaint).
 #[no_mangle]
 pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
+    snapshotd_lifecycle::heartbeat_if_due();
     // Slint `animate` blocks (hover fades, entrance/exit transitions, the
     // loading spinner, the sidebar rail's `animate width`, ...) -- and a
     // `Flickable`'s own interactive flick/momentum motion -- only progress

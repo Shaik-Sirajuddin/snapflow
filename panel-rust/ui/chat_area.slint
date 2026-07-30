@@ -140,6 +140,9 @@ export component ChatArea inherits Rectangle {
     // Reasoning effort (dedicated dropdown; empty hides it).
     in property <[DropdownEntry]> reasoning-dropdown-entries: [];
     in property <string> reasoning-trigger-label: "";
+    // Permission mode (dedicated dropdown; empty hides it).
+    in property <[DropdownEntry]> permission-mode-dropdown-entries: [];
+    in property <string> permission-mode-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence.
     in property <[DropdownEntry]> profile-dropdown-entries: [];
     in property <string> profile-trigger-label: "";
@@ -976,7 +979,8 @@ export component ChatArea inherits Rectangle {
                     property <bool> is-pending: msg.kind == "pending";
                     property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
-                        || msg.kind == "thinking";
+                        || msg.kind == "thinking"
+                        || msg.kind == "pending";
                     property <bool> is-tool-event: root.is-tool-kind(msg.kind);
                     property <bool> is-first-tool-event: is-tool-event && (i == 0 ? true : !root.is-tool-kind(root.messages[i - 1].kind));
                     // Active-session rail on the *latest* row while the
@@ -1450,6 +1454,8 @@ export component ChatArea inherits Rectangle {
             config-trigger-label: config-trigger-label;
             reasoning-dropdown-entries: reasoning-dropdown-entries;
             reasoning-trigger-label: reasoning-trigger-label;
+            permission-mode-dropdown-entries: permission-mode-dropdown-entries;
+            permission-mode-trigger-label: permission-mode-trigger-label;
             profile-dropdown-entries: profile-dropdown-entries;
             profile-trigger-label: profile-trigger-label;
             active-thread-has-session: active-thread-has-session;

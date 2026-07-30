@@ -419,7 +419,6 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		}
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
 	}
-
 	pi := registry.ProcessInstance{
 		ID:               instanceID,
 		ProjectID:        projectID,
@@ -507,6 +506,16 @@ func (m *Manager) Close(instanceID string) error {
 		// still visible in the OS process table, briefly violating the
 		// single-live-instance invariant.
 		_ = cmd.Wait()
+	} else if !ok {
+		// A daemon restart deliberately leaves children alive so startup
+		// reconciliation can recover them. A later final lease release still
+		// has authority to close that recovered child, even though this
+		// Manager no longer owns an *exec.Cmd handle.
+		if pi, lookupErr := m.Reg.GetProcessInstance(instanceID); lookupErr == nil && pi.PID > 0 {
+			if process, findErr := os.FindProcess(pi.PID); findErr == nil {
+				_ = process.Kill()
+			}
+		}
 	}
 
 	pi, err := m.Reg.GetProcessInstance(instanceID)

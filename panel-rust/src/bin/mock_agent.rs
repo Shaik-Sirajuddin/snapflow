@@ -85,6 +85,10 @@ fn persona_commands() -> Vec<AvailableCommand> {
                 "Summarize the conversation (claude persona)",
             ),
         ],
+        "grok" => vec![AvailableCommand::new(
+            "grok_search",
+            "Search the web (grok persona)",
+        )],
         _ => Vec::new(),
     }
 }

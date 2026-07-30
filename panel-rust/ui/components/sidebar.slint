@@ -923,7 +923,7 @@ export component Sidebar inherits Rectangle {
         // the dialog closed, nothing was written, and the list never
         // gained the skill (setup-followups skill_not_listed_after_creation).
         confirmed(name) => {
-            if (root.active-project-path == "") {
+            if (!root.project-open) {
                 // Make the new global skill visible immediately rather
                 // than requiring a separate toggle discovery.
                 root.show-global-skills = true;

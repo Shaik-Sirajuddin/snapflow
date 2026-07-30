@@ -39,6 +39,8 @@ export component ChatInputLayout inherits Rectangle {
     // Reasoning effort — own dropdown (not mixed into model).
     in property <[DropdownEntry]> reasoning-dropdown-entries: [];
     in property <string> reasoning-trigger-label: "";
+    in property <[DropdownEntry]> permission-mode-dropdown-entries: [];
+    in property <string> permission-mode-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence:
     // profile/provider picker. Only ever interactive while the active
     // thread has no attached session yet (ThreadItem.has-session) --
@@ -126,6 +128,9 @@ export component ChatInputLayout inherits Rectangle {
     property <string> local-reasoning-id: "";
     property <string> local-reasoning-value: "";
     property <string> local-reasoning-label: "";
+    property <string> local-permission-mode-id: "";
+    property <string> local-permission-mode-value: "";
+    property <string> local-permission-mode-label: "";
     property <string> local-profile-id: "";
     property <string> local-profile-label: "";
     // Optimistic Fast toggle state until the host rewrites capabilities.
@@ -154,6 +159,9 @@ export component ChatInputLayout inherits Rectangle {
     property <string> reasoning-label-shown:
         local-reasoning-label != "" ? local-reasoning-label
         : (root.reasoning-trigger-label != "" ? root.reasoning-trigger-label : "Effort");
+    property <string> permission-mode-label-shown:
+        local-permission-mode-label != "" ? local-permission-mode-label
+        : (root.permission-mode-trigger-label != "" ? root.permission-mode-trigger-label : "Permission");
 
     // --- / @ # mention popup ---------------------------------------------
     // TextUtil.* callbacks are installed by the Rust host (lib.rs) or
@@ -908,6 +916,34 @@ export component ChatInputLayout inherits Rectangle {
                     profile-dropdown.close();
                     mode-dropdown.close();
                     config-dropdown.close();
+                }
+            }
+
+            permission-mode-dropdown := SearchableDropdown {
+                enabled: root.inputs-enabled;
+                visible: root.permission-mode-dropdown-entries.length > 0;
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                height: root.row2-h;
+                preferred-height: root.row2-h;
+                trigger-min-width: root.row2-compact ? 56px : 72px;
+                trigger-label: root.permission-mode-label-shown;
+                options: root.permission-mode-dropdown-entries;
+                selected-id: root.local-permission-mode-id;
+                selected-value: root.local-permission-mode-value;
+                placeholder: "Permission mode...";
+                popup-width: 220px;
+                entry-selected(id, value, label) => {
+                    root.local-permission-mode-id = id;
+                    root.local-permission-mode-value = value;
+                    root.local-permission-mode-label = label;
+                    root.config-option-selected(id, value);
+                }
+                opened => {
+                    profile-dropdown.close();
+                    mode-dropdown.close();
+                    config-dropdown.close();
+                    reasoning-dropdown.close();
                 }
             }
 

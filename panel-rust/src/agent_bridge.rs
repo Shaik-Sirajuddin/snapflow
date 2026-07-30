@@ -7559,6 +7559,63 @@ done
         );
     }
 
+    /// Supersedes the old `normalize_provider_maps_registry_ids_onto_
+    /// gateway_keys` test now that `normalize_provider` is gone entirely
+    /// (see `resolve_provider_for`'s doc comment): every distinct
+    /// registry id -- not just "codex"/"claude" -- must resolve its own
+    /// gateway and be recorded as itself, never collapsed onto a
+    /// two-family bucket. This is the routing half of the "selected
+    /// grok-build, codex underneath" fix; see
+    /// `open_session_maybe_profiled`'s doc comment for the other half
+    /// (the profile-name fallback needed to actually reach the right
+    /// backend).
+    #[test]
+    fn distinct_registry_ids_each_resolve_and_record_their_own_provider_no_family_collapsing() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let requested_for_resolver = requested.clone();
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[] as &[&str],
+            move |provider| {
+                requested_for_resolver
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(provider.to_owned());
+                Ok(format!("http://127.0.0.1:1/{provider}"))
+            },
+            None,
+        )
+        .expect("bridge");
+
+        let codex_idx = bridge
+            .add_thread_with_profile_and_provider("Codex Thread", None, Some("codex-acp"))
+            .expect("codex-acp thread");
+        let claude_idx = bridge
+            .add_thread_with_profile_and_provider("Claude Thread", None, Some("claude-acp"))
+            .expect("claude-acp thread");
+        let grok_idx = bridge
+            .add_thread_with_profile_and_provider("Grok Thread", None, Some("grok-build"))
+            .expect("grok-build thread -- must not be rejected or silently rebucketed");
+
+        assert_eq!(
+            bridge.thread_provider(codex_idx).as_deref(),
+            Some("codex-acp"),
+            "provider is recorded as the raw requested registry id, not normalized"
+        );
+        assert_eq!(bridge.thread_provider(claude_idx).as_deref(), Some("claude-acp"));
+        assert_eq!(
+            bridge.thread_provider(grok_idx).as_deref(),
+            Some("grok-build"),
+            "grok-build must get its own identity, not collapse onto codex-acp/codex"
+        );
+        assert!(
+            requested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&"grok-build".to_owned()),
+            "the resolver must actually be asked to provision grok-build's own gateway"
+        );
+    }
+
     #[test]
     fn packaged_gateway_binary_resolution_prefers_override_then_relative_install() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -9458,8 +9515,8 @@ done
     /// proved deliver skills via native filesystem discovery with no MCP
     /// present -- panel-rust/tests/skills_manager_live_discovery_e2e_test.rs
     /// ran 4/4 real passes against a real codex-acp backend. "codex" and
-    /// "codex-acp" (both forms `slot.provider` can currently take, see
-    /// `normalize_provider`) must therefore get NO "skills" MCP entry at
+    /// "codex-acp" (both forms `slot.provider` can currently take) must
+    /// therefore get NO "skills" MCP entry at
     /// all -- snapshotd's entry (if a live daemon answers) is unaffected,
     /// this is skills-specific.
     #[test]
