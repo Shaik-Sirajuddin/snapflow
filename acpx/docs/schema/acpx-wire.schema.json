@@ -443,6 +443,287 @@
         "profiles"
       ],
       "description": "`profiles/list` result envelope."
+    },
+    "SessionsSubscribeParams": {
+      "type": "object",
+      "properties": {
+        "sessionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "background": {
+          "type": "boolean",
+          "default": true
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionIds"
+      ]
+    },
+    "SessionsSubscribeResult": {
+      "type": "object",
+      "properties": {
+        "sessionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "background": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionIds",
+        "background"
+      ]
+    },
+    "SessionPaginateParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId"
+      ]
+    },
+    "SessionPageResult": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "messages": {
+          "type": "array",
+          "items": true
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hasMore": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sessionId",
+        "messages",
+        "hasMore"
+      ]
+    },
+    "SessionSyncParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "knownMessageCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lastMatchedMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ]
+    },
+    "SessionSyncResult": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "patch": {
+          "$ref": "#/$defs/SessionTranscriptPatch"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "patch"
+      ]
+    },
+    "SessionTranscriptPatch": {
+      "type": "object",
+      "properties": {
+        "startIndex": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "replaceCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "messages": {
+          "type": "array",
+          "items": true
+        }
+      },
+      "required": [
+        "startIndex",
+        "replaceCount",
+        "messages"
+      ]
+    },
+    "QueueSubscribeParams": {
+      "type": "object",
+      "properties": {
+        "sessionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionIds"
+      ]
+    },
+    "QueueSubscribeResult": {
+      "type": "object",
+      "properties": {
+        "sessionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionIds"
+      ]
+    },
+    "QueueMutationParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/QueueOperation"
+        },
+        "queueEntryId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "operation"
+      ]
+    },
+    "QueueOperation": {
+      "type": "string",
+      "enum": [
+        "enqueue",
+        "sendNow",
+        "cancel",
+        "pause",
+        "resume"
+      ]
+    },
+    "QueueMutationResult": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "accepted": {
+          "type": "boolean"
+        },
+        "queueEntryId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "accepted"
+      ]
     }
   }
 }

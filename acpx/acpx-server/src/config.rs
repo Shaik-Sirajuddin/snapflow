@@ -17,6 +17,10 @@ pub struct ServerConfig {
     /// Native-mode default ACP agent command (`ACPX_DEFAULT_ACP_COMMAND`).
     /// Profiles / `_acpx.agentId` override this for managed sessions.
     pub default_acp_command: SpawnSpec,
+    /// Root for server-owned transcript, queue, and related JSONL state.
+    /// `ACPX_STORAGE_DIR` is preferred, `ACPX_DATA_DIR` is accepted as an
+    /// alias, and the default is `~/.snapflow/acpx/`.
+    pub storage_dir: std::path::PathBuf,
     /// Optional strict-ACP `/acp` bridge policy. `None` keeps every bridge
     /// route disabled so legacy ACPX deployments retain their exact public
     /// surface until an operator opts in.
@@ -190,6 +194,7 @@ impl ServerConfig {
             .ok()
             .filter(|value| !value.is_empty())
             .or_else(|| default_codex_native_auth_method(&program, &args));
+        let storage_dir = configured_storage_dir();
         let http_bind_addr = match std::env::var("ACPX_HTTP_BIND") {
             Ok(raw) if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") => None,
             Ok(raw) => Some(raw.parse().unwrap_or_else(|err| {
@@ -415,6 +420,7 @@ impl ServerConfig {
             default_agent_id,
             native_auth_method_id,
             default_acp_command,
+            storage_dir,
             bridge,
             http_bind_addr,
             auth_token,
@@ -437,6 +443,42 @@ impl ServerConfig {
             process_reader_demux,
         }
     }
+}
+
+fn storage_dir_from_values(
+    storage: Option<&str>,
+    data: Option<&str>,
+    home: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let explicit = storage.or(data);
+    if let Some(value) = explicit {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("ACPX_STORAGE_DIR/ACPX_DATA_DIR cannot be empty".into());
+        }
+        let path = std::path::PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(format!("storage path must be absolute: {value:?}"));
+        }
+        return Ok(path);
+    }
+    Ok(home
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.join(".snapflow").join("acpx"))
+        .unwrap_or_else(|| cwd.join(".snapflow").join("acpx")))
+}
+
+fn configured_storage_dir() -> std::path::PathBuf {
+    storage_dir_from_values(
+        std::env::var("ACPX_STORAGE_DIR").ok().as_deref(),
+        std::env::var("ACPX_DATA_DIR").ok().as_deref(),
+        std::env::var_os("HOME")
+            .as_deref()
+            .map(std::path::Path::new),
+        &std::env::current_dir().expect("current directory must be available"),
+    )
+    .unwrap_or_else(|err| panic!("invalid ACPX storage configuration: {err}"))
 }
 
 /// PROF-14: when neither `ACPX_DEFAULT_ACP_COMMAND` nor legacy
@@ -649,6 +691,46 @@ mod tests {
             parse_positive_duration("ACPX_SESSION_IDLE_TTL_SECONDS", "42"),
             std::time::Duration::from_secs(42)
         );
+    }
+
+    #[test]
+    fn storage_dir_prefers_storage_override_over_data_alias() {
+        let path = storage_dir_from_values(
+            Some("/srv/acpx"),
+            Some("/srv/legacy"),
+            Some(std::path::Path::new("/home/tester")),
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/srv/acpx"));
+    }
+
+    #[test]
+    fn storage_dir_defaults_under_snapflow_home() {
+        let path = storage_dir_from_values(
+            None,
+            None,
+            Some(std::path::Path::new("/home/tester")),
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/tester/.snapflow/acpx")
+        );
+    }
+
+    #[test]
+    fn storage_dir_rejects_empty_and_relative_overrides() {
+        for value in ["", "relative/acpx"] {
+            assert!(storage_dir_from_values(
+                Some(value),
+                None,
+                Some(std::path::Path::new("/home/tester")),
+                std::path::Path::new("/tmp"),
+            )
+            .is_err());
+        }
     }
 
     #[test]

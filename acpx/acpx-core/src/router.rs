@@ -124,6 +124,11 @@ pub fn classify(method: &str) -> MethodClass {
         // meant a real client had no way to ever pick a non-default model
         // for a claude-agent-acp-backed profile through the gateway.
         | "session/set_config_option"
+        | "acpx/sessions/subscribe"
+        | "acpx/sessions/paginate"
+        | "acpx/sessions/sync"
+        | "acpx/sessions/queue/subscribe"
+        | "session/queue"
         // **Phase 9 addition:** `session/delete` -- real, stable v1 ACP
         // method (`DeleteSessionRequest`/`DeleteSessionResponse`, `x-side:
         // agent`, carries `sessionId`) found entirely unclassified during
@@ -4145,6 +4150,13 @@ impl Router {
                         serde_json::json!({ "sessions": sessions })
                     }
                 }
+            }
+            "acpx/sessions/subscribe"
+            | "acpx/sessions/paginate"
+            | "acpx/sessions/sync"
+            | "acpx/sessions/queue/subscribe"
+            | "session/queue" => {
+                return Err(RouterError::NotImplemented("session stream extensions"));
             }
             "agents/list" => {
                 self.ensure_registry_loaded().await;

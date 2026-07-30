@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         native_auth_method_id = ?config.native_auth_method_id,
         program = %config.default_acp_command.program,
         args = ?config.default_acp_command.args,
+        storage_dir = %config.storage_dir.display(),
         http_bind_addr = ?config.http_bind_addr,
         admin_bind_addr = ?config.admin_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
