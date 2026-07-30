@@ -470,4 +470,23 @@ mod tests {
         assert_eq!(snapshot.queue.len(), 2);
         assert!(!snapshot.queue.iter().any(|item| item.text == "second"));
     }
+
+    #[tokio::test]
+    async fn queue_hub_fans_out_each_state_change_to_all_clients() {
+        let hub = QueueHub::default();
+        let mut first = hub.subscribe("s1").await;
+        let mut second = hub.subscribe("s1").await;
+        hub.publish(QueueStateEvent {
+            session_id: "s1".into(),
+            queue: Vec::new(),
+            paused: false,
+            idempotency_key: "client-a".into(),
+        })
+        .await;
+        for receiver in [&mut first, &mut second] {
+            let event = receiver.recv().await.unwrap();
+            assert_eq!(event["method"], "acpx/session/queue");
+            assert_eq!(event["params"]["idempotencyKey"], "client-a");
+        }
+    }
 }

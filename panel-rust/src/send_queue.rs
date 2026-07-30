@@ -129,6 +129,23 @@ impl SendQueue {
         self.remote_ids.get(&id).map(String::as_str)
     }
 
+    /// Removes the first server-owned row that has just arrived in the
+    /// transcript as a user message.  The queue stream normally removes the
+    /// row first, but `session/resume` may deliver the prompt before that
+    /// notification; applying this idempotently keeps the UI from showing
+    /// the same text both as queued and as a transcript message.
+    pub fn dequeue_matching_remote_message(&mut self, text: &str) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry.text == text) else {
+            return false;
+        };
+        self.entries.remove(index);
+        // Keep the remaining local entry ids stable.  They are the keys used
+        // by the reducer for later cancel/send-now actions; only the removed
+        // row's authoritative remote id needs to disappear.
+        self.remote_ids.remove(&QueueEntryId(index as u64));
+        true
+    }
+
     /// In-memory only, no restart survival -- used by callers that manage
     /// their own persistence path (or tests).
     pub fn new() -> Self {
@@ -473,5 +490,22 @@ mod tests {
         let reloaded = SendQueue::load(path).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded.first().unwrap().text, "keep me");
+    }
+
+    #[test]
+    fn resume_user_message_dequeues_matching_remote_row_once() {
+        let mut q = SendQueue::new();
+        q.replace_remote_items(
+            [
+                ("remote-a".into(), "first".into()),
+                ("remote-b".into(), "second".into()),
+            ],
+            false,
+        );
+        assert!(q.dequeue_matching_remote_message("first"));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.first().unwrap().text, "second");
+        assert_eq!(q.remote_id_for(q.first_id().unwrap()), Some("remote-b"));
+        assert!(!q.dequeue_matching_remote_message("first"));
     }
 }

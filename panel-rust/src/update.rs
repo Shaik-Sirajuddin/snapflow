@@ -2263,6 +2263,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         };
         match &bridge_event.event {
             crate::protocol_types::AgentEvent::Message(message) => {
+                if matches!(message.kind, crate::protocol_types::MessageKind::User)
+                    && thread.server_queue
+                {
+                    thread
+                        .send_queue
+                        .dequeue_matching_remote_message(&message.text);
+                }
                 if let Some(message_id) = message.id.as_ref() {
                     if !thread.message_ids.iter().any(|id| id == message_id) {
                         thread.message_ids.push(message_id.clone());
