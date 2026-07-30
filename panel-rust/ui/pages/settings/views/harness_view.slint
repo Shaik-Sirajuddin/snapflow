@@ -36,6 +36,7 @@ export component HarnessView inherits Rectangle {
 
         SettingsRowGroup {
             width: parent.width;
+            cross-axis-alignment: start;
             SettingsRow {
                 label: "Background sessions";
                 hint: root.background-default ? "Enabled" : "Disabled";
