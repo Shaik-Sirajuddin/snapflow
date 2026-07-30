@@ -279,4 +279,40 @@ mod tests {
         );
         assert_eq!(duplicate.queue.len(), 2);
     }
+
+    #[tokio::test]
+    async fn queue_replays_after_store_restart() {
+        let directory = tempdir().unwrap();
+        let first = QueueStore::new(directory.path());
+        first
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "a".into(),
+                    operation: QueueOperation::Enqueue,
+                    queue_entry_id: None,
+                    text: Some("survives restart".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let restarted = QueueStore::new(directory.path());
+        let (snapshot, _) = restarted
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "b".into(),
+                    operation: QueueOperation::Pause,
+                    queue_entry_id: None,
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.queue[0].text, "survives restart");
+        assert!(snapshot.paused);
+    }
 }
