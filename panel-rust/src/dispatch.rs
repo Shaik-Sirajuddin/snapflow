@@ -521,13 +521,24 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
     );
+    // A server-owned queue resumes dispatch alongside the prompt, so a
+    // normal send may produce both MutateQueue(resume) and SendPrompt. The
+    // old assertion only allowed the latter and crashed debug VNC builds
+    // before the prompt could be sent.
+    let send_prompt_count = effects
+        .iter()
+        .filter(|effect| matches!(effect, crate::effect::Effect::SendPrompt { .. }))
+        .count();
     debug_assert!(
-        effects.is_empty()
-            || matches!(
-                effects.as_slice(),
-                [crate::effect::Effect::SendPrompt { .. }]
-            ),
-        "Compose::SendRequested must produce zero (no selected thread) or one SendPrompt effect"
+        send_prompt_count <= 1
+            && effects.iter().all(|effect| {
+                matches!(
+                    effect,
+                    crate::effect::Effect::SendPrompt { .. }
+                        | crate::effect::Effect::MutateQueue { .. }
+                )
+            }),
+        "Compose::SendRequested must produce at most one SendPrompt plus optional queue effects"
     );
     debug_assert!(
         effects.iter().all(|effect| {

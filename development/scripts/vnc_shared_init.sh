@@ -146,7 +146,11 @@ cmd_workspace() {
       local pid="${3:?window pid required}" workspace="${4:?workspace number required}"
       if command -v wmctrl >/dev/null 2>&1; then
         local window_id=""
-        for _ in $(seq 1 50); do
+        # Qt can take several seconds to create the top-level window while
+        # loading filters and initializing the embedded Rust panel.  The
+        # launcher used to give up after 5 seconds, leaving a live process
+        # registered to a workspace but visibly stuck on the current desktop.
+        for _ in $(seq 1 600); do
           window_id="$(wmctrl -lp 2>/dev/null | awk -v pid="$pid" '$3 == pid { print $1; exit }')"
           [ -n "$window_id" ] && break
           sleep 0.1
@@ -158,6 +162,7 @@ cmd_workspace() {
       command -v python3 >/dev/null 2>&1 || die "python3 is required for X11 workspace placement"
       TARGET_PID="$pid" TARGET_DESKTOP="$workspace" python3 - <<'PY'
 import os
+import time
 from Xlib import X, display
 from Xlib.protocol import event
 
@@ -168,18 +173,22 @@ root = d.screen().root
 client_list_atom = d.intern_atom("_NET_CLIENT_LIST")
 pid_atom = d.intern_atom("_NET_WM_PID")
 desktop_atom = d.intern_atom("_NET_WM_DESKTOP")
-prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
-window_ids = [] if prop is None else prop.value
 target = None
-for window_id in window_ids:
-    window = d.create_resource_object("window", int(window_id))
-    try:
-        pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
-        if pid_prop is not None and int(pid_prop.value[0]) == target_pid:
-            target = window
-            break
-    except Exception:
-        continue
+for _ in range(600):
+    prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
+    window_ids = [] if prop is None else prop.value
+    for window_id in window_ids:
+        window = d.create_resource_object("window", int(window_id))
+        try:
+            pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
+            if pid_prop is not None and int(pid_prop.value[0]) == target_pid:
+                target = window
+                break
+        except Exception:
+            continue
+    if target is not None:
+        break
+    time.sleep(0.1)
 if target is None:
     raise SystemExit(f"could not locate X11 window for pid {target_pid}")
 root.send_event(
