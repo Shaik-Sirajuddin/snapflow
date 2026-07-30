@@ -797,6 +797,13 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         &mcp_keys,
         &mcp_rows,
     );
+    // Total real tools discovered across every server's reconciled list
+    // (`mcp_tools_from_entry` already merges live-fetched + persisted
+    // rows) -- shown as a summary next to the "MCP Servers" section
+    // header, computed here rather than in Slint since it has no
+    // array-sum/reduce.
+    let mcp_tools_total_count: i32 =
+        mcp_rows.iter().map(|row| row.tools.row_count() as i32).sum();
 
     let agent_rows = crate::models::to_agent_catalog_entry_rows(model.agent_catalog.clone());
     let agent_keys: Vec<String> = model
@@ -829,6 +836,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
 
     component.set_available_profiles(slint::ModelRc::from(model.profiles_model.clone()));
     component.set_available_mcp_servers(slint::ModelRc::from(model.mcp_servers_model.clone()));
+    component.set_mcp_tools_total_count(mcp_tools_total_count);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),

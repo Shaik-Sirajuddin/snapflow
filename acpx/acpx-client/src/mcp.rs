@@ -89,6 +89,40 @@ pub enum McpAuthStatus {
     Authenticated,
 }
 
+/// One tool an MCP server advertised via a real `tools/list` response --
+/// mirrors `acpx_core::mcp_client::McpToolInfo`'s wire shape exactly (this
+/// crate doesn't depend on acpx-core, so the type is duplicated rather
+/// than shared, same as every other wire type in this module).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The state of a server's background `tools/list` probe, as reported by
+/// `mcp_servers/list`'s `toolCatalog` field -- mirrors `acpx_core::
+/// mcp_client::ToolCatalogState`'s wire shape. Deliberately a different
+/// wire key than the entry's own persisted `tools` array (kept in
+/// [`McpServerEntry::extra`], see that field's doc comment): `tools` is
+/// the user's durable per-tool enable/deferred *preference*, round-
+/// tripped through `mcp_servers/update`; `toolCatalog` is the live,
+/// ephemeral, server-computed result of actually asking the MCP server
+/// what it offers -- reusing one key for both would mean this enum's
+/// tagged-object shape and the preference array's list shape fight over
+/// the same field. `None` on [`McpServerEntry::tool_catalog`] (the field
+/// is simply absent from the gateway's JSON) means "never fetched,"
+/// distinct from `Fetching`/`Ready`/`Error`, which is what lets the
+/// settings UI tell "no fetch attempted yet" apart from "fetch in
+/// progress."
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum McpToolCatalog {
+    Fetching,
+    Ready { tools: Vec<McpToolInfo> },
+    Error { message: String },
+}
+
 /// One centrally-registered MCP server, as sent to/returned by
 /// `mcp_servers/create|update|list`. `extra` retains any wire fields this
 /// type doesn't yet model (forward-compatible with a future ACP/MCP
@@ -105,6 +139,21 @@ pub struct McpServerEntry {
     pub config: McpServerConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_status: Option<McpAuthStatus>,
+    /// Last-known real `tools/list` result -- see [`McpToolCatalog`]'s
+    /// doc comment. **Always** skipped on serialize (`skip_serializing`,
+    /// not merely `skip_serializing_if`) -- unlike `auth_status` (which
+    /// the server persists durably and expects echoed back on update),
+    /// `toolCatalog` is recomputed fresh into every `mcp_servers/list`
+    /// response from the router's in-memory probe cache, never itself
+    /// persisted server-side. If a caller's stale, already-fetched
+    /// `McpServerEntry` (with `tool_catalog: Some(..)`) round-tripped
+    /// through `create`/`update` and the cache later went cold (e.g. a
+    /// gateway restart), an unconditional skip is what stops that stale
+    /// value from leaking back out of a future `list()` as if it were
+    /// still current -- the field is deserializable (reading a real
+    /// response) but never re-serializable (echoing it back).
+    #[serde(default, rename = "toolCatalog", skip_serializing)]
+    pub tool_catalog: Option<McpToolCatalog>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -134,6 +183,11 @@ impl<'de> serde::Deserialize<'de> for McpServerEntry {
             .map(serde_json::from_value)
             .transpose()
             .map_err(serde::de::Error::custom)?;
+        let tool_catalog = map
+            .remove("toolCatalog")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
 
         let transport = map.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let config_fields: &[&str] = match transport.as_str() {
@@ -155,6 +209,7 @@ impl<'de> serde::Deserialize<'de> for McpServerEntry {
             enabled,
             config,
             auth_status,
+            tool_catalog,
             extra: map,
         })
     }
@@ -167,6 +222,7 @@ impl McpServerEntry {
             enabled: true,
             config,
             auth_status: None,
+            tool_catalog: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -279,6 +335,23 @@ impl Gateway {
             .await?;
         Ok(())
     }
+
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe (see `acpx_core::router::Router::spawn_mcp_
+    /// tools_fetch`'s doc comment). Returns as soon as the gateway has
+    /// scheduled the background probe, well before the probe itself
+    /// finishes; the actual tool list comes back through
+    /// [`Self::list_mcp_servers`]'s `tools` field on a later call, not
+    /// this one -- callers should poll that after calling this.
+    pub async fn fetch_mcp_server_tools(&self, name: &str) -> Result<(), ClientError> {
+        self.call(
+            "mcp_servers/tools_fetch",
+            serde_json::json!({ "name": name }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +451,131 @@ mod tests {
             "a plain HTTP server (no static auth header, no oauth.client_id) must still be \
              eligible for Connect via dynamic client registration"
         );
+    }
+
+    #[test]
+    fn tool_catalog_absent_on_a_locally_constructed_entry() {
+        let entry = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                timeout: None,
+            },
+        );
+        assert_eq!(entry.tool_catalog, None);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(
+            json.get("toolCatalog").is_none(),
+            "toolCatalog must never be sent back to the gateway on create/update"
+        );
+    }
+
+    /// The bug this test guards against: an entry the caller obtained
+    /// from a real `mcp_servers/list` response (so `tool_catalog` is
+    /// `Some(..)`) must still never echo `toolCatalog` back out when
+    /// re-serialized for `mcp_servers/update` -- otherwise a stale
+    /// fetched-tools snapshot could leak into a future list response
+    /// after the server's own in-memory cache goes cold (see the field's
+    /// own doc comment).
+    #[test]
+    fn a_populated_tool_catalog_still_never_serializes_outbound() {
+        let mut entry = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(McpToolCatalog::Ready {
+            tools: vec![McpToolInfo { name: "read_file".to_string(), description: None }],
+        });
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(
+            json.get("toolCatalog").is_none(),
+            "a populated tool_catalog must still never be echoed back to the gateway"
+        );
+    }
+
+    #[test]
+    fn ready_tool_catalog_deserializes_from_a_gateway_list_response() {
+        let raw = serde_json::json!({
+            "name": "fs",
+            "type": "stdio",
+            "command": "mcp-fs",
+            "toolCatalog": {
+                "status": "ready",
+                "tools": [
+                    {"name": "read_file", "description": "Reads a file"},
+                    {"name": "list_dir"}
+                ]
+            }
+        });
+        let parsed: McpServerEntry = serde_json::from_value(raw).unwrap();
+        match parsed.tool_catalog.expect("tool_catalog should have parsed") {
+            McpToolCatalog::Ready { tools } => {
+                assert_eq!(tools.len(), 2);
+                assert_eq!(tools[0].name, "read_file");
+                assert_eq!(tools[0].description.as_deref(), Some("Reads a file"));
+                assert_eq!(tools[1].name, "list_dir");
+                assert_eq!(tools[1].description, None);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetching_and_error_tool_catalog_states_deserialize() {
+        let fetching: McpServerEntry = serde_json::from_value(serde_json::json!({
+            "name": "fs",
+            "type": "stdio",
+            "command": "mcp-fs",
+            "toolCatalog": {"status": "fetching"}
+        }))
+        .unwrap();
+        assert_eq!(fetching.tool_catalog, Some(McpToolCatalog::Fetching));
+
+        let errored: McpServerEntry = serde_json::from_value(serde_json::json!({
+            "name": "fs",
+            "type": "stdio",
+            "command": "mcp-fs",
+            "toolCatalog": {"status": "error", "message": "boom"}
+        }))
+        .unwrap();
+        assert_eq!(
+            errored.tool_catalog,
+            Some(McpToolCatalog::Error { message: "boom".to_string() })
+        );
+    }
+
+    /// Real proof the two "tools" concepts don't collide on the wire: a
+    /// server's persisted per-tool preference array (`extra["tools"]`,
+    /// written by `dispatch_mcp_server_tool_enabled_changed`) and its
+    /// live-fetched catalog (`toolCatalog`) must both survive the same
+    /// round trip, untangled.
+    #[test]
+    fn persisted_tool_preferences_and_live_tool_catalog_coexist() {
+        let raw = serde_json::json!({
+            "name": "fs",
+            "type": "stdio",
+            "command": "mcp-fs",
+            "tools": [{"name": "read_file", "enabled": false, "deferred": true}],
+            "toolCatalog": {"status": "ready", "tools": [{"name": "read_file"}]},
+        });
+        let parsed: McpServerEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            parsed.extra.get("tools"),
+            Some(&serde_json::json!([
+                {"name": "read_file", "enabled": false, "deferred": true}
+            ]))
+        );
+        assert!(matches!(
+            parsed.tool_catalog,
+            Some(McpToolCatalog::Ready { .. })
+        ));
     }
 
     #[test]

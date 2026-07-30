@@ -1005,6 +1005,40 @@ pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_mcp_server_tool_deferred_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    server_name: String,
+    tool_name: String,
+    deferred: bool,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
+            server_name: server_name.clone(),
+            tool_name: tool_name.clone(),
+            deferred,
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_tools_fetch_requested(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    server_name: String,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
+            server_name: server_name.clone(),
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_profile_create(
     panel: &PanelSingleton,
     component: &ChatPanel,

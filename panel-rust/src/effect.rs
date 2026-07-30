@@ -157,6 +157,24 @@ pub enum Effect {
         tool_name: String,
         enabled: bool,
     },
+    /// Per-tool deferred (lazy-load) flag -- mirrors `McpServerTool
+    /// EnabledChanged` exactly, same persisted `extra["tools"]` array,
+    /// different field.
+    McpServerToolDeferredChanged {
+        real_index: usize,
+        server_name: String,
+        tool_name: String,
+        deferred: bool,
+    },
+    /// Kicks off a real MCP `tools/list` probe (`mcp_servers/tools_
+    /// fetch`) for one server; the actual tool list comes back on a
+    /// later `mcp_servers/list` refresh, not from this effect's own
+    /// result -- see `PanelSingleton::dispatch_mcp_server_tools_fetch`'s
+    /// doc comment.
+    McpServerToolsFetchRequested {
+        real_index: usize,
+        server_name: String,
+    },
     ProfileCreate {
         real_index: usize,
         name: String,
@@ -271,4 +289,15 @@ pub enum EffectResultMsg {
         thread_id: String,
         message: String,
     },
+    /// One MCP server settings operation (create/update/delete/enable-
+    /// toggle/authenticate/logout/tool-toggle) finished -- `Ok(message)`
+    /// is a ready-to-show success string, `Err` a ready-to-show failure
+    /// string. Reuses the same `show_toast`/`Dirty::Toast` popup
+    /// `EffectResultMsg::SettingsSaved` already shows for "Settings
+    /// saved"/"Settings save failed" -- this is the same shared, app-wide
+    /// action-feedback bar, not a new component, just not previously
+    /// reachable from this view's dispatch path (every MCP settings call
+    /// used to only `eprintln!` on failure, with nothing shown in the UI
+    /// at all).
+    McpServerOperationCompleted(Result<String, EffectError>),
 }

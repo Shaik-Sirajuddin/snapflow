@@ -1357,7 +1357,19 @@ pub fn to_mcp_server_option_rows(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
-            let tools = mcp_tools_from_extra(&entry.extra);
+            let tools = mcp_tools_from_entry(&entry);
+            let (tool_fetch_status, tool_fetch_error) = match &entry.tool_catalog {
+                None => (String::new(), String::new()),
+                Some(crate::protocol_types::McpToolCatalog::Fetching) => {
+                    ("fetching".to_string(), String::new())
+                }
+                Some(crate::protocol_types::McpToolCatalog::Ready { .. }) => {
+                    ("ready".to_string(), String::new())
+                }
+                Some(crate::protocol_types::McpToolCatalog::Error { message }) => {
+                    ("error".to_string(), message.clone())
+                }
+            };
             // Pre-format status subtitle in Rust (audit §4.3) so Slint
             // does not concatenate nested ternaries.
             let mut parts: Vec<&str> = Vec::new();
@@ -1374,6 +1386,15 @@ pub fn to_mcp_server_option_rows(
                 parts.push("disabled");
             }
             let status_line = parts.join(" · ");
+            // Lets the page search bar find a server by one of its real
+            // discovered tool names/descriptions, same reasoning as
+            // widening the predicate to args/env/headers earlier.
+            let tools_search_blob = tools
+                .iter()
+                .flat_map(|t| [t.name.as_str(), t.description.as_str()])
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
             McpServerOption {
                 name: entry.name.into(),
                 command: command.into(),
@@ -1385,6 +1406,9 @@ pub fn to_mcp_server_option_rows(
                 needs_auth,
                 auth_status: auth.into(),
                 tools: ModelRc::new(VecModel::from(tools)),
+                tool_fetch_status: tool_fetch_status.into(),
+                tool_fetch_error: tool_fetch_error.into(),
+                tools_search_blob: tools_search_blob.into(),
                 // Every acpx `mcp_servers/list` row is a user-added registry
                 // entry -- removable. The one non-removable row (the built-in
                 // snapshotd daemon) is prepended separately, see
@@ -1504,6 +1528,12 @@ pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
+        // The built-in daemon isn't a registry entry at all -- there's no
+        // `mcp_servers/tools_fetch` target for it, so it never has a
+        // fetch status to show.
+        tool_fetch_status: String::new().into(),
+        tool_fetch_error: String::new().into(),
+        tools_search_blob: String::new().into(),
         removable: false,
         args: String::new().into(),
         env: String::new().into(),
@@ -1513,34 +1543,71 @@ pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
     })
 }
 
-/// Parse a persisted `tools` array from an MCP server registry entry.
-fn mcp_tools_from_extra(extra: &serde_json::Map<String, serde_json::Value>) -> Vec<McpToolOption> {
-    let Some(arr) = extra.get("tools").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|tool| {
-            let name = tool.get("name")?.as_str()?.to_owned();
-            let enabled = tool
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let deferred = tool
-                .get("deferred")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let token_usage = tool
-                .get("token_usage")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            Some(McpToolOption {
-                name: name.into(),
+/// Reconciles a server's live-fetched tool catalog (`entry.tool_catalog`,
+/// populated by the real `mcp_servers/tools_fetch` background probe --
+/// see `crate::protocol_types::McpToolCatalog`'s doc comment) with its
+/// durable per-tool preferences (`entry.extra["tools"]`, written by
+/// `dispatch_mcp_server_tool_enabled_changed`/`dispatch_mcp_server_tool_
+/// deferred_changed`) into one row list for the settings UI.
+///
+/// A tool present in the live catalog with no persisted preference yet
+/// defaults to `enabled: true, deferred: false` (same default a freshly
+/// discovered ACP capability gets). A tool with a persisted preference
+/// but currently absent from the live catalog (never fetched yet, or the
+/// server just doesn't currently advertise it) still shows up, carrying
+/// its last-known preference -- toggling something once must never
+/// silently vanish just because a later fetch didn't happen to include
+/// it.
+fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<McpToolOption> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut preferences: HashMap<String, (bool, bool, i32)> = HashMap::new();
+    if let Some(arr) = entry.extra.get("tools").and_then(|v| v.as_array()) {
+        for tool in arr {
+            let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let enabled = tool.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let deferred = tool.get("deferred").and_then(|v| v.as_bool()).unwrap_or(false);
+            let token_usage = tool.get("token_usage").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            preferences.insert(name.to_string(), (enabled, deferred, token_usage));
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(crate::protocol_types::McpToolCatalog::Ready { tools }) = &entry.tool_catalog {
+        for tool in tools {
+            let (enabled, deferred, token_usage) =
+                preferences.get(&tool.name).copied().unwrap_or((true, false, 0));
+            seen.insert(tool.name.clone());
+            rows.push(McpToolOption {
+                name: tool.name.clone().into(),
+                description: tool.description.clone().unwrap_or_default().into(),
                 enabled,
                 deferred,
                 token_usage,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    let mut leftover: Vec<(String, (bool, bool, i32))> = preferences
+        .into_iter()
+        .filter(|(name, _)| !seen.contains(name))
+        .collect();
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, (enabled, deferred, token_usage)) in leftover {
+        rows.push(McpToolOption {
+            name: name.into(),
+            description: String::new().into(),
+            enabled,
+            deferred,
+            token_usage,
+        });
+    }
+
+    rows
 }
 
 /// Builds the skill-manager sidebar/settings row model from discovered
@@ -1785,6 +1852,120 @@ mod tests {
         assert_eq!(rows[0].args.as_str(), "");
         assert_eq!(rows[0].env.as_str(), "");
         assert_eq!(rows[0].timeout.as_str(), "");
+    }
+
+    /// A tool present in a real `Ready` live catalog with no persisted
+    /// preference yet must still show up, defaulting to enabled/not
+    /// deferred.
+    #[test]
+    fn tool_row_defaults_to_enabled_when_only_seen_in_the_live_catalog() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![crate::protocol_types::McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        let tools: Vec<_> = rows[0].tools.iter().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_str(), "read_file");
+        assert!(tools[0].enabled);
+        assert!(!tools[0].deferred);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "ready");
+        assert_eq!(rows[0].tool_fetch_error.as_str(), "");
+    }
+
+    /// A tool's persisted preference (set by a previous enabled/deferred
+    /// toggle) must override the live catalog's bare-discovery default,
+    /// and must survive even when the live catalog temporarily doesn't
+    /// include that tool (e.g. before the first fetch, or a fetch that
+    /// failed).
+    #[test]
+    fn persisted_tool_preference_overrides_live_default_and_survives_a_missing_catalog_entry() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                {"name": "read_file", "enabled": false, "deferred": true, "token_usage": 42},
+                {"name": "vanished_tool", "enabled": true, "deferred": false},
+            ]),
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![crate::protocol_types::McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        let tools: Vec<_> = rows[0].tools.iter().collect();
+        assert_eq!(tools.len(), 2);
+        let read_file = tools.iter().find(|t| t.name == "read_file").expect("read_file row");
+        assert!(!read_file.enabled, "persisted preference must override the live default");
+        assert!(read_file.deferred);
+        assert_eq!(read_file.token_usage, 42);
+        let vanished = tools
+            .iter()
+            .find(|t| t.name == "vanished_tool")
+            .expect("a tool absent from the live catalog must still show its last preference");
+        assert!(vanished.enabled);
+        assert!(!vanished.deferred);
+    }
+
+    /// `tool_fetch_status`/`tool_fetch_error` reflect a failed background
+    /// probe -- distinct from "never fetched" (empty string).
+    #[test]
+    fn tool_fetch_error_state_surfaces_the_real_message() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Error {
+            message: "process exited before responding".to_string(),
+        });
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "error");
+        assert_eq!(rows[0].tool_fetch_error.as_str(), "process exited before responding");
+    }
+
+    /// Never-fetched entries (no `tool_catalog` at all) must not be
+    /// confused with a `Fetching` state -- both differ from "ready"/
+    /// "error", but only one means "nothing has ever been requested".
+    #[test]
+    fn never_fetched_entry_has_empty_fetch_status() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "");
+        assert!(rows[0].tools.iter().next().is_none());
     }
 
     #[test]

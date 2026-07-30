@@ -163,7 +163,12 @@ pub fn classify(method: &str) -> MethodClass {
         | "mcp_servers/update"
         | "mcp_servers/delete"
         | "mcp_servers/authenticate"
-        | "mcp_servers/logout" => MethodClass::GatewayNative,
+        | "mcp_servers/logout"
+        // Real `tools/list` preview for the Settings UI (see `crate::
+        // mcp_client`'s module doc comment). Fire-and-forget kickoff --
+        // never touches a backend process, so this is gateway-native like
+        // every other `mcp_servers/*` method, not `Proxied`.
+        | "mcp_servers/tools_fetch" => MethodClass::GatewayNative,
         // `retention_administration` (`acpx-session-lifecycle`). Not a
         // real ACP method -- an acpx-only extension namespace, same
         // category as `profiles/*`/`mcp_servers/*` above. Tenant-scoped
@@ -352,6 +357,13 @@ pub struct Router {
     /// in a detached background task, well past the original RPC call's
     /// `&mut Router` borrow.
     oauth_tokens: crate::oauth::OAuthTokenCache,
+    /// Real `tools/list` preview data for the Settings UI (`crate::
+    /// mcp_client`). Populated by a detached background probe kicked off
+    /// by `mcp_servers/tools_fetch` (see `Self::spawn_mcp_tools_fetch`),
+    /// never inline in a request's own critical section -- same
+    /// off-lock-I/O rationale as `oauth_tokens`/`spawn_oauth_refresh_loop`.
+    /// Merged into each entry's `tools` field by `mcp_servers/list`.
+    mcp_tool_catalog: crate::mcp_client::McpToolCatalogCache,
     /// **Phase 14 addition.** Live `session/update` fan-out to whichever
     /// persistent transport connection (stdio/WS) currently owns a given
     /// gateway session -- see `crate::notify`'s module doc comment for
@@ -1036,6 +1048,7 @@ impl Router {
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
             oauth_tokens: crate::oauth::OAuthTokenCache::new(),
+            mcp_tool_catalog: crate::mcp_client::McpToolCatalogCache::new(),
             secret_keyring: None,
             keyring_path: None,
             notification_hub: NotificationHub::new(),
@@ -1378,6 +1391,41 @@ impl Router {
             .collect()
     }
 
+    /// `mcp_servers/list`'s real payload: every centrally-registered
+    /// server entry, each with a `toolCatalog` field merged in from
+    /// whatever `mcp_tool_catalog` currently holds for it (`{"status":
+    /// "fetching"}`, `{"status": "ready", "tools": [...]}`, or `{"status":
+    /// "error", "message": "..."}`, matching `crate::mcp_client::
+    /// ToolCatalogState`'s serialization) -- entries with no catalog
+    /// state yet (never fetched) get no `toolCatalog` field at all,
+    /// letting the UI tell "never fetched" apart from "fetch in
+    /// progress" without a fourth enum variant. Deliberately a
+    /// *different* key than the entry's own persisted `tools` array
+    /// (`crate::mcp_servers`' opaque per-server JSON, holding the user's
+    /// enable/deferred *preference* for each tool by name) -- that array
+    /// is durable config the client round-trips through `mcp_servers/
+    /// update`; this is ephemeral, server-computed, never round-tripped.
+    fn mcp_servers_list_with_tool_catalog(&self) -> Vec<serde_json::Value> {
+        self.mcp_servers
+            .list()
+            .into_iter()
+            .map(|mut entry| {
+                let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+                    return entry;
+                };
+                let Some(state) = self.mcp_tool_catalog.get(name) else {
+                    return entry;
+                };
+                if let (Some(obj), Ok(tools_value)) =
+                    (entry.as_object_mut(), serde_json::to_value(&state))
+                {
+                    obj.insert("toolCatalog".to_string(), tools_value);
+                }
+                entry
+            })
+            .collect()
+    }
+
     /// Spawns a detached background loop that periodically refreshes any
     /// cached OAuth token past `OAuthTokens::needs_refresh`'s threshold.
     /// Intended call site: once, at startup, right alongside
@@ -1469,6 +1517,77 @@ impl Router {
                 }
             }
         });
+    }
+
+    /// **Settings-only MCP `tools/list` preview.** Fire-and-forget kickoff
+    /// for `mcp_servers/tools_fetch`: if a fetch for `name` isn't already
+    /// in flight, immediately marks the catalog `Fetching` and spawns a
+    /// detached task that runs the real probe (`crate::mcp_client::
+    /// probe`) and writes `Ready`/`Error` back into `mcp_tool_catalog`
+    /// once it finishes. Always returns immediately -- the real result
+    /// comes back through a later `mcp_servers/list` call, which merges
+    /// whatever `mcp_tool_catalog` currently holds into each entry's
+    /// `tools` field (see that method's dispatch arm). This mirrors
+    /// `spawn_oauth_refresh_loop`'s "kick off real I/O using only
+    /// cheap-clone handles, no `&Router` borrow held across the await"
+    /// shape -- a slow/hung MCP server's probe must never block this
+    /// router's single global lock (`inject_oauth_headers`'s doc comment
+    /// explains why that lock exists and what holding it across I/O would
+    /// cost).
+    ///
+    /// Errors returned here are argument-validation only (unknown server
+    /// name, or an entry with no recognizable stdio/http transport) --
+    /// once the probe itself is running, its own failure is reported as
+    /// an `Error` catalog entry, not a `RouterError`, since by then the
+    /// original RPC call has already returned.
+    pub fn spawn_mcp_tools_fetch(&self, name: &str) -> Result<(), RouterError> {
+        let entry = self
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| crate::mcp_servers::McpServerStoreError::NotFound(name.to_string()))?;
+
+        if self.mcp_tool_catalog.is_fetching(name) {
+            return Ok(());
+        }
+
+        let entry_with_auth = self
+            .inject_oauth_headers(vec![entry])
+            .into_iter()
+            .next()
+            .expect("exactly one entry in, exactly one entry out");
+        let Some(spec) = crate::mcp_client::probe_spec_from_entry(&entry_with_auth) else {
+            self.mcp_tool_catalog.insert(
+                name.to_string(),
+                crate::mcp_client::ToolCatalogState::Error {
+                    message: "mcp server entry has no recognizable stdio/http transport"
+                        .to_string(),
+                },
+            );
+            return Ok(());
+        };
+
+        self.mcp_tool_catalog
+            .insert(name.to_string(), crate::mcp_client::ToolCatalogState::Fetching);
+
+        let catalog = self.mcp_tool_catalog.clone();
+        let http = self.http.clone();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let result =
+                crate::mcp_client::probe(&http, spec, Duration::from_secs(15)).await;
+            let state = match result {
+                Ok(tools) => crate::mcp_client::ToolCatalogState::Ready { tools },
+                Err(err) => {
+                    tracing::warn!(%err, server = %name, "mcp tools/list probe failed");
+                    crate::mcp_client::ToolCatalogState::Error {
+                        message: err.to_string(),
+                    }
+                }
+            };
+            catalog.insert(name, state);
+        });
+
+        Ok(())
     }
 
     /// Begins the MCP OAuth 2.1 flow for the HTTP-transport server named
@@ -4751,7 +4870,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                 entry
             }
             "mcp_servers/list" => {
-                serde_json::json!({ "servers": self.mcp_servers.list() })
+                serde_json::json!({ "servers": self.mcp_servers_list_with_tool_catalog() })
             }
             "mcp_servers/delete" => {
                 let name = request
@@ -4783,6 +4902,16 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                     .to_string();
                 self.logout_mcp_server(&name).await?;
                 serde_json::json!({ "name": name, "loggedOut": true })
+            }
+            "mcp_servers/tools_fetch" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                self.spawn_mcp_tools_fetch(&name)?;
+                serde_json::json!({ "name": name, "status": "fetching" })
             }
             "session/retention/get" => {
                 let gateway_session_id = request
@@ -8654,6 +8783,7 @@ mod tests {
         assert_eq!(classify("mcp_servers/list"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/update"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/delete"), MethodClass::GatewayNative);
+        assert_eq!(classify("mcp_servers/tools_fetch"), MethodClass::GatewayNative);
     }
 
     /// **Phase 9.** `session/delete` and `logout` were entirely
@@ -9131,5 +9261,130 @@ mod tests {
             refresh_calls.load(Ordering::SeqCst) >= 1,
             "expected at least one real grant_type=refresh_token request to reach the stub token endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_mcp_tools_fetch_errors_on_unknown_name() {
+        let router = Router::new("default");
+        let result = router.spawn_mcp_tools_fetch("does-not-exist");
+        assert!(matches!(
+            result,
+            Err(RouterError::McpServer(
+                crate::mcp_servers::McpServerStoreError::NotFound(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_mcp_tools_fetch_reports_an_error_state_for_an_unprobeable_entry() {
+        let router = Router::new("default");
+        // No `"type"` field at all -- `probe_spec_from_entry` returns
+        // `None` for this, which must surface as a real `Error` catalog
+        // state (not a panic, not a silently-empty tool list).
+        router
+            .mcp_servers
+            .create(serde_json::json!({"name": "weird"}))
+            .expect("create entry with no transport");
+        router
+            .spawn_mcp_tools_fetch("weird")
+            .expect("kickoff itself should not error for a known server");
+        let state = router
+            .mcp_tool_catalog
+            .get("weird")
+            .expect("catalog should have an entry immediately");
+        assert!(matches!(
+            state,
+            crate::mcp_client::ToolCatalogState::Error { .. }
+        ));
+    }
+
+    /// Real end-to-end proof of `spawn_mcp_tools_fetch` + `mcp_servers/
+    /// list`'s catalog merge: a real subprocess speaking real MCP
+    /// `initialize`/`tools/list` JSON-RPC, probed entirely through the
+    /// background-fetch-and-poll path (not `mcp_client::probe` called
+    /// directly) -- proving the RPC handler, the detached task, the
+    /// cache, and the list-merge all actually connect end to end.
+    #[tokio::test]
+    async fn mcp_servers_list_reflects_a_real_background_stdio_tools_fetch() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stub_mcp_server.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"tools/list"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping"}]}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write stub MCP server script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
+
+        let mut router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({
+                "name": "stub",
+                "type": "stdio",
+                "command": "sh",
+                "args": [script_path.to_string_lossy()],
+            }))
+            .expect("create stdio server");
+
+        let dispatch_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "mcp_servers/tools_fetch",
+            "params": {"name": "stub"},
+        });
+        let kickoff = router
+            .dispatch(dispatch_request)
+            .await
+            .expect("tools_fetch dispatch should succeed");
+        assert_eq!(kickoff["result"]["status"], "fetching");
+
+        let list_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "mcp_servers/list",
+            "params": {},
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut observed_tools = None;
+        while std::time::Instant::now() < deadline {
+            let reply = router
+                .dispatch(list_request.clone())
+                .await
+                .expect("mcp_servers/list dispatch should succeed");
+            let servers = reply["result"]["servers"].as_array().cloned().unwrap_or_default();
+            let stub_entry = servers
+                .iter()
+                .find(|entry| entry.get("name").and_then(|n| n.as_str()) == Some("stub"));
+            if let Some(entry) = stub_entry {
+                if entry.get("toolCatalog").and_then(|t| t.get("status")).and_then(|s| s.as_str())
+                    == Some("ready")
+                {
+                    observed_tools = entry["toolCatalog"]["tools"].as_array().cloned();
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let tools = observed_tools.expect(
+            "expected mcp_servers/list to report a ready tool catalog for \"stub\" \
+             within the timeout",
+        );
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "ping");
     }
 }

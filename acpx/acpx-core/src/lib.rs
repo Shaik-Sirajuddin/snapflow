@@ -13,6 +13,7 @@ pub mod interaction;
 pub mod keystore;
 pub mod launch;
 pub mod lifecycle;
+pub mod mcp_client;
 pub mod mcp_servers;
 pub mod notify;
 pub mod oauth;

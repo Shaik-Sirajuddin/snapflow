@@ -185,6 +185,16 @@ enum Command {
         name: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe (see `acpx_core::router::Router::spawn_mcp_
+    /// tools_fetch`'s doc comment). The real tool list is not this
+    /// command's result -- it comes back through a later `ListMcpServers`
+    /// call's `tool_catalog` field, once the gateway's detached probe
+    /// finishes.
+    FetchMcpServerTools {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     /// `profiles/create`. `entry` must include a `"name"` field (the
     /// merge key `acpx-core::profile::ProfileStore` uses). See
     /// `acpx_client::ext::profiles::create`'s doc comment for the
@@ -522,6 +532,18 @@ impl AcpxThreadHandle {
     pub async fn logout_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
         self.call(|resp| Command::LogoutMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/tools_fetch`. See `Command::FetchMcpServerTools`'s
+    /// doc comment -- returns once the gateway has scheduled the
+    /// background probe, not once it finishes.
+    pub async fn fetch_mcp_server_tools(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::FetchMcpServerTools { name, resp })
             .await
     }
 
@@ -1589,6 +1611,10 @@ async fn run_thread_actor(
             }
             Command::LogoutMcpServer { name, resp } => {
                 let result = client.logout_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::FetchMcpServerTools { name, resp } => {
+                let result = client.fetch_mcp_server_tools(&name).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateProfile { entry, resp } => {

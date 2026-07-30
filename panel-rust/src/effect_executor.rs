@@ -192,6 +192,28 @@ fn dispatch_reactive_sync_failed(operation: &'static str, detail: String) {
     });
 }
 
+/// Feeds one MCP server settings operation's outcome back through
+/// `update_persistent` as `EffectResultMsg::McpServerOperationCompleted`,
+/// arming the shared action-feedback toast -- same `slint::invoke_from_
+/// event_loop` re-entry shape `Effect::SaveSettings`'s own handler above
+/// already uses.
+fn report_mcp_server_result(result: Result<String, String>) {
+    let _ = slint::invoke_from_event_loop(move || {
+        crate::PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let Some(panel) = slot.as_ref() else {
+                return;
+            };
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(EffectResultMsg::McpServerOperationCompleted(
+                    result.map_err(EffectError::new),
+                )),
+            );
+        });
+    });
+}
+
 fn execute_skill_effects(effects: Vec<Effect>) {
     for effect in effects {
         match effect {
@@ -548,37 +570,43 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_create(&component, entry);
+                let result = panel.dispatch_mcp_server_create(&component, entry);
+                report_mcp_server_result(result);
             }
             Effect::McpServerUpdate { entry, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_update(&component, entry);
+                let result = panel.dispatch_mcp_server_update(&component, entry);
+                report_mcp_server_result(result);
             }
             Effect::McpServerDelete { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_delete(&component, &name);
+                let result = panel.dispatch_mcp_server_delete(&component, &name);
+                report_mcp_server_result(result);
             }
             Effect::McpServerEnabledChanged { name, enabled, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
+                let result = panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
+                report_mcp_server_result(result);
             }
             Effect::McpServerAuthenticate { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_authenticate(&component, &name);
+                let result = panel.dispatch_mcp_server_authenticate(&component, &name);
+                report_mcp_server_result(result);
             }
             Effect::McpServerLogout { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_logout(&component, &name);
+                let result = panel.dispatch_mcp_server_logout(&component, &name);
+                report_mcp_server_result(result);
             }
             Effect::McpServerToolEnabledChanged {
                 server_name,
@@ -589,12 +617,37 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_tool_enabled_changed(
+                let result = panel.dispatch_mcp_server_tool_enabled_changed(
                     &component,
                     &server_name,
                     &tool_name,
                     enabled,
                 );
+                report_mcp_server_result(result);
+            }
+            Effect::McpServerToolDeferredChanged {
+                server_name,
+                tool_name,
+                deferred,
+                ..
+            } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                let result = panel.dispatch_mcp_server_tool_deferred_changed(
+                    &component,
+                    &server_name,
+                    &tool_name,
+                    deferred,
+                );
+                report_mcp_server_result(result);
+            }
+            Effect::McpServerToolsFetchRequested { server_name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                let result = panel.dispatch_mcp_server_tools_fetch(&component, &server_name);
+                report_mcp_server_result(result);
             }
             Effect::ProfileCreate {
                 name,

@@ -70,6 +70,7 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> background-override: false;
     in property <[ProfileOption]> available-profiles: [];
     in property <[McpServerOption]> available-mcp-servers: [];
+    in property <int> mcp-tools-total-count: 0;
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     in property <[SkillOption]> available-skills: [];
@@ -84,6 +85,8 @@ export component SettingsPage inherits Rectangle {
     callback mcp-server-authenticate(string);
     callback mcp-server-logout(string);
     callback mcp-server-tool-enabled-changed(string, string, bool);
+    callback mcp-server-tool-deferred-changed(string, string, bool);
+    callback mcp-server-tools-fetch-requested(string);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -249,6 +252,7 @@ export component SettingsPage inherits Rectangle {
                         if root.active-section == "mcp_servers" : McpServersView {
                             width: parent.width;
                             servers: root.available-mcp-servers;
+                            total-tools-count: root.mcp-tools-total-count;
                             page-search-query: root.search-query;
                             mcp-server-submit(data) => { root.mcp-server-submit(data); }
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
@@ -263,6 +267,12 @@ export component SettingsPage inherits Rectangle {
                             }
                             mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
                                 root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
+                            }
+                            mcp-server-tool-deferred-changed(server-name, tool-name, deferred) => {
+                                root.mcp-server-tool-deferred-changed(server-name, tool-name, deferred);
+                            }
+                            mcp-server-tools-fetch-requested(server-name) => {
+                                root.mcp-server-tools-fetch-requested(server-name);
                             }
                             changed search-has-focus => {
                                 root.mcp-servers-focus-mirror = self.search-has-focus;

@@ -252,7 +252,10 @@ pub struct AgentRequestEvent {
 /// shape lives there rather than being narrowed down to the two fields a
 /// settings-gear list view happens to render today, which is what this
 /// type used to do (and is exactly the "incomplete data" this replaced).
-pub use acpx_client::mcp::{McpAuthStatus, McpServerConfig, McpServerEntry, OAuthClientConfig};
+pub use acpx_client::mcp::{
+    McpAuthStatus, McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo,
+    OAuthClientConfig,
+};
 
 /// Registry-reported install/detection status for one agent catalog
 /// entry (`agents/list`/`agents/status`) -- mirrors `acpx_proto::

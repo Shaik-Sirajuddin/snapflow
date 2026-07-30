@@ -1160,6 +1160,26 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             }],
             vec![Dirty::Settings],
         ),
+        SettingsMsg::McpServerToolDeferredChanged {
+            server_name,
+            tool_name,
+            deferred,
+        } => (
+            vec![Effect::McpServerToolDeferredChanged {
+                real_index: idx,
+                server_name,
+                tool_name,
+                deferred,
+            }],
+            vec![Dirty::Settings],
+        ),
+        SettingsMsg::McpServerToolsFetchRequested { server_name } => (
+            vec![Effect::McpServerToolsFetchRequested {
+                real_index: idx,
+                server_name,
+            }],
+            vec![Dirty::Settings],
+        ),
         SettingsMsg::ProfileCreate {
             name,
             agent_id,
@@ -1707,6 +1727,14 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     },
                 ],
             )
+        }
+        EffectResultMsg::McpServerOperationCompleted(Ok(message)) => {
+            let toast = show_toast(model, "status", message);
+            (vec![], vec![toast])
+        }
+        EffectResultMsg::McpServerOperationCompleted(Err(err)) => {
+            let toast = show_toast(model, "error", err.message);
+            (vec![], vec![toast])
         }
         EffectResultMsg::GatewayCallCompleted { real_index, result } => match result {
             Ok(()) => (
@@ -4191,6 +4219,78 @@ mod tests {
         );
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
         assert_eq!(model.toast_kind, "info");
+    }
+
+    #[test]
+    fn mcp_server_operation_result_arms_the_shared_feedback_toast() {
+        // Every `dispatch_mcp_server_*` in lib.rs used to only `eprintln!`
+        // on failure, with nothing shown in the UI at all. Now routed
+        // through the same shared toast every other Settings action-result
+        // already uses (see `action_results_arm_the_shared_feedback_toast`
+        // just above).
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::McpServerOperationCompleted(Err(
+                crate::effect::EffectError::new("Failed to create MCP server \"fs\""),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "error");
+        assert_eq!(model.toast_message, "Failed to create MCP server \"fs\"");
+        let seq_after_error = model.toast_seq;
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::McpServerOperationCompleted(Ok(
+                "MCP server \"fs\" created".to_string(),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "status");
+        assert_eq!(model.toast_message, "MCP server \"fs\" created");
+        assert_ne!(model.toast_seq, seq_after_error, "seq bumps every show");
+    }
+
+    #[test]
+    fn mcp_server_tool_deferred_changed_produces_a_matching_effect() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
+                server_name: "fs".to_string(),
+                tool_name: "read_file".to_string(),
+                deferred: true,
+            })),
+        );
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::McpServerToolDeferredChanged {
+                server_name,
+                tool_name,
+                deferred: true,
+                ..
+            } if server_name == "fs" && tool_name == "read_file"
+        ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
+    }
+
+    #[test]
+    fn mcp_server_tools_fetch_requested_produces_a_matching_effect() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
+                server_name: "fs".to_string(),
+            })),
+        );
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::McpServerToolsFetchRequested { server_name, .. } if server_name == "fs"
+        ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
     }
 
     #[test]

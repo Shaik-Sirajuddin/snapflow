@@ -284,19 +284,35 @@ export struct ConfigOptionRow {
 // on the Rust side (`acpx-core::McpServerStore` never interprets more
 // than `"name"`), this struct only surfaces what the list view needs.
 //
-// One tool advertised by an MCP server (`tools/list`), individually
-// toggleable. Mirrors opencode's per-tool control (its global `tools`
-// glob config, e.g. `"my-mcp*": false`) plus its experimental
-// `mcp_lazy`/`mcp_search` deferred loading and Claude Code's ToolSearch
-// deferred-tool pattern. **UI-only** -- no `tools/list` round trip or
-// per-tool persistence exists yet.
+// One tool advertised by an MCP server, individually toggleable. Mirrors
+// opencode's per-tool control (its global `tools` glob config, e.g.
+// `"my-mcp*": false`) plus its experimental `mcp_lazy`/`mcp_search`
+// deferred loading and Claude Code's ToolSearch deferred-tool pattern.
+// Backed by a real `tools/list` round trip (`mcp_servers/tools_fetch`,
+// `acpx_core::mcp_client`) reconciled with persisted per-tool
+// `enabled`/`deferred` preferences -- see `McpServerOption.tools`'s doc
+// comment.
 export struct McpToolOption {
     name: string,
-    // Whether this tool is exposed to the model (opencode `tools` glob).
+    // Real description from the tool's `tools/list` advertisement, when
+    // the server provided one -- "" otherwise. View-only.
+    description: string,
+    // `enabled`/`deferred` are carried through from the persisted
+    // per-tool preference (`extra["tools"]`) but **deliberately not
+    // rendered as interactive controls** in `mcp_servers_view.slint`:
+    // checked against the real ACP schema (`agent-client-protocol-
+    // schema` 1.4.0, both v1 and v2 -- `McpServerStdio`/`McpServerHttp`/
+    // `McpServerSse` have no field for this) and the real MCP spec
+    // (tool `annotations` describe *behavior* hints, not an enable/
+    // disable switch, and no client-side filtering convention exists
+    // either), neither protocol gives acpx a way to actually make a
+    // "disabled" tool disappear from what a session's backend agent
+    // sees -- toggling this would silently do nothing. Kept as plain
+    // data (not removed) so the persisted-preference read/write
+    // plumbing survives if this is revisited with a real enforcement
+    // mechanism (e.g. acpx becoming a live MCP-traffic intermediary),
+    // rather than being ripped out and rebuilt from scratch.
     enabled: bool,
-    // Lazy-loaded: its schema is not injected up front but discovered
-    // on demand (opencode `mcp_lazy` / Claude Code ToolSearch). Shown as
-    // a monochrome "deferred" tag, never a colored marker.
     deferred: bool,
     // Approximate token cost of this tool's schema being included in the
     // model's context (0 when unknown/not yet measured). UI-only estimate
@@ -361,11 +377,26 @@ export struct McpServerOption {
     // (which only gates whether "Connect" shows): this reports the actual
     // authenticated-vs-not state, never as a colored badge.
     auth-status: string,
-    // Tools this server advertises via MCP `tools/list`, each individually
-    // enable/disable-able and markable "deferred" (lazy-loaded). Empty
-    // list renders no tool section (backend not yet supplying a tool
-    // catalog -- always empty today).
+    // Tools this server advertises, reconciled from a real MCP `tools/
+    // list` fetch (once one has run -- see `tool-fetch-status`) with any
+    // already-persisted per-tool enable/deferred preference. Empty list
+    // renders no tool section (never fetched yet, and no preference was
+    // ever recorded for any tool on this server).
     tools: [McpToolOption],
+    // Status of the real background `tools/list` probe kicked off by the
+    // "Fetch tools"/"Refresh tools" button (`mcp_servers/tools_fetch`,
+    // see `panel-rust::models::to_mcp_server_option_rows`'s doc comment):
+    // "" (never fetched), "fetching", "ready", or "error". Drives that
+    // button's label/enabled state.
+    tool-fetch-status: string,
+    // Real error text from a failed fetch (empty unless `tool-fetch-
+    // status == "error"`).
+    tool-fetch-error: string,
+    // Pre-joined `name`/`description` of every tool in `tools`
+    // (newline-separated, Rust-computed) -- lets the page-level search
+    // bar match a server by one of its real discovered tool names
+    // without Slint needing an array-reduce it doesn't have.
+    tools-search-blob: string,
     // False for built-in, session-injected servers the user cannot delete
     // (PUI-015: the `snapshotd` daemon MCP, always injected into every
     // session while the daemon is reachable -- it is not a user registry

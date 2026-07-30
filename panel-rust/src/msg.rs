@@ -190,6 +190,19 @@ pub enum SettingsMsg {
         tool_name: String,
         enabled: bool,
     },
+    /// Per-tool deferred (lazy-load) toggle -- same persisted `tools`
+    /// JSON array as [`SettingsMsg::McpServerToolEnabledChanged`].
+    McpServerToolDeferredChanged {
+        server_name: String,
+        tool_name: String,
+        deferred: bool,
+    },
+    /// "Fetch tools" / "Refresh tools" button on one MCP server row --
+    /// kicks off a real `mcp_servers/tools_fetch` background probe (see
+    /// `acpx_core::router::Router::spawn_mcp_tools_fetch`'s doc comment).
+    McpServerToolsFetchRequested {
+        server_name: String,
+    },
     ProfileCreate {
         name: String,
         agent_id: Option<String>,

@@ -3358,72 +3358,95 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
-    /// `mcp_servers/create`. Returns `true` on success -- the caller
-    /// (`lib.rs`'s settings-sheet save handler) is expected to re-call
-    /// [`Self::list_mcp_servers`] afterward to refresh the UI list from
-    /// the gateway's own state, same "don't optimistically mutate
-    /// client-side state" posture the mode/config selector uses.
+    /// `mcp_servers/create`. Returns the real gateway/transport error
+    /// text on failure (e.g. a duplicate-name rejection from
+    /// `acpx_core::mcp_servers::McpServerStore::create`, surfaced through
+    /// `AcpxThreadError`'s `Display`) instead of collapsing it to a bare
+    /// `bool` -- `lib.rs`'s settings dispatch methods show this verbatim
+    /// in the action-feedback toast, so a generic "failed" message no
+    /// longer hides *why*. On success, the caller (`lib.rs`'s settings
+    /// dispatch methods) is expected to re-call [`Self::
+    /// list_mcp_servers`] afterward to refresh the UI list from the
+    /// gateway's own state, same "don't optimistically mutate client-side
+    /// state" posture the mode/config selector uses.
     pub fn create_mcp_server(
         &self,
         idx: usize,
         entry: crate::protocol_types::McpServerEntry,
-    ) -> bool {
+    ) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
         self.runtime
             .block_on(handle.create_mcp_server(entry))
-            .is_ok()
+            .map_err(|err| err.to_string())
     }
 
-    /// `mcp_servers/update` -- same payload shape as [`Self::
-    /// create_mcp_server`].
+    /// `mcp_servers/update` -- same payload shape and error-surfacing
+    /// contract as [`Self::create_mcp_server`].
     pub fn update_mcp_server(
         &self,
         idx: usize,
         entry: crate::protocol_types::McpServerEntry,
-    ) -> bool {
+    ) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
         self.runtime
             .block_on(handle.update_mcp_server(entry))
-            .is_ok()
+            .map_err(|err| err.to_string())
     }
 
     /// `mcp_servers/delete`.
-    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> bool {
+    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
         self.runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
-            .is_ok()
+            .map_err(|err| err.to_string())
     }
 
     /// `mcp_servers/authenticate`. Returns the authorization URL to open
-    /// in a browser on success, `None` on any error (server not found,
-    /// stdio transport, discovery failure, etc.).
-    pub fn authenticate_mcp_server(&self, idx: usize, name: &str) -> Option<String> {
-        let slot = self.slots.get(idx)?;
+    /// in a browser on success, the real error text on failure (server
+    /// not found, stdio transport, discovery failure, etc.) instead of
+    /// collapsing it to `None`.
+    pub fn authenticate_mcp_server(&self, idx: usize, name: &str) -> Result<String, String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
         let handle = slot.handle.clone();
         self.runtime
             .block_on(handle.authenticate_mcp_server(name.to_string()))
-            .ok()
+            .map_err(|err| err.to_string())
     }
 
     /// `mcp_servers/logout`.
-    pub fn logout_mcp_server(&self, idx: usize, name: &str) -> bool {
+    pub fn logout_mcp_server(&self, idx: usize, name: &str) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
         self.runtime
             .block_on(handle.logout_mcp_server(name.to_string()))
-            .is_ok()
+            .map_err(|err| err.to_string())
+    }
+
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe. See `AcpxThreadHandle::fetch_mcp_server_tools`'s
+    /// doc comment: the real tool list arrives on a later
+    /// [`Self::list_mcp_servers`] call, not this one.
+    pub fn fetch_mcp_server_tools(&self, idx: usize, name: &str) -> Result<(), String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.fetch_mcp_server_tools(name.to_string()))
+            .map_err(|err| err.to_string())
     }
 
     /// `agents/list` against thread `idx`'s bound gateway -- the
@@ -7334,17 +7357,33 @@ done
                 },
             )
         };
-        assert!(bridge.create_mcp_server(0, stdio_entry("mcp-bridge-fs")));
+        assert!(bridge.create_mcp_server(0, stdio_entry("mcp-bridge-fs")).is_ok());
         let after_create = bridge.list_mcp_servers(0);
         assert_eq!(after_create.len(), 1);
         assert_eq!(after_create[0].name, "bridge-fs");
 
-        assert!(bridge.update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2")));
+        // The real failure-text contract this test exists to prove:
+        // create_mcp_server/etc. used to collapse every failure into a
+        // bare `bool`/`Option`, discarding the actual reason. A duplicate
+        // create against the real gateway is rejected server-side
+        // (`acpx_core::mcp_servers::McpServerStore::create`'s
+        // `AlreadyExists` error) -- confirm that real message reaches the
+        // caller, not a generic "failed" string with no context.
+        let duplicate_create_err = bridge
+            .create_mcp_server(0, stdio_entry("mcp-bridge-fs"))
+            .expect_err("creating the same name twice must fail");
+        assert!(
+            duplicate_create_err.contains("bridge-fs") || duplicate_create_err.contains("already"),
+            "expected the real gateway rejection reason (naming the duplicate server or \
+             \"already exists\"), got: {duplicate_create_err:?}"
+        );
+
+        assert!(bridge.update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2")).is_ok());
         let after_update = bridge.list_mcp_servers(0);
         assert_eq!(after_update.len(), 1);
         assert_eq!(after_update[0].command(), Some("mcp-bridge-fs-v2"));
 
-        assert!(bridge.delete_mcp_server(0, "bridge-fs"));
+        assert!(bridge.delete_mcp_server(0, "bridge-fs").is_ok());
         assert!(
             bridge.list_mcp_servers(0).is_empty(),
             "expected the server to be gone after delete"
@@ -7360,6 +7399,84 @@ done
         assert!(
             !bridge.install_agent(0, "definitely-not-a-real-agent-id"),
             "install_agent against an unknown id should fail against the real registry, not succeed"
+        );
+    }
+
+    /// Real end-to-end proof of `AgentBridge::fetch_mcp_server_tools` --
+    /// proven at the layer `lib.rs` actually calls from Slint (the
+    /// sibling `gateway_actor_mcp_agents_e2e_test.rs` tests only prove
+    /// this one level lower, through `AcpxThreadHandle` directly).
+    /// Real `snapflowd-mcp` subprocess, real `mcp_servers/tools_fetch`
+    /// RPC, real background probe, polled through the real gateway.
+    #[test]
+    fn fetch_mcp_server_tools_reaches_a_real_backend_through_the_bridge() {
+        let gateway = TestGateway::spawn();
+        let names = ["Tools Fetch Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        let global_dir = tempfile::tempdir().expect("global dir tempdir");
+        std::fs::create_dir_all(global_dir.path().join("release")).expect("skill dir");
+        std::fs::write(
+            global_dir.path().join("release").join("SKILL.md"),
+            "---\nname: release\ndescription: release process\n---\n",
+        )
+        .expect("write SKILL.md");
+
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "bridge-tools-preview",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: resolve_snapflowd_mcp_bin().to_string_lossy().into_owned(),
+                args: vec![
+                    "--global-dir".to_string(),
+                    global_dir.path().to_string_lossy().into_owned(),
+                ],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        assert!(bridge.create_mcp_server(0, entry).is_ok());
+
+        let before_fetch = bridge
+            .list_mcp_servers(0)
+            .into_iter()
+            .find(|e| e.name == "bridge-tools-preview")
+            .expect("just-created entry should be listed");
+        assert_eq!(before_fetch.tool_catalog, None);
+
+        assert!(
+            bridge.fetch_mcp_server_tools(0, "bridge-tools-preview").is_ok(),
+            "fetch_mcp_server_tools kickoff should reach the real gateway"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ready_tools = None;
+        while std::time::Instant::now() < deadline {
+            let entry = bridge
+                .list_mcp_servers(0)
+                .into_iter()
+                .find(|e| e.name == "bridge-tools-preview")
+                .expect("entry should still be listed while polling");
+            match entry.tool_catalog {
+                Some(crate::protocol_types::McpToolCatalog::Ready { tools }) => {
+                    ready_tools = Some(tools);
+                    break;
+                }
+                Some(crate::protocol_types::McpToolCatalog::Error { message }) => {
+                    panic!("real tools/list probe through the bridge failed: {message}");
+                }
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let tool_names: Vec<String> = ready_tools
+            .expect("expected a ready real tool catalog within the timeout")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            tool_names.contains(&"list_skills".to_string()),
+            "expected the real snapflowd-mcp tool catalog to include list_skills, got {tool_names:?}"
         );
     }
 

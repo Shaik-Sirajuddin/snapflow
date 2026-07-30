@@ -830,16 +830,28 @@ impl PanelSingleton {
         Ok(())
     }
 
+    /// Every `dispatch_mcp_server_*` method below returns `Result<String,
+    /// String>` (a ready-to-show success/failure message) instead of the
+    /// `eprintln!`-only failure handling they used to have -- the caller
+    /// (`effect_executor.rs`) feeds the result back through
+    /// `EffectResultMsg::McpServerOperationCompleted`, arming the same
+    /// shared action-feedback toast Settings already uses for "Settings
+    /// saved"/"Settings save failed" (`show_toast`/`Dirty::Toast`), so an
+    /// MCP settings failure is no longer silent in the UI.
     pub(crate) fn dispatch_mcp_server_create(
         &self,
         _component: &ChatPanel,
         entry: crate::protocol_types::McpServerEntry,
-    ) {
-        let Some(bridge) = &self.bridge else { return };
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
         let gw = self.settings_gateway_index();
-        if !bridge.create_mcp_server(gw, entry.clone()) {
-            eprintln!("panel-rust: failed to create MCP server {:?}", entry.name);
-        }
+        let name = entry.name.clone();
+        bridge
+            .create_mcp_server(gw, entry)
+            .map(|()| format!("MCP server \"{name}\" created"))
+            .map_err(|err| format!("Failed to create MCP server \"{name}\": {err}"))
     }
 
     /// Full typed create/update, for a richer settings form (transport
@@ -849,21 +861,31 @@ impl PanelSingleton {
         &self,
         _component: &ChatPanel,
         entry: crate::protocol_types::McpServerEntry,
-    ) {
-        let Some(bridge) = &self.bridge else { return };
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
         let gw = self.settings_gateway_index();
-        if !bridge.update_mcp_server(gw, entry.clone()) {
-            eprintln!(
-                "panel-rust: failed to update MCP server {:?}",
-                entry.name
-            );
-        }
+        let name = entry.name.clone();
+        bridge
+            .update_mcp_server(gw, entry)
+            .map(|()| format!("MCP server \"{name}\" updated"))
+            .map_err(|err| format!("Failed to update MCP server \"{name}\": {err}"))
     }
 
-    pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
+    pub(crate) fn dispatch_mcp_server_delete(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
         let gw = self.settings_gateway_index();
-        bridge.delete_mcp_server(gw, name);
+        bridge
+            .delete_mcp_server(gw, name)
+            .map(|()| format!("MCP server \"{name}\" removed"))
+            .map_err(|err| format!("Failed to remove MCP server \"{name}\": {err}"))
     }
 
     pub(crate) fn dispatch_mcp_server_enabled_changed(
@@ -871,27 +893,30 @@ impl PanelSingleton {
         _component: &ChatPanel,
         name: &str,
         enabled: bool,
-    ) {
-        let Some(bridge) = &self.bridge else { return };
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
         let gw = self.settings_gateway_index();
         let Some(mut entry) = bridge
             .list_mcp_servers(gw)
             .into_iter()
             .find(|entry| entry.name == name)
         else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before its enabled state could update",
-                name
-            );
-            return;
+            return Err(format!(
+                "MCP server \"{name}\" disappeared before its enabled state could update"
+            ));
         };
         entry.enabled = enabled;
-        if !bridge.update_mcp_server(gw, entry) {
-            eprintln!(
-                "panel-rust: failed to update enabled state for MCP server {:?}",
-                name
-            );
-        }
+        bridge
+            .update_mcp_server(gw, entry)
+            .map(|()| {
+                format!(
+                    "MCP server \"{name}\" {}",
+                    if enabled { "enabled" } else { "disabled" }
+                )
+            })
+            .map_err(|err| format!("Failed to update enabled state for MCP server \"{name}\": {err}"))
     }
 
     /// Begins the real MCP OAuth 2.1 flow (`acpx_core::router::Router::
@@ -905,98 +930,171 @@ impl PanelSingleton {
     /// resulting `auth_status` change is picked up on the next `mcp_
     /// servers/list` refresh, same as any other server-side state change
     /// (no separate push channel for this yet).
-    pub(crate) fn dispatch_mcp_server_authenticate(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        let Some(authorization_url) = bridge.authenticate_mcp_server(gw, name) else {
-            eprintln!(
-                "panel-rust: mcp_servers/authenticate failed for MCP server {:?}",
-                name
-            );
-            return;
+    pub(crate) fn dispatch_mcp_server_authenticate(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
         };
+        let gw = self.settings_gateway_index();
+        let authorization_url = bridge
+            .authenticate_mcp_server(gw, name)
+            .map_err(|err| format!("Failed to start OAuth flow for MCP server \"{name}\": {err}"))?;
         if let Err(error) = opener::open(&authorization_url) {
-            eprintln!(
-                "panel-rust: failed to open OAuth authorization URL for MCP server {:?}: {error}",
-                name
-            );
+            return Err(format!(
+                "MCP server \"{name}\": failed to open browser for OAuth: {error}"
+            ));
         }
+        Ok(format!("Opened browser to connect \"{name}\""))
     }
 
     /// Forgets a server's OAuth token, reverting it to `AuthRequired`.
-    pub(crate) fn dispatch_mcp_server_logout(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
+    pub(crate) fn dispatch_mcp_server_logout(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
         let gw = self.settings_gateway_index();
-        if !bridge.logout_mcp_server(gw, name) {
-            eprintln!(
-                "panel-rust: mcp_servers/logout failed for MCP server {:?}",
-                name
+        bridge
+            .logout_mcp_server(gw, name)
+            .map(|()| format!("Disconnected \"{name}\""))
+            .map_err(|err| format!("Failed to disconnect MCP server \"{name}\": {err}"))
+    }
+
+    /// Sets one boolean preference field (`"enabled"` or `"deferred"`) for
+    /// `tool_name` inside `entry`'s opaque `tools` JSON array, creating
+    /// the array/row if this is the first preference ever recorded for
+    /// that tool. Shared by [`Self::dispatch_mcp_server_tool_enabled_
+    /// changed`] and [`Self::dispatch_mcp_server_tool_deferred_changed`]
+    /// -- MCP tool-level preferences aren't part of the typed `McpServer
+    /// Config` (tools are a runtime-discovered capability of a connected
+    /// server, not part of its static config), so this still goes
+    /// through `entry.extra` as a `Map` (no `IndexMut`, hence `.insert`
+    /// instead of `entry.extra[..] = ..`).
+    fn set_mcp_tool_preference_field(
+        entry: &mut crate::protocol_types::McpServerEntry,
+        tool_name: &str,
+        field: &str,
+        value: bool,
+    ) {
+        let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
+        if let Some(tools) = tools {
+            let mut found = false;
+            for tool in tools.iter_mut() {
+                if tool.get("name").and_then(|n| n.as_str()) == Some(tool_name) {
+                    tool[field] = serde_json::Value::Bool(value);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let mut row = serde_json::Map::new();
+                row.insert("name".to_string(), serde_json::Value::String(tool_name.to_string()));
+                row.insert(field.to_string(), serde_json::Value::Bool(value));
+                tools.push(serde_json::Value::Object(row));
+            }
+        } else {
+            let mut row = serde_json::Map::new();
+            row.insert("name".to_string(), serde_json::Value::String(tool_name.to_string()));
+            row.insert(field.to_string(), serde_json::Value::Bool(value));
+            entry.extra.insert(
+                "tools".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::Object(row)]),
             );
         }
     }
 
-    /// Per-tool enable flag on one MCP server entry. Persists into the
-    /// entry's opaque `tools` JSON array via `mcp_servers/update` -- MCP
-    /// tool-level enablement isn't part of the typed `McpServerConfig`
-    /// (tools are a runtime-discovered capability of a connected server,
-    /// not part of its static config), so this still goes through
-    /// `entry.extra` same as before, just as a `Map` now instead of a
-    /// `Value` (no `IndexMut`, hence `.insert` instead of `entry.extra[..]
-    /// = ..`).
-    pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
+    fn dispatch_mcp_server_tool_preference_changed(
         &self,
-        _component: &ChatPanel,
         server_name: &str,
         tool_name: &str,
-        enabled: bool,
-    ) {
-        let Some(bridge) = &self.bridge else { return };
+        field: &str,
+        value: bool,
+        action_past_tense: &str,
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
         let gw = self.settings_gateway_index();
         let Some(mut entry) = bridge
             .list_mcp_servers(gw)
             .into_iter()
             .find(|entry| entry.name == server_name)
         else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before tool enable update",
-                server_name
-            );
-            return;
+            return Err(format!(
+                "MCP server \"{server_name}\" disappeared before tool {action_past_tense} update"
+            ));
         };
-        let tools = entry
-            .extra
-            .get_mut("tools")
-            .and_then(|v| v.as_array_mut());
-        if let Some(tools) = tools {
-            let mut found = false;
-            for tool in tools.iter_mut() {
-                if tool.get("name").and_then(|n| n.as_str()) == Some(tool_name) {
-                    tool["enabled"] = serde_json::Value::Bool(enabled);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                tools.push(serde_json::json!({
-                    "name": tool_name,
-                    "enabled": enabled,
-                }));
-            }
-        } else {
-            entry.extra.insert(
-                "tools".to_string(),
-                serde_json::json!([{
-                    "name": tool_name,
-                    "enabled": enabled,
-                }]),
-            );
-        }
-        if !bridge.update_mcp_server(gw, entry) {
-            eprintln!(
-                "panel-rust: failed to update tool {:?} on MCP server {:?}",
-                tool_name, server_name
-            );
-        }
+        Self::set_mcp_tool_preference_field(&mut entry, tool_name, field, value);
+        bridge
+            .update_mcp_server(gw, entry)
+            .map(|()| format!("Tool \"{tool_name}\" {action_past_tense}"))
+            .map_err(|err| {
+                format!("Failed to update tool \"{tool_name}\" on MCP server \"{server_name}\": {err}")
+            })
+    }
+
+    /// Per-tool enable flag on one MCP server entry. Persists into the
+    /// entry's opaque `tools` JSON array via `mcp_servers/update`.
+    pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+        tool_name: &str,
+        enabled: bool,
+    ) -> Result<String, String> {
+        self.dispatch_mcp_server_tool_preference_changed(
+            server_name,
+            tool_name,
+            "enabled",
+            enabled,
+            if enabled { "enabled" } else { "disabled" },
+        )
+    }
+
+    /// Per-tool deferred (lazy-load) flag -- same persisted `tools` JSON
+    /// array as the enabled toggle, different field.
+    pub(crate) fn dispatch_mcp_server_tool_deferred_changed(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+        tool_name: &str,
+        deferred: bool,
+    ) -> Result<String, String> {
+        self.dispatch_mcp_server_tool_preference_changed(
+            server_name,
+            tool_name,
+            "deferred",
+            deferred,
+            if deferred { "set to deferred" } else { "set to eager" },
+        )
+    }
+
+    /// "Fetch tools" / "Refresh tools" -- kicks off a real `mcp_servers/
+    /// tools_fetch` background probe (`acpx_core::router::Router::spawn_
+    /// mcp_tools_fetch`'s doc comment has the full flow). Returns as
+    /// soon as the gateway has scheduled the probe; the real tool list
+    /// arrives on a later `mcp_servers/list` poll (already refreshed
+    /// after every settings action), same "kick off, then poll" pattern
+    /// as `dispatch_mcp_server_authenticate`.
+    pub(crate) fn dispatch_mcp_server_tools_fetch(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+    ) -> Result<String, String> {
+        let Some(bridge) = &self.bridge else {
+            return Err("no gateway connection".to_string());
+        };
+        let gw = self.settings_gateway_index();
+        bridge
+            .fetch_mcp_server_tools(gw, server_name)
+            .map(|()| format!("Fetching tools for \"{server_name}\"..."))
+            .map_err(|err| format!("Failed to fetch tools for MCP server \"{server_name}\": {err}"))
     }
 
     pub(crate) fn dispatch_profile_create(
@@ -1881,6 +1979,44 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 });
             },
         );
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_tool_deferred_changed(
+            move |server_name, tool_name, deferred| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tool_deferred_changed(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                            tool_name.to_string(),
+                            deferred,
+                        );
+                    }
+                });
+            },
+        );
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mcp_server_tools_fetch_requested(move |server_name| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tools_fetch_requested(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                        );
+                    }
+                });
+            });
 
         let component_weak = panel.component.as_weak();
         panel

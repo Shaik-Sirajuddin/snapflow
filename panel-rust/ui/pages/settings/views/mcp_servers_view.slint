@@ -72,6 +72,9 @@ component MultilineField inherits Rectangle {
 // per-connection health probe yet).
 export component McpServersView inherits Rectangle {
     in property <[McpServerOption]> servers: [];
+    // Rust-computed sum of every server's real reconciled tool list --
+    // shown next to the section header. See `sync.rs`'s own comment.
+    in property <int> total-tools-count: 0;
     // settings_page_search_filter: page-level query filters this list.
     in property <string> page-search-query: "";
     callback mcp-server-submit(McpServerFormData);
@@ -80,6 +83,8 @@ export component McpServersView inherits Rectangle {
     callback mcp-server-authenticate(string);
     callback mcp-server-logout(string);
     callback mcp-server-tool-enabled-changed(string, string, bool);
+    callback mcp-server-tool-deferred-changed(string, string, bool);
+    callback mcp-server-tools-fetch-requested(string);
     // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
     // own doc comment: this view's form fields never had any focus state
     // aggregated up into settings_page.slint's OR-chain, so every
@@ -134,7 +139,11 @@ export component McpServersView inherits Rectangle {
     SettingsSection {
         width: parent.width;
 
-        SettingsSectionHeader { text: "MCP Servers"; }
+        SettingsSectionHeader {
+            text: root.total-tools-count > 0
+                ? "MCP Servers · " + root.total-tools-count + " tools discovered"
+                : "MCP Servers";
+        }
 
         SettingsRowGroup {
             width: parent.width;
@@ -144,12 +153,15 @@ export component McpServersView inherits Rectangle {
                 // Hide non-matching servers when page search is active.
                 // Matches across every real field a server carries now
                 // (not just name/command/url) -- e.g. finding a server by
-                // an env var name, a header, or its OAuth client id.
+                // an env var name, a header, its OAuth client id, or one
+                // of its real discovered tool names/descriptions
+                // (`tools-search-blob`, Rust-computed since Slint has no
+                // array-reduce to join `server.tools` itself here).
                 visible: root.page-search-query == ""
                     || TextUtil.matches-filter(
                         server.name + "\n" + server.command + "\n" + server.url + "\n"
                             + server.args + "\n" + server.env + "\n" + server.headers + "\n"
-                            + server.oauth-client-id,
+                            + server.oauth-client-id + "\n" + server.tools-search-blob,
                         root.page-search-query,
                     );
                 // `pad-xs` (4px) -- the compact pre-reveal gap between a
@@ -255,6 +267,28 @@ export component McpServersView inherits Rectangle {
                         clicked => { server-block.tools-expanded = !server-block.tools-expanded; }
                     }
 
+                    // Kicks off a real MCP `tools/list` probe
+                    // (`mcp_servers/tools_fetch`) -- "Fetch tools" before
+                    // the first attempt, "Refresh tools" once a catalog
+                    // (or a failed attempt) exists, "Fetching..." while
+                    // the background probe is in flight.
+                    Button {
+                        label: server.tool-fetch-status == "fetching"
+                            ? "Fetching..."
+                            : (server.tool-fetch-status == "" ? "Fetch tools" : "Refresh tools");
+                        button-accessible-label: "Fetch real tools list for MCP server " + server.name;
+                        btn-width: 88px;
+                        btn-height: 24px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        // No `enabled`/disabled state on `Button` -- a
+                        // click while already fetching is a safe no-op
+                        // server-side (`Router::spawn_mcp_tools_fetch`
+                        // skips spawning a duplicate probe when one is
+                        // already in flight for this server).
+                        clicked => { root.mcp-server-tools-fetch-requested(server.name); }
+                    }
+
                     // Enable/disable without removing the entry -- registry-
                     // backed and immediately re-listed by the Rust host after
                     // update.
@@ -280,60 +314,89 @@ export component McpServersView inherits Rectangle {
                     }
                 }
 
-                // Nested per-tool list -- each tool individually enable/disable
-                // (persisted in the server entry's `tools` JSON array).
+                // Nested per-tool list -- **view-only**. Real names/
+                // descriptions from the actual `tools/list` fetch, no
+                // enable/disable or deferred controls: checked against
+                // the real ACP schema (`agent-client-protocol-schema`
+                // 1.4.0) and the MCP spec, neither gives a client any way
+                // to actually make a "disabled" tool disappear from what
+                // a session's backend agent sees, so an interactive
+                // toggle here would silently do nothing -- see
+                // `McpToolOption.enabled`'s doc comment in types.slint
+                // for the full investigation. Height-capped with its own
+                // `Flickable` (not just relying on the page's outer
+                // scroll) so one server with many tools can't push every
+                // server below it off-screen.
                 if server-block.tools-expanded && server.tools.length > 0 : Rectangle {
                     width: parent.width;
+                    height: min(tools-list-content.preferred-height + 2 * Metrics.pad-md, 220px);
                     background: Theme.bg-sidebar;
                     border-radius: Theme.radius-sm;
                     border-width: 1px;
                     border-color: Theme.border-default;
+                    clip: true;
 
-                    VerticalLayout {
-                        padding: Metrics.pad-md;
-                        padding-left: Metrics.pad-lg;
-                        spacing: Metrics.gap-sm;
+                    Flickable {
+                        width: parent.width;
+                        height: parent.height;
+                        viewport-height: tools-list-content.preferred-height + 2 * Metrics.pad-md;
 
-                        for tool in server.tools : HorizontalLayout {
-                            spacing: Metrics.gap-md;
+                        tools-list-content := VerticalLayout {
+                            width: parent.width;
+                            padding: Metrics.pad-md;
+                            padding-left: Metrics.pad-lg;
+                            spacing: Metrics.gap-sm;
 
-                            Text {
-                                text: tool.name;
-                                color: Theme.text-primary;
-                                font-family: Theme.font-mono;
-                                font-size: 10px * Theme.font-scale;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                            }
+                            for tool in server.tools : VerticalLayout {
+                                spacing: 2px;
 
-                            if tool.token-usage > 0 : Text {
-                                text: tool.token-usage + " tok";
-                                color: Theme.text-muted;
-                                font-family: Theme.font-mono;
-                                font-size: 9px * Theme.font-scale;
-                                vertical-alignment: center;
-                                horizontal-stretch: 0;
-                            }
+                                HorizontalLayout {
+                                    spacing: Metrics.gap-md;
 
-                            if tool.deferred : Text {
-                                text: "deferred";
-                                color: Theme.text-muted;
-                                font-family: Theme.font-mono;
-                                font-size: 9px * Theme.font-scale;
-                                vertical-alignment: center;
-                                horizontal-stretch: 0;
-                            }
+                                    Text {
+                                        text: tool.name;
+                                        color: Theme.text-primary;
+                                        font-family: Theme.font-mono;
+                                        font-size: 10px * Theme.font-scale;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
 
-                            Toggle {
-                                checked: tool.enabled;
-                                toggle-accessible-label: "Toggle tool " + tool.name + " on MCP server " + server.name;
-                                toggled(enabled) => {
-                                    root.mcp-server-tool-enabled-changed(server.name, tool.name, enabled);
+                                    if tool.token-usage > 0 : Text {
+                                        text: tool.token-usage + " tok";
+                                        color: Theme.text-muted;
+                                        font-family: Theme.font-mono;
+                                        font-size: 9px * Theme.font-scale;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 0;
+                                    }
+                                }
+
+                                if tool.description != "" : Text {
+                                    text: tool.description;
+                                    color: Theme.text-muted;
+                                    font-size: 9px * Theme.font-scale;
+                                    overflow: elide;
                                 }
                             }
                         }
                     }
+                }
+
+                // Real error text from a failed background fetch (see
+                // `McpServerOption.tool-fetch-error`'s doc comment) --
+                // surfaced inline rather than only through the shared
+                // settings-page toast, since the toast is transient and
+                // this failure state persists until the next fetch.
+                if server.tool-fetch-status == "error" : Text {
+                    text: "Failed to fetch tools: " + server.tool-fetch-error;
+                    // Same error red `app.slint`'s shared toast border
+                    // uses for `toast-kind == "error"` -- no dedicated
+                    // `Theme.text-danger` token exists yet.
+                    color: #ef4444;
+                    font-size: 9px * Theme.font-scale;
+                    wrap: word-wrap;
                 }
             }
         }
