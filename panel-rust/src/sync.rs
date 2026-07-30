@@ -61,6 +61,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::ThreadListDiff(ops) => {
             apply_thread_ops(model, ops);
+            apply_thread_view_ops(model);
             // Phase 19: section counters (active vs archived) follow every
             // thread-list rebuild.
             let archived = model
@@ -104,7 +105,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             // `thread_id` with empty `ops` carries no actual instruction
             // to apply; skip it entirely rather than let it fall through.
             if !thread_id.is_empty() || !ops.is_empty() {
-                apply_message_ops(model, thread_id, ops);
+                apply_thread_message_ops(model, thread_id, ops);
             }
             sync_has_older_messages(model, component, thread_id);
             if !thread_id.is_empty() {
@@ -116,18 +117,11 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             message_id,
             delta,
         } => {
-            apply_message_streaming(model, thread_id, message_id, delta);
+            apply_thread_message_streaming(model, thread_id, message_id, delta);
             sync_has_older_messages(model, component, thread_id);
-        }
-        Dirty::MessageListInstall { thread_id } => {
-            install_message_list_snapshot(model, thread_id);
-            sync_has_older_messages(model, component, thread_id);
-            if !thread_id.is_empty() {
-                trace_transcript_tail(model, thread_id);
-            }
         }
         Dirty::MessageRowPatch { thread_id, index } => {
-            apply_message_row_patch(model, thread_id, *index);
+            apply_thread_message_row_patch(model, thread_id, *index);
         }
         Dirty::Connection { thread_id } => {
             if let Some(thread) = thread_for_id(model, thread_id) {
@@ -391,10 +385,85 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
     }
 }
 
+/// Reconcile the Slint-facing durable thread -> message-model records.
+///
+/// The outer record list may reorder as the sidebar changes, but each record's
+/// `messages` field points at the registry-owned `Rc<VecModel<MessageItem>>`.
+/// A switch therefore selects another existing model; it never copies rows
+/// from one model into another.
+fn apply_thread_view_ops(model: &Model) {
+    let desired = model
+        .thread_rows
+        .iter()
+        .map(|row| row.thread_id.clone())
+        .collect::<Vec<_>>();
+    let mut keys = model.thread_views_model_keys.borrow_mut();
+
+    while model.thread_views_model.row_count() > desired.len() {
+        model
+            .thread_views_model
+            .remove(model.thread_views_model.row_count() - 1);
+        keys.pop();
+    }
+
+    for (index, thread_id) in desired.iter().enumerate() {
+        let owner_id = model
+            .thread_index_for_id(thread_id)
+            .and_then(|idx| model.threads.get(idx))
+            .map(|thread| thread.thread_id.as_str())
+            .unwrap_or(thread_id.as_str());
+        apply_thread_message_ops(model, owner_id, &[]);
+        let Some(messages) = model.thread_view_models.get(owner_id) else {
+            continue;
+        };
+        if std::env::var_os("RUI_THREAD_VIEW_TRACE").is_some() {
+            eprintln!(
+                "thread-view model thread={} owner={} identity={:p} rows={}",
+                thread_id,
+                owner_id,
+                std::rc::Rc::as_ptr(&messages),
+                messages.row_count()
+            );
+        }
+        let item = crate::ThreadViewItem {
+            thread_id: thread_id.clone().into(),
+            messages: slint::ModelRc::from(messages),
+            tool_groups: model
+                .thread_view_models
+                .tool_groups(owner_id)
+                .unwrap_or_default(),
+            compose_text: model
+                .thread_index_for_id(owner_id)
+                .and_then(|thread_index| model.threads.get(thread_index))
+                .map(|thread| thread.compose_draft.clone().into())
+                .unwrap_or_default(),
+        };
+        if index < model.thread_views_model.row_count() {
+            if keys.get(index).map(String::as_str) != Some(thread_id.as_str()) {
+                model.thread_views_model.set_row_data(index, item);
+            }
+        } else {
+            model.thread_views_model.push(item);
+        }
+        if index < keys.len() {
+            keys[index] = thread_id.clone();
+        } else {
+            keys.push(thread_id.clone());
+        }
+    }
+}
+
 fn thread_for_id<'a>(model: &'a Model, thread_id: &str) -> Option<&'a crate::model::ThreadModel> {
     model
         .thread_index_for_id(thread_id)
         .and_then(|index| model.threads.get(index))
+}
+
+/// Normalize a durable-thread or session alias to the registry key that owns
+/// the retained view. Dirty events may carry either identity, while the
+/// per-thread model registry is intentionally keyed only by durable id.
+fn owner_thread_id(model: &Model, thread_id: &str) -> Option<String> {
+    thread_for_id(model, thread_id).map(|thread| thread.thread_id.clone())
 }
 
 fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
@@ -405,20 +474,13 @@ fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
 }
 
 fn sync_message_snapshot(model: &Model, thread_id: &str) {
-    // Same ownership gate as the three apply_* siblings — do not even build
-    // a diff for a thread that does not own the shared list.
-    if !thread_owns_shared_list(model, thread_id) {
-        return;
-    }
-    let Some(idx) = displayed_thread_for_id(model, thread_id) else {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
         return;
     };
-    let Some(thread) = model.threads.get(idx) else {
-        return;
-    };
-    let old_keys = model.message_model_keys.borrow().clone();
-    let ops = crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &thread.message_rows);
-    apply_message_ops(model, thread_id, &ops);
+    // The retained per-thread model is the previous projection. Reconcile it
+    // in place against the current transcript; no Rust row-cache copy is
+    // needed to service a snapshot notification.
+    apply_thread_message_ops(model, &owner_id, &[]);
 }
 
 fn sync_has_older_messages(model: &Model, component: &ChatPanel, thread_id: &str) {
@@ -439,6 +501,7 @@ fn sync_has_older_messages(model: &Model, component: &ChatPanel, thread_id: &str
 ///
 /// Do not add a fourth apply path without calling this — that is how the
 /// insert leak slipped past the streaming-only fix.
+#[cfg(test)]
 fn thread_owns_shared_list(model: &Model, thread_id: &str) -> bool {
     if thread_id.is_empty() {
         // Empty id = explicit clear / transition sentinel handled by caller.
@@ -455,23 +518,57 @@ fn thread_owns_shared_list(model: &Model, thread_id: &str) -> bool {
 /// Choke point for mutations of the shared on-screen message model. Keeping
 /// the ownership proof attached to the writer prevents a new streaming,
 /// patch, or ops path from accidentally updating another thread's list.
+#[cfg(test)]
 struct GuardedMessagesModel<'a> {
     model: &'a Model,
 }
 
+#[cfg(test)]
 impl<'a> GuardedMessagesModel<'a> {
     fn for_thread(model: &'a Model, thread_id: &str) -> Option<Self> {
         thread_owns_shared_list(model, thread_id).then_some(Self { model })
     }
 }
 
+#[cfg(test)]
 fn apply_message_streaming(model: &Model, thread_id: &str, message_id: &str, delta: &str) {
+    apply_thread_message_streaming(model, thread_id, message_id, delta);
     let Some(guard) = GuardedMessagesModel::for_thread(model, thread_id) else {
         return;
     };
     apply_message_streaming_owned(guard.model, message_id, delta);
 }
 
+fn apply_thread_message_streaming(model: &Model, thread_id: &str, message_id: &str, delta: &str) {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
+        return;
+    };
+    let Some(messages) = model.thread_view_models.get(&owner_id) else {
+        return;
+    };
+    let candidates = [
+        format!("assistant:{message_id}"),
+        format!("thought:{message_id}"),
+        format!("user:{message_id}"),
+        format!("tool:{message_id}"),
+    ];
+    let index = candidates
+        .iter()
+        .find_map(|key| model.thread_view_models.row_index_for(&owner_id, key));
+    let Some(index) = index else {
+        return;
+    };
+    let Some(mut row) = messages.row_data(index) else {
+        return;
+    };
+    row.text = format!("{}{}", row.text, delta).into();
+    messages.set_row_data(index, row.clone());
+    model
+        .thread_view_models
+        .update_tool_group_row(&owner_id, index, row);
+}
+
+#[cfg(test)]
 fn apply_message_streaming_owned(model: &Model, message_id: &str, delta: &str) {
     let candidates = [
         format!("assistant:{message_id}"),
@@ -494,6 +591,7 @@ fn apply_message_streaming_owned(model: &Model, message_id: &str, delta: &str) {
     model.messages_model.set_row_data(index, row);
 }
 
+#[cfg(test)]
 fn thread_matches_owner(model: &Model, thread_id: &str) -> bool {
     let Some(owner) = model.list_owner_thread_id.as_deref() else {
         return false;
@@ -503,7 +601,12 @@ fn thread_matches_owner(model: &Model, thread_id: &str) -> bool {
 
 /// Atomic full install of the shared message list for `thread_id`.
 /// Clears the list when `thread_id` is empty (transition clear).
+#[cfg(test)]
 pub(crate) fn install_message_list_snapshot(model: &Model, thread_id: &str) {
+    // Keep the owning per-thread model warm even while this legacy shared
+    // install path is still active. The destination is the thread's own
+    // model, never another thread's live model.
+    apply_thread_message_ops(model, thread_id, &[]);
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -541,13 +644,33 @@ pub(crate) fn install_message_list_snapshot(model: &Model, thread_id: &str) {
     keys.extend(desired_keys);
 }
 
+#[cfg(test)]
 pub(crate) fn apply_message_row_patch(model: &Model, thread_id: &str, index: usize) {
+    apply_thread_message_row_patch(model, thread_id, index);
     let Some(guard) = GuardedMessagesModel::for_thread(model, thread_id) else {
         return;
     };
     apply_message_row_patch_owned(guard.model, thread_id, index);
 }
 
+fn apply_thread_message_row_patch(model: &Model, thread_id: &str, index: usize) {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
+        return;
+    };
+    if let Some(messages) = model.thread_view_models.get(&owner_id) {
+        if let Some(mut row) = messages.row_data(index) {
+            // Expand/collapse is selected-view UI state. The reducer updates
+            // the scalar flag and this sync boundary applies it to the
+            // owning retained row without reconstructing the transcript.
+            if let Some(expanded) = model.expanded.get(index) {
+                row.expanded = *expanded;
+            }
+            messages.set_row_data(index, row);
+        }
+    }
+}
+
+#[cfg(test)]
 fn apply_message_row_patch_owned(model: &Model, thread_id: &str, index: usize) {
     let Some(idx) = displayed_thread_for_id(model, thread_id) else {
         return;
@@ -682,13 +805,156 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
+    apply_thread_message_ops(model, thread_id, ops);
     let Some(guard) = GuardedMessagesModel::for_thread(model, thread_id) else {
         return;
     };
     apply_message_ops_owned(guard.model, thread_id, ops);
 }
 
+/// Apply message operations to the model owned by `thread_id`. This path has
+/// no selected-thread gate, so a hidden thread can continue streaming into
+/// its retained ChatView without touching the selected thread.
+pub(crate) fn apply_thread_message_ops(
+    model: &Model,
+    thread_id: &str,
+    ops: &[RowOp<crate::MessageItem>],
+) {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
+        return;
+    };
+    let Some(messages) = model.thread_view_models.get(&owner_id) else {
+        return;
+    };
+    let (desired_keys, desired_rows) = projected_thread_rows(model, &owner_id);
+    let mut keys = model.thread_view_models.keys(&owner_id).unwrap_or_default();
+
+    for op in ops {
+        match op {
+            RowOp::Insert { at, row } => {
+                let at = (*at).min(messages.row_count()).min(keys.len());
+                messages.insert(at, row.clone());
+                keys.insert(at, desired_keys.get(at).cloned().unwrap_or_default());
+            }
+            RowOp::Remove { at } => {
+                if *at < messages.row_count() && *at < keys.len() {
+                    messages.remove(*at);
+                    keys.remove(*at);
+                }
+            }
+            RowOp::Move { from, to } => {
+                if *from < messages.row_count()
+                    && *to <= messages.row_count()
+                    && *from < keys.len()
+                    && *to <= keys.len()
+                {
+                    let row = messages.remove(*from);
+                    messages.insert(*to, row);
+                    let key = keys.remove(*from);
+                    keys.insert(*to, key);
+                }
+            }
+        }
+    }
+
+    while messages.row_count() > desired_rows.len() {
+        messages.remove(messages.row_count() - 1);
+    }
+    while keys.len() > desired_keys.len() {
+        keys.pop();
+    }
+    for key in desired_keys.iter().skip(keys.len()) {
+        keys.push(key.clone());
+    }
+    for (index, key) in desired_keys.iter().enumerate() {
+        if index < keys.len() {
+            keys[index] = key.clone();
+        }
+    }
+    for (index, row) in desired_rows.into_iter().enumerate() {
+        if index < messages.row_count() {
+            let same = messages
+                .row_data(index)
+                .is_some_and(|existing| message_row_view_eq(&existing, &row));
+            if !same {
+                messages.set_row_data(index, row);
+            }
+        } else {
+            messages.push(row);
+        }
+    }
+    model.thread_view_models.set_keys(&owner_id, keys);
+    let current_rows = (0..messages.row_count())
+        .filter_map(|index| messages.row_data(index))
+        .collect::<Vec<_>>();
+    model
+        .thread_view_models
+        .reconcile_tool_groups(&owner_id, &desired_keys, &current_rows);
+    let fingerprints = desired_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, key)| messages.row_data(index).map(|row| (key.clone(), row)))
+        .collect::<Vec<_>>();
+    model
+        .thread_view_models
+        .set_content_hashes(&owner_id, fingerprints);
+    if std::env::var_os("RUI_THREAD_VIEW_TRACE").is_some() {
+        if let Some(messages) = model.thread_view_models.get(&owner_id) {
+            eprintln!(
+                "thread-view rows thread={} ops={} rows={}",
+                owner_id,
+                ops.len(),
+                messages.row_count()
+            );
+        }
+    }
+}
+
+/// Build the current UI projection directly from durable thread state. The
+/// previous projection, when needed for presentation flags, is read from the
+/// retained per-thread Slint model itself; production has no Rust row cache.
+fn projected_thread_rows(model: &Model, owner_id: &str) -> (Vec<String>, Vec<crate::MessageItem>) {
+    if owner_id.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(thread) = thread_for_id(model, owner_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    #[cfg(test)]
+    if !thread.message_rows.is_empty() {
+        // Legacy unit fixtures seed the retired cache directly. Keep that
+        // compatibility seam test-only; production never compiles or reads
+        // this field.
+        return (thread.transcript_keys.clone(), thread.message_rows.clone());
+    }
+    let transcript = thread.transcript.clone();
+    let queue = thread.send_queue.clone();
+    let in_flight = matches!(
+        thread.state,
+        crate::models::ThreadState::Loading | crate::models::ThreadState::Cancelling
+    );
+    let (mut rows, keys) =
+        crate::models::message_rows_for_thread_with_state(transcript, &[], &queue, in_flight);
+    if let (Some(old_keys), Some(old_rows)) = (
+        model.thread_view_models.keys(owner_id),
+        model.thread_view_models.rows(owner_id),
+    ) {
+        let mut expanded_by_key = std::collections::HashMap::new();
+        for (key, row) in old_keys.iter().zip(old_rows.iter()) {
+            expanded_by_key.insert(key.as_str(), row.expanded);
+        }
+        for (key, row) in keys.iter().zip(rows.iter_mut()) {
+            if let Some(expanded) = expanded_by_key.get(key.as_str()) {
+                row.expanded = *expanded;
+            }
+        }
+    }
+    (keys, rows)
+}
+
+#[cfg(test)]
 fn apply_message_ops_owned(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
@@ -1039,6 +1305,25 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());
+            let selected_id = crate::update::selected_real_index(model)
+                .and_then(|idx| model.threads.get(idx))
+                .map(|thread| thread.thread_id.as_str());
+            if let Some(selected_id) = selected_id {
+                let row_index = model
+                    .thread_views_model_keys
+                    .borrow()
+                    .iter()
+                    .position(|key| key == selected_id);
+                if let Some(row_index) = row_index {
+                    if let Some(mut item) = model.thread_views_model.row_data(row_index) {
+                        let draft: slint::SharedString = model.compose_text.clone().into();
+                        if item.compose_text != draft {
+                            item.compose_text = draft;
+                            model.thread_views_model.set_row_data(row_index, item);
+                        }
+                    }
+                }
+            }
         }
         ScalarField::SettingsOpen => {
             component.set_settings_open(model.settings_open);
@@ -1116,7 +1401,8 @@ pub(crate) fn sync_language(language: &str) {
 
 pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_threads(slint::ModelRc::from(model.thread_model.clone()));
-    component.set_messages(slint::ModelRc::from(model.messages_model.clone()));
+    apply_thread_view_ops(model);
+    component.set_thread_views(slint::ModelRc::from(model.thread_views_model.clone()));
     component.set_available_skills(slint::ModelRc::from(model.skills_model.clone()));
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
@@ -1355,9 +1641,6 @@ mod tests {
                 crate::dirty::Dirty::MessagesDiff { thread_id, ops } => {
                     apply_message_ops(&model, thread_id, ops);
                 }
-                crate::dirty::Dirty::MessageListInstall { thread_id } => {
-                    install_message_list_snapshot(&model, thread_id);
-                }
                 _ => {}
             }
         }
@@ -1470,9 +1753,11 @@ mod tests {
     fn message_streaming_delta_resolves_by_stable_id_not_position() {
         let mut model = Model::default();
         model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-1".to_owned(),
             session_id: Some("thread-1".to_owned()),
             ..crate::model::ThreadModel::default()
         });
+        model.rebuild_thread_indices();
         model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "hello".into(),
@@ -1513,14 +1798,17 @@ mod tests {
         let mut model = Model::default();
         model.threads.extend([
             crate::model::ThreadModel {
+                thread_id: "displayed-thread".to_owned(),
                 session_id: Some("displayed-thread".to_owned()),
                 ..crate::model::ThreadModel::default()
             },
             crate::model::ThreadModel {
+                thread_id: "background-thread".to_owned(),
                 session_id: Some("background-thread".to_owned()),
                 ..crate::model::ThreadModel::default()
             },
         ]);
+        model.rebuild_thread_indices();
         model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "displayed".into(),
@@ -1528,9 +1816,25 @@ mod tests {
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:shared-id".to_owned()];
 
+        let background = model
+            .thread_view_models
+            .get("background-thread")
+            .expect("background thread owns a retained model");
+        background.push(crate::MessageItem {
+            text: "displayed".into(),
+            ..crate::MessageItem::default()
+        });
+        model
+            .thread_view_models
+            .set_keys("background-thread", vec!["assistant:shared-id".to_owned()]);
+
         apply_message_streaming(&model, "background-thread", "shared-id", " must not appear");
 
         assert_eq!(model.messages_model.row_data(0).unwrap().text, "displayed");
+        assert_eq!(
+            background.row_data(0).unwrap().text,
+            "displayed must not appear"
+        );
     }
 
     #[test]
@@ -1960,6 +2264,7 @@ mod tests {
     fn message_snapshot_reconciles_rows_without_replacing_the_model() {
         let mut model = Model::default();
         model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-1".to_owned(),
             session_id: Some("thread-1".to_owned()),
             transcript_keys: vec!["assistant:m-1".to_owned()],
             message_rows: vec![crate::MessageItem {
@@ -1968,19 +2273,25 @@ mod tests {
             }],
             ..crate::model::ThreadModel::default()
         });
+        model.rebuild_thread_indices();
         model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "old".into(),
             ..crate::MessageItem::default()
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:m-1".to_owned()];
-        let model_identity = model.messages_model.clone();
+        let model_identity = model
+            .thread_view_models
+            .get("thread-1")
+            .expect("thread owns a retained message model");
 
         sync_message_snapshot(&model, "thread-1");
 
-        assert!(std::rc::Rc::ptr_eq(&model_identity, &model.messages_model));
-        assert_eq!(*model.message_model_keys.borrow(), vec!["assistant:m-1"]);
-        assert_eq!(model.messages_model.row_data(0).unwrap().text, "updated");
+        assert!(std::rc::Rc::ptr_eq(
+            &model_identity,
+            &model.thread_view_models.get("thread-1").unwrap()
+        ));
+        assert_eq!(model_identity.row_data(0).unwrap().text, "updated");
     }
 
     #[test]

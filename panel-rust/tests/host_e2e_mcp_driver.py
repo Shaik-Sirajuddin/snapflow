@@ -234,6 +234,7 @@ def scenario_send_now(args):
     client = McpClient(args.mcp_url)
     client.wait_until_up()
     window_handle, root_handle = get_root_element(client)
+    ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
 
     compose_handle = find_element_by_qualified_id(
         client, window_handle, "ChatInputLayout::compose"
@@ -308,6 +309,7 @@ def scenario_fast_track(args):
     client = McpClient(args.mcp_url)
     client.wait_until_up()
     window_handle, root_handle = get_root_element(client)
+    ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
 
     compose_handle = find_element_by_qualified_id(
         client, window_handle, "ChatInputLayout::compose"
@@ -371,6 +373,7 @@ def scenario_rename(args):
     client = McpClient(args.mcp_url)
     client.wait_until_up()
     window_handle, root_handle = get_root_element(client)
+    ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
 
     new_name = "mcp renamed thread"
     rename_handle = wait_for_accessible_label(client, root_handle, "Rename thread")
@@ -439,6 +442,7 @@ def scenario_mid_session_write_failure(args):
     client = McpClient(args.mcp_url)
     client.wait_until_up()
     window_handle, root_handle = get_root_element(client)
+    ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
 
     panel_dir = args.state_dir / "panel"
     original_mode = stat.S_IMODE(panel_dir.stat().st_mode)
@@ -499,6 +503,7 @@ def scenario_real_agent_smoke(args):
     client = McpClient(args.mcp_url)
     client.wait_until_up()
     window_handle, root_handle = get_root_element(client)
+    ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
 
     compose_handle = find_element_by_qualified_id(
         client, window_handle, "ChatInputLayout::compose"
@@ -535,6 +540,24 @@ def scenario_real_agent_smoke(args):
             f"real-agent round trip did not complete"
         )
     print(f"PASS real_agent_smoke scenario: real assistant reply observed: {reply_text!r}")
+
+
+def ensure_active_thread(client, window_handle, root_handle, timeout=15):
+    """Create one real thread when production cold start has no thread.
+
+    The development harness documentation predates the intentional empty
+    ``No thread`` cold start. Existing scenarios assumed the old seeded demo
+    thread, so they must opt into the same user-facing New thread path before
+    looking up compose/rename controls.
+    """
+    labels = [
+        element.get("accessibleLabel", "")
+        for element in client.call_tool(
+            "get_element_tree", {"elementHandle": root_handle, "maxElements": 600}
+        ).get("elements", [])
+    ]
+    if "No thread" in labels:
+        open_new_thread(client, window_handle, root_handle, timeout=timeout)
 
 
 def open_new_thread(client, window_handle, root_handle, timeout=15):

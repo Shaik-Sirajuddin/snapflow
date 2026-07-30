@@ -45,6 +45,7 @@ pub mod skills_state;
 mod state_store;
 mod sync;
 mod snapshotd_lifecycle;
+mod thread_view;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
 // crates from this one, unable to see anything less than `pub` -- can
 // reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
@@ -1835,10 +1836,8 @@ fn panel_rust_create_with_initial_identity(
         };
         let mut model = model::Model::default();
         let thread_model = Rc::new(VecModel::default());
-        let messages_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();
-        model.messages_model = messages_model.clone();
         model.skills_model = skills_model.clone();
         let panel = PanelSingleton {
             window,
@@ -2436,16 +2435,15 @@ fn panel_rust_create_with_initial_identity(
         // into the reducer and effect executor -- see dispatch.rs's
         // doc comment.
         let component_weak = panel.component.as_weak();
-        panel.component.on_send_requested(move || {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            let text = component.get_compose_text().to_string();
-            let text = text.trim().to_owned();
+        panel.component.on_send_requested(move |text| {
+            let text = text.to_string().trim().to_owned();
             if text.is_empty() {
                 trace_host_input("send requested with empty composer");
                 return;
             }
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
             let filtered_idx = component.get_selected_thread() as usize;
             trace_host_input(format_args!(
                 "send requested selected_thread={filtered_idx} text={text:?}"
@@ -2456,6 +2454,14 @@ fn panel_rust_create_with_initial_identity(
                 // the send is dispatched.
                 if let Some(panel) = cell.borrow_mut().as_mut() {
                     dispatch::dispatch_compose_send_maybe_attach(panel, filtered_idx, text);
+                }
+            });
+        });
+
+        panel.component.on_compose_draft_changed(move |text| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_compose_draft_changed(panel, text.to_string());
                 }
             });
         });
