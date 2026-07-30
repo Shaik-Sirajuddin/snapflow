@@ -427,6 +427,11 @@ export component ChatArea inherits Rectangle {
     property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
     // Independent scroll position for the popup view (not synced with main message scroll)
     property <length> popup-scroll-y: 0px;
+    // PROF-11: keep the live plan visible below the chat header without
+    // allowing a large agent plan to consume the transcript viewport.
+    // The plan gets its own Flickable below, so its wheel/drag scrolling
+    // never changes message-scroll's position.
+    property <length> plan-max-height: 180px;
 
     changed full-view-open => {
         if (root.full-view-open) {
@@ -750,38 +755,47 @@ export component ChatArea inherits Rectangle {
         // most agents never send one, so this must never look like a
         // dead/always-present control.
         if root.plan-entries.length > 0 : Rectangle {
-            height: plan-list.preferred-height + 2 * Metrics.space-3;
+            // This chrome band stays outside message-area/message-scroll;
+            // only plan-scroll can move its overflowing entries.
+            height: min(plan-list.preferred-height, root.plan-max-height);
             background: Theme.bg-card;
             border-color: Theme.border-default;
             border-width: 1px;
-            plan-list := VerticalLayout {
-                padding-left: Metrics.space-6;
-                padding-right: Metrics.space-6;
-                padding-top: Metrics.space-3;
-                padding-bottom: Metrics.space-3;
-                spacing: Metrics.space-1;
-                for entry[i] in root.plan-entries : HorizontalLayout {
-                    spacing: Metrics.space-2;
-                    Text {
-                        text: entry.status == "completed" ? "✓"
-                            : entry.status == "in_progress" ? "▶" : "○";
-                        color: entry.status == "completed" ? Theme.text-muted
-                            : Theme.text-primary;
-                        font-size: 10px * Theme.font-scale;
-                        font-family: Theme.font-mono;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        text: entry.content;
-                        color: entry.status == "completed" ? Theme.text-muted : Theme.text-primary;
-                        font-size: 10px * Theme.font-scale;
-                        font-family: Theme.font-mono;
-                        wrap: word-wrap;
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        accessible-role: text;
-                        accessible-label: "Plan entry, " + entry.priority + " priority, " + entry.status + ": " + entry.content;
+            clip: true;
+            plan-scroll := Flickable {
+                width: parent.width;
+                height: parent.height;
+                viewport-height: plan-list.preferred-height;
+                plan-list := VerticalLayout {
+                    width: parent.width;
+                    padding-left: Metrics.space-6;
+                    padding-right: Metrics.space-6;
+                    padding-top: Metrics.space-3;
+                    padding-bottom: Metrics.space-3;
+                    spacing: Metrics.space-1;
+                    for entry[i] in root.plan-entries : HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        Text {
+                            text: entry.status == "completed" ? "✓"
+                                : entry.status == "in_progress" ? "▶" : "○";
+                            color: entry.status == "completed" ? Theme.text-muted
+                                : Theme.text-primary;
+                            font-size: 10px * Theme.font-scale;
+                            font-family: Theme.font-mono;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: entry.content;
+                            color: entry.status == "completed" ? Theme.text-muted : Theme.text-primary;
+                            font-size: 10px * Theme.font-scale;
+                            font-family: Theme.font-mono;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            accessible-role: text;
+                            accessible-label: "Plan entry, " + entry.priority + " priority, " + entry.status + ": " + entry.content;
+                        }
                     }
                 }
             }

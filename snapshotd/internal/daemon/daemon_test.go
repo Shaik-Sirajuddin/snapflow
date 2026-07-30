@@ -34,7 +34,10 @@ func buildFixture(t *testing.T) string {
 		name += ".exe"
 	}
 	out := filepath.Join(t.TempDir(), name)
-	cmd := exec.Command("go", "build", "-o", out, "snapshotd/internal/procmgr/testdata/fixture")
+	// Use the protocol-speaking fixture so daemon.close can exercise its
+	// production save-before-kill path, not only the process manager's liveness
+	// path.
+	cmd := exec.Command("go", "build", "-o", out, "snapshotd/internal/procmgr/testdata/sap_fixture")
 	if outBytes, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building fixture: %v\n%s", err, outBytes)
 	}
