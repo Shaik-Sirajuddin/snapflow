@@ -7980,7 +7980,19 @@ fn enrich_native_session_result(response: &mut serde_json::Value, metadata: serd
     else {
         return;
     };
-    result.insert("_acpx".to_owned(), metadata);
+    let Some(metadata) = metadata.as_object() else {
+        return;
+    };
+    let extension = result
+        .entry("_acpx")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !extension.is_object() {
+        *extension = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let extension = extension.as_object_mut().expect("just assigned object");
+    for (key, value) in metadata {
+        extension.insert(key.clone(), value.clone());
+    }
 }
 
 /// [`dispatch_shared`]'s `session/fork` path. Mirrors
@@ -8625,6 +8637,25 @@ mod tests {
         assert_eq!(classify("session/prompt"), MethodClass::Proxied);
         assert_eq!(classify("agents/list"), MethodClass::GatewayNative);
         assert_eq!(classify("bogus/method"), MethodClass::Unknown);
+    }
+
+    #[test]
+    fn native_session_metadata_merges_without_dropping_updates() {
+        let mut response = serde_json::json!({
+            "result": {"_acpx": {"updates": [{"method": "session/update"}]}}
+        });
+        enrich_native_session_result(
+            &mut response,
+            serde_json::json!({"serverPersistence": true}),
+        );
+        assert_eq!(response["result"]["_acpx"]["serverPersistence"], true);
+        assert_eq!(
+            response["result"]["_acpx"]["updates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// **`acpx-connect-loading-feedback`.** `session/load`/`session/resume`
