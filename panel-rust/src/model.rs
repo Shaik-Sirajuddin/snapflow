@@ -40,18 +40,6 @@ impl ProjectIdentity {
     }
 }
 
-/// Leave/return snapshot for one thread's chat list presentation.
-/// Rows include `MessageItem.expanded` so expand state survives A→B→A.
-/// Not a Slint tree cache — host-owned values installed into the shared
-/// `messages_model` on switch (see chat_view_audit_report §5).
-#[derive(Debug, Clone, Default)]
-pub struct ThreadListUiCache {
-    pub keys: Vec<String>,
-    pub rows: Vec<crate::MessageItem>,
-    #[allow(dead_code)]
-    pub gen: u64,
-}
-
 /// Result of `Effect::LoadInitialState` -- the same data
 /// `panel_rust_create` reads from `PanelStateStore` today (thread
 /// records, or the default thread set when the store is empty/missing),
@@ -135,6 +123,10 @@ pub struct ThreadModel {
     pub message_ids: Vec<String>,
     pub transcript: Vec<TranscriptItem>,
     pub transcript_keys: Vec<String>,
+    #[cfg(test)]
+    /// Legacy projection fixture retained only by unit tests that exercise
+    /// the pre-migration shared-list reducer. Production rows live in the
+    /// durable-ID keyed `ThreadViewModels` registry.
     pub message_rows: Vec<crate::MessageItem>,
     pub has_older_messages: bool,
     pub pending_request: crate::PendingRequestItem,
@@ -199,18 +191,14 @@ pub struct Model {
     pub search_query: String,
     pub visible_indices: Vec<usize>,
     /// Index-parallel expand flags for the *currently displayed* list only.
-    /// Durable expand lives on each `MessageItem.expanded` and in
-    /// `list_ui_cache` / `ThreadModel.message_rows` across switches.
+    /// Durable expand lives on each retained thread's `MessageItem` rows.
     pub expanded: Vec<bool>,
     pub displayed_thread: Option<usize>,
     /// Who currently owns `messages_model` (durable thread id). Must match
     /// the displayed thread after every install; used to refuse cross-thread
     /// writes and detect owner mismatch after selection.
+    #[cfg(test)]
     pub list_owner_thread_id: Option<String>,
-    /// Bumps on every full list install (switch / cold hydrate).
-    pub list_gen: u64,
-    /// Per-thread list presentation cache for leave/return (content + expand).
-    pub list_ui_cache: HashMap<String, ThreadListUiCache>,
     pub expanded_terminal_id: Option<String>,
     /// Terminal-tabs phase: every terminal id currently pinned open as a
     /// full-view tab, in the order tabs were first opened (not
@@ -312,8 +300,19 @@ pub struct Model {
     /// delegates retain identity across unrelated inserts/removals.
     pub thread_model: Rc<VecModel<crate::ThreadItem>>,
     pub thread_model_keys: RefCell<Vec<String>>,
+    /// Stable Slint records that expose one thread-owned message model per
+    /// durable thread to the UI.
+    pub thread_views_model: Rc<VecModel<crate::ThreadViewItem>>,
+    pub thread_views_model_keys: RefCell<Vec<String>>,
+    /// Test-only fixtures for the retired shared-message implementation.
+    /// Production ownership is exclusively in `thread_view_models`.
+    #[cfg(test)]
     pub messages_model: Rc<VecModel<crate::MessageItem>>,
+    #[cfg(test)]
     pub message_model_keys: RefCell<Vec<String>>,
+    /// Stable per-thread Slint-facing message models. This is the sole
+    /// production ownership foundation for retained ChatView instances.
+    pub thread_view_models: crate::thread_view::ThreadViewModels,
     pub skills_model: Rc<VecModel<crate::SkillOption>>,
     /// PUI-003: the displayed thread's ACP available_commands, projected as
     /// SkillOption rows (name+description) for the compose `/` menu. Reuses
@@ -349,8 +348,13 @@ pub struct Model {
 pub(crate) struct PersistentModels {
     pub(crate) thread_model: Rc<VecModel<crate::ThreadItem>>,
     pub(crate) thread_model_keys: Vec<String>,
+    pub(crate) thread_views_model: Rc<VecModel<crate::ThreadViewItem>>,
+    pub(crate) thread_views_model_keys: Vec<String>,
+    #[cfg(test)]
     pub(crate) messages_model: Rc<VecModel<crate::MessageItem>>,
+    #[cfg(test)]
     pub(crate) message_model_keys: Vec<String>,
+    pub(crate) thread_view_models: crate::thread_view::ThreadViewModels,
     pub(crate) skills_model: Rc<VecModel<crate::SkillOption>>,
     pub(crate) skill_model_keys: Vec<std::path::PathBuf>,
     pub(crate) commands_model: Rc<VecModel<crate::SkillOption>>,
@@ -373,8 +377,13 @@ impl Model {
         PersistentModels {
             thread_model: self.thread_model.clone(),
             thread_model_keys: self.thread_model_keys.borrow().clone(),
+            thread_views_model: self.thread_views_model.clone(),
+            thread_views_model_keys: self.thread_views_model_keys.borrow().clone(),
+            #[cfg(test)]
             messages_model: self.messages_model.clone(),
+            #[cfg(test)]
             message_model_keys: self.message_model_keys.borrow().clone(),
+            thread_view_models: self.thread_view_models.clone(),
             skills_model: self.skills_model.clone(),
             skill_model_keys: self.skill_model_keys.borrow().clone(),
             commands_model: self.commands_model.clone(),
@@ -396,8 +405,14 @@ impl Model {
     pub(crate) fn restore_persistent_models(&mut self, persistent: PersistentModels) {
         self.thread_model = persistent.thread_model;
         *self.thread_model_keys.borrow_mut() = persistent.thread_model_keys;
-        self.messages_model = persistent.messages_model;
-        *self.message_model_keys.borrow_mut() = persistent.message_model_keys;
+        self.thread_views_model = persistent.thread_views_model;
+        *self.thread_views_model_keys.borrow_mut() = persistent.thread_views_model_keys;
+        #[cfg(test)]
+        {
+            self.messages_model = persistent.messages_model;
+            *self.message_model_keys.borrow_mut() = persistent.message_model_keys;
+        }
+        self.thread_view_models = persistent.thread_view_models;
         self.skills_model = persistent.skills_model;
         *self.skill_model_keys.borrow_mut() = persistent.skill_model_keys;
         self.commands_model = persistent.commands_model;
@@ -438,6 +453,7 @@ impl Default for ThreadModel {
             message_ids: Vec::new(),
             transcript: Vec::new(),
             transcript_keys: Vec::new(),
+            #[cfg(test)]
             message_rows: Vec::new(),
             has_older_messages: false,
             pending_request: crate::PendingRequestItem::default(),
@@ -475,6 +491,15 @@ impl Model {
                     .or_insert(index);
             }
         }
+        let thread_ids = self
+            .threads
+            .iter()
+            .map(|thread| thread.thread_id.as_str())
+            .collect::<Vec<_>>();
+        self.thread_view_models
+            .retain_thread_ids(thread_ids.iter().copied());
+        self.thread_view_models
+            .ensure_for_thread_ids(thread_ids.iter().copied());
     }
 
     /// Resolve an incoming durable thread or remote session identity. The

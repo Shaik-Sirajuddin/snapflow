@@ -60,8 +60,8 @@
 use crate::conversation::ConversationState;
 use crate::gateway_actor::{
     spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_delayed_gateway_and_pool,
-    spawn_acpx_thread_with_gateway, spawn_acpx_thread_with_gateway_and_pool,
-    AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
+    spawn_acpx_thread_with_gateway, AcpxThreadGatewaySetter, AcpxThreadHandle,
+    GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
     JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
@@ -6332,17 +6332,26 @@ mod tests {
                 )
             });
 
-        crate::sync::apply_message_ops(&model, &thread_id, &ops);
+        crate::sync::apply_thread_message_ops(&model, &thread_id, &ops);
 
         assert!(
-            model.messages_model.row_count() > 0,
-            "the real {provider} reply must render into the shared messages_model, not just \
+            model
+                .thread_view_models
+                .get(&thread_id)
+                .unwrap()
+                .row_count()
+                > 0,
+            "the real {provider} reply must render into its retained thread model, not just \
              AgentBridge::history()"
         );
         assert_eq!(
-            model.messages_model.row_count(),
-            model.message_model_keys.borrow().len(),
-            "messages_model and its key cache must stay aligned after a real reply renders \
+            model
+                .thread_view_models
+                .get(&thread_id)
+                .unwrap()
+                .row_count(),
+            model.thread_view_models.keys(&thread_id).unwrap().len(),
+            "retained thread model and its key cache must stay aligned after a real reply renders \
              (this exact desync used to abort the whole process)"
         );
         let rendered_text: String = (0..model.messages_model.row_count())

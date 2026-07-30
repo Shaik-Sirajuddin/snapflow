@@ -16,6 +16,12 @@ export component UserBubble inherits Rectangle {
     in property <MessageItem> item;
     callback copy-message(string);
 
+    // Expose the durable row text to the Slint MCP/accessibility tree. This
+    // gives live UI tests a direct way to assert that a selected retained
+    // ChatView shows its own message and not another thread's row.
+    accessible-role: text;
+    accessible-label: item.text;
+
     vertical-stretch: 0;
 
     background: Theme.bg-tertiary;

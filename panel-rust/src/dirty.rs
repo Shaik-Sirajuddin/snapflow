@@ -293,13 +293,6 @@ pub enum Dirty {
         message_id: String,
         delta: String,
     },
-    /// Full replace of the shared message list for `thread_id` from
-    /// `ThreadModel.message_rows` (or clear if empty id). Used on **thread
-    /// switch** so selection + list ownership change in one sync turn —
-    /// no flash of the previous agent. See chat_view_audit_report §5.
-    MessageListInstall {
-        thread_id: String,
-    },
     /// One displayed-row patch (expand toggle, single-field update) without
     /// re-projecting or converging the whole list.
     MessageRowPatch {

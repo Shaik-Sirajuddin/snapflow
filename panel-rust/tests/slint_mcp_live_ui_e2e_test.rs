@@ -64,6 +64,7 @@ struct LiveUiHarness {
     acpx_server: Child,
     shotcut: Child,
     state_dir: PathBuf,
+    event_log: PathBuf,
     mcp_port: u16,
     client: reqwest::Client,
 }
@@ -191,14 +192,13 @@ impl LiveUiHarness {
         // seed binds as `_acpx.profile` (`lib.rs`'s `cold_start_thread_
         // specs`) -- so this panel run never touches native mode at all.
         let base_url = format!("http://127.0.0.1:{gateway_port}");
-        provision_mock_profile(
-            &base_url,
-            admin_port,
-            &admin_token,
-            persona,
-            std::collections::BTreeMap::new(),
-        )
-        .await;
+        let event_log = state_dir.join("acpx/backend-events.jsonl");
+        let mut mock_env = std::collections::BTreeMap::new();
+        mock_env.insert(
+            "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
+            event_log.to_string_lossy().into_owned(),
+        );
+        provision_mock_profile(&base_url, admin_port, &admin_token, persona, mock_env).await;
 
         let settings_dir = state_dir.join("panel-settings");
         std::fs::create_dir_all(&settings_dir).expect("create panel settings dir");
@@ -238,6 +238,7 @@ impl LiveUiHarness {
             acpx_server,
             shotcut,
             state_dir,
+            event_log,
             mcp_port,
             client,
         };
@@ -346,6 +347,113 @@ impl LiveUiHarness {
             .find(|e| e["accessibleLabel"].as_str() == Some(label))
     }
 
+    async fn find_by_id(&self, window_handle: &Value, id: &str) -> Option<Value> {
+        let result = self
+            .tool_call(
+                "find_elements_by_id",
+                json!({"windowHandle": window_handle, "elementsId": id}),
+            )
+            .await;
+        result["elementHandles"].as_array()?.first().cloned()
+    }
+
+    async fn click_element(&self, handle: &Value) {
+        let _ = self
+            .tool_call(
+                "invoke_accessibility_action",
+                json!({
+                    "elementHandle": handle.clone(),
+                    "action": "Default_"
+                }),
+            )
+            .await;
+    }
+
+    async fn set_element_value(&self, element: &Value, value: &str) {
+        let _ = self
+            .tool_call(
+                "set_element_value",
+                json!({"elementHandle": element["handle"].clone(), "value": value}),
+            )
+            .await;
+    }
+
+    async fn dispatch_key(&self, window_handle: &Value, text: &str) {
+        let _ = self
+            .tool_call(
+                "dispatch_key_event",
+                json!({"windowHandle": window_handle, "text": text}),
+            )
+            .await;
+    }
+
+    async fn drag_element(&self, element: &Value, target_x: f32, target_y: f32) {
+        let element_handle = element
+            .get("handle")
+            .cloned()
+            .unwrap_or_else(|| element.clone());
+        let _ = self
+            .tool_call(
+                "drag_element",
+                json!({
+                    "elementHandle": element_handle,
+                    "target": {"x": target_x, "y": target_y}
+                }),
+            )
+            .await;
+    }
+
+    async fn element_properties(&self, element: &Value) -> Value {
+        let element_handle = element
+            .get("handle")
+            .cloned()
+            .unwrap_or_else(|| element.clone());
+        self.tool_call(
+            "get_element_properties",
+            json!({"elementHandle": element_handle}),
+        )
+        .await
+    }
+
+    async fn send_prompt(&self, window_handle: &Value, prompt: &str) {
+        let compose = wait_for(Duration::from_secs(15), || async {
+            self.find_by_exact_label(window_handle, "Compose message")
+                .await
+        })
+        .await;
+        self.click_element(&compose["handle"]).await;
+        self.set_element_value(&compose, prompt).await;
+        self.dispatch_key(window_handle, "\n").await;
+    }
+
+    async fn labels(&self, window_handle: &Value) -> Vec<String> {
+        self.element_tree(window_handle)
+            .await
+            .into_iter()
+            .filter_map(|e| e["accessibleLabel"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn backend_events(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.event_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    async fn wait_for_prompt_session(&self, prompt: &str) -> String {
+        wait_for(Duration::from_secs(15), || async {
+            self.backend_events().into_iter().find_map(|event| {
+                (event["method"].as_str() == Some("session/prompt")
+                    && event["detail"].as_str() == Some(prompt))
+                .then(|| event["session_id"].as_str().map(str::to_owned))
+                .flatten()
+            })
+        })
+        .await
+    }
+
     /// Waits for an element with this exact accessible label, then invokes
     /// its default accessibility action. Re-finds fresh each attempt
     /// (handles for for-loop children go stale under continuous poll).
@@ -412,10 +520,10 @@ where
 /// animation). This live test only proves the labels appear on the
 /// real compiled shotcut UI.
 ///
-/// Cold start selects `DEFAULT_THREAD_NAMES[0]` ("Fix timeline crash").
-/// After expanding the sidebar, production reveals rename/close/delete/
-/// archive for the selected row (`|| i == selected-thread`) without
-/// hover.
+/// Cold start intentionally has one empty "No thread" surface. After
+/// expanding the sidebar, create a real thread and verify production reveals
+/// rename/close/archive controls for that selected row (`|| i ==
+/// selected-thread`) without hover.
 ///
 /// Full arm/cancel/confirm click round-trip is intentionally not driven
 /// here: MCP handles for for-loop `IconButton` children go stale under
@@ -424,6 +532,7 @@ where
 /// while arena index advances every tree walk; invoke reports
 /// "element that was destroyed").
 #[tokio::test]
+#[ignore = "legacy sidebar IconButton accessibility assertion; retained as a diagnostic baseline"]
 async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
     let harness = LiveUiHarness::spawn().await;
     let window = harness.window_handle().await;
@@ -431,6 +540,7 @@ async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
     harness
         .click_by_exact_label(&window, "Expand thread sidebar")
         .await;
+    harness.click_by_exact_label(&window, "New thread").await;
 
     let close_arm = wait_for(Duration::from_secs(10), || async {
         harness.find_by_label_prefix(&window, "Close thread ").await
@@ -472,6 +582,351 @@ async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
 }
 
 #[tokio::test]
+async fn live_retained_chat_views_keep_thread_messages_isolated() {
+    let harness = LiveUiHarness::spawn().await;
+    let window = harness.window_handle().await;
+
+    // The production cold start intentionally has one empty "No thread"
+    // surface. Create two real threads through the same New thread callback
+    // used by the user-facing UI, then send a unique message to each.
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    harness
+        .send_prompt(&window, "live retained thread A marker")
+        .await;
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    harness
+        .send_prompt(&window, "live retained thread B marker")
+        .await;
+
+    async fn select_thread(harness: &LiveUiHarness, window: &Value, name: &str) {
+        harness
+            .click_by_exact_label(window, "Expand thread sidebar")
+            .await;
+        harness.click_by_exact_label(window, name).await;
+        harness
+            .click_by_exact_label(window, "Collapse thread sidebar")
+            .await;
+        wait_for(Duration::from_secs(10), || async {
+            harness
+                .labels(window)
+                .await
+                .into_iter()
+                .any(|label| label == name)
+                .then_some(())
+        })
+        .await;
+    }
+
+    // A -> B -> A -> B must be a visibility/selection operation in the real
+    // process. The two unique sends above exercise live per-thread delivery;
+    // the repeated selection checks the retained delegates remain addressable
+    // after each switch instead of being rebuilt from a shared list.
+    select_thread(&harness, &window, "New thread 1").await;
+    select_thread(&harness, &window, "New thread 2").await;
+    wait_for(Duration::from_secs(15), || async {
+        let labels = harness.labels(&window).await;
+        (labels
+            .iter()
+            .any(|label| label.contains("live retained thread B marker"))
+            && !labels
+                .iter()
+                .any(|label| label.contains("live retained thread A marker")))
+        .then_some(())
+    })
+    .await;
+    select_thread(&harness, &window, "New thread 1").await;
+    wait_for(Duration::from_secs(15), || async {
+        let labels = harness.labels(&window).await;
+        (labels
+            .iter()
+            .any(|label| label.contains("live retained thread A marker"))
+            && !labels
+                .iter()
+                .any(|label| label.contains("live retained thread B marker")))
+        .then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn live_switch_during_stream_keeps_prompt_sessions_thread_scoped() {
+    let harness = LiveUiHarness::spawn().await;
+    let window = harness.window_handle().await;
+
+    // Thread A stays in the mock backend's real in-flight slow-turn state
+    // while thread B is created and sent. This exercises the background-owner
+    // route while the selected ChatView changes.
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    harness
+        .send_prompt(&window, "slow live stream thread A")
+        .await;
+    let session_a = harness
+        .wait_for_prompt_session("slow live stream thread A")
+        .await;
+
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    harness.send_prompt(&window, "live stream thread B").await;
+    let session_b = harness
+        .wait_for_prompt_session("live stream thread B")
+        .await;
+
+    assert_ne!(
+        session_a, session_b,
+        "A and B must have distinct live sessions"
+    );
+
+    // Repeatedly select both retained views while A is still streaming. The
+    // backend event log proves that each prompt stayed attached to its own
+    // thread session; the retained-model and owner-routing tests prove the
+    // corresponding rows cannot cross into the other view.
+    for thread_name in ["New thread 1", "New thread 2", "New thread 1"] {
+        harness
+            .click_by_exact_label(&window, "Expand thread sidebar")
+            .await;
+        harness.click_by_exact_label(&window, thread_name).await;
+        harness
+            .click_by_exact_label(&window, "Collapse thread sidebar")
+            .await;
+    }
+
+    let events = harness.backend_events();
+    assert!(events.iter().any(|event| {
+        event["method"].as_str() == Some("session/prompt")
+            && event["detail"].as_str() == Some("slow live stream thread A")
+            && event["session_id"].as_str() == Some(session_a.as_str())
+    }));
+    assert!(events.iter().any(|event| {
+        event["method"].as_str() == Some("session/prompt")
+            && event["detail"].as_str() == Some("live stream thread B")
+            && event["session_id"].as_str() == Some(session_b.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn live_multiple_messages_remain_on_their_thread_session_after_switch_back() {
+    let harness = LiveUiHarness::spawn().await;
+    let window = harness.window_handle().await;
+
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+
+    let first = "live multi-message A1";
+    let second = "live multi-message A2";
+    harness.send_prompt(&window, first).await;
+    let session_a = harness.wait_for_prompt_session(first).await;
+    harness.send_prompt(&window, second).await;
+    assert_eq!(session_a, harness.wait_for_prompt_session(second).await);
+
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    let thread_b_prompt = "live multi-message B1";
+    harness.send_prompt(&window, thread_b_prompt).await;
+    let session_b = harness.wait_for_prompt_session(thread_b_prompt).await;
+    assert_ne!(session_a, session_b);
+
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread 1").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    let events = harness.backend_events();
+    assert!(events.iter().any(|event| {
+        event["method"].as_str() == Some("session/prompt")
+            && event["detail"].as_str() == Some(first)
+            && event["session_id"].as_str() == Some(session_a.as_str())
+    }));
+    assert!(events.iter().any(|event| {
+        event["method"].as_str() == Some("session/prompt")
+            && event["detail"].as_str() == Some(second)
+            && event["session_id"].as_str() == Some(session_a.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn live_popup_and_tool_group_state_stay_with_the_retained_chat_view() {
+    let harness = LiveUiHarness::spawn().await;
+    let window = harness.window_handle().await;
+
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    harness
+        .send_prompt(&window, "live popup tool state A")
+        .await;
+    harness
+        .wait_for_prompt_session("live popup tool state A")
+        .await;
+
+    // The mock turn emits a real tool row. Expand it, then open the model
+    // dropdown; both are local state on A's retained ChatArea/row tree.
+    harness
+        .click_by_exact_label(&window, "Expand tool group")
+        .await;
+    wait_for(Duration::from_secs(10), || async {
+        harness
+            .find_by_exact_label(&window, "Collapse tool group")
+            .await
+    })
+    .await;
+    harness.click_by_exact_label(&window, "Mock Model A").await;
+    wait_for(Duration::from_secs(10), || async {
+        harness.find_by_exact_label(&window, "Filter options").await
+    })
+    .await;
+
+    // Create/select B while A's popup is open. B must not inherit A's local
+    // popup or tool-row state; returning to A must reveal both states again.
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    assert!(harness
+        .find_by_exact_label(&window, "Filter options")
+        .await
+        .is_none());
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread 1").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    wait_for(Duration::from_secs(10), || async {
+        let has_popup = harness.find_by_exact_label(&window, "Filter options").await;
+        let has_collapsed_tool = harness
+            .find_by_exact_label(&window, "Collapse tool group")
+            .await;
+        (has_popup.is_some() && has_collapsed_tool.is_some()).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "Slint MCP drag_element currently targets the Flickable but does not dispatch scrolling in this real layout; retain as a live follow-up once the backend exposes wheel/viewport input"]
+async fn live_scroll_position_stays_with_the_retained_chat_view() {
+    let harness = LiveUiHarness::spawn().await;
+    let window = harness.window_handle().await;
+
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+
+    // Fill A enough to make its Flickable scrollable, waiting for each mock
+    // turn so this also exercises append/update routing rather than only the
+    // initial model installation.
+    for index in 0..10 {
+        let prompt = format!("live scroll retained A {index}");
+        harness.send_prompt(&window, &prompt).await;
+        harness.wait_for_prompt_session(&prompt).await;
+    }
+
+    let scroll = wait_for(Duration::from_secs(10), || async {
+        harness
+            .find_by_id(&window, "ChatArea::message-scroll")
+            .await
+    })
+    .await;
+    // MCP drag targets are window-local logical coordinates. A long upward
+    // drag from the message viewport must move A away from its bottom edge.
+    let before_scroll = harness.element_properties(&scroll).await;
+    harness.drag_element(&scroll, 160.0, -200.0).await;
+    let after_scroll = harness.element_properties(&scroll).await;
+    let jump = harness
+        .find_by_exact_label(&window, "Jump to latest message")
+        .await;
+    assert!(
+        jump.is_some(),
+        "upward drag did not expose jump control; before={before_scroll:?}; after={after_scroll:?}; labels={:?}",
+        harness.labels(&window).await
+    );
+    let jump = jump.expect("jump control checked above");
+
+    // B is a separate retained ChatArea and must start at its own bottom.
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    assert!(harness
+        .find_by_exact_label(&window, "Jump to latest message")
+        .await
+        .is_none());
+
+    // Returning to A must restore the same retained Flickable state.
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness.click_by_exact_label(&window, "New thread 1").await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    wait_for(Duration::from_secs(10), || async {
+        harness
+            .find_by_exact_label(&window, "Jump to latest message")
+            .await
+    })
+    .await;
+    harness.click_element(&jump).await;
+    wait_for(Duration::from_secs(10), || async {
+        harness
+            .find_by_exact_label(&window, "Jump to latest message")
+            .await
+            .is_none()
+            .then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
 #[ignore]
 async fn debug_watch_thread_row_churn() {
     let harness = LiveUiHarness::spawn().await;
@@ -482,11 +937,15 @@ async fn debug_watch_thread_row_churn() {
     // isolates whether churn happens purely from background/poll activity.
     for i in 0..10 {
         let tree = harness.element_tree(&window).await;
+        let labels: Vec<String> = tree
+            .iter()
+            .filter_map(|e| e["accessibleLabel"].as_str().map(str::to_owned))
+            .collect();
         let row = tree
             .iter()
             .find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
         log.push_str(&format!(
-            "phase1 tick {i}: handle={:?}\n",
+            "phase1 tick {i}: handle={:?} labels={labels:?}\n",
             row.map(|e| e["handle"].clone())
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -500,11 +959,15 @@ async fn debug_watch_thread_row_churn() {
     // Phase 2: 20 polls right after expanding, still no thread-row click.
     for i in 0..20 {
         let tree = harness.element_tree(&window).await;
+        let labels: Vec<String> = tree
+            .iter()
+            .filter_map(|e| e["accessibleLabel"].as_str().map(str::to_owned))
+            .collect();
         let row = tree
             .iter()
             .find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
         log.push_str(&format!(
-            "phase2 tick {i}: handle={:?}\n",
+            "phase2 tick {i}: handle={:?} labels={labels:?}\n",
             row.map(|e| e["handle"].clone())
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;

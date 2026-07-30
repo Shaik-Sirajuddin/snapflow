@@ -508,6 +508,16 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
     dispatch_compose_send(panel, filtered_idx, text);
 }
 
+/// Persists live unsent composer text into the selected thread immediately.
+/// The retained ChatArea remains the UI source of truth while this reducer
+/// mirror lets thread switching and send/restore flows use durable Rust state.
+pub(crate) fn dispatch_compose_draft_changed(panel: &PanelSingleton, text: String) {
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::DraftChanged(text))),
+    );
+}
+
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
     let expected_thread_id = panel.real_index(filtered_idx).and_then(|real_idx| {
         panel

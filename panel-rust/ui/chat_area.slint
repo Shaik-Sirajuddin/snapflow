@@ -4,7 +4,7 @@ import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
 import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
-import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
+import { MessageItem, ToolGroupItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -31,6 +31,11 @@ import { TerminalView } from "./chat-view/components/execution/terminal_view.sli
 // for why tool-call gets the richer timeline-style card instead of the
 // bubble layout's flat text dump.
 export component ChatArea inherits Rectangle {
+    // Retained-view command generations. A stack host can address the
+    // selected ChatArea without invoking methods on hidden delegates.
+    in property <int> focus-command: 0;
+    in property <int> approve-command: 0;
+    in property <int> reject-command: 0;
     in property <string> active-thread-name: "";
     in property <string> active-thread-description: "";
     // The active thread's effective background-session mode -- drives the
@@ -39,6 +44,7 @@ export component ChatArea inherits Rectangle {
     in property <bool> active-thread-background: false;
     callback toggle-background();
     in property <[MessageItem]> messages: [];
+    in property <[ToolGroupItem]> tool-groups: [];
     // Phase 3 step 2: an upward user scroll which reaches the actual top
     // boundary asks Rust to prepend the next local JSONL page. The visible
     // button remains as an accessible fallback for keyboard/screen-reader
@@ -90,6 +96,10 @@ export component ChatArea inherits Rectangle {
     // struct" convention `PendingRequestItem` already established.
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
+    // Composer state is owned by this retained ChatArea. The stack forwards
+    // only the selected delegate's changes to Rust; hidden delegates keep
+    // their own text and never overwrite the active draft.
+    callback compose-text-changed(string);
     in-out property <bool> full-view-open: false;
     in-out property <int> full-view-group-idx: -1;
     in-out property <string> full-view-title: "";
@@ -165,7 +175,7 @@ export component ChatArea inherits Rectangle {
     callback profile-selected(string, string);
     callback configure-provider-requested();
     callback context-view-requested();
-    callback send-requested();
+    callback send-requested(string);
     callback queue-fast-track-requested();
     callback stop-requested();
     // PUI-002a/b: forwarded from ChatInputLayout's terminals chip (see
@@ -208,6 +218,8 @@ export component ChatArea inherits Rectangle {
     // focus — returns accept when a shortcut was handled.
     callback panel-shortcut(KeyEvent) -> EventResult;
     out property <bool> compose-has-focus: chat-input.compose-has-focus;
+
+    changed compose-text => { root.compose-text-changed(root.compose-text); }
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
     // Mode/model dropdown search + mention popup filter -- see
@@ -330,7 +342,11 @@ export component ChatArea inherits Rectangle {
             return;
         }
         root.demo-trigger-scratch = "";
-        root.send-requested();
+        // Normal sends clear this retained ChatArea's own composer before
+        // notifying Rust. The per-thread draft callback then mirrors the
+        // empty value, without relying on a shared stack-level setter.
+        root.send-requested(root.compose-text);
+        root.compose-text = "";
     }
 
     function handle-permission-option(option-id: string) {
@@ -1109,41 +1125,35 @@ export component ChatArea inherits Rectangle {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
-                        label: msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE";
-                        item-count: tool-group-size;
+                        label: root.tool-groups.length > 0 ? root.tool-groups[msg.index].label : (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE");
+                        item-count: root.tool-groups.length > 0 ? root.tool-groups[msg.index].item-count : tool-group-size;
+                        messages: root.tool-groups.length > 0 ? root.tool-groups[msg.index].messages : root.messages;
+                        group-start: i;
+                        group-length: tool-group-size;
+                        group-local: root.tool-groups.length > 0;
+                        row-cap-height: root.height * 0.3;
                         loading: is-live-tail;
-                        default-expanded: (i + tool-group-size) >= root.messages.length;
+                        // Tool/MCP execution groups are opt-in surfaces:
+                        // even the newest live group stays collapsed until
+                        // the user explicitly expands it.
+                        default-expanded: false;
+                        mcp-variant: root.tool-groups.length > 0 ? root.tool-groups[msg.index].label == "MCP CALL" : msg.kind == "mcp_server_call";
                         max-visible-height: min(230px, root.height * 0.35);
                         open-group-full-view => {
-                            root.full-view-title = (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE") + " EXECUTION (" + tool-group-size + " TOTAL CALLS)";
-                            root.full-view-is-mcp = msg.kind == "mcp_server_call";
+                            root.full-view-title = (root.tool-groups.length > 0 ? root.tool-groups[msg.index].label : (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE")) + " EXECUTION (" + (root.tool-groups.length > 0 ? root.tool-groups[msg.index].item-count : tool-group-size) + " TOTAL CALLS)";
+                            root.full-view-is-mcp = root.tool-groups.length > 0 ? root.tool-groups[msg.index].label == "MCP CALL" : msg.kind == "mcp_server_call";
                             root.full-view-group-idx = i;
                             root.full-view-open = true;
                         }
-                        for sub-msg[sub-idx] in root.messages : ToolEventRow {
-                            visible: sub-idx >= i && root.in-same-tool-group(root.messages, i, sub-idx);
-                            height: self.visible ? self.preferred-height : 0px;
-                            horizontal-stretch: self.visible ? 1 : 0;
-                            vertical-stretch: 0;
-                            in-group: true;
-                            kind: sub-msg.kind;
-                            first-use: sub-msg.first-use;
-                            text: sub-msg.text;
-                            cap-height: root.height * 0.3;
-                            raw-input: sub-msg.raw-input;
-                            raw-output: sub-msg.raw-output;
-                            expanded: sub-msg.expanded;
-                            index: sub-msg.index;
-                            toggle-expanded(idx) => { toggle-expanded(idx); }
-                            open-full-view(title, input, output, term, mcp) => {
-                                root.full-view-title = title;
-                                root.full-view-raw-input = input;
-                                root.full-view-raw-output = output;
-                                root.full-view-is-terminal = term;
-                                root.full-view-is-mcp = mcp;
-                                root.full-view-group-idx = -1;
-                                root.full-view-open = true;
-                            }
+                        toggle-expanded(idx) => { toggle-expanded(idx); }
+                        open-full-view(title, input, output, term, mcp) => {
+                            root.full-view-title = title;
+                            root.full-view-raw-input = input;
+                            root.full-view-raw-output = output;
+                            root.full-view-is-terminal = term;
+                            root.full-view-is-mcp = mcp;
+                            root.full-view-group-idx = -1;
+                            root.full-view-open = true;
                         }
                     }
                     if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
@@ -1219,6 +1229,7 @@ export component ChatArea inherits Rectangle {
                 background: #00000080;
 
                 TouchArea {
+                    mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Close full view";
                     accessible-action-default => { self.clicked(); }
@@ -1265,10 +1276,10 @@ export component ChatArea inherits Rectangle {
                                 vertical-alignment: center;
                             }
                             Rectangle { horizontal-stretch: 1; height: 0px; }
-                            TouchArea {
-                                width: 20px;
-                                height: 20px;
-                                mouse-cursor: pointer;
+                            IconButton {
+                                btn-width: 20px;
+                                btn-height: 20px;
+                                button-accessible-label: "Close full view";
                                 clicked => { root.close-full-view(); }
                                 Text {
                                     text: "\u{2715}";
@@ -1304,8 +1315,11 @@ export component ChatArea inherits Rectangle {
                                     // ToolGroupView's own body-layout already does
                                     // this (spacing: 0px).
                                     spacing: 0px;
-                                    for sub-msg[sub-idx] in root.messages : VerticalLayout {
-                                        property <bool> row-visible: sub-idx >= root.full-view-group-idx && root.in-same-tool-group(root.messages, root.full-view-group-idx, sub-idx);
+                                    for sub-msg[sub-idx] in (root.tool-groups.length > 0 ? root.tool-groups[root.full-view-group-idx].messages : root.messages) : VerticalLayout {
+                                        property <bool> row-visible: root.tool-groups.length > 0
+                                            ? true
+                                            : sub-idx >= root.full-view-group-idx
+                                                && root.in-same-tool-group(root.messages, root.full-view-group-idx, sub-idx);
                                         spacing: 0px;
                                         ToolEventRow {
                                         visible: parent.row-visible;
@@ -1319,8 +1333,13 @@ export component ChatArea inherits Rectangle {
                                         cap-height: 260px;
                                         raw-input: sub-msg.raw-input;
                                         raw-output: sub-msg.raw-output;
-                                        expanded: true;
+                                        // Full-view rows follow the same
+                                        // collapsed-by-default policy as the
+                                        // inline group. Users opt into each
+                                        // payload explicitly.
+                                        expanded: false;
                                         index: sub-msg.index;
+                                        mcp-variant: root.full-view-is-mcp;
                                         toggle-expanded(idx) => { toggle-expanded(idx); }
                                         open-full-view(title, input, output, term, mcp) => {
                                             // Save current state for nested popup (stack style)
