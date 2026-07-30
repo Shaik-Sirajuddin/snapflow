@@ -1,5 +1,6 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
+import { Strings } from "../../../tokens/strings.slint";
 import { Button } from "../../../base/button.slint";
 import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
@@ -106,11 +107,11 @@ export component AgentsView inherits Rectangle {
     SettingsSection {
         width: parent.width;
 
-        SettingsSectionHeader { text: "Chat Defaults"; }
+        SettingsSectionHeader { text: Strings.chat-defaults; }
 
         SettingsField {
             width: parent.width;
-            label: "Profile";
+            label: Strings.profile;
             default-profile-field := TextField {
                 text <=> root.default-profile;
                 field-accessible-label: "Default profile";
@@ -281,7 +282,7 @@ export component AgentsView inherits Rectangle {
 
         SettingsField {
             width: parent.width;
-            label: "Permission profile";
+            label: Strings.permission-profile;
             permission-profile-field := TextField {
                 text <=> root.permission-profile;
                 field-accessible-label: "Permission profile";
@@ -291,12 +292,12 @@ export component AgentsView inherits Rectangle {
 
         SettingsDivider { width: parent.width; }
 
-        SettingsSectionHeader { text: "Agents"; subsection: true; }
+        SettingsSectionHeader { text: Strings.agents; subsection: true; }
 
         agent-search-bar := SettingsSearchBar {
             width: parent.width;
-            placeholder: "Search agents...";
-            bar-accessible-label: "Search agents";
+            placeholder: Strings.search-agents-ellipsis;
+            bar-accessible-label: Strings.search-agents;
             query <=> root.agent-search-query;
         }
 
@@ -388,6 +389,7 @@ export component AgentsView inherits Rectangle {
                         card-width: cards-per-row == 1 ? root.width : 260px;
                         is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
                         enabled: root.agent-catalog[first-agent-index].enabled;
+                        loading: root.agent-catalog[first-agent-index].loading;
                         set-default(new-default) => {
                             root.default-agent-id = new-default ? root.agent-catalog[first-agent-index].id : "";
                         }
@@ -405,6 +407,7 @@ export component AgentsView inherits Rectangle {
                         card-width: 260px;
                         is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
                         enabled: root.agent-catalog[first-agent-index + 1].enabled;
+                        loading: root.agent-catalog[first-agent-index + 1].loading;
                         set-default(new-default) => {
                             root.default-agent-id = new-default ? root.agent-catalog[first-agent-index + 1].id : "";
                         }
@@ -432,9 +435,9 @@ export component AgentsView inherits Rectangle {
         // e2e test's "Attach recovered session" assertion never matching
         // anything). Attaching binds via `session/load`, never
         // `session/new` (`AgentBridge::add_thread_recovering_session`).
-        SettingsSectionHeader { text: "Recoverable Sessions"; subsection: true; }
+        SettingsSectionHeader { text: Strings.recoverable-sessions; subsection: true; }
         if root.recoverable-sessions.length == 0 : Text {
-            text: "No orphaned sessions for this provider.";
+            text: Strings.no-orphaned-sessions;
             color: Theme.text-muted;
             font-size: 10px * Theme.font-scale;
         }
@@ -442,8 +445,8 @@ export component AgentsView inherits Rectangle {
             label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
             row-height: 26px;
             Button {
-                label: "Attach";
-                button-accessible-label: "Attach recovered session " + session.session-id;
+                label: Strings.attach;
+                button-accessible-label: Strings.attach + " recovered session " + session.session-id;
                 btn-width: 52px;
                 btn-height: 20px;
                 font-size: 9px;

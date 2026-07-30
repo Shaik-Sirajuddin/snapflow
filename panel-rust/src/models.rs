@@ -13,8 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption, TerminalItem,
-    ThreadItem,
+    McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
+    TerminalItem, ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -102,20 +102,55 @@ fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
 /// Agent rows get full markdown parse; other kinds leave lines empty so
 /// MarkdownView falls back to plain `text`.
 fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
-    if kind != "agent" {
+    if kind != "agent" && kind != "thinking" {
+        return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
+    }
+    // UI freeze fix: reconnect/status storms (e.g. "Reconnecting... 1/5")
+    // and hard transport failures update agent text many times per second.
+    // Full markdown reparse of the whole transcript on every poll tick
+    // stalls the single UI/paint thread under software GL. These lines
+    // are plain status -- MarkdownView already falls back to `text`
+    // when `markdown_lines` is empty.
+    if agent_text_skips_markdown(text) {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
     lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
+}
+
+/// True for agent text that is only status/reconnect/hard-error noise --
+/// never real markdown content worth a full document parse.
+pub(crate) fn agent_text_skips_markdown(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty()
+            || line.starts_with("Reconnecting...")
+            || line.starts_with("unexpected status ")
+            || line.contains("502 Bad Gateway")
+            || line.contains("Bad Gateway")
+    })
+}
+
+/// Hard agent/backend failure that should clear `Loading` immediately so
+/// the compose/send controls unlock instead of waiting for a late
+/// `TurnEnded` after a long reconnect loop.
+pub(crate) fn agent_text_is_hard_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("502 bad gateway")
+        || lower.contains("unexpected status 5")
+        || lower.contains("unexpected status 4")
+        || (lower.contains("reconnecting... 5/5")
+            && (lower.contains("unexpected status") || lower.contains("bad gateway")))
 }
 
 /// Plan phase 27: markdown render of the skill editor's active content
 /// for the editor's Preview toggle -- same renderer/wrap as agent chat
 /// bodies, so the "MD formatter" applies to the skill's editing section.
 pub fn skill_markdown_preview(text: &str) -> ModelRc<MarkdownLine> {
-    lines_to_slint_model(markdown::render_document(
-        text,
-        markdown::DEFAULT_WRAP_COLS,
-    ))
+    lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
 }
 
 /// Incremental render for an in-flight agent message.
@@ -138,6 +173,18 @@ pub enum ThreadState {
     Loading,
     Cancelling,
     Error,
+    /// PROF-7 (`profile-only-backend-selection` plan): a real per-thread
+    /// state, not a render-time heuristic -- set once, at the moment a
+    /// thread's session attach completes (see `external_snapshot`'s
+    /// `agent_detected` collection and `update.rs`'s fold of it), when the
+    /// thread's bound profile names an agent id that acpx's own
+    /// `agents/list` reports as NOT `Installed`/`InstalledNoSession`
+    /// (typically a restored thread whose agent is no longer present on
+    /// this machine). A thread with no bound profile (native/unmanaged
+    /// mode) is never marked Stale -- there is no registry agent id to
+    /// check it against, so "can't determine" fails open rather than
+    /// guessing.
+    Stale,
 }
 
 impl ThreadState {
@@ -147,6 +194,7 @@ impl ThreadState {
             ThreadState::Loading => "loading",
             ThreadState::Cancelling => "cancelling",
             ThreadState::Error => "error",
+            ThreadState::Stale => "stale",
         }
     }
 }
@@ -744,10 +792,8 @@ fn append_option_entries(items: &mut Vec<DropdownEntry>, option: ConfigOptionInf
 fn looks_on_value(value: &str, name: &str) -> bool {
     let v = value.to_ascii_lowercase();
     let n = name.to_ascii_lowercase();
-    matches!(
-        v.as_str(),
-        "on" | "true" | "1" | "yes" | "enabled" | "fast"
-    ) || matches!(n.as_str(), "on" | "true" | "yes" | "enabled" | "fast")
+    matches!(v.as_str(), "on" | "true" | "1" | "yes" | "enabled" | "fast")
+        || matches!(n.as_str(), "on" | "true" | "yes" | "enabled" | "fast")
 }
 
 fn looks_off_value(value: &str, name: &str) -> bool {
@@ -756,7 +802,10 @@ fn looks_off_value(value: &str, name: &str) -> bool {
     matches!(
         v.as_str(),
         "off" | "false" | "0" | "no" | "disabled" | "slow" | "quality"
-    ) || matches!(n.as_str(), "off" | "false" | "no" | "disabled" | "slow" | "quality")
+    ) || matches!(
+        n.as_str(),
+        "off" | "false" | "no" | "disabled" | "slow" | "quality"
+    )
 }
 
 /// UI projection for the compose-bar Fast toggle. Empty/unavailable when
@@ -811,120 +860,21 @@ pub fn fast_mode_from_config(options: &[ConfigOptionInfo]) -> FastModeUi {
 }
 
 /// Model selector rows: **only** the ACP `"model"` option (not reasoning,
-/// not fast-mode). When `provider_agent_id` is set and at least one value
-/// is namespaced to that agent (`agent/model`, etc.), only those values
-/// are kept; if none are namespaced, the full session model list is
-/// shown (session ads are already per-agent).
+/// not fast-mode). The catalog is already agent-scoped by ACPX's
+/// `models/list` or the session that advertised it; the panel must not guess
+/// ownership from model-name strings.
 pub fn to_config_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
-    to_config_dropdown_entries_for_provider(options, "")
-}
-
-pub fn to_config_dropdown_entries_for_provider(
-    options: Vec<ConfigOptionInfo>,
-    provider_agent_id: &str,
-) -> ModelRc<DropdownEntry> {
     let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
         if option_id_norm(&option.id) != "model" {
             continue;
         }
-        let option = filter_model_option_for_provider(option, provider_agent_id);
         if option.options.is_empty() {
             continue;
         }
         append_option_entries(&mut items, option);
     }
     ModelRc::new(VecModel::from(items))
-}
-
-fn filter_model_option_for_provider(
-    mut option: ConfigOptionInfo,
-    provider_agent_id: &str,
-) -> ConfigOptionInfo {
-    if provider_agent_id.is_empty() || option.options.is_empty() {
-        return option;
-    }
-    let agent = provider_agent_id.to_ascii_lowercase();
-    let any_namespaced = option
-        .options
-        .iter()
-        .any(|v| model_value_looks_namespaced(&v.value));
-    if !any_namespaced {
-        // Bare model ids (gpt-5, sonnet) — already session-scoped.
-        return option;
-    }
-    let filtered: Vec<_> = option
-        .options
-        .iter()
-        .filter(|v| model_value_matches_provider(&v.value, &v.name, &agent))
-        .cloned()
-        .collect();
-    if filtered.is_empty() {
-        // Fail CLOSED for providers whose vendor vocabulary we know: a
-        // namespaced catalog where *nothing* matches claude/grok/codex is a
-        // foreign provider's catalog, and returning it whole is exactly the
-        // live "claude-acp thread offering GPT models" bug (plan phase 24).
-        // Unknown/custom agent ids keep the permissive fallback so a
-        // custom-catalog gateway (bifrost-style) still shows its list.
-        if provider_vendor_stems(&agent).is_some() {
-            option.options.clear();
-            return option;
-        }
-        return option;
-    }
-    if let Some(cur) = option.current_value.as_ref() {
-        if !filtered.iter().any(|v| &v.value == cur) {
-            option.current_value = filtered.first().map(|v| v.value.clone());
-        }
-    }
-    option.options = filtered;
-    option
-}
-
-fn model_value_looks_namespaced(value: &str) -> bool {
-    value.contains('/') || value.contains(':')
-}
-
-/// Vendor vocabulary per known provider stem. Interim panel-side
-/// heuristic only -- the plan's phase 8 moves provider->model filtering
-/// into acpx-server proper and DELETES this table along with the string
-/// matching around it. Until then it is what makes "codex-acp carries an
-/// additional openai/gpt custom catalog" work while "claude-acp shows a
-/// gpt catalog" fails closed (plan phase 24 matrix).
-fn provider_vendor_stems(agent_lower: &str) -> Option<&'static [&'static str]> {
-    let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
-    match stem {
-        "claude" | "anthropic" => Some(&["claude", "anthropic", "sonnet", "haiku", "opus"]),
-        "codex" | "openai" => Some(&["codex", "openai", "gpt", "o3", "o4"]),
-        "grok" | "xai" => Some(&["grok", "xai"]),
-        "gemini" | "google" => Some(&["gemini", "google"]),
-        _ => None,
-    }
-}
-
-fn model_value_matches_provider(value: &str, name: &str, agent_lower: &str) -> bool {
-    let v = value.to_ascii_lowercase();
-    let n = name.to_ascii_lowercase();
-    if v.starts_with(agent_lower) {
-        return true;
-    }
-    if let Some((prefix, _)) = v.split_once('/') {
-        if prefix == agent_lower || agent_lower.contains(prefix) || prefix.contains(agent_lower) {
-            return true;
-        }
-    }
-    if let Some((prefix, _)) = v.split_once(':') {
-        if prefix == agent_lower {
-            return true;
-        }
-    }
-    if let Some(stems) = provider_vendor_stems(agent_lower) {
-        return stems
-            .iter()
-            .any(|stem| v.contains(stem) || n.contains(stem));
-    }
-    let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
-    stem.len() >= 3 && (v.contains(stem) || n.contains(stem))
 }
 
 /// Reasoning-effort selector rows (dedicated compose dropdown).
@@ -991,7 +941,77 @@ pub struct VisibleThreadItem {
     /// into `ThreadModel::session_id` (add_thread attaches async now, so
     /// no `SessionAttached` fold ever carries it).
     pub session_id: Option<String>,
+    /// PROF-7: whether the thread's bound profile's agent id is
+    /// `Installed`/`InstalledNoSession` per a real `agents/list` catalog
+    /// read, collected ONLY at the same session-attach-completion
+    /// transition `session_id` above is collected for (never every frame
+    /// -- `agents/list` is a real RPC, and every other frame this stays
+    /// `None`, meaning "no new information this frame", not "not
+    /// detected"). `None` also covers native/unmanaged-mode threads (no
+    /// bound profile to check) and the profile/catalog lookup failing to
+    /// resolve -- both fail open rather than guessing Stale.
+    pub agent_detected: Option<bool>,
     pub item: ThreadItem,
+}
+
+/// PROF-7: resolves whether `profile_name`'s bound agent id is genuinely
+/// present on this machine, from real `profiles/list` + `agents/list`
+/// reads (never a guess). Pure so it's directly testable without a real
+/// bridge: `None` (fail open, not "not detected") when `profile_name` is
+/// empty (native/unmanaged mode has no agent id to check), when no
+/// profile with that name is found (a real profiles/list race/lag, not
+/// evidence of anything), or when the profile's `agent_id` doesn't appear
+/// in the catalog at all (an incomplete/still-loading catalog read, same
+/// reasoning). `Some(false)` only when the catalog genuinely reports the
+/// bound agent id as something other than `Installed`/`InstalledNoSession`.
+pub fn agent_detected_for_profile(
+    profiles: &[crate::gateway_actor::ProfileSummary],
+    agents: &[crate::protocol_types::AgentCatalogEntry],
+    profile_name: &str,
+) -> Option<bool> {
+    if profile_name.is_empty() {
+        return None;
+    }
+    let agent_id = &profiles.iter().find(|p| p.name == profile_name)?.agent_id;
+    let entry = agents.iter().find(|a| &a.id == agent_id)?;
+    Some(matches!(
+        entry.status,
+        crate::protocol_types::AgentStatus::Installed
+            | crate::protocol_types::AgentStatus::InstalledNoSession
+    ))
+}
+
+/// PROF-8 (`profile-only-backend-selection` plan): detects whether an
+/// `AgentEvent::Error` message text is acpx-core's
+/// `RouterError::BackendRequiresAuthentication` (acpx-core/src/router.rs)
+/// -- "the agent is reachable but not authenticated" -- rather than any
+/// other session/new or turn failure.
+///
+/// **This is fragile by design, not by oversight, and the team decided to
+/// accept that rather than reach into acpx-core right now.** acpx-server's
+/// own transport maps EVERY `RouterError` variant to the same generic
+/// JSON-RPC code -32000 (see acpx-server/src/transport/http.rs's
+/// `json_rpc_error`) -- there is no distinct code or structured field for
+/// "needs auth" to match on instead, so the exact `Display` text of
+/// `RouterError::BackendRequiresAuthentication` ("backend requires
+/// authentication before session/new") is the only signal that exists.
+/// Nothing keeps that string in sync between the two crates -- a future
+/// acpx-core wording change breaks this silently, with no compile error
+/// anywhere. `agent_bridge.rs`'s
+/// `open_session_fails_with_a_detectable_authentication_required_message`
+/// test is the tripwire for that: it runs a real acpx-server against a
+/// real backend that advertises `authMethods` with no `auth_method_id`
+/// configured, and asserts the REAL error text this function is matching
+/// against still contains the substring below -- so a wording drift fails
+/// that test loudly instead of this detector silently going dark.
+///
+/// A real acpx-core fix (a distinct error code/field) belongs in the same
+/// class as PROF-14's acpx-side fix: deferred, not attempted here, because
+/// acpx-core/acpx-server are mid-rewrite in the uncommitted
+/// agents-install-runtime worktree and touching them now risks a
+/// guaranteed merge conflict for no benefit today.
+pub fn is_backend_requires_authentication_error(message: &str) -> bool {
+    message.contains("backend requires authentication before session/new")
 }
 
 /// Builds the sidebar's thread-list items from `names`/`state`
@@ -1026,6 +1046,7 @@ pub fn build_thread_items<N: AsRef<str>>(
             // Post-populated by real_index in external_snapshot, same as
             // provider/model.
             session_id: None,
+            agent_detected: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
                 relative_time: String::from("now").into(),
@@ -1062,6 +1083,7 @@ pub fn build_thread_items<N: AsRef<str>>(
                 // as provider/model above.
                 project_path: String::new().into(),
                 project_name: String::new().into(),
+                project_instance_live: false,
                 profile_name: String::new().into(),
                 has_session: false,
             },
@@ -1069,13 +1091,11 @@ pub fn build_thread_items<N: AsRef<str>>(
         .collect()
 }
 
-/// Plan phase 26 (`chat_project_binding`): scope the visible thread list
-/// to the active project. A thread belongs to the active project when its
-/// recorded session project path (captured at session-open time from the
-/// active MLT project) matches it, or when it has NO recorded path yet
-/// (pre-project/global threads stay visible everywhere rather than
-/// vanishing). With no active project everything is visible. Pure so the
-/// reducer-side snapshot collection stays thin and this stays unit-tested.
+/// Scope the visible thread list to the active project. Empty associations
+/// are legacy-only and must not make a thread global: a newly-created project
+/// has a real identity before a first save. With no active project, nothing is
+/// displayed by the legacy shared-store compatibility path; the chat surface
+/// still renders its explicit neutral state after a close signal.
 pub fn retain_items_for_project(
     items: &mut Vec<VisibleThreadItem>,
     thread_project_paths: &[String],
@@ -1091,6 +1111,54 @@ pub fn retain_items_for_project(
             .unwrap_or("");
         recorded.is_empty() || recorded == active
     });
+}
+
+/// PISO-5 (project-isolation-mlt-binding plan): the project path to show on
+/// a thread row's project indicator/chip -- STRICTLY the thread's own
+/// recorded association (`ThreadRecord::project_path`, hydrated durably as
+/// of PISO-3), never a guess. `""` when the thread has none, meaning the
+/// indicator stays dark.
+///
+/// This retires the former "no recorded path -> show whatever project is
+/// ACTIVE right now" fallback. That fallback was added (phase 16/26) back
+/// when a restored thread's recorded path was always empty regardless of
+/// its real history -- borrowing the active project was the only way to
+/// light the indicator at all. PISO-3 fixed the underlying data (restored
+/// threads now carry their real recorded path), which makes the fallback
+/// actively wrong instead of merely redundant: it would relabel an
+/// intentionally-unscoped thread with whatever project a user happens to
+/// have open, the exact "guess the association" pattern this whole plan
+/// exists to delete (see `retain_items_for_project`'s doc comment -- an
+/// empty recorded path already means "visible/neutral everywhere", not
+/// "assume the active project").
+pub fn display_project_path(recorded: Option<&str>) -> String {
+    recorded
+        .filter(|path| !path.is_empty())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// PISO-8 (project-isolation-mlt-binding plan): true only when
+/// `thread_project_path` (the same value that gates `display_project_
+/// path`'s badge above) is CONFIRMED live right now via snapshotd's
+/// `daemon.list`/`daemon.listProjects` -- an agent-launched, possibly
+/// headless, instance for a project this panel's own host process never
+/// opened -- rather than merely a stale sqlite-recorded association from
+/// a session that has long since closed. Mirrors `display_project_path`'s
+/// own precedent: derives purely from the thread's OWN recorded value,
+/// never a guess, and never lights up for a thread whose project never
+/// changed (empty or equal to the active project).
+pub fn thread_project_instance_is_live(
+    thread_project_path: &str,
+    active_project_path: Option<&str>,
+    live_daemon_projects: &[crate::agent_bridge::DaemonProjectInstance],
+) -> bool {
+    if thread_project_path.is_empty() || Some(thread_project_path) == active_project_path {
+        return false;
+    }
+    live_daemon_projects.iter().any(|instance| {
+        std::path::Path::new(&instance.project_path) == std::path::Path::new(thread_project_path)
+    })
 }
 
 /// The current value of a thread's `"model"` config option, or "" when the
@@ -1213,8 +1281,23 @@ pub fn to_profile_option_rows(
 /// `ProfileSelected` / session open keep working); `value` carries the
 /// agent/provider id for model filtering. Label prefers `agent_id`.
 /// `current` is the thread's `profile_name` (maps to that profile's agent).
+///
+/// PROF-10 (`profile-only-backend-selection` plan): also filters OUT
+/// providers whose agent is not actually live, using the exact same
+/// liveness marker PROF-7's `agent_detected_for_profile` reads --
+/// `agents` (a real `agents/list` catalog) reporting the profile's
+/// `agent_id` as `Installed`/`InstalledNoSession`. Without this, the
+/// picker listed every profile regardless of whether its agent was ever
+/// installed, letting a user pick a provider session/new can't open.
+/// Same fail-open posture as PROF-7 throughout: a profile with no
+/// `agent_id` (native/unmanaged mode, nothing to check) or whose
+/// `agent_id` isn't in `agents` yet (an incomplete/still-loading catalog
+/// read, not evidence the agent is missing) is kept, not hidden -- only a
+/// catalog hit that's genuinely NOT `Installed`/`InstalledNoSession`
+/// excludes the row.
 pub fn to_profile_dropdown_entries(
     profiles: &[ProfileOption],
+    agents: &[crate::protocol_types::AgentCatalogEntry],
     current: &str,
 ) -> ModelRc<DropdownEntry> {
     let current_agent = profiles
@@ -1223,10 +1306,29 @@ pub fn to_profile_dropdown_entries(
         .map(|p| p.agent_id.to_string())
         .unwrap_or_default();
 
+    let is_live = |agent_id: &str| -> bool {
+        if agent_id.is_empty() {
+            return true;
+        }
+        agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .is_none_or(|entry| {
+                matches!(
+                    entry.status,
+                    crate::protocol_types::AgentStatus::Installed
+                        | crate::protocol_types::AgentStatus::InstalledNoSession
+                )
+            })
+    };
+
     let mut seen_agents = std::collections::HashSet::<String>::new();
     let mut items: Vec<DropdownEntry> = Vec::new();
     for p in profiles {
         let agent = p.agent_id.to_string();
+        if !is_live(&agent) {
+            continue;
+        }
         let key = if agent.is_empty() {
             p.name.to_string()
         } else {
@@ -1253,6 +1355,13 @@ pub fn to_profile_dropdown_entries(
             is_header: false,
         });
     }
+    items.push(DropdownEntry {
+        is_current: false,
+        id: "__new_provider__".into(),
+        label: "+ New provider".into(),
+        value: "".into(),
+        is_header: false,
+    });
     ModelRc::new(VecModel::from(items))
 }
 
@@ -1401,23 +1510,18 @@ pub fn to_mcp_server_option_rows(
         .collect()
 }
 
-/// PUI-015: the built-in `snapshotd` daemon MCP row for the Settings list,
-/// or `None` when the daemon is not currently reachable. This is the same
-/// endpoint the panel actually injects into every session's `mcpServers`
-/// array (`agent_bridge::snapshotd_mcp_server_entry`, gated on the same live
-/// probe cached in `agent_bridge::snapshotd_reachable`) -- surfaced here as a
+/// PUI-015: the built-in `snapflow` daemon MCP row for the Settings list,
+/// or `None` when the watcher has no current authoritative MCP status. This
+/// is the same endpoint the panel injects into sessions, surfaced here as a
 /// first-class, non-removable row so the always-on daemon server the model
 /// really talks to is visible in Settings, instead of the list showing only
 /// user-added registry servers and hiding the built-in one entirely. Not a
 /// synthetic UI guess: it names the exact `http://<addr>/mcp` endpoint the
 /// injection uses (`agent_bridge::snapshotd_mcp_addr`).
-pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
-    if !reachable {
-        return None;
-    }
-    let addr = crate::agent_bridge::snapshotd_mcp_addr();
+pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption> {
+    let addr = addr?;
     Some(McpServerOption {
-        name: "snapshotd".into(),
+        name: "snapflow".into(),
         command: String::new().into(),
         status_line: "built-in daemon · always available".into(),
         transport: "http".into(),
@@ -1518,7 +1622,7 @@ pub fn to_remote_session_option_rows(
 pub fn to_agent_catalog_entries(
     agents: Vec<crate::protocol_types::AgentCatalogEntry>,
 ) -> ModelRc<AgentCatalogEntry> {
-    ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents)))
+    ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents, &[])))
 }
 
 /// setup-followups plan, agent_settings_ordering_and_install_enable_flow:
@@ -1542,16 +1646,38 @@ fn agent_status_sort_priority(status: &crate::protocol_types::AgentStatus) -> u8
 
 pub fn to_agent_catalog_entry_rows(
     mut agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    loading_ids: &[String],
 ) -> Vec<AgentCatalogEntry> {
     agents.sort_by_key(|entry| agent_status_sort_priority(&entry.status));
     agents
         .into_iter()
-        .map(|entry| AgentCatalogEntry {
-            id: entry.id.into(),
-            name: entry.name.into(),
-            version: entry.version.into(),
-            status: entry.status.as_wire_str().into(),
-            enabled: entry.enabled,
+        .map(|entry| {
+            let id = entry.id.clone();
+            AgentCatalogEntry {
+                id: id.clone().into(),
+                name: entry.name.into(),
+                version: entry.version.into(),
+                status: entry.status.as_wire_str().into(),
+                enabled: entry.enabled,
+                loading: loading_ids.iter().any(|loading_id| loading_id == &id),
+            }
+        })
+        .collect()
+}
+
+/// PROF-11: builds the compose-header plan panel's row model from a real
+/// `plan` session/update (`AgentBridge::plan`). Order is preserved
+/// verbatim -- ACP's `Plan.entries` is already the agent's own intended
+/// display order, not something this layer should re-sort.
+pub fn to_plan_entry_rows(
+    entries: Vec<crate::protocol_types::PlanEntryInfo>,
+) -> Vec<PlanEntryItem> {
+    entries
+        .into_iter()
+        .map(|entry| PlanEntryItem {
+            content: entry.content.into(),
+            priority: entry.priority.into(),
+            status: entry.status.into(),
         })
         .collect()
 }
@@ -1617,17 +1743,122 @@ mod tests {
     use super::*;
     use slint::Model;
 
+    // PROF-7: agent_detected_for_profile is the pure decision function the
+    // real per-thread Stale state is built on -- exercised directly here so
+    // its fail-open cases (empty profile, unknown profile, agent id absent
+    // from the catalog) don't depend on a real bridge/gateway to prove.
+    fn catalog_entry(
+        id: &str,
+        status: crate::protocol_types::AgentStatus,
+    ) -> crate::protocol_types::AgentCatalogEntry {
+        crate::protocol_types::AgentCatalogEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            version: String::new(),
+            status,
+            enabled: true,
+        }
+    }
+
+    fn profile_summary(name: &str, agent_id: &str) -> crate::gateway_actor::ProfileSummary {
+        crate::gateway_actor::ProfileSummary {
+            name: name.to_owned(),
+            agent_id: agent_id.to_owned(),
+            allow_terminal_access: false,
+            allow_fs_access: false,
+        }
+    }
+
+    #[test]
+    fn agent_detected_for_profile_true_when_catalog_says_installed() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::Installed,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_false_when_catalog_says_not_installed() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::NotInstalled,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(false),
+            "a real registry hit that isn't Installed/InstalledNoSession must read as not \
+             detected"
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_installed_no_session_still_counts_as_detected() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::InstalledNoSession,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_on_empty_profile_name() {
+        // Native/unmanaged mode: no bound profile, so no agent id to check
+        // against the registry at all -- must never guess Stale.
+        assert_eq!(agent_detected_for_profile(&[], &[], ""), None);
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_when_profile_name_not_found() {
+        let profiles = [profile_summary("other-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::NotInstalled,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "missing-profile"),
+            None,
+            "a profiles/list that hasn't caught up yet must fail open, not read as not detected"
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_when_agent_id_absent_from_catalog() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        // Catalog present but doesn't (yet) include this agent id -- an
+        // incomplete/still-loading read, not evidence the agent is gone.
+        let agents = [catalog_entry(
+            "claude-acp",
+            crate::protocol_types::AgentStatus::Installed,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            None
+        );
+    }
+
     // PUI-015: the built-in snapshotd daemon row is only produced when the
     // daemon is reachable, is non-removable, and names the same /mcp
     // endpoint the session injection uses.
     #[test]
     fn builtin_snapshotd_option_is_present_and_non_removable_only_when_reachable() {
         assert!(
-            builtin_snapshotd_option(false).is_none(),
+            builtin_snapshotd_option(None).is_none(),
             "no built-in row when the daemon is unreachable"
         );
-        let row = builtin_snapshotd_option(true).expect("row present when reachable");
-        assert_eq!(row.name.as_str(), "snapshotd");
+        let addr = "127.0.0.1:43210";
+        let row =
+            builtin_snapshotd_option(Some(addr.to_owned())).expect("row present when reachable");
+        assert_eq!(row.name.as_str(), "snapflow");
         assert!(!row.removable, "built-in daemon row must not be removable");
         assert_eq!(row.transport.as_str(), "http");
         assert!(
@@ -1636,7 +1867,7 @@ mod tests {
             row.url
         );
         assert!(
-            row.url.contains(&crate::agent_bridge::snapshotd_mcp_addr()),
+            row.url.contains(addr),
             "must name the same address the session injection uses"
         );
     }
@@ -1673,7 +1904,15 @@ mod tests {
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "",
+        );
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].item.name, "Fix timeline crash");
         assert_eq!(items[0].real_index, 0);
@@ -1683,8 +1922,15 @@ mod tests {
 
     #[test]
     fn substring_match_is_case_insensitive() {
-        let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "FADE");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "FADE",
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -1692,8 +1938,15 @@ mod tests {
         // list. This is exactly the mismatch `real_index` exists to fix.
         assert_eq!(items[0].real_index, 1);
 
-        let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "fade",
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -1703,7 +1956,15 @@ mod tests {
         // "x" appears in 2 non-adjacent names (index 0 and 3); must come
         // back in the same relative order as NAMES, not re-sorted, and
         // must skip the non-matching ones in between.
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "x");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "x",
+        );
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
         assert_eq!(
             matched_names,
@@ -1729,13 +1990,29 @@ mod tests {
 
     #[test]
     fn whitespace_only_query_behaves_like_empty() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "   ");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "   ",
+        );
         assert_eq!(items.len(), 4);
     }
 
     #[test]
     fn status_is_carried_through_unfiltered() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "",
+        );
         assert_eq!(items[1].item.status, "loading");
         assert_eq!(items[2].item.status, "error");
     }
@@ -1747,7 +2024,15 @@ mod tests {
         // whatever transient `ThreadState` it was last in -- STATE[1]
         // is `Loading` here, proving the override wins even over that.
         let closed: &[bool] = &[false, true, false, false];
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            closed,
+            NO_ARCHIVED,
+            "",
+        );
         assert_eq!(items[1].item.status, "closed");
         assert!(items[1].item.closed);
         assert_eq!(items[0].item.status, "idle");
@@ -1763,7 +2048,15 @@ mod tests {
         // may already be closed.
         let closed: &[bool] = &[false, true, false, false];
         let archived: &[bool] = &[false, true, false, false];
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, archived, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            closed,
+            archived,
+            "",
+        );
         assert_eq!(items[1].item.status, "archived");
         assert!(items[1].item.archived);
         assert!(items[1].item.closed);
@@ -1779,21 +2072,44 @@ mod tests {
             "".into(),
             "Bug still open".into(),
         ];
-        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            &descriptions,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "fade",
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.description, "Added a fade");
     }
 
     #[test]
     fn description_defaults_to_empty_when_shorter_than_names() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "",
+        );
         assert!(items.iter().all(|i| i.item.description.is_empty()));
     }
 
     #[test]
     fn background_policy_is_preserved_after_filtering() {
-        let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "fade",
+        );
         assert!(items[0].item.background);
     }
 
@@ -1908,7 +2224,10 @@ mod tests {
         assert_eq!(rows[0].title.as_str(), "cargo test");
         assert_eq!(rows[0].last_command.as_str(), "cargo test --lib");
         assert!(rows[0].active, "a non-exited terminal is active");
-        assert_eq!(rows[0].started_at.as_str(), "2026-07-24T05:00:00.000000000Z");
+        assert_eq!(
+            rows[0].started_at.as_str(),
+            "2026-07-24T05:00:00.000000000Z"
+        );
     }
 
     #[test]
@@ -1938,8 +2257,8 @@ mod tests {
     #[test]
     fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
         use slint::Model;
-        let servers = vec![crate::protocol_types::McpServerEntry::from_json(
-            &serde_json::json!({
+        let servers = vec![
+            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
                 "name": "remote-tools",
                 "url": "https://example.com/mcp",
                 "type": "remote",
@@ -1948,9 +2267,9 @@ mod tests {
                     { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
                     { "name": "write", "enabled": false, "deferred": true }
                 ]
-            }),
-        )
-        .unwrap()];
+            }))
+            .unwrap(),
+        ];
         let model = to_mcp_server_options(servers);
         let row = model.row_data(0).unwrap();
         assert_eq!(row.transport.as_str(), "http");
@@ -2018,7 +2337,13 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["codex-acp", "claude-acp", "blocked-acp", "aardvark-acp", "zebra-acp"],
+            vec![
+                "codex-acp",
+                "claude-acp",
+                "blocked-acp",
+                "aardvark-acp",
+                "zebra-acp"
+            ],
             "expected installed/installed_no_session first, then runtime_missing, then \
              not_installed with original relative order preserved within each group"
         );
@@ -2276,12 +2601,20 @@ mod transcript_model_tests {
                 fs_enabled: false,
             },
         ];
-        let entries = to_profile_dropdown_entries(&profiles, "work");
-        assert_eq!(entries.row_count(), 2); // one per agent
+        // Empty catalog: PROF-10's fail-open posture (catalog not loaded
+        // yet is not evidence an agent is missing), so nothing is filtered
+        // here -- exercised on its own below.
+        let entries = to_profile_dropdown_entries(&profiles, &[], "work");
+        assert_eq!(entries.row_count(), 3); // one per agent + new-provider action
         assert_eq!(entries.row_data(0).unwrap().label.as_str(), "codex-acp");
         assert_eq!(entries.row_data(0).unwrap().value.as_str(), "codex-acp");
         assert!(entries.row_data(0).unwrap().is_current);
         assert_eq!(entries.row_data(1).unwrap().label.as_str(), "claude-acp");
+        assert_eq!(entries.row_data(2).unwrap().id.as_str(), "__new_provider__");
+        assert_eq!(
+            entries.row_data(2).unwrap().label.as_str(),
+            "+ New provider"
+        );
         assert_eq!(
             current_provider_trigger_label(&profiles, "work"),
             "codex-acp"
@@ -2307,10 +2640,89 @@ mod transcript_model_tests {
                 },
             ],
         }];
-        let filtered = to_config_dropdown_entries_for_provider(options, "codex-acp");
-        // header + one value
-        assert_eq!(filtered.row_count(), 2);
-        assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
+        let filtered = to_config_dropdown_entries(options);
+        // header + both provider-scoped values. Provider ownership is
+        // authoritative from models/list/session state; the panel no longer
+        // drops namespaced values using string heuristics.
+        assert_eq!(filtered.row_count(), 3);
+        assert_eq!(
+            filtered.row_data(1).unwrap().value.as_str(),
+            "codex-acp/gpt-5"
+        );
+        assert_eq!(
+            filtered.row_data(2).unwrap().value.as_str(),
+            "claude-acp/sonnet"
+        );
+    }
+
+    /// PROF-10: a provider whose agent the catalog genuinely reports as
+    /// NOT `Installed`/`InstalledNoSession` must not appear in the
+    /// compose-bar picker at all -- but a profile with no `agent_id`
+    /// (native/unmanaged mode) and one whose `agent_id` isn't in the
+    /// catalog yet (still-loading read) must both still be listed, same
+    /// fail-open posture as `agent_detected_for_profile`.
+    #[test]
+    fn provider_dropdown_hides_providers_the_catalog_reports_as_not_live() {
+        let profiles = vec![
+            ProfileOption {
+                name: "work".into(),
+                agent_id: "codex-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "gone".into(),
+                agent_id: "vanished-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "still-loading".into(),
+                agent_id: "unknown-to-catalog-yet".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "native".into(),
+                agent_id: "".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+        ];
+        // Inlined rather than reusing `models::tests::catalog_entry` --
+        // this test lives in `transcript_model_tests`, a sibling module
+        // that helper is private to.
+        let agent_catalog_entry = |id: &str, status: crate::protocol_types::AgentStatus| {
+            crate::protocol_types::AgentCatalogEntry {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                version: String::new(),
+                status,
+                enabled: true,
+            }
+        };
+        let agents = [
+            agent_catalog_entry("codex-acp", crate::protocol_types::AgentStatus::Installed),
+            agent_catalog_entry(
+                "vanished-acp",
+                crate::protocol_types::AgentStatus::NotInstalled,
+            ),
+        ];
+        let entries = to_profile_dropdown_entries(&profiles, &agents, "work");
+        let labels: Vec<String> = (0..entries.row_count())
+            .filter_map(|i| entries.row_data(i))
+            .map(|e| e.label.to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "codex-acp".to_owned(),
+                "unknown-to-catalog-yet".to_owned(),
+                "native".to_owned(),
+                "+ New provider".to_owned(),
+            ],
+            "vanished-acp must be hidden; still-loading and native must fail open and stay visible"
+        );
     }
 
     fn model_option(values: &[(&str, &str)]) -> Vec<ConfigOptionInfo> {
@@ -2340,8 +2752,8 @@ mod transcript_model_tests {
             .collect()
     }
 
-    // Plan phase 24: provider->models matrix. One shared mixed namespaced
-    // catalog; each provider must keep EXACTLY its own vendor's models.
+    // Model catalogs are already scoped by the backend; preserve every value
+    // returned by the agent instead of applying panel-side vendor guesses.
     fn mixed_catalog() -> Vec<ConfigOptionInfo> {
         model_option(&[
             ("anthropic/claude-sonnet-4", "Claude Sonnet 4"),
@@ -2353,45 +2765,18 @@ mod transcript_model_tests {
     }
 
     #[test]
-    fn provider_matrix_claude_acp_keeps_only_anthropic_models() {
-        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "claude-acp");
+    fn agent_scoped_catalog_preserves_backend_values() {
+        let entries = to_config_dropdown_entries(mixed_catalog());
         assert_eq!(
             dropdown_values(&entries),
-            vec!["anthropic/claude-sonnet-4", "anthropic/claude-opus-4"]
+            vec![
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-opus-4",
+                "openai/gpt-5",
+                "openai/o4-mini",
+                "xai/grok-4"
+            ]
         );
-    }
-
-    #[test]
-    fn provider_matrix_grok_acp_keeps_only_xai_models() {
-        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "grok-acp");
-        assert_eq!(dropdown_values(&entries), vec!["xai/grok-4"]);
-    }
-
-    #[test]
-    fn provider_matrix_codex_acp_keeps_its_openai_custom_catalog() {
-        // codex-acp may carry an ADDITIONAL custom (bifrost-style) openai
-        // catalog whose values never contain "codex" -- the vendor alias
-        // table is what keeps these visible under codex.
-        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "codex-acp");
-        assert_eq!(
-            dropdown_values(&entries),
-            vec!["openai/gpt-5", "openai/o4-mini"]
-        );
-    }
-
-    #[test]
-    fn claude_acp_never_falls_back_to_a_pure_foreign_gpt_catalog() {
-        // The live phase-24 repro: a catalog holding ONLY another vendor's
-        // namespaced models used to hit the permissive empty-filter
-        // fallback and be shown WHOLE under claude-acp ("selected
-        // claude-acp, models of gpt are shown"). Known providers now fail
-        // closed: no foreign models, empty dropdown.
-        let gpt_only = model_option(&[
-            ("openai/gpt-5", "GPT-5"),
-            ("openai/gpt-5-mini", "GPT-5 mini"),
-        ]);
-        let entries = to_config_dropdown_entries_for_provider(gpt_only, "claude-acp");
-        assert_eq!(entries.row_count(), 0);
     }
 
     // Plan phase 26: project-scoped thread list.
@@ -2401,6 +2786,7 @@ mod transcript_model_tests {
                 real_index,
                 thread_id: format!("thread:{real_index}"),
                 session_id: None,
+                agent_detected: None,
                 item: ThreadItem::default(),
             })
             .collect()
@@ -2418,12 +2804,12 @@ mod transcript_model_tests {
         assert_eq!(
             items.iter().map(|i| i.real_index).collect::<Vec<_>>(),
             vec![1, 2],
-            "other-project threads drop; active + path-less threads stay"
+            "other-project threads drop; legacy-unscoped rows remain visible for compatibility"
         );
     }
 
     #[test]
-    fn no_active_project_keeps_every_thread_visible() {
+    fn no_active_project_keeps_legacy_threads_visible_for_compatibility() {
         let mut items = project_items(2);
         let paths = vec!["/work/a/project.mlt".to_owned(), String::new()];
         retain_items_for_project(&mut items, &paths, None);
@@ -2433,12 +2819,85 @@ mod transcript_model_tests {
         assert_eq!(items.len(), 2);
     }
 
+    // PISO-5: the indicator must show ONLY a thread's own recorded
+    // project, never a live guess at whatever is currently active.
     #[test]
-    fn unknown_custom_agent_keeps_the_permissive_catalog_fallback() {
-        // A gateway with an agent id outside the vendor table (fully
-        // custom catalog) still shows its list rather than nothing.
+    fn display_project_path_shows_the_threads_own_recorded_project() {
+        assert_eq!(
+            display_project_path(Some("/work/b/project.mlt")),
+            "/work/b/project.mlt"
+        );
+    }
+
+    #[test]
+    fn display_project_path_stays_dark_for_an_unscoped_thread() {
+        // Pre-PISO-5 the caller fell back to whatever project happened to
+        // be active -- this function deliberately takes no such fallback
+        // input at all: an unscoped thread must never appear to belong to
+        // a project it was never actually bound to.
+        assert_eq!(display_project_path(None), "");
+        assert_eq!(display_project_path(Some("")), "");
+    }
+
+    fn daemon_instance(path: &str, headless: bool) -> crate::agent_bridge::DaemonProjectInstance {
+        crate::agent_bridge::DaemonProjectInstance {
+            project_path: path.to_string(),
+            headless,
+        }
+    }
+
+    #[test]
+    fn thread_project_instance_is_live_false_for_an_unscoped_thread() {
+        let live = vec![daemon_instance("/work/b/project.mlt", true)];
+        assert!(!thread_project_instance_is_live(
+            "",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    // PISO-8's negative case: a thread whose project never changed (equal
+    // to the panel's own active project) must never show any indicator,
+    // even if that same project happens to also have a live daemon
+    // instance (e.g. the user's own headful instance).
+    #[test]
+    fn thread_project_instance_is_live_false_when_thread_project_equals_active() {
+        let live = vec![daemon_instance("/work/a/project.mlt", false)];
+        assert!(!thread_project_instance_is_live(
+            "/work/a/project.mlt",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    #[test]
+    fn thread_project_instance_is_live_false_when_recorded_but_not_actually_live() {
+        // Differs from active (so the existing project-name badge WOULD
+        // show) but snapshotd reports no live instance for it -- a stale
+        // sqlite-recorded association from a session that has since
+        // closed, not something the agent is actually driving right now.
+        let live = vec![daemon_instance("/work/c/project.mlt", true)];
+        assert!(!thread_project_instance_is_live(
+            "/work/b/project.mlt",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    #[test]
+    fn thread_project_instance_is_live_true_for_a_confirmed_live_headless_instance() {
+        let live = vec![daemon_instance("/work/b/project.mlt", true)];
+        assert!(thread_project_instance_is_live(
+            "/work/b/project.mlt",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    #[test]
+    fn custom_agent_catalog_is_preserved() {
         let custom = model_option(&[("somevendor/model-x", "Model X")]);
-        let entries = to_config_dropdown_entries_for_provider(custom, "my-router");
+        let entries = to_config_dropdown_entries(custom);
         assert_eq!(dropdown_values(&entries), vec!["somevendor/model-x"]);
     }
 
@@ -2511,7 +2970,10 @@ mod transcript_model_tests {
 
         let reasoning = to_reasoning_dropdown_entries(options.clone());
         assert_eq!(reasoning.row_count(), 4); // header + low/medium/high
-        assert_eq!(reasoning.row_data(0).unwrap().label.as_str(), "Reasoning effort");
+        assert_eq!(
+            reasoning.row_data(0).unwrap().label.as_str(),
+            "Reasoning effort"
+        );
         assert!(reasoning.row_data(2).unwrap().is_current); // medium
         assert_eq!(current_reasoning_trigger_label(&options), "Medium");
         assert_eq!(current_config_trigger_label(&options), "GPT-5");

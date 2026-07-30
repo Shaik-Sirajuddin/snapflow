@@ -178,8 +178,11 @@ mod tests {
 
     /// Builds a `FramedReader` over a real pipe so tests exercise the same
     /// newline-delimited framing path a real child stdout would.
-    async fn reader_over_pipe() -> (FramedReader, tokio::process::ChildStdin, tokio::process::Child)
-    {
+    async fn reader_over_pipe() -> (
+        FramedReader,
+        tokio::process::ChildStdin,
+        tokio::process::Child,
+    ) {
         // `cat` echoes stdin to stdout unmodified -- a minimal stand-in for
         // a backend process's stdio pipe without depending on any acpx
         // agent binary being installed.
@@ -209,11 +212,18 @@ mod tests {
 
         let id = json!(1);
         let rx = pending.register(&id).await;
-        write_line(&mut stdin, &json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}})).await;
+        write_line(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}),
+        )
+        .await;
 
         let resolved = recv(rx).await.expect("response");
         assert_eq!(resolved["result"]["ok"], json!(true));
-        assert!(unmatched_rx.try_recv().is_err(), "matched frame must not also appear on the unmatched channel");
+        assert!(
+            unmatched_rx.try_recv().is_err(),
+            "matched frame must not also appear on the unmatched channel"
+        );
 
         let _ = child.start_kill();
     }
@@ -271,8 +281,16 @@ mod tests {
 
         // Responses arrive out of registration order -- the table must
         // route by id, not by arrival order.
-        write_line(&mut stdin, &json!({"jsonrpc": "2.0", "id": "b", "result": "second"})).await;
-        write_line(&mut stdin, &json!({"jsonrpc": "2.0", "id": "a", "result": "first"})).await;
+        write_line(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "id": "b", "result": "second"}),
+        )
+        .await;
+        write_line(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "id": "a", "result": "first"}),
+        )
+        .await;
 
         let a = recv(rx_a).await.expect("a resolves");
         let b = recv(rx_b).await.expect("b resolves");
@@ -315,7 +333,11 @@ mod tests {
         pending.cancel(&json!("a")).await;
         assert_eq!(pending.len().await, 1);
 
-        write_line(&mut stdin, &json!({"jsonrpc": "2.0", "id": "b", "result": "ok"})).await;
+        write_line(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "id": "b", "result": "ok"}),
+        )
+        .await;
         assert_eq!(recv(rx_b).await.unwrap()["result"], json!("ok"));
 
         let _ = child.start_kill();

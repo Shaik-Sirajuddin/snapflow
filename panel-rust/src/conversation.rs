@@ -19,6 +19,14 @@
 //! Thought chunks with no real id share one synthetic id, reset when a
 //! different event kind interrupts (ToolCall, User, end of history).
 
+fn is_standalone_agent_status(text: &str) -> bool {
+    let text = text.trim().to_ascii_lowercase();
+    text.starts_with("reconnecting...")
+        || text.starts_with("unexpected status ")
+        || text.contains("502 bad gateway")
+        || text.contains("bad gateway")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptItem {
     User {
@@ -84,25 +92,26 @@ pub enum ConversationEvent {
         raw_input: Option<String>,
         raw_output: Option<String>,
     },
+    #[allow(dead_code)]
     TerminalCreated {
         thread_id: String,
         terminal_id: String,
         title: String,
     },
+    #[allow(dead_code)]
     TerminalOutput {
         thread_id: String,
         terminal_id: String,
         text: String,
     },
+    #[allow(dead_code)]
     TerminalExited {
         thread_id: String,
         terminal_id: String,
         exit_code: i32,
     },
-    Notice {
-        thread_id: String,
-        text: String,
-    },
+    #[allow(dead_code)]
+    Notice { thread_id: String, text: String },
 }
 
 impl ConversationEvent {
@@ -384,19 +393,30 @@ pub fn rebuild_from_chat_messages(
                 });
             }
             ChatKind::Agent | ChatKind::Thinking => {
-                let message_id = match &msg.id {
-                    Some(real_id) => {
-                        open_run = Some((msg.kind.clone(), real_id.clone()));
-                        real_id.clone()
-                    }
-                    None => match &open_run {
-                        Some((kind, id)) if *kind == msg.kind => id.clone(),
-                        _ => {
-                            let id = next_synthetic(&mut synthetic_counter);
-                            open_run = Some((msg.kind.clone(), id.clone()));
-                            id
+                // Status updates are complete, independent rows rather than
+                // streamed chunks. In particular, reconnect attempts may
+                // carry the same message id (or no id at all); never merge
+                // them into one growing assistant bubble.
+                let standalone_status =
+                    msg.kind == ChatKind::Agent && is_standalone_agent_status(&msg.text);
+                let message_id = if standalone_status {
+                    open_run = None;
+                    next_synthetic(&mut synthetic_counter)
+                } else {
+                    match &msg.id {
+                        Some(real_id) => {
+                            open_run = Some((msg.kind.clone(), real_id.clone()));
+                            real_id.clone()
                         }
-                    },
+                        None => match &open_run {
+                            Some((kind, id)) if *kind == msg.kind => id.clone(),
+                            _ => {
+                                let id = next_synthetic(&mut synthetic_counter);
+                                open_run = Some((msg.kind.clone(), id.clone()));
+                                id
+                            }
+                        },
+                    }
                 };
                 let event = if msg.kind == ChatKind::Thinking {
                     ConversationEvent::ThoughtChunk {
@@ -539,6 +559,41 @@ mod tests {
             &state.items()[0],
             TranscriptItem::Terminal { title, output, exit_code, .. }
                 if title == "cargo test" && output == "building\n" && *exit_code == Some(0)
+        ));
+    }
+
+    #[test]
+    fn reconnect_status_updates_remain_separate_rows_even_with_same_id() {
+        use crate::protocol_types::{ChatMessage, MessageKind};
+
+        let history = [
+            ChatMessage {
+                kind: MessageKind::Agent,
+                text: "Reconnecting... 1/5".to_owned(),
+                status: None,
+                id: Some("reconnect".to_owned()),
+                raw_input: None,
+                raw_output: None,
+            },
+            ChatMessage {
+                kind: MessageKind::Agent,
+                text: "Reconnecting... 2/5".to_owned(),
+                status: None,
+                id: Some("reconnect".to_owned()),
+                raw_input: None,
+                raw_output: None,
+            },
+        ];
+
+        let state = rebuild_from_chat_messages("thread-a", &history);
+        assert_eq!(state.items().len(), 2);
+        assert!(matches!(
+            &state.items()[0],
+            TranscriptItem::Assistant { text, .. } if text == "Reconnecting... 1/5"
+        ));
+        assert!(matches!(
+            &state.items()[1],
+            TranscriptItem::Assistant { text, .. } if text == "Reconnecting... 2/5"
         ));
     }
 }

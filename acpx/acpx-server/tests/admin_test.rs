@@ -356,7 +356,7 @@ async fn real_binary_starts_the_loopback_admin_listener() {
     let database = unique_temp_path("acpx-admin-test.sqlite");
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", "sh -c cat")
+        .env("ACPX_DEFAULT_ACP_COMMAND", "sh -c cat")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_AUTH_TOKEN", "client-secret")
         .env("ACPX_ADMIN_TOKEN", "admin-secret")
@@ -437,7 +437,7 @@ async fn disabling_an_agent_over_the_real_admin_http_blocks_a_real_session_new()
     // deleting_a_custom_agent_stops_its_live_backend's custom-agent
     // command above uses, registered here as the *default* agent instead
     // so a plain, unmanaged session/new (no _acpx.profile/agentId)
-    // reaches it. Written to a script file (not an inline ACPX_BACKEND_CMD
+    // reaches it. Written to a script file (not an inline ACPX_DEFAULT_ACP_COMMAND
     // string) since that env var is parsed as plain space-separated
     // program+args, not passed through a shell -- see
     // ServerConfig::from_env's own doc comment.
@@ -449,7 +449,10 @@ async fn disabling_an_agent_over_the_real_admin_http_blocks_a_real_session_new()
     .expect("write stand-in backend script");
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env(
+            "ACPX_DEFAULT_ACP_COMMAND",
+            format!("sh {}", script_path.display()),
+        )
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")
@@ -568,7 +571,10 @@ async fn closing_all_sessions_over_the_real_admin_http_leaves_the_tenant_count_a
     .expect("write stand-in backend script");
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env(
+            "ACPX_DEFAULT_ACP_COMMAND",
+            format!("sh {}", script_path.display()),
+        )
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")

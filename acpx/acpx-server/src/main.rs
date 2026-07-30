@@ -6,8 +6,8 @@
 //! (many concurrent remote clients) run concurrently against the same
 //! router, so they share one session registry and one set of supervised
 //! backend processes regardless of which transport a client used. If
-//! `ACPX_DB_PATH` is set, session metadata + transcripts are persisted to
-//! that sqlite file (see `acpx_core::persistence`); otherwise persistence
+//! `ACPX_DB_PATH` is set, session metadata is persisted to that sqlite file
+//! (see `acpx_core::persistence`); otherwise persistence
 //! is skipped entirely (`Router::with_persistence` is optional). Setting
 //! `ACPX_DB_PATH` also enables the durable secret/config store
 //! (`Router::enable_durable_config`, see `acpx_core::keystore`'s module
@@ -17,9 +17,9 @@
 //! (default `<ACPX_DB_PATH>.keyring`); `ACPX_MASTER_KEYRING_ROTATE=1`
 //! triggers a one-shot key rotation on that startup.
 //!
-//! One agent is registered today (`ServerConfig::default_agent_id`,
-//! spawned via `ACPX_BACKEND_CMD`); Phase 3's profile store is what lets
-//! `session/new`'s `_acpx.profile` select among more than one.
+//! One agent is registered at startup (`ServerConfig::default_agent_id`,
+//! spawned via `ACPX_DEFAULT_ACP_COMMAND`); `session/new`'s `_acpx.profile`
+//! (or `_acpx.agentId`) selects among more agents on demand.
 
 mod config;
 mod provisioning;
@@ -39,12 +39,16 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    if let Some(bin_dir) = acpx_core::detect::prepare_node_runtime_path() {
+        tracing::info!(path = %bin_dir.display(), "using discovered Node runtime prefix");
+    }
+
     let config = ServerConfig::from_env();
     tracing::info!(
         default_agent_id = %config.default_agent_id,
         native_auth_method_id = ?config.native_auth_method_id,
-        program = %config.backend.program,
-        args = ?config.backend.args,
+        program = %config.default_acp_command.program,
+        args = ?config.default_acp_command.args,
         http_bind_addr = ?config.http_bind_addr,
         admin_bind_addr = ?config.admin_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
@@ -83,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
             config.stream_replay_buffer_size,
             config.stream_idle_retention,
         ));
-    router.register_agent(config.default_agent_id.clone(), config.backend.clone());
+    router.register_agent(
+        config.default_agent_id.clone(),
+        config.default_acp_command.clone(),
+    );
 
     if let Ok(db_path) = std::env::var("ACPX_DB_PATH") {
         match acpx_core::PersistenceStore::open(std::path::Path::new(&db_path)) {

@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { HoverSurface } from "./hover.slint";
 
@@ -38,7 +39,7 @@ export component SelectableChip inherits HoverSurface {
     border-color: Theme.border-default;
     border-width: 1px;
     border-radius: Theme.radius-sm;
-    button-accessible-label: "Select " + root.label;
+    button-accessible-label: Strings.select-prefix + root.label;
 
     chip-label := Text {
         text: root.label;

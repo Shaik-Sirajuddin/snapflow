@@ -99,6 +99,11 @@ func TestMCPAdapter_ToolsListedAndCallable(t *testing.T) {
 		"daemon.list":          false,
 		"daemon.health":        false,
 		"daemon.close":         false,
+		"project.open":         false,
+		"project.close":        false,
+		"project.create":       false,
+		"project.list":         false,
+		"project.clone":        false,
 		"project.select":       false,
 		"project.exit":         false,
 	}

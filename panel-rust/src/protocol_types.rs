@@ -127,13 +127,55 @@ pub enum AgentEvent {
     /// Phase 18: live `usage_update` session/update (used/size tokens)
     /// -- streams DURING a turn so the compose context ring updates
     /// actively, not only at turn end.
-    UsageUpdate { used: i64, size: i64 },
+    UsageUpdate {
+        used: i64,
+        size: i64,
+    },
     /// PUI-003: the agent's own built-in slash commands, from an ACP
     /// `available_commands_update` session/update (schema
     /// `AvailableCommandsUpdate { available_commands: Vec<AvailableCommand> }`).
     /// Like [`AgentEvent::ConfigOptions`], the notification always carries
     /// the *complete* current command set -- replace, don't append.
     AvailableCommands(Vec<AvailableCommandInfo>),
+    /// PROF-11: a live ACP v1 `plan` session/update (schema `Plan {
+    /// entries: Vec<PlanEntry> }`) -- an agent's self-reported execution
+    /// plan/todo list. Per agentclientprotocol.com, each occurrence is
+    /// the *complete* current plan, same "replace, don't append" contract
+    /// as [`AgentEvent::ConfigOptions`]/[`AgentEvent::AvailableCommands`]
+    /// -- NOT the unstable `plan_update`/`plan_removed` partial-mutation
+    /// variants (those live behind ACP's `unstable_plan_operations`
+    /// feature, which this crate does not enable; see
+    /// `agent-client-protocol-schema`'s `Plan` doc comment: "the client
+    /// replaces the entire plan with each update").
+    PlanUpdate(Vec<PlanEntryInfo>),
+    /// PROF-11: a live ACP v1 `session_info_update` session/update
+    /// (schema `SessionInfoUpdate { title?, updatedAt? }`). Both fields
+    /// are `MaybeUndefined` on the wire (present-with-value /
+    /// present-null / field-absent are three distinct wire states) but
+    /// collapsed to a plain `Option<String>` here -- "field absent" and
+    /// "explicitly null" both read as `None`, i.e. this can't yet
+    /// distinguish "no change" from "agent cleared the title". No real
+    /// backend observed doing the latter, so that distinction is
+    /// deliberately not carried further than this parse for now.
+    SessionInfoUpdate {
+        title: Option<String>,
+        updated_at: Option<String>,
+    },
+}
+
+/// One entry of a live [`AgentEvent::PlanUpdate`] -- `{content, priority,
+/// status}` per ACP v1's `PlanEntry` schema. `priority`/`status` are kept
+/// as plain `String`s (not closed enums) round-tripping the wire's
+/// snake_case tag verbatim, same "the panel has no independent opinion
+/// about what a real backend's own values mean" posture
+/// [`crate::protocol_types::AgentStatus`]'s doc comment documents for its
+/// own `Unknown(String)` fallback -- an unrecognized future priority/
+/// status string still displays as literal text instead of being dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEntryInfo {
+    pub content: String,
+    pub priority: String,
+    pub status: String,
 }
 
 /// One mode an ACP agent advertises as selectable for a session. See

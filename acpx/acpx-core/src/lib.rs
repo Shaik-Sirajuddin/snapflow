@@ -1,6 +1,6 @@
 //! The acpx gateway's brain: session registry, method-classification
 //! router, profile/provider config, central MCP server registry, and
-//! transcript persistence. See
+//! durable session-state persistence. See
 //! `memory/acpx/gen/plans/acp-gateway-daemon/02-architecture.md`.
 
 pub mod admin;
@@ -35,10 +35,7 @@ pub use interaction::{
 };
 pub use lifecycle::LifecycleConfig;
 pub use notify::{NotificationHub, ResumeCursor, StreamResumeState, SubscribeError};
-pub use persistence::{
-    Direction, PersistenceError, PersistenceStore, RecoveryStatusCounts, SessionRecord,
-    TranscriptRecord,
-};
+pub use persistence::{PersistenceError, PersistenceStore, RecoveryStatusCounts, SessionRecord};
 pub use router::{
     recover_open_sessions_shared, LifecycleReapReport, MethodClass, Router, StartupRecoveryPolicy,
     StartupRecoveryReport,

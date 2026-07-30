@@ -6,7 +6,7 @@
 //!
 //! Same "spawn the real compiled acpx-server binary, don't fake the
 //! boundary" discipline as gateway_actor_mcp_agents_e2e_test.rs, but here
-//! the backend is *also* real: no `ACPX_BACKEND_CMD` override, so
+//! the backend is *also* real: no `ACPX_DEFAULT_ACP_COMMAND` override, so
 //! acpx-server's own default (`npx -y @agentclientprotocol/codex-acp@1.1.2`,
 //! wrapping the real, locally-authenticated Codex CLI) is what actually
 //! answers `session/new`/`session/prompt`. Per
@@ -26,14 +26,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-fn acpx_server_bin() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port};
 
 struct GatewayProcess {
     child: Child,
@@ -41,7 +36,7 @@ struct GatewayProcess {
 }
 
 impl GatewayProcess {
-    /// No `ACPX_BACKEND_CMD` override -- acpx-server's own built-in
+    /// No `ACPX_DEFAULT_ACP_COMMAND` override -- acpx-server's own built-in
     /// default is the real `codex-acp` adapter (see
     /// acpx/acpx-server/src/config.rs:155-156), which is exactly the
     /// point of this test.
@@ -56,7 +51,9 @@ impl GatewayProcess {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let mut child = command.spawn().expect("spawn real acpx-server binary for test");
+            let mut child = command
+                .spawn()
+                .expect("spawn real acpx-server binary for test");
 
             let deadline = std::time::Instant::now() + Duration::from_millis(3000);
             let mut reachable = false;

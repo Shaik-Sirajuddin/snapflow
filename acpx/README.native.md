@@ -43,10 +43,21 @@ No config file needed. This example uses `codex-acp` against an
 already-`codex login`'d machine (ambient auth, no API key required):
 
 ```sh
-ACPX_BACKEND_CMD="npx -y @agentclientprotocol/codex-acp@1.1.2" \
+ACPX_DEFAULT_ACP_COMMAND="npx -y @agentclientprotocol/codex-acp@1.1.2" \
 ACPX_HTTP_BIND="127.0.0.1:8790" \
   target/release/acpx-server
 ```
+
+### Node runtimes under systemd
+
+`acpx-server` repairs a restricted service `PATH` at startup when the
+Node-based ACP runtime is otherwise unavailable. It first preserves a
+complete `node`/`npm`/`npx` runtime already on `PATH`; otherwise it scans
+`$NVM_DIR/versions/node/*/bin` (falling back to `~/.nvm`) and prepends the
+newest complete prefix to `PATH`. The repaired prefix is inherited by agent
+detection and every spawned ACP adapter, so login-shell initialization is not
+required. `SNAPFLOW_ACP_NODE_HOME` remains an explicit higher-priority
+override for a product-bundled Node runtime.
 
 Any HTTP/JSON-RPC client can now talk to `POST http://127.0.0.1:8790/rpc`,
 or upgrade `GET /ws` for a persistent connection with live
@@ -94,8 +105,9 @@ Omitting `_acpx.profile` entirely stays in native/unmanaged mode against
 
 ## 5. Durable sessions and retention (optional)
 
-Set `ACPX_DB_PATH=/path/to/sessions.sqlite3` to persist session
-metadata/transcripts across restarts, and add
+Set `ACPX_DB_PATH=/path/to/sessions.sqlite3` to persist session metadata and
+state revisions across restarts; message transcripts remain in Panel-Rust's
+JSONL store. Add
 `ACPX_STARTUP_SESSION_RECOVERY_ENABLED=1` to restore load/resume-capable
 sessions automatically before either transport starts accepting
 requests. Idle sessions are safely closed by a background reaper

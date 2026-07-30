@@ -2,11 +2,13 @@ package procmgr
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,7 +74,7 @@ func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	pi, err := mgr.Launch(ctx, "proj-1", LaunchOptions{Headless: true})
+	pi, _, err := mgr.Launch(ctx, "proj-1", LaunchOptions{Headless: true})
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -141,7 +143,7 @@ func TestLaunch_MissingBinary_ReturnsCleanError(t *testing.T) {
 
 	mgr := New(reg, filepath.Join(t.TempDir(), "does-not-exist-binary"), t.TempDir(), t.TempDir())
 
-	_, err := mgr.Launch(context.Background(), "proj-2", LaunchOptions{})
+	_, _, err := mgr.Launch(context.Background(), "proj-2", LaunchOptions{})
 	if err == nil {
 		t.Fatalf("expected error for missing binary")
 	}
@@ -158,7 +160,7 @@ func TestClose_StopsProcessAndMarksClosed(t *testing.T) {
 	}
 
 	mgr := New(reg, fixtureBin, t.TempDir(), t.TempDir())
-	pi, err := mgr.Launch(context.Background(), "proj-3", LaunchOptions{})
+	pi, _, err := mgr.Launch(context.Background(), "proj-3", LaunchOptions{})
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -174,4 +176,227 @@ func TestClose_StopsProcessAndMarksClosed(t *testing.T) {
 	if row.Status != registry.StatusClosed {
 		t.Fatalf("expected status closed, got %s", row.Status)
 	}
+}
+
+// --- PISO-9: per-project launch dedup ---
+
+func TestLaunch_SecondCallForSameProjectReusesInstance(t *testing.T) {
+	fixtureBin := buildFixture(t)
+	reg := openTestRegistry(t)
+	if err := reg.CreateProject(&registry.Project{ID: "proj-dedup", RootDir: t.TempDir(), Status: "active"}); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	mgr := New(reg, fixtureBin, t.TempDir(), t.TempDir())
+	mgr.ConnectTimeout = 3 * time.Second
+
+	first, reused, err := mgr.Launch(context.Background(), "proj-dedup", LaunchOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("first launch: %v", err)
+	}
+	if reused {
+		t.Fatalf("expected the first launch for a project to spawn fresh, got reused=true")
+	}
+	defer mgr.Close(first.ID)
+
+	second, reused, err := mgr.Launch(context.Background(), "proj-dedup", LaunchOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("second launch: %v", err)
+	}
+	if !reused {
+		t.Fatalf("expected the second launch for the same live project to be reused")
+	}
+	if second.ID != first.ID || second.PID != first.PID {
+		t.Fatalf("expected the same instance back, got first=%+v second=%+v", first, second)
+	}
+
+	// Assert on the real count, not just the response -- the actual bug
+	// this test exists to catch is a second process getting spawned even
+	// if the response happened to look plausible.
+	rows, err := reg.ListProcessInstancesByProject("proj-dedup")
+	if err != nil {
+		t.Fatalf("list by project: %v", err)
+	}
+	readyCount := 0
+	for _, r := range rows {
+		if r.Status == registry.StatusReady {
+			readyCount++
+		}
+	}
+	if readyCount != 1 {
+		t.Fatalf("expected exactly 1 ready instance row for the project, got %d: %+v", readyCount, rows)
+	}
+}
+
+func TestLaunch_DifferentProjectStillSpawns(t *testing.T) {
+	fixtureBin := buildFixture(t)
+	reg := openTestRegistry(t)
+	for _, id := range []string{"proj-x", "proj-y"} {
+		if err := reg.CreateProject(&registry.Project{ID: id, RootDir: t.TempDir(), Status: "active"}); err != nil {
+			t.Fatalf("create project %s: %v", id, err)
+		}
+	}
+
+	mgr := New(reg, fixtureBin, t.TempDir(), t.TempDir())
+	mgr.ConnectTimeout = 3 * time.Second
+
+	piX, reusedX, err := mgr.Launch(context.Background(), "proj-x", LaunchOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("launch proj-x: %v", err)
+	}
+	defer mgr.Close(piX.ID)
+	if reusedX {
+		t.Fatalf("proj-x has no prior instance, must not be reused")
+	}
+
+	piY, reusedY, err := mgr.Launch(context.Background(), "proj-y", LaunchOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("launch proj-y: %v", err)
+	}
+	defer mgr.Close(piY.ID)
+	if reusedY {
+		t.Fatalf("proj-y has no prior instance, must not be reused")
+	}
+
+	if piX.ID == piY.ID || piX.PID == piY.PID {
+		t.Fatalf("expected two distinct instances for two distinct projects, got %+v and %+v", piX, piY)
+	}
+}
+
+func TestLaunch_DeadRegisteredInstanceStillRelaunches(t *testing.T) {
+	fixtureBin := buildFixture(t)
+	reg := openTestRegistry(t)
+	if err := reg.CreateProject(&registry.Project{ID: "proj-dead", RootDir: t.TempDir(), Status: "active"}); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	mgr := New(reg, fixtureBin, t.TempDir(), t.TempDir())
+	mgr.ConnectTimeout = 3 * time.Second
+
+	first, _, err := mgr.Launch(context.Background(), "proj-dead", LaunchOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("first launch: %v", err)
+	}
+
+	// Simulate a real crash -- kill the OS process directly, leaving the
+	// registry row still saying "ready" (mgr.Close, which also updates the
+	// row, is deliberately not used here).
+	proc, err := os.FindProcess(first.PID)
+	if err != nil {
+		t.Fatalf("find process: %v", err)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatalf("kill process: %v", err)
+	}
+	_, _ = proc.Wait()
+
+	// Give health.SocketResponsive something unambiguous to fail against:
+	// poll until the socket genuinely stops accepting connections instead
+	// of racing the kill.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !socketStillResponds(first.SocketPath) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	second, reused, err := mgr.Launch(context.Background(), "proj-dead", LaunchOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("relaunch after crash: %v", err)
+	}
+	defer mgr.Close(second.ID)
+	if reused {
+		t.Fatalf("a dead-but-registered instance must not be reused, got reused=true for %+v", second)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("expected a genuinely new instance after the crash, got the same id back")
+	}
+
+	row, err := reg.GetProcessInstance(first.ID)
+	if err != nil {
+		t.Fatalf("get original instance row: %v", err)
+	}
+	if row.Status != registry.StatusCrashed {
+		t.Fatalf("expected the dead instance's row to be marked crashed, got %s", row.Status)
+	}
+}
+
+func TestLaunch_ConcurrentDoubleLaunchYieldsOneProcess(t *testing.T) {
+	fixtureBin := buildFixture(t)
+	reg := openTestRegistry(t)
+	if err := reg.CreateProject(&registry.Project{ID: "proj-concurrent", RootDir: t.TempDir(), Status: "active"}); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	mgr := New(reg, fixtureBin, t.TempDir(), t.TempDir())
+	mgr.ConnectTimeout = 3 * time.Second
+
+	const n = 8
+	type result struct {
+		pi     registry.ProcessInstance
+		reused bool
+		err    error
+	}
+	results := make(chan result, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			pi, reused, err := mgr.Launch(context.Background(), "proj-concurrent", LaunchOptions{Headless: true})
+			results <- result{pi: pi, reused: reused, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var spawned, reused int
+	var ids = map[string]bool{}
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("concurrent launch: %v", r.err)
+		}
+		ids[r.pi.ID] = true
+		if r.reused {
+			reused++
+		} else {
+			spawned++
+		}
+	}
+	if spawned != 1 {
+		t.Fatalf("expected exactly 1 of %d concurrent launches to actually spawn, got %d", n, spawned)
+	}
+	if reused != n-1 {
+		t.Fatalf("expected the other %d launches to be reused, got %d", n-1, reused)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected all %d concurrent launches to converge on one instance id, got %d distinct: %v", n, len(ids), ids)
+	}
+
+	rows, err := reg.ListProcessInstancesByProject("proj-concurrent")
+	if err != nil {
+		t.Fatalf("list by project: %v", err)
+	}
+	readyCount := 0
+	for _, row := range rows {
+		if row.Status == registry.StatusReady {
+			readyCount++
+		}
+	}
+	if readyCount != 1 {
+		t.Fatalf("expected exactly 1 ready instance row after %d concurrent launches, got %d: %+v", n, readyCount, rows)
+	}
+}
+
+// socketStillResponds is a thin local wrapper so the dead-instance test
+// above doesn't need to import internal/health directly just for one poll
+// loop.
+func socketStillResponds(path string) bool {
+	c, err := net.DialTimeout("unix", path, 50*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }

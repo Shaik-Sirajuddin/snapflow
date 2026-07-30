@@ -32,30 +32,57 @@ mod model;
 pub mod models;
 mod msg;
 mod permission;
+pub mod project_store;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
+pub mod snapshotd_client;
 // `pub` (not just `mod`) so the `snapflowd-mcp` bin target can
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
-pub mod skills_state;
 mod skills_manager_adapter;
+pub mod skills_state;
 mod state_store;
 mod sync;
+// `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
+// crates from this one, unable to see anything less than `pub` -- can
+// reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
+// of each keeping its own unsynchronized `free_port()` copy. Found live
+// (worktree-project-isolation's own test-flakiness investigation,
+// 2026-07-25): `free_port()` was duplicated into five separate
+// `tests/*.rs` e2e harnesses, each with the same bind-then-drop-then-
+// hope-nobody-else-grabs-it gap that `agent_bridge.rs`'s own unit tests
+// used to have before switching onto `reserve_ephemeral_port`'s
+// lock-file convention -- see that function's doc comment for the full
+// root-cause writeup. `agent_bridge` itself stays `mod` (private): only
+// this narrow reservation helper is meant to be public, not its whole
+// internal surface.
+pub mod test_support {
+    pub use crate::agent_bridge::{reserve_ephemeral_port, reserve_port};
+    // PISO-8 (project-isolation-mlt-binding plan): lets a real e2e test
+    // (a separate crate, same `pub`-only visibility rule as above) drive
+    // the actual `snapshotd list`/`listProjects` subprocess round trip
+    // against a real spawned daemon, rather than only exercising the
+    // pure JSONL-parsing helper via `agent_bridge`'s own unit tests.
+    pub use crate::agent_bridge::{fetch_daemon_project_instances, DaemonProjectInstance};
+}
 mod theme;
 mod update;
 
-use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec};
+use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec, NO_PROVIDER_REQUESTED_FALLBACK};
 use appearance::{ColorScheme, HostAppearance};
 use models::ThreadState;
 use protocol_types::{ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
-use slint::platform::{EventLoopProxy, Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
+use slint::platform::{
+    EventLoopProxy, Key, Platform, PointerEventButton, WindowAdapter, WindowEvent,
+};
 use slint::{SharedString, VecModel};
 use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -75,6 +102,111 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
     "Refactor filters",
     "Export pipeline bug",
 ];
+
+/// PROF-1/PROF-2: builds the cold-start `ThreadSpec`s for a fresh install
+/// (`restored_records.is_empty()`) -- pulled out of the giant window-setup
+/// function purely so this rule is unit-testable on its own.
+///
+/// `configured_agent_id` is this machine's real, non-sentinel
+/// `default_agent_id` from resolved settings, if any (settings.global.json
+/// / bundled defaults, the same value the settings sheet's agent picker
+/// writes) -- `None` means genuinely nothing is configured yet.
+///
+/// Every seed thread shares ONE real provider: `configured_agent_id` when
+/// set, else the single documented [`NO_PROVIDER_REQUESTED_FALLBACK`] --
+/// never an index-parity guess alternating "codex"/"claude" by thread
+/// position, which silently mis-bound half of every fresh install's
+/// default threads to whichever provider parity happened to land on
+/// regardless of what was actually configured/available.
+///
+/// `profile_name` (PROF-2) is bound to `configured_agent_id` too, but
+/// ONLY when it's real -- never to the `NO_PROVIDER_REQUESTED_FALLBACK`
+/// label, which is a bare gateway-routing key, not a real registry agent
+/// id. acpx's `Router::ensure_default_profiles_seeded` auto-fills exactly
+/// one profile per installed registry agent, named after that agent's own
+/// id, so this name resolves without requiring any `profiles/create`
+/// setup first (see `ProfileSource`'s own doc comment in
+/// acpx-core/src/profile.rs) -- without this, a thread with a real
+/// `default_agent_id` configured but no hand-picked profile silently fell
+/// all the way through to acpx-server's own native/unmanaged-mode default
+/// backend instead of the agent actually configured. Passing the bare
+/// fallback label as `_acpx.profile` would instead make every
+/// unconfigured-fresh-install `session/new` fail outright
+/// (`RouterError::UnknownProfile`) -- strictly worse than today's
+/// graceful native/unmanaged degrade -- so with nothing configured at
+/// all, `profile_name` stays `None`.
+fn cold_start_thread_specs(
+    seed_names: &[&str],
+    configured_agent_id: Option<String>,
+) -> Vec<ThreadSpec> {
+    let seed_provider = configured_agent_id
+        .clone()
+        .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_owned());
+    seed_names
+        .iter()
+        .map(|name| ThreadSpec {
+            display_name: (*name).to_owned(),
+            provider: seed_provider.clone(),
+            session_id: None,
+            profile_name: configured_agent_id.clone(),
+            // Cold-start seed threads: nothing persisted yet, so there is
+            // no stored association to hydrate from (PISO-3).
+            project_path: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cold_start_thread_specs_tests {
+    use super::cold_start_thread_specs;
+
+    /// PROF-2's own acceptance question: on a clean cache dir with no
+    /// `default_agent_id` configured (the real "nothing set anywhere"
+    /// case `cold_start_thread_specs` is called with when
+    /// `settings_file::SettingsPaths::load_resolved` finds nothing), the
+    /// seed threads get the one documented routing fallback for
+    /// `provider` and stay unprofiled (`profile_name: None`) rather than
+    /// guessing a profile name that would make `session/new` fail
+    /// outright. This is an honest degrade to native/unmanaged mode, not
+    /// a "usable default profile" -- see the written PROF-2 answer this
+    /// test backs up.
+    #[test]
+    fn with_nothing_configured_seed_threads_use_the_fallback_provider_and_stay_unprofiled() {
+        let specs = cold_start_thread_specs(&["Fix timeline crash", "Add fade transition"], None);
+        assert_eq!(specs.len(), 2);
+        for spec in &specs {
+            assert_eq!(spec.provider, super::NO_PROVIDER_REQUESTED_FALLBACK);
+            assert_eq!(spec.profile_name, None, "got: {specs:?}");
+        }
+    }
+
+    /// With a real, configured `default_agent_id` (settings.global.json /
+    /// bundled defaults), the first thread genuinely binds to a usable
+    /// profile: `provider` AND `profile_name` both carry the real agent
+    /// id, so `session/new`'s `_acpx.profile` resolves against acpx's own
+    /// `ensure_default_profiles_seeded` auto-fill with zero
+    /// `profiles/create` setup required.
+    #[test]
+    fn with_a_configured_default_agent_id_every_seed_thread_binds_to_it_as_its_profile() {
+        let specs = cold_start_thread_specs(
+            &[
+                "Fix timeline crash",
+                "Add fade transition",
+                "Refactor filters",
+            ],
+            Some("codex-acp".to_owned()),
+        );
+        assert_eq!(specs.len(), 3);
+        for spec in &specs {
+            assert_eq!(spec.provider, "codex-acp");
+            assert_eq!(
+                spec.profile_name.as_deref(),
+                Some("codex-acp"),
+                "got: {specs:?}"
+            );
+        }
+    }
+}
 
 /// Maps a Qt key event (`QKeyEvent::key()`'s `int` plus `QKeyEvent::text()`)
 /// to a Slint key-event `SharedString`. Qt::Key special codes below are the
@@ -283,7 +415,10 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
 
 /// Load multi-process panel prefs from JSON (project → global → default).
 /// `selected_thread_id` remains process-local (SQLite) when provided.
-fn load_panel_prefs(selected_thread_id: Option<String>, warnings: &mut Vec<String>) -> PanelDefaults {
+fn load_panel_prefs(
+    selected_thread_id: Option<String>,
+    warnings: &mut Vec<String>,
+) -> PanelDefaults {
     let paths = settings_file::SettingsPaths::from_env();
     match paths.load_resolved() {
         Ok(resolved) => settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
@@ -511,6 +646,10 @@ impl Platform for SpikePlatform {
             let _ = effect_executor::write_clipboard_text(&text);
         });
     }
+
+    fn clipboard_text(&self, _clipboard: slint::platform::Clipboard) -> Option<String> {
+        effect_executor::read_clipboard_text()
+    }
 }
 
 #[cfg(test)]
@@ -557,15 +696,60 @@ struct PanelSingleton {
     // closure so the blocking SQLite write happens off the Slint UI
     // thread (offload_state_effects_off_ui_thread).
     panel_state: Option<Arc<PanelStateStore>>,
+    /// Identity-scoped durable stores. The legacy `panel_state` above is the
+    /// global/None store and remains the migration fallback only.
+    project_state_stores: RefCell<HashMap<model::ProjectIdentity, Arc<PanelStateStore>>>,
     /// Set by [`settings_file::SettingsWatcher`]; drained on poll to
     /// refresh open settings fields without clobbering dirty edits.
     settings_reload_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Suppress self-write feedback from settings save for a short window.
     settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
     _settings_watcher: Option<settings_file::SettingsWatcher>,
+    snapshotd_registration: Option<snapshotd_client::SnapshotdRegistration>,
 }
 
 impl PanelSingleton {
+    fn project_identity_for_path(path: &str) -> model::ProjectIdentity {
+        if path.ends_with(".mlt") {
+            model::ProjectIdentity::Saved(path.to_owned())
+        } else {
+            model::ProjectIdentity::Untitled(path.to_owned())
+        }
+    }
+
+    pub(crate) fn project_state_for_identity(
+        &self,
+        identity: &model::ProjectIdentity,
+    ) -> Option<Arc<PanelStateStore>> {
+        self.project_state_stores.borrow().get(identity).cloned()
+    }
+
+    /// Return the physically isolated durable store for the lifecycle
+    /// identity currently folded into the model.
+    pub(crate) fn active_panel_state(&self) -> Option<Arc<PanelStateStore>> {
+        let identity = self.model.borrow().active_project.clone();
+        if matches!(identity, model::ProjectIdentity::None) {
+            return self.panel_state.clone();
+        }
+        if let Some(store) = self.project_state_stores.borrow().get(&identity).cloned() {
+            return Some(store);
+        }
+        let path = crate::project_store::panel_state_path(&identity, &resolve_cache_dir());
+        match PanelStateStore::open(path) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                self.project_state_stores
+                    .borrow_mut()
+                    .insert(identity, store.clone());
+                Some(store)
+            }
+            Err(error) => {
+                eprintln!("panel-rust: project state persistence unavailable: {error}");
+                None
+            }
+        }
+    }
+
     /// Gateway index for settings RPCs: selected real thread, else first
     /// bound thread, else `0` only as last resort when the bridge exists.
     fn settings_gateway_index(&self) -> usize {
@@ -596,7 +780,7 @@ impl PanelSingleton {
     }
 
     fn sync_runtime_defaults(&self, effective: &PanelDefaults) {
-        let Some(store) = self.panel_state.as_ref() else {
+        let Some(store) = self.active_panel_state() else {
             return;
         };
         let selected_thread_id = store
@@ -662,6 +846,18 @@ impl PanelSingleton {
     /// than being reimplemented against `Model`.
     pub(crate) fn execute_send_prompt_real(&self, real_idx: usize, text: &str) {
         let Some(bridge) = &self.bridge else { return };
+        if let Some(error) = bridge.attachment_error(real_idx) {
+            let _ = crate::dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::PromptSent {
+                    real_index: real_idx,
+                    result: Err(effect::EffectError::new(format!(
+                        "session attachment failed: {error}"
+                    ))),
+                }),
+            );
+            return;
+        }
         self.start_send_prompt(real_idx, text, bridge);
     }
 
@@ -670,6 +866,18 @@ impl PanelSingleton {
             trace_host_input(format_args!(
                 "send ignored real_thread={idx} because the thread is closed"
             ));
+            return;
+        }
+        if let Some(error) = bridge.attachment_error(idx) {
+            let _ = crate::dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::PromptSent {
+                    real_index: idx,
+                    result: Err(effect::EffectError::new(format!(
+                        "session attachment failed: {error}"
+                    ))),
+                }),
+            );
             return;
         }
         bridge.push_local(
@@ -808,7 +1016,7 @@ impl PanelSingleton {
         self.settings_ignore_watch_until.set(Some(
             std::time::Instant::now() + std::time::Duration::from_millis(500),
         ));
-        if let Some(store) = self.panel_state.as_ref() {
+        if let Some(store) = self.active_panel_state().as_ref() {
             if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
                 if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
                     return Err(effect::EffectError::new(format!(
@@ -885,11 +1093,7 @@ impl PanelSingleton {
     /// `auth_status`/`needs_auth` on the entry via `mcp_servers/update`
     /// so the Connect button can clear and the status line updates on
     /// the next settings gateway snapshot.
-    pub(crate) fn dispatch_mcp_server_authenticate(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-    ) {
+    pub(crate) fn dispatch_mcp_server_authenticate(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         let Some(mut entry) = bridge
@@ -935,10 +1139,7 @@ impl PanelSingleton {
             );
             return;
         };
-        let tools = entry
-            .extra
-            .get_mut("tools")
-            .and_then(|v| v.as_array_mut());
+        let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
         if let Some(tools) = tools {
             let mut found = false;
             for tool in tools.iter_mut() {
@@ -1102,8 +1303,71 @@ impl PanelSingleton {
     /// This must stay separate from `dispatch_project_path_changed`, which
     /// creates that effect; calling the dispatcher here would recurse forever.
     pub(crate) fn apply_active_project_path(&self, path: Option<String>) {
+        let (reason, generation, identity) = {
+            let model = self.model.borrow();
+            (
+                model.project_lifecycle_reason.clone(),
+                model.project_generation,
+                model.active_project.clone(),
+            )
+        };
         if let Some(bridge) = self.bridge.as_ref() {
-            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
+            bridge.set_active_project_identity(&identity);
+        }
+        if let Some(registration) = self.snapshotd_registration.as_ref() {
+            registration.update(path, reason, generation);
+        }
+    }
+
+    /// Move the durable project store during Save-As/first-save. The rename
+    /// effect already owns this transition for live bridge associations; the
+    /// filesystem half keeps the physical SQLite store aligned with it.
+    pub(crate) fn move_project_store_for_rename(
+        &self,
+        old_identity: &model::ProjectIdentity,
+        new: &str,
+    ) {
+        let cache_root = resolve_cache_dir();
+        let new_identity = Self::project_identity_for_path(new);
+        let old_dir = crate::project_store::project_store_dir(old_identity, &cache_root);
+        let new_dir = crate::project_store::project_store_dir(&new_identity, &cache_root);
+        let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) else {
+            return;
+        };
+        if old_dir == new_dir || !old_dir.exists() {
+            return;
+        }
+        if new_dir.exists() {
+            eprintln!(
+                "panel-rust: retaining existing project store at {} during rename from {}",
+                new_dir.display(),
+                old_dir.display()
+            );
+            return;
+        }
+        if let Some(parent) = new_dir.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                eprintln!("panel-rust: failed to create project store parent: {error}");
+                return;
+            }
+        }
+        if let Err(error) = std::fs::rename(&old_dir, &new_dir) {
+            eprintln!(
+                "panel-rust: failed to move project store {} -> {}: {error}",
+                old_dir.display(),
+                new_dir.display()
+            );
+        } else {
+            let moved_store = self.project_state_stores.borrow_mut().remove(old_identity);
+            if let Some(store) = moved_store {
+                // The SQLite connection remains valid after the directory move,
+                // but its registry key must move with the project identity or a
+                // later switch can reopen the old path and leave two live cache
+                // entries for the same physical store.
+                self.project_state_stores
+                    .borrow_mut()
+                    .insert(new_identity, store);
+            }
         }
     }
 
@@ -1172,6 +1436,14 @@ static SENTINEL: PanelHandle = PanelHandle { _private: () };
 /// this process must run with `QSG_RENDER_LOOP=basic`.
 #[no_mangle]
 pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut PanelHandle {
+    panel_rust_create_with_initial_identity(width, height, None)
+}
+
+fn panel_rust_create_with_initial_identity(
+    width: c_uint,
+    height: c_uint,
+    initial_identity: Option<model::ProjectIdentity>,
+) -> *mut PanelHandle {
     PANEL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if let Some(existing) = slot.as_mut() {
@@ -1226,8 +1498,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
             static FIRST_PLATFORM_CLAIMED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            let is_first_platform = !FIRST_PLATFORM_CLAIMED
-                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            let is_first_platform =
+                !FIRST_PLATFORM_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
             slint::platform::set_platform(Box::new(SpikePlatform {
                 window: window.clone(),
                 is_first_platform,
@@ -1336,7 +1608,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // Dirty::Error instead of silently degrading with no UI signal.
         let mut startup_warnings: Vec<String> = Vec::new();
         let panel_state = {
-            let path = resolve_cache_dir().join("panel-state.sqlite3");
+            let cache_dir = resolve_cache_dir();
+            let identity = initial_identity
+                .as_ref()
+                .unwrap_or(&model::ProjectIdentity::None);
+            let path = crate::project_store::panel_state_path(identity, &cache_dir);
             match PanelStateStore::open(path) {
                 Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
@@ -1360,33 +1636,58 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             })
             .unwrap_or_default();
         // Cold-start seed when panel-state has no prior threads.
-        // RUI_SEED_THREADS:
-        //   unset  -> DEFAULT_THREAD_NAMES (product v1 fixtures)
-        //   "0"    -> single empty "Chat" (dev/VNC: no fake stale-looking titles)
-        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped)
-        // setup-followups stale_threads_not_torn_down_after_testing: VNC
-        // harnesses must set RUI_SEED_THREADS=0 so restarts don't look like
-        // leftover work ("Fix timeline crash" et al.) and only open one session.
-        let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
+        // PISO-13 (user report, 2026-07-25): "stale 4 threads bundled in
+        // production ... we don't want these at all in production ...
+        // user chooses the threads". Prior to this fix, an UNSET
+        // RUI_SEED_THREADS defaulted to the full DEFAULT_THREAD_NAMES
+        // fixture set on EVERY build, including a real production launch --
+        // there was no signal at all that distinguished "a dev/QA harness
+        // that wants demo content" from "a real user's first launch", so a
+        // production install unconditionally got 4 threads named "Fix
+        // timeline crash" etc. that nobody created and nobody asked for.
+        // The prior comment here already correctly diagnosed the surface
+        // symptom (these look like leftover work on any restore-empty
+        // launch) but the prescribed fix -- "VNC harnesses must set
+        // RUI_SEED_THREADS=0" -- was aspirational and never actually done
+        // anywhere in this repo (grepped: zero scripts set it), so the
+        // fixture set kept shipping to everyone by default regardless.
+        // RUI_SEED_THREADS now:
+        //   unset    -> single empty "Chat" (the real default: no fixture
+        //                content, the user creates their own threads)
+        //   "0"      -> same as unset, kept for any caller that already
+        //                passes it explicitly
+        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped) -- now an
+        //                explicit OPT-IN for dev/QA/demo harnesses that
+        //                genuinely want named fixture content, not
+        //                something a real launch falls into by default.
+        // A panel without a project identity must still restore durable
+        // *unscoped* records from the global panel store. Only the synthetic
+        // cold-start seed is suppressed in that state; otherwise restart
+        // would erase the visible thread list until the user opened a
+        // project. Restored records carry their own project_path, so this
+        // does not invent a cwd or bind an old session to the host process.
+        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty()
+            && initial_identity.is_some()
+        {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
                 Ok(v) => {
-                    let n = v.trim().parse::<usize>().unwrap_or(DEFAULT_THREAD_NAMES.len());
+                    let n = v
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap_or(DEFAULT_THREAD_NAMES.len());
                     DEFAULT_THREAD_NAMES.iter().copied().take(n).collect()
                 }
-                Err(_) => DEFAULT_THREAD_NAMES.to_vec(),
+                Err(_) => vec!["Chat"],
             };
-            seed_names
-                .into_iter()
-                .enumerate()
-                .map(|(idx, name)| ThreadSpec {
-                    display_name: name.to_owned(),
-                    provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
-                    session_id: None,
-                    profile_name: None,
-                })
-                .collect()
-        } else {
+            let configured_agent_id = settings_file::SettingsPaths::from_env()
+                .load_resolved()
+                .ok()
+                .and_then(|resolved| {
+                    settings_file::non_default_sentinel(resolved.default_agent_id)
+                });
+            cold_start_thread_specs(&seed_names, configured_agent_id)
+        } else if !restored_records.is_empty() {
             restored_records
                 .iter()
                 .map(|record| ThreadSpec {
@@ -1406,27 +1707,73 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // forever ("the default thread's chat input isn't
                     // linked to a real agent"). Guard here too, at this
                     // third point of use.
-                    profile_name: settings_file::non_default_sentinel(
-                        record.profile_name.clone(),
-                    ),
+                    profile_name: settings_file::non_default_sentinel(record.profile_name.clone()),
+                    // PISO-3: hydrate the durable per-thread project
+                    // association straight from the persisted record, so
+                    // `AgentBridge::new_with_thread_specs` can bind the
+                    // restored slot's `project_path` to what this thread
+                    // was actually created under -- not whatever project
+                    // happens to be active at this restart.
+                    project_path: record.project_path.clone(),
                 })
                 .collect()
+        } else {
+            Vec::new()
         };
+        if let Some(identity) = initial_identity.as_ref() {
+            // Fresh and legacy rows in this project-local store inherit the
+            // current saved MLT association. Untitled remains pathless in
+            // durable thread metadata, but its initial store cwd is passed
+            // separately below.
+            if let Some(saved_path) = identity.saved_path() {
+                for spec in &mut initial_specs {
+                    if spec.project_path.is_none() {
+                        spec.project_path = Some(saved_path.to_owned());
+                    }
+                }
+            }
+        }
         let initial_permission_profiles: Vec<Option<String>> = restored_records
             .iter()
             .map(|record| settings_file::non_default_sentinel(record.permission_profile.clone()))
             .chain(std::iter::repeat(None))
             .take(initial_specs.len())
             .collect();
-        let (bridge, bridge_available) = match AgentBridge::new_with_thread_specs(&initial_specs) {
-            Ok(b) => (Some(b), true),
-            Err(e) => {
-                let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
-                eprintln!("panel-rust: {message}");
-                startup_warnings.push(message);
-                (None, false)
+        // The bridge owns the panel-level ACPX server connection as well as
+        // per-thread sessions. Construct it even before a project is open or
+        // a chat thread exists, so Settings > Agents/MCP can discover the
+        // live gateway on the empty-project screen. Project identity remains
+        // optional input to the constructor; it only controls persistence
+        // scope and session cwd.
+        let initial_cwd = initial_identity.as_ref().and_then(|identity| {
+            crate::project_store::project_store_dir(identity, &resolve_cache_dir())
+        });
+        let (bridge, bridge_available) =
+            match AgentBridge::new_with_thread_specs_and_initial_identity(
+                &initial_specs,
+                initial_cwd,
+                initial_identity
+                    .as_ref()
+                    .and_then(|identity| identity.saved_path().map(std::path::PathBuf::from)),
+            ) {
+                Ok(b) => (Some(b), true),
+                Err(e) => {
+                    let message =
+                        format!("agent bridge unavailable, chat panel is display-only: {e}");
+                    eprintln!("panel-rust: {message}");
+                    startup_warnings.push(message);
+                    (None, false)
+                }
+            };
+        if let Some(bridge) = bridge.as_ref() {
+            if let Some(store) = panel_state.as_ref() {
+                for (index, record) in restored_records.iter().enumerate() {
+                    if let Ok(background) = store.effective_background_session(&record.thread_id) {
+                        bridge.set_thread_background(index, background);
+                    }
+                }
             }
-        };
+        }
         let initial_selected_thread_id = panel_state
             .as_ref()
             .and_then(|store| store.defaults().ok())
@@ -1450,9 +1797,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         let initial_thread_ids: Vec<String> = restored_records
             .iter()
             .map(|record| record.thread_id.clone())
-            .chain(
-                (restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")),
-            )
+            .chain((restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")))
             .collect();
         // Each thread's send queue persists to its own
         // <thread_id>.sendqueue.jsonl (see send_queue.rs's module doc) --
@@ -1511,10 +1856,36 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             height,
             bridge,
             panel_state,
+            project_state_stores: RefCell::new(HashMap::new()),
             settings_reload_pending,
             settings_ignore_watch_until: Cell::new(None),
             _settings_watcher: settings_watcher,
+            // Register the GUI process even when no project is open yet.  The
+            // daemon owns the process lifecycle independently of project
+            // selection; waiting for an initial identity made a fresh panel
+            // invisible to snapshotd until the first project was opened.
+            snapshotd_registration: snapshotd_client::SnapshotdRegistration::start(
+                initial_identity
+                    .as_ref()
+                    .and_then(|identity| identity.saved_path().map(str::to_owned)),
+            ),
         };
+        // Gateway availability is panel-scoped, independent of project-open.
+        // This enables the first `+` thread on the empty-project screen.
+        panel.component.set_gateway_ready(bridge_available);
+        if let Some(identity) = initial_identity {
+            let saved_path = identity.saved_path().map(str::to_owned);
+            let mut model = panel.model.borrow_mut();
+            model.active_project = identity;
+            model.active_project_path = saved_path;
+            drop(model);
+            if let Some(store) = panel.panel_state.clone() {
+                panel
+                    .project_state_stores
+                    .borrow_mut()
+                    .insert(panel.model.borrow().active_project.clone(), store);
+            }
+        }
         // Bind persistent VecModels before any callback can fire; content
         // arrives from the Init hydration + first Frame snapshot below.
         crate::sync::sync_initial_models(&panel.model.borrow(), &panel.component);
@@ -1565,9 +1936,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             selected_from_sqlite.clone(),
             &mut post_hydration_warnings,
         );
-        let defaults = scoped_prefs.as_ref().map(|prefs| prefs.defaults.clone()).unwrap_or_else(
-            || load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings),
-        );
+        let defaults = scoped_prefs
+            .as_ref()
+            .map(|prefs| prefs.defaults.clone())
+            .unwrap_or_else(|| {
+                load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings)
+            });
         panel.sync_runtime_defaults(&defaults);
         for message in post_hydration_warnings {
             let _ = dispatch::update_persistent(
@@ -1795,29 +2169,21 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 });
             });
 
-        panel
-            .component
-            .on_md_link_activated(move |target| {
-                open_md_link_target(target.as_str());
-            });
+        panel.component.on_md_link_activated(move |target| {
+            open_md_link_target(target.as_str());
+        });
 
         let component_weak = panel.component.as_weak();
-        panel
-            .component
-            .on_mcp_server_authenticate(move |name| {
-                let Some(component) = component_weak.upgrade() else {
-                    return;
-                };
-                PANEL.with(|cell| {
-                    if let Some(panel) = cell.borrow().as_ref() {
-                        dispatch::dispatch_mcp_server_authenticate(
-                            panel,
-                            &component,
-                            name.to_string(),
-                        );
-                    }
-                });
+        panel.component.on_mcp_server_authenticate(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_mcp_server_authenticate(panel, &component, name.to_string());
+                }
             });
+        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_tool_enabled_changed(
@@ -1888,13 +2254,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        panel.component.on_agent_set_enabled(move |agent_id, enabled| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_agent_set_enabled(panel, agent_id.to_string(), enabled);
-                }
+        panel
+            .component
+            .on_agent_set_enabled(move |agent_id, enabled| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_agent_set_enabled(panel, agent_id.to_string(), enabled);
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2103,20 +2471,24 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        panel.component.on_queue_cancel_requested(move |message_index| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_queue_cancel(panel, message_index as usize);
-                }
+        panel
+            .component
+            .on_queue_cancel_requested(move |message_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_queue_cancel(panel, message_index as usize);
+                    }
+                });
             });
-        });
-        panel.component.on_queue_edit_requested(move |message_index| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_queue_edit(panel, message_index as usize);
-                }
+        panel
+            .component
+            .on_queue_edit_requested(move |message_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_queue_edit(panel, message_index as usize);
+                    }
+                });
             });
-        });
         panel.component.on_queue_stop_requested(move || {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
@@ -2124,10 +2496,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
             });
         });
-        panel.component.on_queue_send_now_requested(move |message_index| {
+        panel
+            .component
+            .on_queue_send_now_requested(move |message_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_queue_send_now(panel, message_index as usize);
+                    }
+                });
+            });
+        panel.component.on_queue_fast_track_requested(move || {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_queue_send_now(panel, message_index as usize);
+                    dispatch::dispatch_queue_fast_track(panel);
                 }
             });
         });
@@ -2139,13 +2520,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // delete above -- archive_thread itself never sends an ACP
         // request, it's a purely local, durable (see AgentBridge::
         // archive_thread's doc comment) presentation flag.
-        panel.component.on_thread_archive_requested(move |filtered_idx| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_thread_archive(panel, filtered_idx as usize);
-                }
+        panel
+            .component
+            .on_thread_archive_requested(move |filtered_idx| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_archive(panel, filtered_idx as usize);
+                    }
+                });
             });
-        });
 
         // Interactive agent-request relay addition: approve/reject
         // buttons on the request card. Both handlers re-read the exact
@@ -2230,20 +2613,22 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
 
         // PUI-002b: terminals popup's `[x]` kill button.
         let component_weak = panel.component.as_weak();
-        panel.component.on_terminal_kill_requested(move |terminal_id| {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_terminal_kill_requested(
-                        panel,
-                        &component,
-                        terminal_id.to_string(),
-                    );
-                }
+        panel
+            .component
+            .on_terminal_kill_requested(move |terminal_id| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_terminal_kill_requested(
+                            panel,
+                            &component,
+                            terminal_id.to_string(),
+                        );
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_close_terminal_overlay(move || {
@@ -2261,16 +2646,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // from the overlay's open set, both fired from the tab strip
         // inside `TerminalOverlay` itself (not the popup).
         let component_weak = panel.component.as_weak();
-        panel.component.on_terminal_tab_selected(move |terminal_id| {
-            let Some(_component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_terminal_tab_selected(panel, terminal_id.to_string());
-                }
+        panel
+            .component
+            .on_terminal_tab_selected(move |terminal_id| {
+                let Some(_component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_terminal_tab_selected(panel, terminal_id.to_string());
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_terminal_tab_closed(move |terminal_id| {
@@ -2353,13 +2740,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        panel.component.on_profile_selected(move |profile_name| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_profile_selected(panel, profile_name.to_string());
-                }
+        panel
+            .component
+            .on_profile_selected(move |profile_name, agent_id| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_profile_selected(
+                            panel,
+                            profile_name.to_string(),
+                            agent_id.to_string(),
+                        );
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2454,6 +2847,32 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         *slot = Some(panel);
         &SENTINEL as *const PanelHandle as *mut PanelHandle
     })
+}
+
+/// Cold-start variant used by the Qt adapter when it already has the host's
+/// pending project lifecycle signal. Supplying the identity before creating
+/// the bridge makes initial thread hydration read the project-local store.
+#[no_mangle]
+pub extern "C" fn panel_rust_create_with_identity(
+    width: c_uint,
+    height: c_uint,
+    path_ptr: *const c_uchar,
+    path_len: usize,
+    untitled: bool,
+) -> *mut PanelHandle {
+    let identity = if untitled {
+        Some(model::ProjectIdentity::Untitled(
+            uuid::Uuid::new_v4().to_string(),
+        ))
+    } else if path_ptr.is_null() || path_len == 0 {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(|path| model::ProjectIdentity::Saved(path.to_owned()))
+    };
+    panel_rust_create_with_initial_identity(width, height, identity)
 }
 
 #[no_mangle]
@@ -2827,6 +3246,108 @@ pub extern "C" fn panel_rust_set_project_path(
     })
 }
 
+#[no_mangle]
+pub extern "C" fn panel_rust_project_created_untitled(_handle: *mut PanelHandle) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        dispatch::dispatch_project_created_untitled(panel);
+        true
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn panel_rust_project_closed(_handle: *mut PanelHandle) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        dispatch::dispatch_project_closed(panel);
+        true
+    })
+}
+
+/// PISO-7 (project-isolation-mlt-binding plan) FFI crossing point --
+/// mirrors `panel_rust_set_project_path`'s byte-buffer shape, but takes
+/// TWO strings (old path, then new path) since a rename is a pair, not a
+/// single value. `ChatRustDock` should call this instead of
+/// `panel_rust_set_project_path` specifically for an MLT Save-As (where
+/// Shotcut knows both the path being replaced and its replacement);
+/// every other project-path change (open, close, first save of an
+/// untitled project) keeps going through `panel_rust_set_project_path`
+/// as before. Passing a zero-length `old` buffer is equivalent to "not a
+/// rename" and is a no-op on the Rust side (see `HostMsg::
+/// ProjectPathRenamed`'s doc comment) -- callers with no old path should
+/// call `panel_rust_set_project_path` instead of this function.
+#[no_mangle]
+pub extern "C" fn panel_rust_rename_project_path(
+    _handle: *mut PanelHandle,
+    old_path_ptr: *const c_uchar,
+    old_path_len: usize,
+    new_path_ptr: *const c_uchar,
+    new_path_len: usize,
+) -> bool {
+    let old_path = if old_path_ptr.is_null() || old_path_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(old_path_ptr, old_path_len) };
+        std::str::from_utf8(bytes).unwrap_or_default().to_owned()
+    };
+    let new_path = if new_path_ptr.is_null() || new_path_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(new_path_ptr, new_path_len) };
+        std::str::from_utf8(bytes).unwrap_or_default().to_owned()
+    };
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        dispatch::dispatch_project_path_renamed(panel, old_path, new_path);
+        true
+    })
+}
+
+/// language-switch-sync plan: sets the active UI language from a QSettings
+/// locale code (e.g. "fr", "zh_CN") -- mirrors `panel_rust_set_theme`'s/
+/// `panel_rust_set_project_path`'s byte-buffer shape exactly.
+/// `ChatRustDock` calls this once at construction (seeded from
+/// `Settings.language()`, the cold-start value) and again live every time
+/// `MainWindow::languageChanged` fires (a real switch in Qt's Settings >
+/// Language menu) -- see that signal's own doc comment for why this is
+/// wired as a genuine live signal rather than construction-time only
+/// (the gap `panel_rust_set_theme`/`applyTheme` still has). An empty
+/// buffer is a real no-op here (unlike theme's "empty means dark"
+/// default) -- there's no sensible language to fall back to other than
+/// "don't switch", so this returns `true` (the panel exists) without
+/// dispatching anything.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_language(
+    _handle: *mut PanelHandle,
+    text_ptr: *const c_uchar,
+    text_len: usize,
+) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        if text_ptr.is_null() || text_len == 0 {
+            return true;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return true;
+        };
+        dispatch::dispatch_language_changed(panel, text.to_owned());
+        true
+    })
+}
+
 /// Applies a generation-ordered host appearance snapshot. The host owns only
 /// selector values; the panel retains its component palette and tokens.
 #[no_mangle]
@@ -3184,15 +3705,22 @@ mod lifecycle_tests {
         let port = listener.local_addr().expect("local_addr").port();
         drop(listener);
         let mut command = std::process::Command::new(acpx_server_bin_for_lifecycle_test());
-        command
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", mock_agent.to_string_lossy().into_owned())
-            .env("ACPX_DEFAULT_AGENT_ID", "codex")
-            .env("RUI_MOCK_AGENT_PERSONA", "codex")
-            .env("RUST_LOG", "error")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+        // PROF-5: routed through the crate's one sanctioned in-crate-test
+        // exemption (see agent_bridge.rs's own doc comment on
+        // `test_only_set_backend_cmd_env`) instead of a raw `.env(...)`
+        // write, so the backend_cmd_env_write_regression_test guard has
+        // exactly one call site to recognize.
+        crate::agent_bridge::test_only_set_backend_cmd_env(
+            &mut command,
+            mock_agent.to_string_lossy().into_owned(),
+        )
+        .env("ACPX_DEFAULT_AGENT_ID", "codex")
+        .env("RUI_MOCK_AGENT_PERSONA", "codex")
+        .env("RUST_LOG", "error")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
         let mut child = command.spawn().expect("spawn real acpx-server for test");
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         let mut reachable = false;
@@ -3215,7 +3743,15 @@ mod lifecycle_tests {
         std::env::set_var("RUI_ACPX_CODEX_URL", format!("http://127.0.0.1:{port}"));
         std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
 
-        let handle = panel_rust_create(96, 64);
+        let project_path = cache_dir.path().join("lifecycle-test.mlt");
+        let project_path = project_path.to_string_lossy().into_owned();
+        let handle = panel_rust_create_with_identity(
+            96,
+            64,
+            project_path.as_ptr(),
+            project_path.len(),
+            false,
+        );
         assert!(!handle.is_null());
 
         // `dispatch_thread_new`'s `_component` parameter is unused in its
@@ -3356,7 +3892,15 @@ mod keyboard_shortcut_tests {
             std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
             std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
 
-            let handle = panel_rust_create(240, 260);
+            let project_path = cache_dir.path().join("test-panel.mlt");
+            let project_path = project_path.to_string_lossy().into_owned();
+            let handle = panel_rust_create_with_identity(
+                240,
+                260,
+                project_path.as_ptr(),
+                project_path.len(),
+                false,
+            );
             assert!(!handle.is_null());
             Self {
                 handle,
@@ -3468,6 +4012,7 @@ mod keyboard_shortcut_tests {
             model: "".into(),
             project_name: "".into(),
             project_path: "".into(),
+            project_instance_live: false,
             profile_name: "".into(),
             has_session: false,
             relative_time: "now".into(),
@@ -3765,7 +4310,6 @@ mod keyboard_shortcut_tests {
     }
 }
 
-
 /// Phase 17 (`markdown_highlight_and_real_links`): opens a Ctrl+Clicked
 /// markdown link target -- file paths and external URLs both go through
 /// the platform opener (`xdg-open` on Linux). `RUI_LINK_OPEN_CMD`
@@ -3793,6 +4337,8 @@ pub(crate) fn open_md_link_target(target: &str) {
                 let _ = child.wait();
             });
         }
-        Err(error) => eprintln!("panel-rust: failed to open link {target:?} via {opener:?}: {error}"),
+        Err(error) => {
+            eprintln!("panel-rust: failed to open link {target:?} via {opener:?}: {error}")
+        }
     }
 }

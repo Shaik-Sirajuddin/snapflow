@@ -1,4 +1,5 @@
 import { Theme } from "../../../tokens/theme.slint";
+import { Strings } from "../../../tokens/strings.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { NavItem } from "../../../base/nav_item.slint";
 
@@ -23,8 +24,8 @@ export component SettingsLeftTabs inherits Rectangle {
 
         NavItem {
             height: 34px;
-            label: "MCP Servers";
-            button-accessible-label: "MCP Servers section";
+            label: Strings.mcp-servers;
+            button-accessible-label: Strings.mcp-servers-section;
             active: root.active-section == "mcp_servers";
             show-icon: true;
             show-label: root.expanded;
@@ -36,8 +37,8 @@ export component SettingsLeftTabs inherits Rectangle {
         }
         NavItem {
             height: 34px;
-            label: "Agents";
-            button-accessible-label: "Agents section";
+            label: Strings.agents;
+            button-accessible-label: Strings.agents-section;
             active: root.active-section == "agents";
             show-icon: true;
             show-label: root.expanded;
@@ -49,8 +50,8 @@ export component SettingsLeftTabs inherits Rectangle {
         }
         NavItem {
             height: 34px;
-            label: "Harness";
-            button-accessible-label: "Harness section";
+            label: Strings.harness;
+            button-accessible-label: Strings.harness-section;
             active: root.active-section == "harness";
             show-icon: true;
             show-label: root.expanded;
@@ -62,8 +63,8 @@ export component SettingsLeftTabs inherits Rectangle {
         }
         NavItem {
             height: 34px;
-            label: "Skills";
-            button-accessible-label: "Skills section";
+            label: Strings.skills;
+            button-accessible-label: Strings.skills-section;
             active: root.active-section == "skills";
             show-icon: true;
             show-label: root.expanded;

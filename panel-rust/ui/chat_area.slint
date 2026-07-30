@@ -4,7 +4,7 @@ import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
 import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
-import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption } from "./types.slint";
+import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -56,9 +56,30 @@ export component ChatArea inherits Rectangle {
     in property <string> project-name: "";
     in property <string> project-path: "";
     in property <bool> project-mcp-live: false;
+    in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
     callback error-banner-dismissed();
+    // PROF-8: persistent (not dismissible) yellow strip -- the displayed
+    // thread's agent is reachable but not authenticated. Clears itself
+    // once a turn completes (update.rs's TurnEnded handling), unlike
+    // last-error which the user dismisses by hand.
+    in property <bool> agent-unauthenticated: false;
+    // PROF-11: the agent's most recently pushed execution plan/todo list
+    // (`AgentBridge::plan`, a live ACP `plan` session/update). Empty
+    // hides the panel entirely -- most agents never send one.
+    in property <[PlanEntryItem]> plan-entries: [];
+    // PROF-11: the most recently pushed live session title (`session_
+    // info_update`), deliberately kept separate from the durable,
+    // user-editable `active-thread-name` above -- shown as a small
+    // suffix on the header only when present and different, never
+    // replacing what the user named the thread.
+    in property <string> live-session-title: "";
+    // Computed once so the header `Text` below doesn't reference
+    // `active-thread-name` twice in one expression (generated Rust
+    // codegen moved the first `SharedString` use out from under the
+    // second in that shape).
+    property <string> header-title: active-thread-name != "" ? active-thread-name : "No thread";
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
@@ -141,9 +162,11 @@ export component ChatArea inherits Rectangle {
     in property <[string]> file-options: [];
     callback mode-selected(string);
     callback config-option-selected(string, string);
-    callback profile-selected(string);
+    callback profile-selected(string, string);
+    callback configure-provider-requested();
     callback context-view-requested();
     callback send-requested();
+    callback queue-fast-track-requested();
     callback stop-requested();
     // PUI-002a/b: forwarded from ChatInputLayout's terminals chip (see
     // chat-input := ChatInputLayout below); toggles the terminals popup
@@ -404,6 +427,11 @@ export component ChatArea inherits Rectangle {
     property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
     // Independent scroll position for the popup view (not synced with main message scroll)
     property <length> popup-scroll-y: 0px;
+    // PROF-11: keep the live plan visible below the chat header without
+    // allowing a large agent plan to consume the transcript viewport.
+    // The plan gets its own Flickable below, so its wheel/drag scrolling
+    // never changes message-scroll's position.
+    property <length> plan-max-height: 180px;
 
     changed full-view-open => {
         if (root.full-view-open) {
@@ -538,7 +566,14 @@ export component ChatArea inherits Rectangle {
                         }
                     }
                     if !root.rename-editing : Text {
-                        text: active-thread-name != "" ? active-thread-name : "No thread";
+                        // PROF-11: an agent-pushed live title is appended
+                        // as a small suffix, not swapped in for the
+                        // durable name -- see `live-session-title`'s doc
+                        // comment for why the two must never merge.
+                        text: root.header-title
+                            + (root.live-session-title != "" && root.live-session-title != root.header-title
+                                ? "  ·  " + root.live-session-title
+                                : "");
                         color: Theme.text-primary;
                         // Match sidebar "Chats" title when rail collapsed.
                         font-size: (root.match-title-bar ? 14px
@@ -686,6 +721,85 @@ export component ChatArea inherits Rectangle {
             height: 1px;
             background: Theme.border-default;
         }
+        // PROF-8: yellow "reachable but not authenticated" strip,
+        // directly below the top bar (ahead of the red error banner
+        // below, which is dismissible -- this one isn't, it clears
+        // itself once a turn actually completes).
+        if root.agent-unauthenticated : Rectangle {
+            height: auth-banner-text.preferred-height + 2 * Metrics.space-3;
+            background: #422006;
+            border-color: #eab308;
+            border-width: 1px;
+            HorizontalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                padding-top: Metrics.space-3;
+                padding-bottom: Metrics.space-3;
+                spacing: Metrics.space-3;
+                auth-banner-text := Text {
+                    text: "⚠ Agent is reachable but not authenticated. Configure an auth method for this profile.";
+                    color: #eab308;
+                    font-size: 10px * Theme.font-scale;
+                    font-family: Theme.font-mono;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    accessible-role: text;
+                    accessible-label: self.text;
+                }
+            }
+        }
+        // PROF-11: the agent's self-reported execution plan/todo list.
+        // Hidden entirely when empty (`plan-entries.length == 0`) --
+        // most agents never send one, so this must never look like a
+        // dead/always-present control.
+        if root.plan-entries.length > 0 : Rectangle {
+            // This chrome band stays outside message-area/message-scroll;
+            // only plan-scroll can move its overflowing entries.
+            height: min(plan-list.preferred-height, root.plan-max-height);
+            background: Theme.bg-card;
+            border-color: Theme.border-default;
+            border-width: 1px;
+            clip: true;
+            plan-scroll := Flickable {
+                width: parent.width;
+                height: parent.height;
+                viewport-height: plan-list.preferred-height;
+                plan-list := VerticalLayout {
+                    width: parent.width;
+                    padding-left: Metrics.space-6;
+                    padding-right: Metrics.space-6;
+                    padding-top: Metrics.space-3;
+                    padding-bottom: Metrics.space-3;
+                    spacing: Metrics.space-1;
+                    for entry[i] in root.plan-entries : HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        Text {
+                            text: entry.status == "completed" ? "✓"
+                                : entry.status == "in_progress" ? "▶" : "○";
+                            color: entry.status == "completed" ? Theme.text-muted
+                                : Theme.text-primary;
+                            font-size: 10px * Theme.font-scale;
+                            font-family: Theme.font-mono;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: entry.content;
+                            color: entry.status == "completed" ? Theme.text-muted : Theme.text-primary;
+                            font-size: 10px * Theme.font-scale;
+                            font-family: Theme.font-mono;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            accessible-role: text;
+                            accessible-label: "Plan entry, " + entry.priority + " priority, " + entry.status + ": " + entry.content;
+                        }
+                    }
+                }
+            }
+        }
         // Send/session-attach failure banner. Previously this only ever
         // surfaced as a small "Error: ..." sidebar subtitle under the
         // thread's name (models::describe_thread's error branch) --
@@ -821,7 +935,20 @@ export component ChatArea inherits Rectangle {
                 // Phase 18 empty/loading states: never leave the chat
                 // view blank. While (re)connecting, a blinking loading
                 // line; once live with no messages, a centered starter.
-                if root.messages.length == 0 : VerticalLayout {
+                if root.no-project : VerticalLayout {
+                    height: 160px;
+                    alignment: center;
+                    Text {
+                        text: "No project open";
+                        color: Theme.text-muted;
+                        opacity: 0.8;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.messages.length == 0 && !root.no-project : VerticalLayout {
                     height: 160px;
                     alignment: center;
                     property <bool> reloading: connection-status == "Connecting...";
@@ -1340,10 +1467,12 @@ export component ChatArea inherits Rectangle {
             file-options: file-options;
             terminal-count: root.terminals.length;
             send-requested => { root.handle-send(); }
+            queue-fast-track-requested => { root.queue-fast-track-requested(); }
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
-            profile-selected(id) => { profile-selected(id); }
+            profile-selected(id, agent) => { profile-selected(id, agent); }
+            configure-provider-requested => { configure-provider-requested(); }
             context-view-requested => { context-view-requested(); }
             terminals-clicked => {
                 root.terminals-clicked();

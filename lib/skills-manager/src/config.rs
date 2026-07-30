@@ -19,10 +19,9 @@ pub enum SkillManagerConfig {
 impl SkillManagerConfig {
     pub(crate) fn resolve(&self) -> (PathBuf, PathBuf) {
         match self {
-            SkillManagerConfig::Default { app_data_dir } => (
-                app_data_dir.join("skills.db"),
-                app_data_dir.join("store"),
-            ),
+            SkillManagerConfig::Default { app_data_dir } => {
+                (app_data_dir.join("skills.db"), app_data_dir.join("store"))
+            }
             SkillManagerConfig::AtPath {
                 db_path,
                 central_store_dir,
@@ -53,10 +52,7 @@ impl SkillManagerConfig {
         let global_snapflow_skills = home.join(".snapflow").join("skills");
         let db_path = global_snapflow_skills.join("skills.db");
         let central_store_dir = match project_root {
-            Some(root) => root
-                .join(".snapflow")
-                .join("skills")
-                .join(".manager-store"),
+            Some(root) => root.join(".snapflow").join("skills").join(".manager-store"),
             None => global_snapflow_skills.join(".manager-store"),
         };
         SkillManagerConfig::AtPath {

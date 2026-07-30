@@ -84,10 +84,13 @@ async fn capability_probe_works_after_demux_is_already_active_on_the_process() {
     // through fast.
     let unrelated = tokio::time::timeout(
         Duration::from_secs(5),
-        dispatch_shared(&router, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
-            "params": {"sessionId": session_id, "prompt": []}
-        })),
+        dispatch_shared(
+            &router,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": []}
+            }),
+        ),
     )
     .await;
     assert!(

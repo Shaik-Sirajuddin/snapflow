@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use acpx_conductor::SpawnSpec;
-use acpx_core::{LifecycleConfig, Router};
 use acpx_core::router::dispatch_shared;
+use acpx_core::{LifecycleConfig, Router};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -223,7 +223,10 @@ async fn reap_expired_session_works_after_demux_is_already_active_on_the_process
         let mut r = router.lock().await;
         r.reap_expired_sessions(std::time::Instant::now()).await
     };
-    assert_eq!(report.closed, 1, "must not panic once demux is already active");
+    assert_eq!(
+        report.closed, 1,
+        "must not panic once demux is already active"
+    );
     assert_eq!(report.failed, 0);
 
     let log_contents = tokio::fs::read_to_string(&log).await.expect("reaper log");

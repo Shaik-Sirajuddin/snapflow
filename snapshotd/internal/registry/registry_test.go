@@ -72,3 +72,37 @@ func TestOpen_SetsWALJournalModeAndBusyTimeout(t *testing.T) {
 		t.Fatalf("expected busy_timeout=5000, got %d", busyTimeout)
 	}
 }
+
+func TestAuditOnce_InitKindIdempotent(t *testing.T) {
+	reg := openTestRegistry(t)
+	if err := reg.AuditOnce("proj-1", AuditInit, "first open"); err != nil {
+		t.Fatalf("AuditOnce: %v", err)
+	}
+	if err := reg.AuditOnce("proj-1", AuditInit, "second open must not insert"); err != nil {
+		t.Fatalf("AuditOnce second: %v", err)
+	}
+	// Different project still gets its own init row.
+	if err := reg.AuditOnce("proj-2", AuditInit, "other project"); err != nil {
+		t.Fatalf("AuditOnce other: %v", err)
+	}
+	events, err := reg.ListAuditEvents("proj-1")
+	if err != nil {
+		t.Fatalf("ListAuditEvents: %v", err)
+	}
+	initCount := 0
+	for _, e := range events {
+		if e.Kind == AuditInit {
+			initCount++
+		}
+	}
+	if initCount != 1 {
+		t.Fatalf("expected exactly 1 init audit for proj-1, got %d (%+v)", initCount, events)
+	}
+	events2, err := reg.ListAuditEvents("proj-2")
+	if err != nil {
+		t.Fatalf("ListAuditEvents proj-2: %v", err)
+	}
+	if len(events2) != 1 || events2[0].Kind != AuditInit {
+		t.Fatalf("expected one init for proj-2, got %+v", events2)
+	}
+}

@@ -9,6 +9,7 @@ use slint::{Model, VecModel};
 
 /// Reconciles `model` from `old_keys` to `new_keys` without replacing the
 /// model object. Returns the structural operations for focused tests.
+///
 pub fn reconcile<T, K>(
     model: &VecModel<T>,
     old_keys: &mut Vec<K>,

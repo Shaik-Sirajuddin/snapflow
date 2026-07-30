@@ -23,6 +23,10 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // Project identity is independent from the panel-level ACPX server
+    // connection. A gateway-backed panel can create an unscoped first chat.
+    in property <bool> project-open: false;
+    in property <bool> gateway-ready: false;
     // Phase 19: section counters (computed in Rust; slint lacks reduce).
     in property <int> active-count: 0;
     in property <int> archived-count: 0;
@@ -173,7 +177,7 @@ export component Sidebar inherits Rectangle {
         spacing: expanded ? Metrics.space-5 : Metrics.space-1;
         Rectangle {
             height: 36px;
-            background: Theme.bg-card;
+            background: Theme.bg-sidebar;
             // Collapse / "Chats" / new-thread on one vertical midline.
             HorizontalLayout {
                 width: 100%;
@@ -239,6 +243,7 @@ export component Sidebar inherits Rectangle {
                     alignment: center;
                     IconButton {
                         button-accessible-label: "New thread";
+                        enabled: root.gateway-ready;
                         clicked => { new-thread-requested(); }
                         Icon {
                             source: @image-url("../assets/icons/plus.svg");
@@ -266,13 +271,15 @@ export component Sidebar inherits Rectangle {
         // Threads / Skills tab row -- `assistant-sidebar refine`'s
         // "thread view + skill-manager" sibling-mode switch.
         if expanded : Rectangle {
-            height: 28px;
-            background: Theme.bg-canvas;
-            HorizontalLayout {
+            height: 32px;
+            background: Theme.bg-sidebar;
+            tab-layout := HorizontalLayout {
                 padding-left: Metrics.space-3;
                 padding-right: Metrics.space-3;
-                spacing: Metrics.space-3;
-                NavItem {
+                padding-bottom: Metrics.space-2;
+                spacing: Metrics.space-4;
+                cross-axis-alignment: center;
+                threads-nav := NavItem {
                     horizontal-stretch: 0;
                     fill-width: false;
                     idle-bg: transparent;
@@ -282,12 +289,13 @@ export component Sidebar inherits Rectangle {
                     inactive-color: Theme.text-muted;
                     label: "Threads";
                     show-icon: true;
+                    show-underline: false;
                     icon-source: @image-url("../assets/icons/book-open.svg");
                     active: !skill-mode;
                     button-accessible-label: "Show threads";
                     clicked => { skill-mode = false; }
                 }
-                NavItem {
+                skills-nav := NavItem {
                     horizontal-stretch: 0;
                     fill-width: false;
                     idle-bg: transparent;
@@ -297,62 +305,30 @@ export component Sidebar inherits Rectangle {
                     inactive-color: Theme.text-muted;
                     label: "Skills";
                     show-icon: true;
+                    show-underline: false;
                     icon-source: @image-url("../assets/icons/sparkles.svg");
                     active: skill-mode;
                     button-accessible-label: "Show skills";
                     clicked => { skill-mode = true; }
                 }
             }
-        }
-        // Project skills stay visible by default. Global skills can be
-        // included in the list without replacing the current project view.
-        if expanded && skill-mode : Rectangle {
-            height: 28px;
-            background: Theme.bg-canvas;
-            HorizontalLayout {
-                padding-left: Metrics.space-3;
-                padding-right: Metrics.space-3;
-                spacing: Metrics.space-2;
-                show-global-skills-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    horizontal-stretch: 0;
-                    accessible-role: button;
-                    accessible-label: root.show-global-skills
-                        ? "Hide global skills"
-                        : "Show global skills";
-                    accessible-action-default => { root.show-global-skills = !root.show-global-skills; }
-                    clicked => { root.show-global-skills = !root.show-global-skills; }
-                    Rectangle {
-                        height: 24px;
-                        background: root.show-global-skills || show-global-skills-touch.has-hover
-                            ? Theme.bg-primary-container
-                            : transparent;
-                        animate background { duration: 100ms; }
-                        border-radius: Theme.radius-sm;
-                        HorizontalLayout {
-                            padding-left: Metrics.space-2;
-                            padding-right: Metrics.space-2;
-                            spacing: Metrics.space-1;
-                            Text {
-                                text: "Show global skills";
-                                color: root.show-global-skills || show-global-skills-touch.has-hover
-                                    ? Theme.text-primary
-                                    : Theme.text-secondary;
-                                font-size: 10px * Theme.font-scale;
-                                font-weight: root.show-global-skills ? 700 : 400;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
+            active-line := Rectangle {
+                y: parent.height - 2px;
+                x: (!skill-mode ? threads-nav.x : skills-nav.x) + tab-layout.x;
+                width: !skill-mode ? threads-nav.width : skills-nav.width;
+                height: 2px;
+                background: Theme.bg-primary;
+                border-radius: 1px;
+                animate x { duration: 180ms; easing: ease-out; }
+                animate width { duration: 180ms; easing: ease-out; }
             }
         }
         Rectangle {
-            height: 32px;
+            height: 36px;
             // Collapsed rail: whole row is hit target (ui.yaml thread-view).
             background: !expanded && search-rail-hit.has-hover
                 ? Theme.bg-primary-container
-                : Theme.bg-canvas;
+                : Theme.bg-sidebar;
             animate background { duration: 100ms; }
 
             search-rail-hit := TouchArea {
@@ -385,9 +361,9 @@ export component Sidebar inherits Rectangle {
             // after expand; hidden when collapsed. Cursor-kind reporting
             // (pointer/text) lives inside FilterSearchBar itself.
             thread-search := FilterSearchBar {
-                x: Metrics.space-3;
+                x: compact ? Metrics.space-5 : Metrics.space-6;
                 y: (parent.height - self.height) / 2;
-                width: parent.width - 2 * Metrics.space-3;
+                width: parent.width - 2 * (compact ? Metrics.space-5 : Metrics.space-6);
                 visible: expanded;
                 // Keep mounted for focus-search even when not visible.
                 placeholder: skill-mode ? "Search skills..." : "Search active threads...";
@@ -395,7 +371,7 @@ export component Sidebar inherits Rectangle {
                 show-icon: true;
                 icon-trailing: true;
                 bar-height: 28px;
-                bar-bg: Theme.bg-sidebar;
+                bar-bg: Theme.bg-tertiary;
                 query <=> root.search-query;
                 edited => { search-changed(self.query); }
                 icon-clicked => { root.open-search(); }
@@ -409,6 +385,53 @@ export component Sidebar inherits Rectangle {
                         return EventResult.accept;
                     }
                     return EventResult.reject;
+                }
+            }
+        }
+        // Project skills stay visible by default. Global skills can be
+        // included in the list without replacing the current project view.
+        // Positioned below the search bar so switching between Threads and Skills
+        // keeps the search bar at the exact same vertical position.
+        if expanded && skill-mode : Rectangle {
+            height: 32px;
+            background: Theme.bg-sidebar;
+            HorizontalLayout {
+                padding-left: Metrics.space-5;
+                padding-right: Metrics.space-5;
+                padding-bottom: Metrics.space-2;
+                spacing: Metrics.space-2;
+                cross-axis-alignment: center;
+                show-global-skills-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    horizontal-stretch: 0;
+                    accessible-role: button;
+                    accessible-label: root.show-global-skills
+                        ? "Hide global skills"
+                        : "Show global skills";
+                    accessible-action-default => { root.show-global-skills = !root.show-global-skills; }
+                    clicked => { root.show-global-skills = !root.show-global-skills; }
+                    Rectangle {
+                        height: 24px;
+                        background: root.show-global-skills || show-global-skills-touch.has-hover
+                            ? Theme.bg-primary-container
+                            : transparent;
+                        animate background { duration: 100ms; }
+                        border-radius: Theme.radius-sm;
+                        HorizontalLayout {
+                            padding-left: Metrics.space-2;
+                            padding-right: Metrics.space-2;
+                            spacing: Metrics.space-1;
+                            Text {
+                                text: "Show global skills";
+                                color: root.show-global-skills || show-global-skills-touch.has-hover
+                                    ? Theme.text-primary
+                                    : Theme.text-secondary;
+                                font-size: 10px * Theme.font-scale;
+                                font-weight: root.show-global-skills ? 700 : 400;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -645,6 +668,7 @@ export component Sidebar inherits Rectangle {
                         padding-top: Metrics.space-1;
                         padding-bottom: Metrics.space-1;
                         spacing: Metrics.space-2;
+                        cross-axis-alignment: center;
                         Text {
                             text: root.archived-count > 0 ? "Archived  [" + root.archived-count + "]" : "Archived";
                             color: Theme.text-secondary;
@@ -808,6 +832,7 @@ export component Sidebar inherits Rectangle {
                 padding-right: Metrics.pad-sm;
                 spacing: Metrics.gap-sm;
                 alignment: start;
+                cross-axis-alignment: center;
                 VerticalLayout {
                     alignment: center;
                     horizontal-stretch: 0;

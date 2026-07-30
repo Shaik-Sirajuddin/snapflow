@@ -7,116 +7,70 @@
 //! real binary, don't fake the boundary" testing discipline (see
 //! `panel-rust`'s own headless smoke-test methodology).
 
-use panel_rust::gateway_actor::spawn_acpx_thread;
-use panel_rust::protocol_types::AgentEvent;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use acpx_client::Gateway;
+use panel_rust::gateway_actor::{spawn_acpx_thread, spawn_acpx_thread_with_gateway};
+use panel_rust::jsonl_store::JsonlStore;
+use panel_rust::protocol_types::{AgentEvent, ChatMessage, MessageKind};
+use std::collections::BTreeMap;
+use std::process::Child;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// Resolves the real, already-built `acpx-server` binary next to this
-/// crate's own checkout -- mirrors `panel-rust/src/agent_bridge.rs`'s
-/// `resolve_agent_command`'s dev-checkout-relative-path pattern.
-fn acpx_server_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
-
-fn mock_agent_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/rui-mock-agent")
-}
-
-/// Binds an ephemeral TCP port synchronously (std, not tokio -- this
-/// helper runs before any runtime is guaranteed up), then immediately
-/// drops the listener so `acpx-server` can bind the same port itself.
-/// Same "probe a free port, drop it, hand the number to the real process"
-/// trick `acpx-server`'s own tests use.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
-/// Spawns a real `acpx-server` child, retrying the whole pick-port/
-/// spawn/wait-for-connect cycle (bounded at 5 attempts) if the process
-/// never becomes reachable within one attempt's own shorter window.
-///
-/// **Why this exists.** `free_port()`'s "bind a listener, read its
-/// port, then drop it" trick has an unavoidable TOCTOU gap: a different
-/// concurrently-running test's own `free_port()` call can claim the
-/// exact same port before this function's spawned process binds it.
-/// When that race is lost, `acpx-server` fails its bind and exits
-/// immediately -- ported verbatim from `panel-rust::agent_bridge`'s
-/// `spawn_acpx_server_with_retry` (see its doc comment for the full
-/// root-cause writeup), whose fix this file's tests never picked up,
-/// which is the confirmed cause of this file's own `resume_session_
-/// replays_history_via_session_load` flake under parallel test load.
-fn spawn_acpx_server_with_retry(
-    configure: impl Fn(&mut Command, u16),
-) -> (Child, String) {
-    for attempt in 0..5 {
-        let port = free_port();
-        let mut command = Command::new(acpx_server_bin());
-        configure(&mut command, port);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-        let mut reachable = false;
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                reachable = true;
-                break;
-            }
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        if reachable {
-            return (child, format!("http://127.0.0.1:{port}"));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-        }
-    }
-    panic!(
-        "acpx-server never became reachable after 5 fresh-port attempts -- \
-         this looks like more than ordinary port contention"
-    );
-}
+mod common;
+#[allow(unused_imports)]
+use common::{
+    acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile,
+    spawn_acpx_server_with_retry,
+};
 
 struct GatewayProcess {
     child: Child,
     pub base_url: String,
+    /// PROF-4: the real, admin-provisioned profile name a test should pass
+    /// to `open_session_with_profile` to reach `rui-mock-agent` -- see
+    /// `provision_mock_profile`'s doc comment.
+    pub profile_name: String,
 }
 
 impl GatewayProcess {
-    /// Spawns a real `acpx-server` process with `persona` as both its
-    /// `ACPX_DEFAULT_AGENT_ID` and the `RUI_MOCK_AGENT_PERSONA` its
-    /// backend replies with -- the same shape
+    /// Spawns a real `acpx-server` process, with `persona` naming its
+    /// `ACPX_DEFAULT_AGENT_ID` and doubling as the mock backend's
+    /// `RUI_MOCK_AGENT_PERSONA` reply tag -- the same shape
     /// `panel-rust::agent_bridge::ensure_gateway_running` uses in
-    /// production, just parameterized for a test's own tempdir.
+    /// production, just parameterized for a test's own tempdir. PROF-4:
+    /// no `ACPX_BACKEND_CMD` -- the mock backend is provisioned as a real
+    /// custom agent + profile instead (`provision_mock_profile`), and
+    /// `profile_name` is what callers pass to `open_session_with_profile`.
     async fn spawn(persona: &str, db_path: &std::path::Path) -> Self {
         let persona = persona.to_string();
+        let persona_for_profile = persona.clone();
         let db_path = db_path.to_path_buf();
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
+        let admin_token_for_env = admin_token.clone();
         let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env(
-                    "ACPX_BACKEND_CMD",
-                    mock_agent_bin().to_string_lossy().to_string(),
-                )
                 .env("ACPX_DEFAULT_AGENT_ID", &persona)
                 .env("ACPX_DB_PATH", &db_path)
-                .env("RUI_MOCK_AGENT_PERSONA", &persona)
+                .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+                .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
-        GatewayProcess { child, base_url }
+        let profile_name = provision_mock_profile(
+            &base_url,
+            admin_port,
+            &admin_token,
+            &persona_for_profile,
+            BTreeMap::new(),
+        )
+        .await;
+        GatewayProcess {
+            child,
+            base_url,
+            profile_name,
+        }
     }
 }
 
@@ -171,9 +125,13 @@ async fn open_session_prompt_and_turn_ended_round_trip_through_a_real_gateway() 
     let mut handle = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = handle.take_events();
     let session_id = handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     assert!(!session_id.is_empty());
 
     handle
@@ -190,6 +148,121 @@ async fn open_session_prompt_and_turn_ended_round_trip_through_a_real_gateway() 
 }
 
 #[tokio::test]
+async fn two_shared_gateway_actors_keep_interleaved_events_and_jsonl_isolated() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let cache_dir = tempfile::tempdir().expect("jsonl cache");
+    let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
+    let shared_gateway = Arc::new(Gateway::connect(gateway.base_url.clone()).await);
+    let mut thread_one = spawn_acpx_thread_with_gateway(Arc::clone(&shared_gateway));
+    let mut thread_two = spawn_acpx_thread_with_gateway(shared_gateway);
+    let mut events_one = thread_one.take_events();
+    let mut events_two = thread_two.take_events();
+
+    let cwd = std::env::current_dir().expect("cwd");
+    let (open_one, open_two) = tokio::join!(
+        thread_one.open_session_with_profile(cwd.clone(), &gateway.profile_name, Vec::new()),
+        thread_two.open_session_with_profile(cwd, &gateway.profile_name, Vec::new()),
+    );
+    open_one.expect("thread one open_session_with_profile");
+    open_two.expect("thread two open_session_with_profile");
+    let store = JsonlStore::open(cache_dir.path()).expect("open jsonl store");
+    let user_one = ChatMessage {
+        kind: MessageKind::User,
+        text: "thread one only".into(),
+        status: None,
+        id: None,
+        raw_input: None,
+        raw_output: None,
+    };
+    let user_two = ChatMessage {
+        kind: MessageKind::User,
+        text: "thread two only".into(),
+        status: None,
+        id: None,
+        raw_input: None,
+        raw_output: None,
+    };
+    store
+        .append("thread-one", &user_one)
+        .expect("write thread one user");
+    store
+        .append("thread-two", &user_two)
+        .expect("write thread two user");
+    let (send_one, send_two) = tokio::join!(
+        thread_one.send_prompt("thread one only"),
+        thread_two.send_prompt("thread two only"),
+    );
+    send_one.expect("thread one prompt");
+    send_two.expect("thread two prompt");
+
+    let mut one_reply = None;
+    let mut two_reply = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && (one_reply.is_none() || two_reply.is_none()) {
+        tokio::select! {
+            Some(event) = events_one.recv() => {
+                if let AgentEvent::Message(message) = event {
+                    store.append("thread-one", &message).expect("write thread one agent message");
+                    if message.text.contains("THREAD ONE ONLY") {
+                        one_reply = Some(message.text);
+                    }
+                }
+            }
+            Some(event) = events_two.recv() => {
+                if let AgentEvent::Message(message) = event {
+                    store.append("thread-two", &message).expect("write thread two agent message");
+                    if message.text.contains("THREAD TWO ONLY") {
+                        two_reply = Some(message.text);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    assert!(
+        one_reply.is_some(),
+        "thread one did not receive its own reply"
+    );
+    assert!(
+        two_reply.is_some(),
+        "thread two did not receive its own reply"
+    );
+
+    let one = store.load("thread-one").expect("load thread one jsonl");
+    let two = store.load("thread-two").expect("load thread two jsonl");
+    let one_text: String = one
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
+    let two_text: String = two
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
+    assert!(one_text.contains("THREAD ONE ONLY"));
+    assert!(!one_text.contains("THREAD TWO ONLY"));
+    assert!(two_text.contains("THREAD TWO ONLY"));
+    assert!(!two_text.contains("THREAD ONE ONLY"));
+    assert_eq!(
+        one.messages
+            .iter()
+            .filter(|message| message.text.contains("THREAD ONE ONLY"))
+            .count(),
+        1,
+        "thread one transcript must contain one reply, not a replay duplicate"
+    );
+    assert_eq!(
+        two.messages
+            .iter()
+            .filter(|message| message.text.contains("THREAD TWO ONLY"))
+            .count(),
+        1,
+        "thread two transcript must contain one reply, not a replay duplicate"
+    );
+}
+
+#[tokio::test]
 async fn resume_session_replays_history_via_session_load() {
     let db_dir = tempfile::tempdir().expect("tempdir");
     let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
@@ -197,9 +270,13 @@ async fn resume_session_replays_history_via_session_load() {
     let mut opener = spawn_acpx_thread(gateway.base_url.clone());
     let mut opener_events = opener.take_events();
     let session_id = opener
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     opener
         .send_prompt("history before relaunch")
         .await
@@ -236,6 +313,22 @@ async fn resume_session_replays_history_via_session_load() {
         reply.is_some(),
         "expected session/load's replayed-history reply via the gateway"
     );
+    let mut duplicate_replies = 0;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < drain_deadline {
+        let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(Some(AgentEvent::Message(message))) =
+            tokio::time::timeout(remaining.min(Duration::from_millis(50)), events_rx.recv()).await
+        {
+            if message.text.contains("HISTORY BEFORE RELAUNCH") {
+                duplicate_replies += 1;
+            }
+        }
+    }
+    assert_eq!(
+        duplicate_replies, 0,
+        "session history must be delivered once after reattachment, not duplicated"
+    );
 }
 
 #[tokio::test]
@@ -245,9 +338,13 @@ async fn reattach_session_uses_resume_without_replaying_history() {
 
     let opener = spawn_acpx_thread(gateway.base_url.clone());
     let session_id = opener
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     opener
         .send_prompt("history must stay cached locally")
         .await
@@ -371,7 +468,11 @@ async fn resume_session_retries_after_transient_gateway_errors() {
 
     let handle = spawn_acpx_thread(format!("http://127.0.0.1:{port}"));
     handle
-        .resume_session("persisted-session", std::env::current_dir().unwrap(), Vec::new())
+        .resume_session(
+            "persisted-session",
+            std::env::current_dir().unwrap(),
+            Vec::new(),
+        )
         .await
         .expect("resume_session should retry transient gateway errors");
     handle
@@ -394,13 +495,21 @@ async fn two_gateways_stay_isolated_no_cross_provider_bleed() {
     let mut claude_events = claude_handle.take_events();
 
     codex_handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &codex_gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("codex open_session");
+        .expect("codex open_session_with_profile");
     claude_handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &claude_gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("claude open_session");
+        .expect("claude open_session_with_profile");
 
     // Fire both prompts concurrently -- the negative-control shape this
     // plan's Phase 3 explicitly calls for: if the two gateways were ever
@@ -452,9 +561,13 @@ async fn window_close_does_not_close_the_gateway_session() {
 
     let handle = spawn_acpx_thread(gateway.base_url.clone());
     let session_id = handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     handle.shutdown(); // simulates window/process close -- no session/close sent
     drop(handle);
 
@@ -489,27 +602,43 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
     let event_log = db_dir.path().join("backend-events.jsonl");
     let persona = "codex".to_string();
     let db_path = db_dir.path().join("acpx.sqlite3");
-    let event_log_for_env = event_log.clone();
+    let admin_port = free_port();
+    let admin_token = format!("test-admin-token-{admin_port}");
+    let admin_token_for_env = admin_token.clone();
     let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
             .env("ACPX_DEFAULT_AGENT_ID", &persona)
             .env("ACPX_DB_PATH", &db_path)
-            .env("RUI_MOCK_AGENT_PERSONA", &persona)
-            .env("RUI_MOCK_AGENT_EVENT_LOG", &event_log_for_env)
+            .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", "error");
     });
-    let gateway = GatewayProcess { child, base_url };
+    // PROF-4: `RUI_MOCK_AGENT_EVENT_LOG` goes on the custom agent's own
+    // spawn env (not the gateway's) -- see `provision_mock_profile`'s doc
+    // comment.
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert(
+        "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
+        event_log.to_string_lossy().into_owned(),
+    );
+    let profile_name =
+        provision_mock_profile(&base_url, admin_port, &admin_token, "codex", extra_env).await;
+    let gateway = GatewayProcess {
+        child,
+        base_url,
+        profile_name,
+    };
 
     let handle = spawn_acpx_thread(gateway.base_url.clone());
     let session_id = handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
 
     handle.close_session(false).await.expect("close_session");
 
@@ -538,8 +667,12 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
     // method-name match is unambiguous; a real regression (the relay
     // silently no-op'ing instead of reaching the backend) would leave
     // these lines entirely absent, not merely mis-attributed.
-    let close_line = events.lines().find(|line| line.contains("\"session/close\""));
-    let delete_line = events.lines().find(|line| line.contains("\"session/delete\""));
+    let close_line = events
+        .lines()
+        .find(|line| line.contains("\"session/close\""));
+    let delete_line = events
+        .lines()
+        .find(|line| line.contains("\"session/delete\""));
     assert!(
         close_line.is_some(),
         "expected a real session/close request to reach the backend for {session_id}; log:\n{events}"
@@ -569,28 +702,41 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
     let event_log = db_dir.path().join("backend-events.jsonl");
     let persona = "codex".to_string();
     let db_path = db_dir.path().join("acpx.sqlite3");
-    let event_log_for_env = event_log.clone();
+    let admin_port = free_port();
+    let admin_token = format!("test-admin-token-{admin_port}");
+    let admin_token_for_env = admin_token.clone();
     let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
             .env("ACPX_DEFAULT_AGENT_ID", &persona)
             .env("ACPX_DB_PATH", &db_path)
-            .env("RUI_MOCK_AGENT_PERSONA", &persona)
-            .env("RUI_MOCK_AGENT_EVENT_LOG", &event_log_for_env)
+            .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", "error");
     });
-    let gateway = GatewayProcess { child, base_url };
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert(
+        "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
+        event_log.to_string_lossy().into_owned(),
+    );
+    let profile_name =
+        provision_mock_profile(&base_url, admin_port, &admin_token, "codex", extra_env).await;
+    let gateway = GatewayProcess {
+        child,
+        base_url,
+        profile_name,
+    };
 
     let mut handle = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = handle.take_events();
     handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
 
     // Critical, easy to get wrong: `AcpxThreadHandle::send_prompt`'s own
     // doc comment says it "drain[s] the turn to completion" before
@@ -615,7 +761,9 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
         let mut prompt_seen = false;
         while std::time::Instant::now() < deadline && !prompt_seen {
             let events = std::fs::read_to_string(&event_log).unwrap_or_default();
-            prompt_seen = events.lines().any(|line| line.contains("\"session/prompt\""));
+            prompt_seen = events
+                .lines()
+                .any(|line| line.contains("\"session/prompt\""));
             if !prompt_seen {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -643,5 +791,67 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
         stop_reason.as_deref(),
         Some("cancelled"),
         "expected the slow turn to end with stopReason \"cancelled\" after cancel_session(), got {stop_reason:?}"
+    );
+}
+
+/// PROF-11 (`profile-only-backend-selection` plan): proves the two real
+/// gaps that phase closed -- `plan` and `session_info_update` session/
+/// updates -- actually reach `AgentEvent` through a REAL gateway +
+/// `rui-mock-agent` backend, not just a unit-level parse test on a
+/// hand-built JSON fixture (`parse_capability_update_recognizes_plan`/
+/// `..._recognizes_session_info_update` in `thread_actor.rs` cover the
+/// parse layer in isolation; this covers the whole wire round trip).
+/// `rui-mock-agent` only sends these for a `"plan "`-prefixed prompt (see
+/// its own doc comment on that branch) so unrelated e2e tests' message-
+/// count assumptions are undisturbed.
+#[tokio::test]
+async fn plan_and_session_info_update_round_trip_through_a_real_gateway() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
+
+    let mut handle = spawn_acpx_thread(gateway.base_url.clone());
+    let mut events_rx = handle.take_events();
+    handle
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
+        .await
+        .expect("open_session_with_profile");
+
+    handle
+        .send_prompt("plan hello gateway")
+        .await
+        .expect("send_prompt");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut plan_entries = None;
+    let mut session_title = None;
+    while tokio::time::Instant::now() < deadline
+        && (plan_entries.is_none() || session_title.is_none())
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.min(Duration::from_millis(200)), events_rx.recv())
+            .await
+        {
+            Ok(Some(AgentEvent::PlanUpdate(entries))) => plan_entries = Some(entries),
+            Ok(Some(AgentEvent::SessionInfoUpdate { title, .. })) => session_title = title,
+            _ => {}
+        }
+    }
+
+    let plan_entries = plan_entries.expect(
+        "expected a real AgentEvent::PlanUpdate to arrive via the gateway for a \"plan \"-prefixed prompt",
+    );
+    assert_eq!(plan_entries.len(), 2);
+    assert_eq!(plan_entries[0].content, "Read the file");
+    assert_eq!(plan_entries[0].status, "completed");
+    assert_eq!(plan_entries[1].status, "in_progress");
+
+    assert_eq!(
+        session_title.as_deref(),
+        Some("Fixing the login bug"),
+        "expected a real AgentEvent::SessionInfoUpdate with the mock agent's title to arrive via the gateway"
     );
 }

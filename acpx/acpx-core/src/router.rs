@@ -4,14 +4,14 @@
 //! resolution, MCP-server merge, and gateway-native handlers land in
 //! Phase 2/3.
 
+use crate::agent_relay::AgentRequestHub;
 use crate::keystore::Keystore;
 use crate::lifecycle::LifecycleConfig;
 use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
-use crate::agent_relay::AgentRequestHub;
 use crate::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    Direction, PersistenceStore,
+    PersistenceStore,
 };
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
@@ -300,7 +300,7 @@ pub struct Router {
     /// `crate::persistence`). `None` by default -- a `Router` used purely
     /// in-memory (e.g. most of this crate's own tests) never touches
     /// sqlite at all. When set via [`Router::with_persistence`], session
-    /// metadata and transcripts are written fire-and-forget via
+    /// metadata and durable state revisions are written fire-and-forget via
     /// `tokio::spawn` off the dispatch hot path, per that module's
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
@@ -317,7 +317,7 @@ pub struct Router {
     /// {agent, provider, key-ref, launch overrides, mcp servers} profiles.
     /// All in-memory only (see `crate::provider`/`crate::profile`'s doc
     /// comments for why -- not persisted to the sqlite `persistence` path
-    /// used for sessions/transcripts). `session/new`'s `_acpx.profile`
+    /// used for session metadata). `session/new`'s `_acpx.profile`
     /// resolves against `profiles`, which in turn references `providers`
     /// and `keystore`.
     providers: ProviderStore,
@@ -1097,7 +1097,7 @@ impl Router {
         tokio::spawn(backend_idle_scavenger(backend, ctx));
     }
 
-    /// Attach a [`PersistenceStore`] -- session metadata and transcripts
+    /// Attach a [`PersistenceStore`] -- session metadata and state revisions
     /// are recorded from that point on. Builder-style so callers can write
     /// `Router::new(id).with_persistence(store)`.
     pub fn with_persistence(mut self, store: PersistenceStore) -> Self {
@@ -2148,7 +2148,7 @@ impl Router {
                     Ok(Ok(())) => {}
                 }
             }
-            self.spawn_transcript(gateway_id.0.clone(), Direction::ClientToAgent, notification);
+            self.spawn_state_revision(gateway_id.0.clone());
             self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
             tracing::warn!(
                 gateway_session_id = %gateway_id.0,
@@ -2159,21 +2159,15 @@ impl Router {
         cancelled
     }
 
-    /// Fire-and-forget one transcript append, if persistence is attached.
-    /// Never awaited by the caller -- spawned onto the runtime so a slow
-    /// sqlite write can't add latency to the client-visible request path.
-    fn spawn_transcript(
-        &self,
-        gateway_session_id: impl Into<String>,
-        direction: Direction,
-        payload: serde_json::Value,
-    ) {
-        spawn_transcript_fn(
-            self.persistence.clone(),
-            gateway_session_id,
-            direction,
-            payload,
-        );
+    /// Fire-and-forget one durable session-state revision, if persistence is
+    /// attached.
+    fn spawn_state_revision(&self, gateway_session_id: impl Into<String>) {
+        spawn_state_revision_fn(self.persistence.clone(), gateway_session_id);
+    }
+
+    /// Preserve the existing event timing without retaining payloads.
+    fn spawn_state_revision_for_event(&self, gateway_session_id: impl Into<String>) {
+        self.spawn_state_revision(gateway_session_id);
     }
 
     async fn persist_session_recovery(
@@ -2336,7 +2330,10 @@ impl Router {
     /// close path (backend timeout, demux/pending-request routing,
     /// persistence-store bookkeeping) as the idle reaper via
     /// [`Self::close_candidate_sessions`].
-    pub async fn close_all_sessions_for_tenant(&mut self, tenant_id: &TenantId) -> LifecycleReapReport {
+    pub async fn close_all_sessions_for_tenant(
+        &mut self,
+        tenant_id: &TenantId,
+    ) -> LifecycleReapReport {
         let candidates: Vec<(TenantId, acpx_proto::session::GatewaySessionId)> = self
             .sessions
             .list_for_tenant(tenant_id)
@@ -2988,16 +2985,8 @@ impl Router {
             return Err(error);
         }
         admission.commit();
-        self.spawn_transcript(
-            gateway_session_id_str.clone(),
-            Direction::ClientToAgent,
-            request,
-        );
-        self.spawn_transcript(
-            gateway_session_id_str,
-            Direction::AgentToClient,
-            response.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id_str.clone());
+        self.spawn_state_revision_for_event(gateway_session_id_str);
         Ok(response)
     }
 
@@ -3356,7 +3345,10 @@ impl Router {
         method: &str,
         gateway_session_id: &str,
     ) -> Result<crate::session_registry::SessionEntry, RouterError> {
-        if !matches!(classify(method), MethodClass::Proxied | MethodClass::SessionFork) {
+        if !matches!(
+            classify(method),
+            MethodClass::Proxied | MethodClass::SessionFork
+        ) {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
         if !self.on_demand_recovery_enabled {
@@ -3489,34 +3481,34 @@ impl Router {
         Ok(entry)
     }
 
-/// Extracts and strips the optional `_acpx.bg` background-mode override
-/// from `request.params` -- see `LifecycleConfig::background_mode`'s doc
-/// comment for the full feature. Mirrors `transport::live::
-/// take_resume_cursor`'s existing convention exactly: additive,
-/// namespaced under `_acpx` (never part of the upstream ACP `session/
-/// close` schema, so forwarding it verbatim would make a strict backend
-/// choke on an unrecognized field), and surgically removed -- only the
-/// `bg` key, not the whole `_acpx` object, so any other `_acpx.*` field
-/// a caller also sent survives untouched. Accepts a JSON boolean or the
-/// strings `"on"`/`"off"` (case-insensitive); anything else is treated
-/// as absent (no override) rather than an error, matching `take_resume_
-/// cursor`'s "malformed input is fresh state, not a hard failure"
-/// precedent.
-fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
-    let params = request.get_mut("params")?.as_object_mut()?;
-    let extension = params.get_mut("_acpx")?.as_object_mut()?;
-    let override_value = extension.get("bg").and_then(|value| match value {
-        serde_json::Value::Bool(flag) => Some(*flag),
-        serde_json::Value::String(text) if text.eq_ignore_ascii_case("off") => Some(false),
-        serde_json::Value::String(text) if text.eq_ignore_ascii_case("on") => Some(true),
-        _ => None,
-    });
-    extension.remove("bg");
-    if extension.is_empty() {
-        params.remove("_acpx");
+    /// Extracts and strips the optional `_acpx.bg` background-mode override
+    /// from `request.params` -- see `LifecycleConfig::background_mode`'s doc
+    /// comment for the full feature. Mirrors `transport::live::
+    /// take_resume_cursor`'s existing convention exactly: additive,
+    /// namespaced under `_acpx` (never part of the upstream ACP `session/
+    /// close` schema, so forwarding it verbatim would make a strict backend
+    /// choke on an unrecognized field), and surgically removed -- only the
+    /// `bg` key, not the whole `_acpx` object, so any other `_acpx.*` field
+    /// a caller also sent survives untouched. Accepts a JSON boolean or the
+    /// strings `"on"`/`"off"` (case-insensitive); anything else is treated
+    /// as absent (no override) rather than an error, matching `take_resume_
+    /// cursor`'s "malformed input is fresh state, not a hard failure"
+    /// precedent.
+    fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
+        let params = request.get_mut("params")?.as_object_mut()?;
+        let extension = params.get_mut("_acpx")?.as_object_mut()?;
+        let override_value = extension.get("bg").and_then(|value| match value {
+            serde_json::Value::Bool(flag) => Some(*flag),
+            serde_json::Value::String(text) if text.eq_ignore_ascii_case("off") => Some(false),
+            serde_json::Value::String(text) if text.eq_ignore_ascii_case("on") => Some(true),
+            _ => None,
+        });
+        extension.remove("bg");
+        if extension.is_empty() {
+            params.remove("_acpx");
+        }
+        override_value
     }
-    override_value
-}
 
     /// **`background_mode` (bg-mode `session/close` override).** See
     /// `LifecycleConfig::background_mode`'s doc comment for the full
@@ -3640,11 +3632,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         // in 02-architecture.md.
         params["sessionId"] = serde_json::Value::String(backend_session_id);
 
-        self.spawn_transcript(
-            gateway_session_id.clone(),
-            Direction::ClientToAgent,
-            request.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id.clone());
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let response = {
@@ -3673,11 +3661,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         }
         mark_successful_recovery_retry(self.persistence.clone(), &gateway_session_id, &method)
             .await?;
-        self.spawn_transcript(
-            gateway_session_id.clone(),
-            Direction::AgentToClient,
-            response.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id.clone());
         if method == "session/close" {
             if let Some(store) = self.persistence.clone() {
                 store
@@ -3803,16 +3787,10 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
             result["sessionId"] = serde_json::Value::String(forked_gateway_id.0.clone());
         }
 
-        // Persisted as the *new* forked session's own inaugural
-        // transcript (client request that created it, agent's response
-        // minting it) -- mirrors `dispatch_session_new`'s own persistence
-        // exactly, since a fork is a fresh session from a persistence
-        // point of view, just one whose backend process happens to
-        // already be running (reused, not freshly spawned) and whose
-        // conversation history the backend itself carried over. Nothing
-        // is recorded against the *source* `gateway_session_id` here --
-        // `session/fork` doesn't add a message to the source session's
-        // own conversation.
+        // Persist state for the new forked session. A fork is a fresh
+        // session from a persistence point of view, even though its backend
+        // process is reused and carries the source conversation internally.
+        // Nothing is recorded against the source gateway session here.
         if let Some(entry) = self.sessions.resolve(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(forked_gateway_session_id_str.clone()),
@@ -3915,11 +3893,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
             "method": "session/cancel",
             "params": { "sessionId": backend_session_id }
         });
-        self.spawn_transcript(
-            gateway_session_id,
-            Direction::ClientToAgent,
-            notification.clone(),
-        );
+        self.spawn_state_revision_for_event(gateway_session_id);
 
         // `None` means this agent's process was never spawned (or was
         // `stop`ped) -- nothing is in flight to cancel, a benign no-op
@@ -4090,9 +4064,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
             // resolved backend instead of writing the request to its
             // stdio transport.
             "terminal/kill" => {
-                let params = request
-                    .get("params")
-                    .ok_or(RouterError::MissingParams)?;
+                let params = request.get("params").ok_or(RouterError::MissingParams)?;
                 let gateway_session_id = params
                     .get("sessionId")
                     .and_then(|s| s.as_str())
@@ -4118,7 +4090,9 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                     .call_policy_for(entry.profile_name.as_deref(), &agent_id)
                     .await;
                 if !call_policy.allow_terminal_access {
-                    return Err(RouterError::TerminalAccessDisabled("terminal/kill".to_string()));
+                    return Err(RouterError::TerminalAccessDisabled(
+                        "terminal/kill".to_string(),
+                    ));
                 }
                 let backend = self.supervisor.ensure_running(&agent_id).await?;
                 let mut backend = backend.lock().await;
@@ -4237,8 +4211,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                 let mut catalogs: Vec<serde_json::Value> = Vec::new();
                 match requested_agent {
                     Some(agent_id) => {
-                        let capabilities =
-                            self.probe_adapter_capabilities(&agent_id, &cwd).await?;
+                        let capabilities = self.probe_adapter_capabilities(&agent_id, &cwd).await?;
                         catalogs.push(serde_json::json!({
                             "agentId": agent_id,
                             "models": capabilities.models,
@@ -4254,17 +4227,13 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                                 registry
                                     .agents
                                     .iter()
-                                    .map(|agent| {
-                                        (agent.id.clone(), Some(agent.version.clone()))
-                                    })
+                                    .map(|agent| (agent.id.clone(), Some(agent.version.clone())))
                                     .collect()
                             })
                             .unwrap_or_default();
                         for (agent_id, version) in agents {
-                            let key = acpx_registry::CapabilityCacheKey::new(
-                                agent_id.clone(),
-                                version,
-                            );
+                            let key =
+                                acpx_registry::CapabilityCacheKey::new(agent_id.clone(), version);
                             if let Some(capabilities) =
                                 self.capability_cache.get(&key, Instant::now())
                             {
@@ -4326,6 +4295,11 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                     .cloned()
                     .ok_or(RouterError::UnknownAgentId(agent_id))?;
                 let outcome = acpx_registry::install(&agent).await?;
+                // Install may have just written a ready marker / confirmed
+                // runtimes that were missing at process start -- drop the
+                // short which() cache so agents/list|status see Installed
+                // on the next call without restart (agents-install-runtime).
+                crate::detect::invalidate_which_cache();
                 serde_json::json!({ "id": agent.id, "outcome": format!("{outcome:?}") })
             }
             "profiles/create" | "profiles/update" => {
@@ -5386,7 +5360,11 @@ impl PendingUpdates {
         }
     }
 
-    async fn drain(&self, tenant_id: &TenantId, gateway_session_id: &str) -> Vec<serde_json::Value> {
+    async fn drain(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Vec<serde_json::Value> {
         let mut inner = self.inner.lock().await;
         inner
             .remove(&(tenant_id.clone(), gateway_session_id.to_string()))
@@ -5478,7 +5456,9 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
     }
-    ctx.notification_hub.publish(&tenant_id, &gateway_id.0, translated).await
+    ctx.notification_hub
+        .publish(&tenant_id, &gateway_id.0, translated)
+        .await
 }
 
 /// Forward a backend-initiated request to the persistent client that owns
@@ -5509,7 +5489,12 @@ async fn try_forward_interaction(
         *session_id = serde_json::Value::String(gateway_id.0.clone());
     }
     interaction_hub
-        .request(&tenant_id, &gateway_id.0, request, DEFAULT_INTERACTION_TIMEOUT)
+        .request(
+            &tenant_id,
+            &gateway_id.0,
+            request,
+            DEFAULT_INTERACTION_TIMEOUT,
+        )
         .await
 }
 
@@ -5619,7 +5604,8 @@ async fn backend_idle_scavenger(
         // holding) waiting for it.
         loop {
             let attempt =
-                tokio::time::timeout(Duration::from_millis(0), proc.reader_mut().read_value()).await;
+                tokio::time::timeout(Duration::from_millis(0), proc.reader_mut().read_value())
+                    .await;
             let value = match attempt {
                 Ok(Ok(value)) => value,
                 Ok(Err(err)) => {
@@ -5721,8 +5707,7 @@ fn spawn_demux_consumer(
                             {
                                 *field = serde_json::Value::String(gateway_id.0.clone());
                             }
-                            let pending_updates =
-                                { ctx.router.lock().await.pending_updates() };
+                            let pending_updates = { ctx.router.lock().await.pending_updates() };
                             pending_updates
                                 .push(&tenant_id, &gateway_id.0, translated)
                                 .await;
@@ -5851,7 +5836,10 @@ async fn try_relay_approval(
 /// this profile" arms above it, so a client-side log can tell "this
 /// profile never allows it" apart from "a human said no this time".
 fn build_approval_rejected_reply(request: &serde_json::Value, method: &str) -> serde_json::Value {
-    let req_id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let req_id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": req_id,
@@ -6018,11 +6006,8 @@ async fn read_matching_response_with_idle_timeout(
         // process running) prevents a stale late reply for this
         // abandoned `id` from later being misclassified as a
         // notification in some unrelated call's own read loop.
-        let value = match tokio::time::timeout(
-            idle_read_timeout,
-            backend.reader_mut().read_value(),
-        )
-        .await
+        let value = match tokio::time::timeout(idle_read_timeout, backend.reader_mut().read_value())
+            .await
         {
             Ok(result) => result?,
             Err(_) => {
@@ -6033,9 +6018,7 @@ async fn read_matching_response_with_idle_timeout(
                      lock it held is freed for every other session on this agent"
                 );
                 let _ = backend.kill().await;
-                return Err(RouterError::BackendIdleReadTimeout(
-                    idle_read_timeout,
-                ));
+                return Err(RouterError::BackendIdleReadTimeout(idle_read_timeout));
             }
         };
         if value.get("id") == Some(id) {
@@ -6178,238 +6161,234 @@ async fn handle_unmatched_frame(
             }
         }
         let reply = if method == "session/request_permission" {
-                // **Interactive relay addition.** A live client (WS,
-                // currently) that owns this gateway session gets first
-                // say: it may take real user interaction to answer, so
-                // this waits up to `PERMISSION_RELAY_TIMEOUT` before
-                // falling back to the exact same static-policy answer
-                // this arm always gave before the relay existed. An
-                // HTTP-only client (`live: None`) or a WS client that
-                // never subscribed to this session always falls straight
-                // through to that same fallback, unchanged.
-                //
-                // **`InteractionHub` fallback.** A connection that bound
-                // `InteractionHub` but never subscribed to
-                // `AgentRequestHub` for this session (e.g. a strict ACP
-                // bridge connection -- see `strict_acp_ws_forwards_
-                // backend_permission_requests_to_the_bound_client`) gets
-                // a second chance here before falling back to policy,
-                // since `try_relay_agent_request` returns `None`
-                // immediately for it (no `AgentRequestHub` subscriber).
-                match try_relay_agent_request(live, &value, PERMISSION_RELAY_TIMEOUT).await {
-                    Some(relayed) => relayed,
-                    None => match live {
-                        Some(live) => match try_forward_interaction(live, &value).await {
-                            Ok(Some(mut reply)) => {
-                                reply["id"] =
-                                    value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                                reply
-                            }
-                            Ok(None) => build_permission_reply(&value, policy.permission_policy),
-                            Err(error) => {
-                                tracing::warn!(
-                                    ?error,
-                                    "interaction-hub permission forward failed, falling back to policy"
-                                );
-                                build_permission_reply(&value, policy.permission_policy)
-                            }
-                        },
-                        None => build_permission_reply(&value, policy.permission_policy),
-                    },
-                }
-            } else if (method == "fs/read_text_file" || method == "fs/write_text_file")
-                && policy.allow_fs_access
-            {
-                // **Interactive approval addition.** Same relay
-                // machinery as `session/request_permission` above, but
-                // the client answers a lightweight `{"approved": bool}`
-                // decision rather than a native ACP reply -- the real
-                // disk I/O always happens here in acpx-server either
-                // way (see `try_relay_approval`'s doc comment). No live
-                // decision (`None`) preserves this arm's pre-existing
-                // auto-allow-because-capability-is-on behavior exactly.
-                match try_relay_approval(live, &value, PERMISSION_RELAY_TIMEOUT).await {
-                    Some(false) => build_approval_rejected_reply(&value, method),
-                    _ => handle_fs_request(&value, method).await,
-                }
-            } else if method == "fs/read_text_file" || method == "fs/write_text_file" {
-                // Capability wasn't enabled for this profile -- declared
-                // `false` in `initialize`, so a well-behaved backend
-                // shouldn't be asking at all, but reply with a clear
-                // "not enabled" error (not a plain method-not-found) if
-                // one does anyway, distinguishing "acpx doesn't have this
-                // handler" from "this profile turned it off".
-                let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("'{method}' is disabled for this profile (Profile::allow_fs_access is false)"),
-                    }
-                })
-            } else if method == "terminal/create" && policy.allow_terminal_access {
-                // **Interactive approval + live streaming addition.**
-                // Same approval relay as the `fs/*` arm above; a
-                // successful creation additionally starts
-                // `spawn_terminal_output_stream` so a subscribed live
-                // client sees this terminal's output as it happens,
-                // not only via the backend's own polling
-                // `terminal/output` calls.
-                match try_relay_approval(live, &value, PERMISSION_RELAY_TIMEOUT).await {
-                    Some(false) => build_approval_rejected_reply(&value, method),
-                    _ => {
-                        let reply = handle_terminal_request(backend, &value, method).await;
-                        if let (Some(ctx), Some(terminal_id)) = (
-                            live,
+            // **Interactive relay addition.** A live client (WS,
+            // currently) that owns this gateway session gets first
+            // say: it may take real user interaction to answer, so
+            // this waits up to `PERMISSION_RELAY_TIMEOUT` before
+            // falling back to the exact same static-policy answer
+            // this arm always gave before the relay existed. An
+            // HTTP-only client (`live: None`) or a WS client that
+            // never subscribed to this session always falls straight
+            // through to that same fallback, unchanged.
+            //
+            // **`InteractionHub` fallback.** A connection that bound
+            // `InteractionHub` but never subscribed to
+            // `AgentRequestHub` for this session (e.g. a strict ACP
+            // bridge connection -- see `strict_acp_ws_forwards_
+            // backend_permission_requests_to_the_bound_client`) gets
+            // a second chance here before falling back to policy,
+            // since `try_relay_agent_request` returns `None`
+            // immediately for it (no `AgentRequestHub` subscriber).
+            match try_relay_agent_request(live, &value, PERMISSION_RELAY_TIMEOUT).await {
+                Some(relayed) => relayed,
+                None => match live {
+                    Some(live) => match try_forward_interaction(live, &value).await {
+                        Ok(Some(mut reply)) => {
+                            reply["id"] =
+                                value.get("id").cloned().unwrap_or(serde_json::Value::Null);
                             reply
-                                .get("result")
-                                .and_then(|r| r.get("terminalId"))
-                                .and_then(|t| t.as_str()),
-                        ) {
-                            // Same `spawn_demux_consumer`-has-no-per-call
-                            // tenant/session context gap as
-                            // `try_relay_agent_request`/`try_forward_
-                            // interaction` -- fall back to resolving from
-                            // `value`'s own `params.sessionId` (the
-                            // original `terminal/create` request, still
-                            // in scope here) when `ctx`'s own fields are
-                            // `None`, instead of silently never starting
-                            // the live output stream. See
-                            // `resolve_gateway_session`'s doc comment.
-                            let resolved = match (
-                                ctx.tenant_id.clone(),
-                                ctx.gateway_session_id.clone(),
-                            ) {
-                                (Some(tenant_id), Some(gateway_session_id)) => {
-                                    Some((tenant_id, gateway_session_id))
-                                }
-                                _ => {
-                                    let backend_session_id = value
-                                        .get("params")
-                                        .and_then(|p| p.get("sessionId"))
-                                        .and_then(|s| s.as_str());
-                                    match backend_session_id {
-                                        Some(backend_session_id) => {
-                                            resolve_gateway_session(ctx, backend_session_id)
-                                                .await
-                                                .map(|(tenant_id, gateway_id)| {
-                                                    (tenant_id, gateway_id.0)
-                                                })
-                                        }
-                                        None => None,
-                                    }
-                                }
-                            };
-                            if let Some((tenant_id, gateway_session_id)) = resolved {
-                                // One-shot `acpx/terminal_created`
-                                // notification (background-terminals-ui
-                                // plan, PUI-002b): the command/args a
-                                // client needs to show a terminal's title
-                                // are known only here, at the original
-                                // `terminal/create` request -- neither
-                                // `terminal/output` nor
-                                // `spawn_terminal_output_stream`'s polling
-                                // loop below ever sees them again, so this
-                                // is the only point this data can be
-                                // captured and relayed downstream.
-                                // Fire-and-forget (`tokio::spawn`, not
-                                // awaited here) -- this whole match arm
-                                // runs under the caller's held per-process
-                                // `BackendProcess` lock (see
-                                // `read_matching_response_with_idle_
-                                // timeout`'s doc comment), and awaiting
-                                // the publish directly would extend that
-                                // held-lock window for an unrelated
-                                // notification send. Same best-effort,
-                                // no-guaranteed-delivery contract
-                                // `spawn_terminal_output_stream` itself
-                                // already documents.
-                                let command = value
-                                    .get("params")
-                                    .and_then(|p| p.get("command"))
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let args: Vec<String> = value
-                                    .get("params")
-                                    .and_then(|p| p.get("args"))
-                                    .and_then(|a| a.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|v| v.as_str().map(str::to_string))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let hub = ctx.notification_hub.clone();
-                                let created_tenant_id = tenant_id.clone();
-                                let created_gateway_session_id = gateway_session_id.clone();
-                                let created_terminal_id = terminal_id.to_string();
-                                tokio::spawn(async move {
-                                    hub.publish(
-                                        &created_tenant_id,
-                                        &created_gateway_session_id,
-                                        serde_json::json!({
-                                            "jsonrpc": "2.0",
-                                            "method": "acpx/terminal_created",
-                                            "params": {
-                                                "sessionId": created_gateway_session_id,
-                                                "terminalId": created_terminal_id,
-                                                "command": command,
-                                                "args": args,
-                                                "startedAt": now_rfc3339(),
-                                            }
-                                        }),
-                                    )
-                                    .await;
-                                });
-                                spawn_terminal_output_stream(
-                                    std::sync::Arc::clone(&ctx.backend),
-                                    ctx.notification_hub.clone(),
-                                    tenant_id,
-                                    gateway_session_id,
-                                    terminal_id.to_string(),
-                                );
-                            }
                         }
-                        reply
-                    }
+                        Ok(None) => build_permission_reply(&value, policy.permission_policy),
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "interaction-hub permission forward failed, falling back to policy"
+                            );
+                            build_permission_reply(&value, policy.permission_policy)
+                        }
+                    },
+                    None => build_permission_reply(&value, policy.permission_policy),
+                },
+            }
+        } else if (method == "fs/read_text_file" || method == "fs/write_text_file")
+            && policy.allow_fs_access
+        {
+            // **Interactive approval addition.** Same relay
+            // machinery as `session/request_permission` above, but
+            // the client answers a lightweight `{"approved": bool}`
+            // decision rather than a native ACP reply -- the real
+            // disk I/O always happens here in acpx-server either
+            // way (see `try_relay_approval`'s doc comment). No live
+            // decision (`None`) preserves this arm's pre-existing
+            // auto-allow-because-capability-is-on behavior exactly.
+            match try_relay_approval(live, &value, PERMISSION_RELAY_TIMEOUT).await {
+                Some(false) => build_approval_rejected_reply(&value, method),
+                _ => handle_fs_request(&value, method).await,
+            }
+        } else if method == "fs/read_text_file" || method == "fs/write_text_file" {
+            // Capability wasn't enabled for this profile -- declared
+            // `false` in `initialize`, so a well-behaved backend
+            // shouldn't be asking at all, but reply with a clear
+            // "not enabled" error (not a plain method-not-found) if
+            // one does anyway, distinguishing "acpx doesn't have this
+            // handler" from "this profile turned it off".
+            let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("'{method}' is disabled for this profile (Profile::allow_fs_access is false)"),
                 }
-            } else if (method == "terminal/output"
-                || method == "terminal/wait_for_exit"
-                || method == "terminal/kill"
-                || method == "terminal/release")
-                && policy.allow_terminal_access
-            {
-                handle_terminal_request(backend, &value, method).await
-            } else if method == "terminal/create"
-                || method == "terminal/output"
-                || method == "terminal/wait_for_exit"
-                || method == "terminal/kill"
-                || method == "terminal/release"
-            {
-                // Same "disabled, not unsupported" distinction as the
-                // `fs/*` arm above, gated on `Profile::allow_terminal_access`.
-                let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("'{method}' is disabled for this profile (Profile::allow_terminal_access is false)"),
+            })
+        } else if method == "terminal/create" && policy.allow_terminal_access {
+            // **Interactive approval + live streaming addition.**
+            // Same approval relay as the `fs/*` arm above; a
+            // successful creation additionally starts
+            // `spawn_terminal_output_stream` so a subscribed live
+            // client sees this terminal's output as it happens,
+            // not only via the backend's own polling
+            // `terminal/output` calls.
+            match try_relay_approval(live, &value, PERMISSION_RELAY_TIMEOUT).await {
+                Some(false) => build_approval_rejected_reply(&value, method),
+                _ => {
+                    let reply = handle_terminal_request(backend, &value, method).await;
+                    if let (Some(ctx), Some(terminal_id)) = (
+                        live,
+                        reply
+                            .get("result")
+                            .and_then(|r| r.get("terminalId"))
+                            .and_then(|t| t.as_str()),
+                    ) {
+                        // Same `spawn_demux_consumer`-has-no-per-call
+                        // tenant/session context gap as
+                        // `try_relay_agent_request`/`try_forward_
+                        // interaction` -- fall back to resolving from
+                        // `value`'s own `params.sessionId` (the
+                        // original `terminal/create` request, still
+                        // in scope here) when `ctx`'s own fields are
+                        // `None`, instead of silently never starting
+                        // the live output stream. See
+                        // `resolve_gateway_session`'s doc comment.
+                        let resolved = match (ctx.tenant_id.clone(), ctx.gateway_session_id.clone())
+                        {
+                            (Some(tenant_id), Some(gateway_session_id)) => {
+                                Some((tenant_id, gateway_session_id))
+                            }
+                            _ => {
+                                let backend_session_id = value
+                                    .get("params")
+                                    .and_then(|p| p.get("sessionId"))
+                                    .and_then(|s| s.as_str());
+                                match backend_session_id {
+                                    Some(backend_session_id) => {
+                                        resolve_gateway_session(ctx, backend_session_id).await.map(
+                                            |(tenant_id, gateway_id)| (tenant_id, gateway_id.0),
+                                        )
+                                    }
+                                    None => None,
+                                }
+                            }
+                        };
+                        if let Some((tenant_id, gateway_session_id)) = resolved {
+                            // One-shot `acpx/terminal_created`
+                            // notification (background-terminals-ui
+                            // plan, PUI-002b): the command/args a
+                            // client needs to show a terminal's title
+                            // are known only here, at the original
+                            // `terminal/create` request -- neither
+                            // `terminal/output` nor
+                            // `spawn_terminal_output_stream`'s polling
+                            // loop below ever sees them again, so this
+                            // is the only point this data can be
+                            // captured and relayed downstream.
+                            // Fire-and-forget (`tokio::spawn`, not
+                            // awaited here) -- this whole match arm
+                            // runs under the caller's held per-process
+                            // `BackendProcess` lock (see
+                            // `read_matching_response_with_idle_
+                            // timeout`'s doc comment), and awaiting
+                            // the publish directly would extend that
+                            // held-lock window for an unrelated
+                            // notification send. Same best-effort,
+                            // no-guaranteed-delivery contract
+                            // `spawn_terminal_output_stream` itself
+                            // already documents.
+                            let command = value
+                                .get("params")
+                                .and_then(|p| p.get("command"))
+                                .and_then(|c| c.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let args: Vec<String> = value
+                                .get("params")
+                                .and_then(|p| p.get("args"))
+                                .and_then(|a| a.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let hub = ctx.notification_hub.clone();
+                            let created_tenant_id = tenant_id.clone();
+                            let created_gateway_session_id = gateway_session_id.clone();
+                            let created_terminal_id = terminal_id.to_string();
+                            tokio::spawn(async move {
+                                hub.publish(
+                                    &created_tenant_id,
+                                    &created_gateway_session_id,
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "acpx/terminal_created",
+                                        "params": {
+                                            "sessionId": created_gateway_session_id,
+                                            "terminalId": created_terminal_id,
+                                            "command": command,
+                                            "args": args,
+                                            "startedAt": now_rfc3339(),
+                                        }
+                                    }),
+                                )
+                                .await;
+                            });
+                            spawn_terminal_output_stream(
+                                std::sync::Arc::clone(&ctx.backend),
+                                ctx.notification_hub.clone(),
+                                tenant_id,
+                                gateway_session_id,
+                                terminal_id.to_string(),
+                            );
+                        }
                     }
-                })
-            } else {
-                let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("acpx gateway does not support agent-initiated method '{method}'"),
-                    }
-                })
-            };
+                    reply
+                }
+            }
+        } else if (method == "terminal/output"
+            || method == "terminal/wait_for_exit"
+            || method == "terminal/kill"
+            || method == "terminal/release")
+            && policy.allow_terminal_access
+        {
+            handle_terminal_request(backend, &value, method).await
+        } else if method == "terminal/create"
+            || method == "terminal/output"
+            || method == "terminal/wait_for_exit"
+            || method == "terminal/kill"
+            || method == "terminal/release"
+        {
+            // Same "disabled, not unsupported" distinction as the
+            // `fs/*` arm above, gated on `Profile::allow_terminal_access`.
+            let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("'{method}' is disabled for this profile (Profile::allow_terminal_access is false)"),
+                }
+            })
+        } else {
+            let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("acpx gateway does not support agent-initiated method '{method}'"),
+                }
+            })
+        };
         write_backend_value_locked(backend, &reply).await?;
         return Ok(UnmatchedOutcome::AgentRequestAnswered(
             serde_json::json!({"request": value, "reply": reply}),
@@ -6515,32 +6494,20 @@ fn attach_session_new_extras(
     response
 }
 
-/// Free-function twin of `Router::spawn_transcript`, taking an already-
-/// cloned `Option<PersistenceStore>` instead of `&self` -- shared by both
-/// the original `&mut self` dispatch path and [`dispatch_shared`]'s
-/// unlock-during-backend-I/O path below, so the two never drift apart.
-fn spawn_transcript_fn(
-    store: Option<PersistenceStore>,
-    gateway_session_id: impl Into<String>,
-    direction: Direction,
-    payload: serde_json::Value,
-) {
+/// Free-function state-revision writer shared by both dispatch paths.
+fn spawn_state_revision_fn(store: Option<PersistenceStore>, gateway_session_id: impl Into<String>) {
     let Some(store) = store else {
         return;
     };
     let gateway_session_id = gateway_session_id.into();
     tokio::spawn(async move {
-        if let Err(err) = store
-            .append_transcript(gateway_session_id, direction, payload, now_rfc3339())
-            .await
-        {
-            tracing::warn!(%err, "failed to persist transcript entry");
+        if let Err(err) = store.bump_state_revision(gateway_session_id).await {
+            tracing::warn!(%err, "failed to persist session state revision");
         }
     });
 }
 
-/// Free-function twin of `Router::spawn_session_persistence` -- see
-/// `spawn_transcript_fn`'s doc comment for why this split exists.
+/// Free-function twin of `Router::spawn_session_persistence`.
 #[allow(clippy::too_many_arguments)]
 fn spawn_session_persistence_fn(
     store: Option<PersistenceStore>,
@@ -6574,27 +6541,11 @@ fn spawn_session_persistence_fn(
             tracing::warn!(%err, "failed to persist session metadata");
             return;
         }
-        if let Err(err) = store
-            .append_transcript(
-                gateway_session_id.clone(),
-                Direction::ClientToAgent,
-                client_request,
-                now_rfc3339(),
-            )
-            .await
-        {
-            tracing::warn!(%err, "failed to persist transcript entry");
-        }
-        if let Err(err) = store
-            .append_transcript(
-                gateway_session_id,
-                Direction::AgentToClient,
-                agent_response,
-                now_rfc3339(),
-            )
-            .await
-        {
-            tracing::warn!(%err, "failed to persist transcript entry");
+        let _ = (client_request, agent_response);
+        for _ in 0..2 {
+            if let Err(err) = store.bump_state_revision(gateway_session_id.clone()).await {
+                tracing::warn!(%err, "failed to persist session state revision");
+            }
         }
     });
 }
@@ -6874,9 +6825,9 @@ pub struct StreamResumeState {
 }
 
 /// Inspect the session registry and optional persistence store without
-/// holding the router mutex across SQLite I/O. A transcript count mismatch
-/// means a non-ACPX writer changed durable history since the last observed
-/// state and must invalidate any resume cursor.
+/// holding the router mutex across SQLite I/O. A durable state-revision
+/// mismatch means a non-ACPX writer changed session state since the last
+/// observed state and must invalidate any resume cursor.
 pub async fn stream_resume_state_shared(
     router: &SharedRouterHandle,
     tenant_id: &TenantId,
@@ -6894,10 +6845,10 @@ pub async fn stream_resume_state_shared(
         )
     };
     let durable_state_changed = match persistence {
-        Some(store) => match store.transcript_state_changed(gateway_session_id).await {
+        Some(store) => match store.state_revision_changed(gateway_session_id).await {
             Ok(changed) => changed,
             Err(err) => {
-                tracing::warn!(%err, %gateway_session_id, "failed to inspect durable transcript state for stream resume");
+                tracing::warn!(%err, %gateway_session_id, "failed to inspect durable session state for stream resume");
                 false
             }
         },
@@ -7112,6 +7063,7 @@ async fn dispatch_agents_install_shared(
             .ok_or(RouterError::UnknownAgentId(agent_id))?
     };
     let outcome = acpx_registry::install(&agent).await?;
+    crate::detect::invalidate_which_cache();
     Ok(serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -7167,12 +7119,7 @@ async fn dispatch_session_cancel_shared(
         "method": "session/cancel",
         "params": { "sessionId": backend_session_id }
     });
-    spawn_transcript_fn(
-        persistence,
-        gateway_session_id,
-        Direction::ClientToAgent,
-        notification.clone(),
-    );
+    spawn_state_revision_fn(persistence, gateway_session_id);
 
     // Same "nothing running, nothing to cancel" no-op as
     // `Router::dispatch_session_cancel` -- see that method's comment.
@@ -7207,7 +7154,15 @@ async fn dispatch_session_list_real_shared(
         obj.remove("_acpx");
     }
 
-    let (agent_id, profile_name, backend, call_policy, agent_relay, notification_hub, process_reader_demux) = {
+    let (
+        agent_id,
+        profile_name,
+        backend,
+        call_policy,
+        agent_relay,
+        notification_hub,
+        process_reader_demux,
+    ) = {
         let mut r = router.lock().await;
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
@@ -7299,7 +7254,9 @@ async fn dispatch_session_list_real_shared(
                     );
                     let mut proc = backend.lock().await;
                     let _ = proc.kill().await;
-                    return Err(RouterError::BackendIdleReadTimeout(BACKEND_IDLE_READ_TIMEOUT));
+                    return Err(RouterError::BackendIdleReadTimeout(
+                        BACKEND_IDLE_READ_TIMEOUT,
+                    ));
                 }
             }
         } else {
@@ -7372,7 +7329,7 @@ async fn dispatch_session_list_real_shared(
 /// [`dispatch_shared`]'s `session/prompt`/`session/resume`/`session/load`/
 /// `session/close`/`session/set_mode`/`session/cancel` path. Mirrors
 /// `Router::dispatch_proxied` exactly (session resolution, sessionId
-/// rewrite, transcript persistence, `session/close` bookkeeping) but
+/// rewrite, state-revision persistence, `session/close` bookkeeping) but
 /// restructured to release `router`'s lock before the backend round trip.
 async fn dispatch_proxied_shared(
     router: &SharedRouterHandle,
@@ -7399,7 +7356,15 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, call_policy, agent_id, agent_relay, notification_hub, process_reader_demux) = {
+    let (
+        backend,
+        persistence,
+        call_policy,
+        agent_id,
+        agent_relay,
+        notification_hub,
+        process_reader_demux,
+    ) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(
             tenant_id,
@@ -7443,12 +7408,7 @@ async fn dispatch_proxied_shared(
         )
     };
 
-    spawn_transcript_fn(
-        persistence.clone(),
-        gateway_session_id.clone(),
-        Direction::ClientToAgent,
-        request.clone(),
-    );
+    spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
 
     let response_result = async {
         let mut proc = backend.lock().await;
@@ -7481,24 +7441,24 @@ async fn dispatch_proxied_shared(
             let idle_timeout = session_establish_or_default_idle_timeout(&method);
             let rx = pending.register(&id).await;
             write_backend_value_via_handle(&backend, &writer, &request).await?;
-            let response = match tokio::time::timeout(idle_timeout, acpx_conductor::demux::recv(rx)).await
-            {
-                Ok(Ok(value)) => value,
-                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
-                    return Err(RouterError::BackendDemuxReaderClosed);
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        timeout_secs = idle_timeout.as_secs(),
-                        "backend produced no output for the entire idle-read timeout window \
+            let response =
+                match tokio::time::timeout(idle_timeout, acpx_conductor::demux::recv(rx)).await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                        return Err(RouterError::BackendDemuxReaderClosed);
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_secs = idle_timeout.as_secs(),
+                            "backend produced no output for the entire idle-read timeout window \
                          (process-reader-demux path); killing the wedged process so every \
                          other session sharing it is unblocked"
-                    );
-                    let mut proc = backend.lock().await;
-                    let _ = proc.kill().await;
-                    return Err(RouterError::BackendIdleReadTimeout(idle_timeout));
-                }
-            };
+                        );
+                        let mut proc = backend.lock().await;
+                        let _ = proc.kill().await;
+                        return Err(RouterError::BackendIdleReadTimeout(idle_timeout));
+                    }
+                };
             // Unmatched frames (notifications/agent-requests) are handled
             // entirely by the independent demux consumer task, not
             // observed by this call's own read loop -- but any
@@ -7553,12 +7513,7 @@ async fn dispatch_proxied_shared(
     let response = response_result?;
     mark_successful_recovery_retry(persistence.clone(), &gateway_session_id, &method).await?;
 
-    spawn_transcript_fn(
-        persistence.clone(),
-        gateway_session_id.clone(),
-        Direction::AgentToClient,
-        response.clone(),
-    );
+    spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
 
     if method == "session/close" {
         if let Some(store) = persistence.clone() {
@@ -7716,7 +7671,9 @@ async fn dispatch_session_fork_shared(
                     );
                     let mut proc = backend.lock().await;
                     let _ = proc.kill().await;
-                    return Err(RouterError::BackendIdleReadTimeout(BACKEND_IDLE_READ_TIMEOUT));
+                    return Err(RouterError::BackendIdleReadTimeout(
+                        BACKEND_IDLE_READ_TIMEOUT,
+                    ));
                 }
             };
             Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
@@ -8094,26 +8051,15 @@ async fn dispatch_session_new_shared(
         }
     }
     admission.commit();
-    spawn_transcript_fn(
-        persistence.clone(),
-        gateway_session_id_str.clone(),
-        Direction::ClientToAgent,
-        request,
-    );
-    spawn_transcript_fn(
-        persistence,
-        gateway_session_id_str,
-        Direction::AgentToClient,
-        response.clone(),
-    );
+    spawn_state_revision_fn(persistence.clone(), gateway_session_id_str.clone());
+    spawn_state_revision_fn(persistence, gateway_session_id_str);
 
     Ok(response)
 }
 
 /// Wall-clock timestamp for persistence rows, RFC 3339 via `SystemTime` (no
 /// extra date/time crate dependency -- acpx-core doesn't otherwise need
-/// one, and this precision is more than enough for session/transcript
-/// bookkeeping).
+/// one, and this precision is more than enough for session bookkeeping).
 fn now_rfc3339() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8206,7 +8152,16 @@ fn npx_spawn_spec(agent: &acpx_registry::Agent) -> Option<acpx_conductor::SpawnS
     if let Some(npx) = &agent.distribution.npx {
         let mut args = vec!["-y".to_string(), npx.package.clone()];
         args.extend(npx.args.iter().cloned());
-        return Some(acpx_conductor::SpawnSpec::new("npx", args));
+        // Bundled ACP Node (when global-first lost and acpxmgr set
+        // SNAPFLOW_ACP_NODE_HOME): use absolute npx so we never mix
+        // global/bundled bins mid-spawn.
+        let program = std::env::var("SNAPFLOW_ACP_NODE_HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join("bin").join("npx"))
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "npx".to_string());
+        return Some(acpx_conductor::SpawnSpec::new(program, args));
     }
     if let Some(uvx) = &agent.distribution.uvx {
         let mut args = vec![uvx.package.clone()];
@@ -8321,7 +8276,8 @@ mod tests {
     #[tokio::test]
     async fn backend_idle_read_timeout_kills_a_wedged_process_and_frees_the_lock() {
         // A silent backend: spawns, writes nothing to stdout, ever.
-        let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+        let spec =
+            acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
         let mut backend = acpx_conductor::BackendProcess::spawn(&spec)
             .await
             .expect("failed to spawn silent test backend");
@@ -8365,11 +8321,12 @@ mod tests {
     /// `tokio::time::timeout` + kill path via `ensure_backend_
     /// initialized_with_handshake_timeout`'s parameter, in milliseconds
     /// rather than the real 30-second constant.
-   #[tokio::test]
-   async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
+    #[tokio::test]
+    async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
         // A silent backend: spawns, writes nothing to stdout, ever -- so
         // `initialize` is guaranteed to never be answered.
-        let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+        let spec =
+            acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
         let mut backend = acpx_conductor::BackendProcess::spawn(&spec)
             .await
             .expect("failed to spawn silent test backend");
@@ -8389,12 +8346,12 @@ mod tests {
             ),
             "expected BackendHandshakeTimeout(\"initialize\", _), got {result:?}"
         );
-       tokio::time::sleep(Duration::from_millis(200)).await;
-       assert!(
-           backend.has_exited(),
-           "wedged backend process should have been killed on handshake timeout"
-       );
-   }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            backend.has_exited(),
+            "wedged backend process should have been killed on handshake timeout"
+        );
+    }
 
     /// **Regression test for a real production panic** (`BackendProcess::
     /// reader_mut called after start_demux() took the reader; use
@@ -8426,7 +8383,9 @@ mod tests {
         let backend = std::sync::Arc::new(tokio::sync::Mutex::new(backend));
 
         let ctx = LiveNotifyCtx {
-            router: std::sync::Arc::new(tokio::sync::Mutex::new(Router::new("idle-scavenger-demux-agent"))),
+            router: std::sync::Arc::new(tokio::sync::Mutex::new(Router::new(
+                "idle-scavenger-demux-agent",
+            ))),
             agent_id: "idle-scavenger-demux-agent".to_string(),
             tenant_id: None,
             agent_relay: AgentRequestHub::new(),
@@ -8448,7 +8407,7 @@ mod tests {
         );
     }
 
-   /// Regression test for the startup-recovery agent-registration bug:
+    /// Regression test for the startup-recovery agent-registration bug:
     /// confirmed live via `last_recovery_error` across 7 consecutive real
     /// `acpx-server` restarts, `no spawn spec registered for agent
     /// codex-acp`, 0 successful recoveries out of 9 accumulated bridge

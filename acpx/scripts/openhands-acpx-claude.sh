@@ -30,7 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACPX_SERVER_BIN="${ACPX_SERVER_BIN:-$SCRIPT_DIR/../target/release/acpx-server}"
 
-export ACPX_BACKEND_CMD="${ACPX_BACKEND_CMD:-npx -y @agentclientprotocol/claude-agent-acp@0.58.1}"
+export ACPX_DEFAULT_ACP_COMMAND="${ACPX_DEFAULT_ACP_COMMAND:-npx -y @agentclientprotocol/claude-agent-acp@0.58.1}"
 export ACPX_DEFAULT_AGENT_ID="${ACPX_DEFAULT_AGENT_ID:-claude-acp}"
 export ACPX_HTTP_BIND="off"
 

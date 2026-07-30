@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
@@ -13,7 +14,7 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 export component ExpandablePanel {
     in property <length> collapsed-max-height: 140px;
     in property <bool> collapsed-by-default: true;
-    in property <string> title: "FULL CALL DETAILS & PAYLOAD";
+    in property <string> title: Strings.full-call-details-payload;
     property <bool> expanded: !collapsed-by-default;
     callback toggled(bool);
     callback open-full-view();

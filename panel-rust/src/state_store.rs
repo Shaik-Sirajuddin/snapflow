@@ -47,6 +47,51 @@ pub struct ThreadRecord {
     pub profile_name: Option<String>,
     pub permission_profile: Option<String>,
     pub background_session: Option<bool>,
+    /// PISO-3 (project-isolation-mlt-binding plan): the MLT project *file
+    /// path* this thread's session was opened/resumed against, mirroring
+    /// `ThreadSlot::project_path`'s own doc comment -- captured once at
+    /// session-open time and never updated afterward. `None` for a thread
+    /// created before this column existed, or one created with no MLT
+    /// project open at all; both are treated identically as "unscoped",
+    /// shown regardless of which project is active (see
+    /// `models::retain_items_for_project`). Legacy rows never gain a value
+    /// retroactively -- there is no way to know after the fact which
+    /// project a pre-migration thread belonged to.
+    ///
+    /// Stored as a PATH, not a synthesized project id, deliberately: every
+    /// existing consumer (`AgentBridge::session_cwd_override`,
+    /// `PanelModel::active_project_path`, `cwd_for_session`,
+    /// `retain_items_for_project`) already compares raw MLT project file
+    /// paths, so a path needs no new lookup table and stays comparable
+    /// with zero translation at every call site. The known cost: a
+    /// Save-As or on-disk rename changes the path out from under an
+    /// already-recorded row, and this phase does not detect or reconcile
+    /// that -- the row simply keeps its old path (same "stranded" outcome
+    /// `ThreadSlot::project_path`'s capture-once design already accepts
+    /// for the live in-memory value; this durable copy inherits the same
+    /// limitation rather than introducing a new one). A future phase
+    /// (PISO-1 propagates Save-As/rename from the host) can add
+    /// rename-aware rebinding on top of this column without a schema
+    /// change.
+    pub project_path: Option<String>,
+}
+
+/// A durable candidate for `acpx_client::pool::ProjectSessionPool`'s idle
+/// key (`project_dir` + `agent_id` + `provider_profile`). `pool_status`
+/// and `leased_thread_id` mirror the plan's diagnostic/recovery hint
+/// fields -- SQL is never the runtime source of truth for lease ownership,
+/// only for which session ids are worth trying to `session/resume` after a
+/// restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolBindingRecord {
+    pub project_dir: String,
+    pub agent_id: String,
+    pub provider_profile: String,
+    pub session_id: String,
+    pub desired_config_options: Option<String>,
+    pub pool_status: Option<String>,
+    pub leased_thread_id: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,7 +157,38 @@ impl PanelStateStore {
         Self::add_column_if_missing(&connection, "display_name", "TEXT")?;
         Self::add_column_if_missing(&connection, "provider", "TEXT")?;
         Self::add_defaults_column_if_missing(&connection, "selected_thread_id", "TEXT")?;
-        connection.execute_batch("PRAGMA user_version = 3;")?;
+        // PISO-3: durable thread<->project association. An existing
+        // database from before this column existed migrates in place via
+        // `add_column_if_missing` -- every pre-existing row simply reads
+        // back with `project_path = NULL` (see `ThreadRecord::project_path`'s
+        // doc comment for why that is the correct, permanent state for
+        // those rows rather than a value to backfill).
+        Self::add_column_if_missing(&connection, "project_path", "TEXT")?;
+        // acpx-client-session-lease-pool plan: durable project/agent/
+        // provider -> session binding for the client-side lease pool.
+        // `pool_status`/`leased_thread_id` are diagnostic/recovery hints
+        // only -- the in-process `ProjectSessionPool` is authoritative
+        // while panel-rust is running; on restart these rows are the
+        // candidates the pool validates with `session/resume` before
+        // reuse. Distinct from `thread_settings` (per-thread presentation
+        // state): a pool binding is keyed by project+agent+provider, never
+        // by thread_id, matching the plan's idle-pool key.
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS project_session_pool_bindings (
+                project_dir TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                provider_profile TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                desired_config_options TEXT,
+                pool_status TEXT,
+                leased_thread_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (project_dir, agent_id, provider_profile, session_id)
+            );
+            ",
+        )?;
+        connection.execute_batch("PRAGMA user_version = 5;")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -258,7 +334,7 @@ impl PanelStateStore {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = connection.prepare(
             "SELECT thread_id, display_name, provider, session_id,
-                    profile_name, permission_profile, background_session
+                    profile_name, permission_profile, background_session, project_path
              FROM thread_settings
              WHERE display_name IS NOT NULL
                AND provider IS NOT NULL
@@ -274,6 +350,7 @@ impl PanelStateStore {
                 profile_name: row.get(4)?,
                 permission_profile: row.get(5)?,
                 background_session: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+                project_path: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -313,9 +390,14 @@ impl PanelStateStore {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "UPDATE thread_settings
-             SET display_name = ?2, provider = ?3
+             SET display_name = ?2, provider = ?3, project_path = ?4
              WHERE thread_id = ?1",
-            params![record.thread_id, record.display_name, record.provider],
+            params![
+                record.thread_id,
+                record.display_name,
+                record.provider,
+                record.project_path,
+            ],
         )?;
         Ok(())
     }
@@ -378,6 +460,93 @@ impl PanelStateStore {
         Ok(())
     }
 
+    /// Upserts one durable project/agent/provider -> session candidate for
+    /// the client-side lease pool. `desired_config_options` is caller-
+    /// serialized (e.g. JSON) opaque text; this store does not interpret
+    /// it. Keyed by `(project_dir, agent_id, provider_profile, session_id)`
+    /// so a provider that has cycled through multiple session ids over
+    /// time (e.g. after invalidation) keeps its prior rows as history
+    /// rather than clobbering them -- callers wanting "the" binding should
+    /// use [`Self::pool_bindings_for_project`] and prefer the most
+    /// recently `updated_at`.
+    pub fn save_pool_binding(&self, binding: &PoolBindingRecord) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "INSERT INTO project_session_pool_bindings
+                (project_dir, agent_id, provider_profile, session_id,
+                 desired_config_options, pool_status, leased_thread_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(project_dir, agent_id, provider_profile, session_id) DO UPDATE SET
+                desired_config_options = excluded.desired_config_options,
+                pool_status = excluded.pool_status,
+                leased_thread_id = excluded.leased_thread_id,
+                updated_at = excluded.updated_at",
+            params![
+                binding.project_dir,
+                binding.agent_id,
+                binding.provider_profile,
+                binding.session_id,
+                binding.desired_config_options,
+                binding.pool_status,
+                binding.leased_thread_id,
+                binding.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted pool-binding candidates for one project, newest
+    /// `updated_at` first. Restart hydration reads this to find prior
+    /// activated providers; each candidate must still be proven usable
+    /// with `session/resume` before the in-memory pool treats it as idle.
+    pub fn pool_bindings_for_project(
+        &self,
+        project_dir: &str,
+    ) -> Result<Vec<PoolBindingRecord>, StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT project_dir, agent_id, provider_profile, session_id,
+                    desired_config_options, pool_status, leased_thread_id, updated_at
+             FROM project_session_pool_bindings
+             WHERE project_dir = ?1
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = statement
+            .query_map(params![project_dir], |row| {
+                Ok(PoolBindingRecord {
+                    project_dir: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    provider_profile: row.get(2)?,
+                    session_id: row.get(3)?,
+                    desired_config_options: row.get(4)?,
+                    pool_status: row.get(5)?,
+                    leased_thread_id: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Removes one binding row -- called when the pool invalidates a
+    /// session (stale/closed/auth-failed), so a restart never re-offers a
+    /// candidate already confirmed unusable.
+    pub fn delete_pool_binding(
+        &self,
+        project_dir: &str,
+        agent_id: &str,
+        provider_profile: &str,
+        session_id: &str,
+    ) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "DELETE FROM project_session_pool_bindings
+             WHERE project_dir = ?1 AND agent_id = ?2 AND provider_profile = ?3 AND session_id = ?4",
+            params![project_dir, agent_id, provider_profile, session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_background_override(
         &self,
         thread_id: &str,
@@ -401,11 +570,116 @@ impl PanelStateStore {
             .and_then(|settings| settings.background_session)
             .unwrap_or(self.defaults()?.background_session))
     }
+
+    /// PISO-7 (project-isolation-mlt-binding plan): the durable half of a
+    /// Save-As rebind -- rewrites every row whose `project_path` equals
+    /// `old` to `new`. Rows recorded against a DIFFERENT project, or with
+    /// no recorded project at all (`project_path IS NULL`, the SQL
+    /// equality below never matches those either way), are untouched.
+    ///
+    /// This alone only takes effect on the NEXT restart: the live
+    /// session's visible thread list reads `AgentBridge::thread_project_
+    /// path`, which reads each `ThreadSlot`'s own in-memory copy, not
+    /// sqlite -- `AgentBridge::rebind_project_path` is the matching live
+    /// half, and both must be called together (see the `Effect::
+    /// RenameProjectAssociation` handler, the only caller of either).
+    ///
+    /// Callers must never pass an empty `old`: that would mean "every
+    /// legacy/never-scoped row", and an untitled project's first save is
+    /// NOT a rename of anything (those threads were created unscoped on
+    /// purpose and must stay that way) -- `update_host`'s `ProjectPath
+    /// Renamed` handler guards this before it ever reaches here.
+    pub fn rename_project_path(&self, old: &str, new: &str) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "UPDATE thread_settings SET project_path = ?2 WHERE project_path = ?1",
+            params![old, new],
+        )?;
+        Ok(())
+    }
+
+    /// First-save migration for rows created while the project was Untitled.
+    /// Those rows intentionally carry NULL project_path until the staging
+    /// identity becomes a saved MLT identity; update only those rows so a
+    /// different project's durable chats can never be rehomed accidentally.
+    pub fn assign_unscoped_project_path(&self, new: &str) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "UPDATE thread_settings SET project_path = ?1 WHERE project_path IS NULL",
+            params![new],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_binding_upsert_updates_status_without_duplicating_rows() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let mut binding = PoolBindingRecord {
+            project_dir: "/proj".to_string(),
+            agent_id: "agent-1".to_string(),
+            provider_profile: "codex/default".to_string(),
+            session_id: "sess-1".to_string(),
+            desired_config_options: Some("{}".to_string()),
+            pool_status: Some("idle".to_string()),
+            leased_thread_id: None,
+            updated_at: "1".to_string(),
+        };
+        store.save_pool_binding(&binding).unwrap();
+        binding.pool_status = Some("leased".to_string());
+        binding.leased_thread_id = Some("thread-1".to_string());
+        binding.updated_at = "2".to_string();
+        store.save_pool_binding(&binding).unwrap();
+
+        let rows = store.pool_bindings_for_project("/proj").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pool_status.as_deref(), Some("leased"));
+        assert_eq!(rows[0].leased_thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn pool_bindings_are_isolated_per_project() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let make = |project_dir: &str| PoolBindingRecord {
+            project_dir: project_dir.to_string(),
+            agent_id: "agent-1".to_string(),
+            provider_profile: "codex/default".to_string(),
+            session_id: "sess-1".to_string(),
+            desired_config_options: None,
+            pool_status: None,
+            leased_thread_id: None,
+            updated_at: "1".to_string(),
+        };
+        store.save_pool_binding(&make("/proj-a")).unwrap();
+        store.save_pool_binding(&make("/proj-b")).unwrap();
+
+        assert_eq!(store.pool_bindings_for_project("/proj-a").unwrap().len(), 1);
+        assert_eq!(store.pool_bindings_for_project("/proj-c").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_pool_binding_removes_only_the_matching_row() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let binding = PoolBindingRecord {
+            project_dir: "/proj".to_string(),
+            agent_id: "agent-1".to_string(),
+            provider_profile: "codex/default".to_string(),
+            session_id: "sess-stale".to_string(),
+            desired_config_options: None,
+            pool_status: Some("invalid".to_string()),
+            leased_thread_id: None,
+            updated_at: "1".to_string(),
+        };
+        store.save_pool_binding(&binding).unwrap();
+        store
+            .delete_pool_binding("/proj", "agent-1", "codex/default", "sess-stale")
+            .unwrap();
+        assert!(store.pool_bindings_for_project("/proj").unwrap().is_empty());
+    }
 
     /// mutex_poison_convention_unification: a panic in one caller while
     /// holding `connection`'s lock must not permanently wedge every future
@@ -432,6 +706,45 @@ mod tests {
         );
     }
 
+    /// SCNA-10: a real, deterministic mid-session write-failure trigger.
+    /// The store's default rollback-journal mode needs to create/delete a
+    /// `-journal` sibling file in the same directory on every write, even
+    /// though the main .sqlite3 file itself stays writable -- so making
+    /// *just the containing directory* read-only after the connection is
+    /// already open reproduces a real "attempt to write a readonly
+    /// database" failure on an already-open connection, without any
+    /// test-only production hook. Restoring directory permissions heals it
+    /// again with no code changes needed, same as the poison-mutex tests.
+    #[test]
+    fn a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("panel-state.sqlite3");
+        let store = PanelStateStore::open(&db_path).unwrap();
+        // Succeeds while the directory is still writable.
+        store.save_defaults(&PanelDefaults::default()).unwrap();
+
+        let original_mode = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.save_defaults(&PanelDefaults {
+            profile_name: Some("codex".to_owned()),
+            ..PanelDefaults::default()
+        });
+        assert!(
+            matches!(result, Err(StateStoreError::Sql(_))),
+            "write against a read-only state dir must surface as StateStoreError::Sql, got {result:?}"
+        );
+
+        // Restore so tempdir's own Drop cleanup can remove the directory.
+        std::fs::set_permissions(dir.path(), original_mode).unwrap();
+        assert!(
+            store.save_defaults(&PanelDefaults::default()).is_ok(),
+            "write must succeed again once the directory is writable"
+        );
+    }
+
     #[test]
     fn defaults_and_background_override_restore_without_transcript_data() {
         let store = PanelStateStore::in_memory().unwrap();
@@ -455,7 +768,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn save_thread_record_supersedes_a_dead_session_binding() {
         // consolidation plan phase 9: relaunch after a failed resume
@@ -469,6 +781,7 @@ mod tests {
             profile_name: None,
             permission_profile: None,
             background_session: None,
+            project_path: None,
         };
         store.save_thread_record(&record).unwrap();
         record.session_id = "session-2".to_owned();
@@ -507,6 +820,7 @@ mod tests {
             profile_name: Some("review".to_owned()),
             permission_profile: None,
             background_session: None,
+            project_path: Some("/projects/timeline.mlt".to_owned()),
         };
         let second = ThreadRecord {
             thread_id: "filters".to_owned(),
@@ -516,6 +830,7 @@ mod tests {
             profile_name: None,
             permission_profile: Some("confirm".to_owned()),
             background_session: Some(true),
+            project_path: None,
         };
         store.save_thread_record(&first).unwrap();
         store
@@ -542,7 +857,8 @@ mod tests {
     /// name untouched, using the exact same composition lib.rs's cold
     /// start calls.
     #[test]
-    fn a_persisted_default_sentinel_profile_is_stripped_on_restore_not_forwarded_to_a_real_session() {
+    fn a_persisted_default_sentinel_profile_is_stripped_on_restore_not_forwarded_to_a_real_session()
+    {
         let store = PanelStateStore::in_memory().unwrap();
         let poisoned = ThreadRecord {
             thread_id: "legacy-thread".to_owned(),
@@ -552,6 +868,7 @@ mod tests {
             profile_name: Some("default".to_owned()),
             permission_profile: Some("default".to_owned()),
             background_session: None,
+            project_path: None,
         };
         let real = ThreadRecord {
             thread_id: "real-thread".to_owned(),
@@ -561,6 +878,7 @@ mod tests {
             profile_name: Some("my-real-profile".to_owned()),
             permission_profile: Some("workspace".to_owned()),
             background_session: None,
+            project_path: None,
         };
         store.save_thread_record(&poisoned).unwrap();
         store.save_thread_record(&real).unwrap();
@@ -606,6 +924,7 @@ mod tests {
             profile_name: Some("review".to_owned()),
             permission_profile: None,
             background_session: None,
+            project_path: None,
         };
         store.save_thread_record(&record).unwrap();
         store
@@ -618,6 +937,105 @@ mod tests {
                 display_name: "Repair timeline".to_owned(),
                 ..record
             }]
+        );
+    }
+
+    /// PISO-7: the durable half of a Save-As rebind. Two threads on
+    /// different projects plus one unscoped thread -- renaming A -> B
+    /// must move only A's row, leave B's alone, and leave the unscoped
+    /// row's NULL untouched (an untitled project's first save is not a
+    /// rename of anything).
+    #[test]
+    fn rename_project_path_rewrites_only_matching_rows() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let on_a = ThreadRecord {
+            thread_id: "on-a".to_owned(),
+            display_name: "On A".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-a".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: Some("/projects/a/timeline.mlt".to_owned()),
+        };
+        let on_b = ThreadRecord {
+            thread_id: "on-b".to_owned(),
+            display_name: "On B".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-b".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: Some("/projects/b/timeline.mlt".to_owned()),
+        };
+        let unscoped = ThreadRecord {
+            thread_id: "unscoped".to_owned(),
+            display_name: "Unscoped".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-u".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: None,
+        };
+        store.save_thread_record(&on_a).unwrap();
+        store.save_thread_record(&on_b).unwrap();
+        store.save_thread_record(&unscoped).unwrap();
+
+        store
+            .rename_project_path(
+                "/projects/a/timeline.mlt",
+                "/projects/a-renamed/timeline.mlt",
+            )
+            .unwrap();
+
+        let records = store.thread_records().unwrap();
+        let by_id = |id: &str| records.iter().find(|r| r.thread_id == id).unwrap();
+        assert_eq!(
+            by_id("on-a").project_path.as_deref(),
+            Some("/projects/a-renamed/timeline.mlt"),
+            "the renamed project's thread must follow it"
+        );
+        assert_eq!(
+            by_id("on-b").project_path.as_deref(),
+            Some("/projects/b/timeline.mlt"),
+            "an unrelated project's thread must never move"
+        );
+        assert_eq!(
+            by_id("unscoped").project_path,
+            None,
+            "an unscoped thread must stay unscoped"
+        );
+    }
+
+    /// PISO-7: an empty `old` must never match every legacy/unscoped row
+    /// -- the caller-side contract (`update_host`'s `ProjectPathRenamed`
+    /// handler must never issue the rename effect for an empty old path
+    /// at all) is backed here by proving the SQL itself can't retro-bind
+    /// unscoped rows even if that guard were somehow bypassed.
+    #[test]
+    fn rename_project_path_with_an_empty_old_path_touches_no_row() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let unscoped = ThreadRecord {
+            thread_id: "unscoped".to_owned(),
+            display_name: "Unscoped".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-u".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: None,
+        };
+        store.save_thread_record(&unscoped).unwrap();
+
+        store
+            .rename_project_path("", "/projects/untitled-saved-as.mlt")
+            .unwrap();
+
+        assert_eq!(
+            store.thread_records().unwrap()[0].project_path,
+            None,
+            "an unscoped thread must never be retro-bound via an empty old path"
         );
     }
 
@@ -661,5 +1079,90 @@ mod tests {
         );
         assert!(store.thread_records().unwrap().is_empty());
         assert_eq!(store.defaults().unwrap().selected_thread_id, None);
+    }
+
+    /// PISO-3: a database created by a build before the `project_path`
+    /// column existed (v3 shape -- `display_name`/`provider` present,
+    /// `project_path` absent) must open, migrate in place via
+    /// `add_column_if_missing`, and keep every existing row -- not error,
+    /// and not silently wipe the thread the user already had open.
+    #[test]
+    fn an_old_v3_database_without_project_path_migrates_and_keeps_its_row() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE panel_defaults (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    profile_name TEXT,
+                    permission_profile TEXT,
+                    background_session INTEGER NOT NULL CHECK (background_session IN (0, 1)),
+                    selected_thread_id TEXT
+                );
+                CREATE TABLE thread_settings (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT,
+                    profile_name TEXT,
+                    permission_profile TEXT,
+                    background_session INTEGER CHECK (background_session IN (0, 1)),
+                    display_name TEXT,
+                    provider TEXT
+                );
+                INSERT INTO thread_settings
+                    (thread_id, session_id, profile_name, permission_profile,
+                     background_session, display_name, provider)
+                VALUES ('pre-migration-thread', 'session-pre', 'codex', 'review',
+                        1, 'Pre-migration thread', 'codex');
+                PRAGMA user_version = 3;
+                ",
+            )
+            .unwrap();
+
+        let store = PanelStateStore::from_connection(connection).unwrap();
+
+        // The row survives the migration, and -- being from before this
+        // column existed -- reads back with `project_path: None`, which is
+        // the documented "unscoped, visible everywhere" state, not an
+        // error or a dropped row.
+        assert_eq!(
+            store.thread_records().unwrap(),
+            vec![ThreadRecord {
+                thread_id: "pre-migration-thread".to_owned(),
+                display_name: "Pre-migration thread".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: "session-pre".to_owned(),
+                profile_name: Some("codex".to_owned()),
+                permission_profile: Some("review".to_owned()),
+                background_session: Some(true),
+                project_path: None,
+            }]
+        );
+
+        // A fresh write on the migrated table exercises the new column end
+        // to end, proving the ALTER TABLE actually took (not just that the
+        // old row happens to still be readable).
+        store
+            .save_thread_record(&ThreadRecord {
+                thread_id: "pre-migration-thread".to_owned(),
+                display_name: "Pre-migration thread".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: "session-pre".to_owned(),
+                profile_name: Some("codex".to_owned()),
+                permission_profile: Some("review".to_owned()),
+                background_session: Some(true),
+                project_path: Some("/projects/pre-migration.mlt".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .thread_records()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .project_path
+                .as_deref(),
+            Some("/projects/pre-migration.mlt")
+        );
     }
 }

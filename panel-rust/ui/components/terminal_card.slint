@@ -148,9 +148,9 @@ export component TerminalOverlay inherits Rectangle {
                             Rectangle {
                                 width: 6px;
                                 height: 6px;
-                                border-radius: 3px;
+                                border-radius: self.width / 2;
                                 y: (parent.height - self.height) / 2;
-                                background: tab-item.active ? #22c55e : (tab-item.exit-code == 0 ? Theme.text-muted : #ef4444);
+                                background: tab-item.active ? Theme.status-success : (tab-item.exit-code == 0 ? Theme.text-muted : Theme.status-error);
                             }
                             tab-label := Text {
                                 text: tab-item.title != "" ? tab-item.title : tab-item.terminal-id;

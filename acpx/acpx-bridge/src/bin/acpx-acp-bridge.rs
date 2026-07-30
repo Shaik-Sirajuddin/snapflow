@@ -56,31 +56,29 @@ async fn main() -> anyhow::Result<()> {
     'connection: loop {
         let request = bridge_request(&url)?;
         eprintln!("acpx-acp-bridge: connecting to {url} (is_reconnect={is_reconnect})");
-        let socket = match tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(request),
-        )
-        .await
-        {
-            Ok(Ok((socket, _))) => socket,
-            Ok(Err(err)) => {
-                eprintln!(
-                    "acpx-acp-bridge: connect to {url} failed ({err}); retrying in {backoff:?}"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
-                continue 'connection;
-            }
-            Err(_elapsed) => {
-                eprintln!(
-                    "acpx-acp-bridge: connect to {url} timed out after {CONNECT_TIMEOUT:?}; \
+        let socket =
+            match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+                .await
+            {
+                Ok(Ok((socket, _))) => socket,
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "acpx-acp-bridge: connect to {url} failed ({err}); retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    continue 'connection;
+                }
+                Err(_elapsed) => {
+                    eprintln!(
+                        "acpx-acp-bridge: connect to {url} timed out after {CONNECT_TIMEOUT:?}; \
                      retrying in {backoff:?}"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
-                continue 'connection;
-            }
-        };
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    continue 'connection;
+                }
+            };
         backoff = INITIAL_RECONNECT_BACKOFF;
         if is_reconnect {
             tracker.mark_all_for_resync();

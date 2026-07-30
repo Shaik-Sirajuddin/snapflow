@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Icon } from "icon.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
@@ -37,8 +38,8 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 export component Select inherits Rectangle {
     in property <[string]> options: [];
     in-out property <string> value: "";
-    in property <string> placeholder: "Select...";
-    in property <string> select-accessible-label: "Select";
+    in property <string> placeholder: Strings.select-ellipsis;
+    in property <string> select-accessible-label: Strings.select-label;
     // Show the in-popup search field. Off by default -- only long pickers
     // (the model picker) opt in; short ones (the profile picker) reuse the
     // same component and design with it simply hidden.
@@ -136,7 +137,7 @@ export component Select inherits Rectangle {
                 // itself, so every call site inherits it.
                 if root.searchable : FilterSearchBar {
                     query <=> root.query;
-                    placeholder: "Search...";
+                    placeholder: Strings.search-ellipsis;
                     bar-accessible-label: root.select-accessible-label + " search";
                     show-icon: false;
                     bar-bg: Theme.bg-tertiary;
@@ -166,7 +167,7 @@ export component Select inherits Rectangle {
                             opt-touch := TouchArea {
                                 mouse-cursor: pointer;
                                 accessible-role: button;
-                                accessible-label: "Select " + opt;
+                                accessible-label: Strings.select-prefix + opt;
                                 accessible-action-default => { root.value = opt; root.selected(opt); popup.close(); }
                                 clicked => { root.value = opt; root.selected(opt); popup.close(); }
                             }

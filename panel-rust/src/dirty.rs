@@ -267,7 +267,9 @@ pub enum Dirty {
     /// One existing thread row changed shape-preservingly (rename,
     /// toggle-background, status) -- `set_row_data(idx, ..)`, no
     /// insert/remove.
-    ThreadRow(usize),
+    ThreadRow {
+        thread_id: String,
+    },
     /// The thread list's *shape* changed (add/remove/reorder) -- id-keyed
     /// diff ops, never a full replace (see 00-plan.md's known gap).
     ThreadListDiff(Vec<RowOp<crate::models::VisibleThreadItem>>),
@@ -291,6 +293,19 @@ pub enum Dirty {
         message_id: String,
         delta: String,
     },
+    /// Full replace of the shared message list for `thread_id` from
+    /// `ThreadModel.message_rows` (or clear if empty id). Used on **thread
+    /// switch** so selection + list ownership change in one sync turn —
+    /// no flash of the previous agent. See chat_view_audit_report §5.
+    MessageListInstall {
+        thread_id: String,
+    },
+    /// One displayed-row patch (expand toggle, single-field update) without
+    /// re-projecting or converging the whole list.
+    MessageRowPatch {
+        thread_id: String,
+        index: usize,
+    },
     /// `thread_id`'s connection/reconnect status changed -- updates the
     /// *existing* status row in place (fixes
     /// `reconnecting_message_and_acpx_settings_propagation`).
@@ -311,10 +326,17 @@ pub enum Dirty {
     ProjectPath,
     Appearance,
     Theme,
+    /// language-switch-sync plan: `Model::language` changed -- `sync()`
+    /// calls `slint::select_bundled_translation`, which live-updates
+    /// every `@tr()`-bound `Strings.*` property on screen; no explicit
+    /// per-string Slint setter needed (unlike Theme's variant, which
+    /// does push named properties).
+    Language,
     /// Settings changed -- pushed into both the settings panel and chat
     /// view in one place (fixes "settings not propagated to chat view").
     Settings,
     SkillsListDiff(Vec<RowOp<crate::SkillOption>>),
+    #[allow(dead_code)]
     SkillRow(usize),
     SkillEditor,
     Capabilities {
@@ -330,6 +352,7 @@ pub enum ScalarField {
     ComposeText,
     SettingsOpen,
     SettingsScope,
+    #[allow(dead_code)]
     ExpandedTerminal,
     SearchQuery,
 }

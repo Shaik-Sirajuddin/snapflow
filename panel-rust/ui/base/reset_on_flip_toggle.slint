@@ -13,6 +13,7 @@ import { Toggle } from "./toggle.slint";
 // -> toggle shape don't have to rediscover this.
 export component ResetOnFlipToggle {
     in property <bool> checked: false;
+    in property <bool> enabled: true;
     in property <string> toggle-accessible-label-on: "";
     in property <string> toggle-accessible-label-off: "";
     callback toggled(bool);
@@ -22,11 +23,13 @@ export component ResetOnFlipToggle {
 
     if root.checked : Toggle {
         checked: true;
+        enabled: root.enabled;
         toggle-accessible-label: root.toggle-accessible-label-on;
         toggled(new-checked) => { root.toggled(new-checked); }
     }
     if !root.checked : Toggle {
         checked: false;
+        enabled: root.enabled;
         toggle-accessible-label: root.toggle-accessible-label-off;
         toggled(new-checked) => { root.toggled(new-checked); }
     }

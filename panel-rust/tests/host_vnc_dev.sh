@@ -67,7 +67,7 @@ x11vnc -display "$display" -rfbport "$vnc_port" -forever -shared -nopw \
     -bg -o "$state_dir/x11vnc.log"
 vnc_pid="$(pgrep -f "x11vnc -display $display -rfbport $vnc_port" | head -1)"
 
-# No ACPX_BACKEND_CMD override -- real agent ids (codex-acp, claude-acp,
+# No ACPX_DEFAULT_ACP_COMMAND override -- real agent ids (codex-acp, claude-acp,
 # ...) resolve through acpx-registry's real fallback registry (npx-spawned,
 # ambient CLI auth), the same real-process path this repo's own
 # real-backend tests use (see ACPX_LIVE_TEST_AMBIENT-gated tests).

@@ -22,6 +22,7 @@
 //! therefore does NOT define a status-color map; tool-call status
 //! renders as plain uppercase mono-font text (Phase 3, in
 //! `message_card.slint`), not a color code.
+#![allow(dead_code)]
 
 /// A plain RGBA color, 0-255 per channel. Slint-free by design (see
 /// module doc) -- Phase 1 converts these into `slint::Color` at the

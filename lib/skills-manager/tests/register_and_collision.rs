@@ -47,7 +47,10 @@ fn two_vendors_registering_identical_content_adopts_existing() {
     };
 
     let second = manager.register_skill("claude-acp", &source).unwrap();
-    let RegisterOutcome::AdoptedExisting { skill_id: second_id } = second else {
+    let RegisterOutcome::AdoptedExisting {
+        skill_id: second_id,
+    } = second
+    else {
         panic!("expected AdoptedExisting, got {:?}", second)
     };
 
@@ -71,7 +74,10 @@ fn two_vendors_same_name_different_content_is_a_name_collision() {
     .unwrap();
 
     let first = manager.register_skill("codex-acp", &source_a).unwrap();
-    let RegisterOutcome::Registered { skill_id: existing_id } = first else {
+    let RegisterOutcome::Registered {
+        skill_id: existing_id,
+    } = first
+    else {
         panic!("expected Registered")
     };
 

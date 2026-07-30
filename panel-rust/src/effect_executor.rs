@@ -122,8 +122,8 @@ fn schedule_debounced_skill_resync(skill_dir: std::path::PathBuf) {
 /// mutations, re-scan and fold an explicit skills snapshot so the list
 /// stays in sync without a dual-path `refresh_skills_model`.
 fn refresh_skills_after_effect(panel: &PanelSingleton) {
-    let skills_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
-        .collect_skills_snapshot();
+    let skills_snapshot =
+        crate::external_snapshot::ExternalSnapshotSource::new(panel).collect_skills_snapshot();
     panel.dispatch_frame_input(FrameInput {
         skills_snapshot: Some(skills_snapshot),
         ..FrameInput::default()
@@ -489,8 +489,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
         );
         match effect {
             Effect::LoadInitialState => {}
-            Effect::SendPrompt { real_index, text } => {
-                panel.execute_send_prompt_real(real_index, &text);
+            Effect::SendPrompt { thread_id, text } => {
+                let real_index = panel.model.borrow().thread_index_for_id(&thread_id);
+                if let Some(real_index) = real_index {
+                    panel.execute_send_prompt_real(real_index, &text);
+                }
             }
             Effect::CancelGeneration { real_index } => {
                 panel.execute_cancel_generation_real(real_index);
@@ -641,7 +644,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                         eprintln!(
                             "panel-rust: skills-manager agent-enabled reactive sync failed for {agent_id} (enabled={enabled}): {error}"
                         );
-                        let operation = if enabled { "agent-enable" } else { "agent-disable" };
+                        let operation = if enabled {
+                            "agent-enable"
+                        } else {
+                            "agent-disable"
+                        };
                         dispatch_reactive_sync_failed(operation, error.to_string());
                     }
                 });
@@ -658,6 +665,74 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             Effect::SetActiveProjectPath { path } => {
                 panel.apply_active_project_path(path);
             }
+            Effect::RefreshDaemonProjectInstances => {
+                // Real subprocess spawns + (inside the CLI) a real Unix
+                // socket dial -- off the UI thread, per `agent_bridge::
+                // fetch_daemon_project_instances`'s own doc comment.
+                std::thread::spawn(move || {
+                    let result = crate::agent_bridge::fetch_daemon_project_instances()
+                        .map_err(EffectError::new);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::DaemonProjectInstancesLoaded(result)),
+                            );
+                        });
+                    });
+                });
+            }
+            Effect::RenameProjectAssociation {
+                old,
+                new,
+                old_identity,
+            } => {
+                // Rewrite the live SQLite rows before moving its directory.
+                // An open SQLite connection can become read-only when its
+                // containing directory is renamed first (especially with a
+                // WAL/journal present), which would leave Save-As looking
+                // correct in memory but stale after restart.
+                // `update_host(ProjectPathRenamed)` has already folded the
+                // destination identity into the model. Resolve the source
+                // store by its durable old path; using active_panel_state()
+                // here would create the destination store prematurely and
+                // make the filesystem move a no-op.
+                let store = panel.project_state_for_identity(&old_identity);
+                if let Some(store) = store.as_ref() {
+                    let result = if old.is_empty() {
+                        store.assign_unscoped_project_path(&new)
+                    } else {
+                        store.rename_project_path(&old, &new)
+                    };
+                    if let Err(error) = result {
+                        eprintln!(
+                            "panel-rust: failed to persist project rename {old:?} -> {new:?}: {error}"
+                        );
+                    }
+                }
+                panel.move_project_store_for_rename(&old_identity, &new);
+                // Synchronous, in-memory only (no I/O) -- must run before
+                // this call returns, not spawned, so the very next poll
+                // tick already sees the rebind and the running session's
+                // sidebar self-heals without waiting on the sqlite write
+                // below. See `AgentBridge::rebind_project_path`'s doc
+                // comment for why sqlite alone isn't enough on its own.
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    if old.is_empty() {
+                        bridge.rebind_unscoped_project_path(&new);
+                    } else {
+                        bridge.rebind_project_path(&old, &new);
+                    }
+                }
+                // Durable half: survives a restart. This write is kept
+                // synchronous at the lifecycle boundary so Save-As cannot
+                // return with the in-memory association moved while SQLite
+                // still contains the old project path.
+            }
             Effect::CloseThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // The actual wiring for this thread's own "background"
@@ -667,16 +742,13 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     let thread_id = bridge
                         .thread_binding(real_index)
                         .map(|binding| binding.thread_id);
+                    let store = panel.active_panel_state();
                     let background = thread_id
                         .as_ref()
                         .and_then(|thread_id| {
-                            panel
-                                .panel_state
-                                .as_ref()
-                                .map(|store| (store, thread_id))
-                        })
-                        .and_then(|(store, thread_id)| {
-                            store.effective_background_session(thread_id).ok()
+                            store.as_ref().and_then(|store| {
+                                store.effective_background_session(thread_id).ok()
+                            })
                         })
                         .unwrap_or(false);
                     if !bridge.close_thread(real_index, background) {
@@ -692,7 +764,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     }
                 }
             }
-            Effect::ArchiveThread { real_index, archived } => {
+            Effect::ArchiveThread {
+                real_index,
+                archived,
+            } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // Keep main's toggle-capable archive (archived=false
                     // resumes) and adopt the audit branch's failure surfacing
@@ -713,7 +788,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 }
             }
             Effect::PersistSelectedThread { thread_id } => {
-                let Some(store) = panel.panel_state.clone() else {
+                let Some(store) = panel.active_panel_state() else {
                     continue;
                 };
                 std::thread::spawn(move || {
@@ -739,7 +814,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::ToggleBackground { real_index } => {
-                let Some(store) = panel.panel_state.clone() else {
+                let Some(store) = panel.active_panel_state() else {
                     continue;
                 };
                 let Some(thread_id) = panel
@@ -773,11 +848,23 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                                 );
                             });
                         });
+                    } else {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            crate::PANEL.with(|cell| {
+                                let slot = cell.borrow();
+                                let Some(panel) = slot.as_ref() else {
+                                    return;
+                                };
+                                if let Some(bridge) = panel.bridge.as_ref() {
+                                    bridge.set_thread_background(real_index, next);
+                                }
+                            });
+                        });
                     }
                 });
             }
             Effect::PersistThreadRecord { record } => {
-                let store = panel.panel_state.clone();
+                let store = panel.active_panel_state();
                 std::thread::spawn(move || {
                     let result = store
                         .map(|store| {
@@ -806,7 +893,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 // write itself is offloaded.
                 let record = crate::external_snapshot::ExternalSnapshotSource::new(panel)
                     .collect_thread_record(real_index);
-                let store = panel.panel_state.clone();
+                let store = panel.active_panel_state();
                 std::thread::spawn(move || {
                     let result = record.map(|record| {
                         store
@@ -826,7 +913,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                             };
                             let _ = update_persistent(
                                 panel,
-                                Msg::Effect(EffectResultMsg::ThreadPersisted { real_index, result }),
+                                Msg::Effect(EffectResultMsg::ThreadPersisted {
+                                    real_index,
+                                    result,
+                                }),
                             );
                         });
                     });
@@ -842,7 +932,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     .threads
                     .get(real_index)
                     .map(|thread| thread.thread_id.clone());
-                let store = panel.panel_state.clone();
+                let store = panel.active_panel_state();
                 if let (Some(store), Some(thread_id)) = (store, thread_id) {
                     std::thread::spawn(move || {
                         if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
@@ -1023,6 +1113,33 @@ pub(crate) fn write_clipboard_text(text: &str) -> Result<(), String> {
     Err("no clipboard helper (wl-copy/xclip/xsel) available".into())
 }
 
+/// Read the system clipboard for Slint's native TextInput paste path.
+/// Keep the helper order aligned with `write_clipboard_text` so Wayland and
+/// X11 sessions use the same small external-tool fallback strategy.
+pub(crate) fn read_clipboard_text() -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let helpers: [(&str, &[&str]); 3] = [
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    for (bin, args) in helpers {
+        let Ok(output) = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod debounce_tests {
     use super::debounce;
@@ -1051,7 +1168,10 @@ mod debounce_tests {
 
         // Must not have run yet -- still inside the debounce window.
         std::thread::sleep(Duration::from_millis(10));
-        assert!(!*ran.lock().unwrap(), "must not run before the delay elapses");
+        assert!(
+            !*ran.lock().unwrap(),
+            "must not run before the delay elapses"
+        );
 
         std::thread::sleep(Duration::from_millis(40));
         assert!(*ran.lock().unwrap(), "must run once the delay has elapsed");

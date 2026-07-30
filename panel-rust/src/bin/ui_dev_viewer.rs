@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use slint_interpreter::{ComponentHandle, Compiler, SharedString, Value};
+use slint_interpreter::{Compiler, ComponentHandle, SharedString, Value};
 
 fn arg_string(args: &[Value], i: usize) -> String {
     match args.get(i) {
@@ -72,11 +72,9 @@ fn install_text_util(instance: &slint_interpreter::ComponentInstance) {
         let text = arg_string(args, 0);
         let cursor = arg_i32(args, 1);
         let replacement = arg_string(args, 2);
-        Value::String(SharedString::from(panel_rust::models::replace_active_token(
-            &text,
-            cursor,
-            &replacement,
-        )))
+        Value::String(SharedString::from(
+            panel_rust::models::replace_active_token(&text, cursor, &replacement),
+        ))
     });
 }
 
@@ -104,18 +102,12 @@ fn main() {
 
     let def = result
         .component("DevRoot")
-        .or_else(|| {
-            result
-                .components()
-                .last()
-                .map(|c| c.clone())
-        })
+        .or_else(|| result.components().last().map(|c| c.clone()))
         .expect("no exported component");
     let instance = def.create().expect("create");
     install_text_util(&instance);
 
     println!("ui-dev-viewer: {}", path.display());
-    println!("TextUtil installed — filter works for / skills and mode/model SearchableDropdown");
     println!("Demo approval: type /demo-permission (or /demo-approve) in compose and press Enter");
     println!("  → one-of card appears above the input; click an option or Esc / Ctrl+Enter");
     instance.run().ok();

@@ -162,11 +162,8 @@ async fn spawn_server(demux_enabled: bool) -> (ServerGuard, SocketAddr, reqwest:
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
-        format!(
-            "python3 {} {PROMPT_DELAY_SECS}",
-            script_path.display()
-        ),
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("python3 {} {PROMPT_DELAY_SECS}", script_path.display()),
     )
     .env("ACPX_HTTP_BIND", addr.to_string())
     .env("ACPX_DB_PATH", db_path.display().to_string())
@@ -216,7 +213,12 @@ async fn session_new(client: &reqwest::Client, addr: SocketAddr, id: i64) -> Str
         .to_string()
 }
 
-async fn session_prompt(client: &reqwest::Client, addr: SocketAddr, id: i64, session_id: &str) -> Value {
+async fn session_prompt(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    id: i64,
+    session_id: &str,
+) -> Value {
     rpc(
         client,
         addr,
@@ -251,8 +253,16 @@ async fn demux_on_two_concurrent_sessions_on_one_shared_process_overlap_in_wall_
     let result_a = result_a.expect("task a must not panic");
     let result_b = result_b.expect("task b must not panic");
 
-    assert_eq!(result_a["result"]["stopReason"], json!("end_turn"), "{result_a:?}");
-    assert_eq!(result_b["result"]["stopReason"], json!("end_turn"), "{result_b:?}");
+    assert_eq!(
+        result_a["result"]["stopReason"],
+        json!("end_turn"),
+        "{result_a:?}"
+    );
+    assert_eq!(
+        result_b["result"]["stopReason"],
+        json!("end_turn"),
+        "{result_b:?}"
+    );
 
     let one_turn = Duration::from_secs_f64(PROMPT_DELAY_SECS);
     let two_turns_serialized = one_turn * 2;
@@ -326,7 +336,10 @@ async fn demux_on_launch_and_resume_stay_responsive_under_concurrent_load() {
     let (client_b, addr_b, sid_b_c) = (client.clone(), addr, sid_b.clone());
     let task_b = tokio::spawn(async move { session_prompt(&client_b, addr_b, 4, &sid_b_c).await });
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(!task_a.is_finished() && !task_b.is_finished(), "A and B's turns should still be in flight");
+    assert!(
+        !task_a.is_finished() && !task_b.is_finished(),
+        "A and B's turns should still be in flight"
+    );
 
     // Launch: a brand new session/new on the same shared agent, while A
     // and B's turns are genuinely mid-flight on the process it shares.
@@ -346,7 +359,11 @@ async fn demux_on_launch_and_resume_stay_responsive_under_concurrent_load() {
     let resume_started = Instant::now();
     let result_c = session_prompt(&client, addr, 6, &sid_c).await;
     let resume_elapsed = resume_started.elapsed();
-    assert_eq!(result_c["result"]["stopReason"], json!("end_turn"), "{result_c:?}");
+    assert_eq!(
+        result_c["result"]["stopReason"],
+        json!("end_turn"),
+        "{result_c:?}"
+    );
     assert!(
         resume_elapsed < Duration::from_secs_f64(PROMPT_DELAY_SECS) + Duration::from_millis(700),
         "session/prompt on a third session took {resume_elapsed:?} while sharing the backend \

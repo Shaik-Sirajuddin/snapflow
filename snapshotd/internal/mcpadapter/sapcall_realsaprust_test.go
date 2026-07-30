@@ -37,8 +37,15 @@ import (
 func realSapRustBinary(t *testing.T) string {
 	t.Helper()
 	repoRoot := filepath.Join("..", "..", "..")
-	matches, err := filepath.Glob(filepath.Join(repoRoot, "shotcut", "build*", "src", "shotcut"))
-	if err == nil {
+	patterns := []string{
+		filepath.Join(repoRoot, "shotcut", "build*", "src", "snapflow"),
+		filepath.Join(repoRoot, "shotcut", "build*", "src", "shotcut"),
+	}
+	for _, pat := range patterns {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			continue
+		}
 		for _, candidate := range matches {
 			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
 				abs, absErr := filepath.Abs(candidate)
@@ -49,7 +56,7 @@ func realSapRustBinary(t *testing.T) string {
 			}
 		}
 	}
-	t.Skip("real Qt/real_ffi shotcut binary not found under shotcut/build*/src/shotcut; run `cmake -S shotcut -B shotcut/build-real-ffi -G Ninja && ninja -C shotcut/build-real-ffi` first to run this integration test")
+	t.Skip("real Qt/real_ffi snapflow/shotcut binary not found under shotcut/build*/src/{snapflow,shotcut}; run `cmake -S shotcut -B shotcut/build-real-ffi -G Ninja && ninja -C shotcut/build-real-ffi snapflow` first to run this integration test")
 	return ""
 }
 

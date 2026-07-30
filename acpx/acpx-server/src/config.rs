@@ -3,17 +3,20 @@
 use acpx_conductor::SpawnSpec;
 use acpx_core::LifecycleConfig;
 
-/// Which backend to proxy to by default (native/unmanaged mode, no
+/// Which agent command to proxy to by default (native/unmanaged mode, no
 /// `_acpx.profile` given -- see `02-architecture.md`), and how to spawn
-/// it. Phase 3 adds real profile -> agent/provider resolution on top of
-/// this single default; until then `default_agent_id` is the only agent
-/// `Router` knows how to spawn.
+/// it. Profiles can override this per `session/new`. Phase 3 adds real
+/// profile -> agent/provider resolution on top of this single default;
+/// until then `default_agent_id` is the only agent `Router` registers at
+/// startup (additional agents still register on demand via profiles).
 pub struct ServerConfig {
     pub default_agent_id: String,
     /// Backend auth method for native/unmanaged sessions. This is opt-in so
     /// native ACPX retains its no-guessing authentication default.
     pub native_auth_method_id: Option<String>,
-    pub backend: SpawnSpec,
+    /// Native-mode default ACP agent command (`ACPX_DEFAULT_ACP_COMMAND`).
+    /// Profiles / `_acpx.agentId` override this for managed sessions.
+    pub default_acp_command: SpawnSpec,
     /// Optional strict-ACP `/acp` bridge policy. `None` keeps every bridge
     /// route disabled so legacy ACPX deployments retain their exact public
     /// surface until an operator opts in.
@@ -111,9 +114,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Read the backend command from `ACPX_BACKEND_CMD` (space-separated
-    /// program + args), defaulting to `codex-acp` via npx per the official
-    /// registry (see `01-research.md`) if unset. `ACPX_HTTP_BIND` sets the
+    /// Read the native-mode default ACP command from
+    /// `ACPX_DEFAULT_ACP_COMMAND` (space-separated program + args),
+    /// defaulting to `codex-acp` via npx per the official registry (see
+    /// `01-research.md`) if unset. Legacy alias: `ACPX_BACKEND_CMD` is still
+    /// accepted when the new name is unset. `ACPX_HTTP_BIND` sets the
     /// HTTP/WS bind address (default = `acpx_proto::DEFAULT_ACPX_HTTP_ADDR`,
     /// the single source of truth panel-rust also dials, currently
     /// `127.0.0.1:8790` -- loopback only,
@@ -152,13 +157,35 @@ impl ServerConfig {
     /// tenant-map growth" concern for deployments that know their full
     /// tenant set up front.
     pub fn from_env() -> Self {
-        let raw = std::env::var("ACPX_BACKEND_CMD")
-            .unwrap_or_else(|_| "npx -y @agentclientprotocol/codex-acp@1.1.2".to_string());
-        let mut parts = raw.split_whitespace();
-        let program = parts.next().unwrap_or("npx").to_string();
-        let args: Vec<String> = parts.map(|s| s.to_string()).collect();
         let default_agent_id =
             std::env::var("ACPX_DEFAULT_AGENT_ID").unwrap_or_else(|_| "default".to_string());
+        // Explicit env (new name or legacy alias) always wins. When unset,
+        // PROF-14: prefer a single real registry agent's launch command
+        // (matching ACPX_DEFAULT_AGENT_ID if it names a registry id, else
+        // exactly one Installed launchable agent) over the hardcoded
+        // codex-acp npx literal. Ambiguous/empty still falls back.
+        let default_acp_command = match std::env::var("ACPX_DEFAULT_ACP_COMMAND")
+            .or_else(|_| std::env::var("ACPX_BACKEND_CMD"))
+        {
+            Ok(raw) => {
+                let mut parts = raw.split_whitespace();
+                let program = parts.next().unwrap_or("npx").to_string();
+                let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+                SpawnSpec::new(program, args)
+            }
+            Err(_) => resolve_native_default_from_seeded_registry(&default_agent_id)
+                .unwrap_or_else(|| {
+                    SpawnSpec::new(
+                        "npx",
+                        vec![
+                            "-y".to_string(),
+                            "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+                        ],
+                    )
+                }),
+        };
+        let program = default_acp_command.program.clone();
+        let args = default_acp_command.args.clone();
         let native_auth_method_id = std::env::var("ACPX_NATIVE_AUTH_METHOD_ID")
             .ok()
             .filter(|value| !value.is_empty())
@@ -379,7 +406,7 @@ impl ServerConfig {
         let session_process_isolation = std::env::var("ACPX_SESSION_PROCESS_ISOLATION")
             .map(|value| value == "1")
             .unwrap_or(false);
-    let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
+        let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
             .map(|value| value == "1")
             .unwrap_or(true);
         let bridge = acpx_bridge::BridgeConfig::from_env()
@@ -387,7 +414,7 @@ impl ServerConfig {
         Self {
             default_agent_id,
             native_auth_method_id,
-            backend: SpawnSpec::new(program, args),
+            default_acp_command,
             bridge,
             http_bind_addr,
             auth_token,
@@ -412,6 +439,58 @@ impl ServerConfig {
     }
 }
 
+/// PROF-14: when neither `ACPX_DEFAULT_ACP_COMMAND` nor legacy
+/// `ACPX_BACKEND_CMD` is set, pick a native-mode backend spawn from the
+/// ACP registry the same way `Router::ensure_default_profiles_seeded`
+/// would auto-seed profiles — but only when the choice is unambiguous.
+fn resolve_native_default_from_seeded_registry(default_agent_id: &str) -> Option<SpawnSpec> {
+    let registry = acpx_registry::fallback_registry();
+    let launchable: Vec<&acpx_registry::Agent> = registry
+        .agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                acpx_core::detect::detect(&agent.id, &agent.distribution),
+                acpx_proto::agent::AgentStatus::Installed
+                    | acpx_proto::agent::AgentStatus::InstalledNoSession
+            ) && registry_spawn_spec(agent).is_some()
+        })
+        .collect();
+
+    if let Some(agent) = launchable.iter().find(|a| a.id == default_agent_id) {
+        return registry_spawn_spec(agent);
+    }
+    if matches!(default_agent_id, "default" | "codex") {
+        if let Some(agent) = launchable.iter().find(|a| a.id == "codex-acp") {
+            return registry_spawn_spec(agent);
+        }
+    }
+    if launchable.len() == 1 {
+        return registry_spawn_spec(launchable[0]);
+    }
+    None
+}
+
+fn registry_spawn_spec(agent: &acpx_registry::Agent) -> Option<SpawnSpec> {
+    if let Some(npx) = &agent.distribution.npx {
+        let mut args = vec!["-y".to_string(), npx.package.clone()];
+        args.extend(npx.args.iter().cloned());
+        let program = std::env::var("SNAPFLOW_ACP_NODE_HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join("bin").join("npx"))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "npx".to_string());
+        return Some(SpawnSpec::new(program, args));
+    }
+    if let Some(uvx) = &agent.distribution.uvx {
+        let mut args = vec![uvx.package.clone()];
+        args.extend(uvx.args.iter().cloned());
+        return Some(SpawnSpec::new("uvx", args));
+    }
+    None
+}
+
 /// Auto-defaults `native_auth_method_id` to `"api-key"` for a codex-acp
 /// backend when the operator hasn't set `ACPX_NATIVE_AUTH_METHOD_ID`
 /// explicitly, mirroring the same auto-detection panel-rust's own
@@ -426,7 +505,7 @@ impl ServerConfig {
 /// this server directly -- not just panel-rust's own wrapper -- gets a
 /// working ambient login for free. Only fires for the codex-acp npx
 /// package (never silently reinterprets an operator's custom
-/// `ACPX_BACKEND_CMD` for some other adapter), and only when a real key
+/// `ACPX_DEFAULT_ACP_COMMAND` for some other adapter), and only when a real key
 /// is actually found -- an operator with a ChatGPT-account-only login (no
 /// API key in the auth file) keeps today's behavior unchanged.
 fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<String> {
@@ -458,7 +537,11 @@ fn read_codex_api_key_from_auth_file() -> Option<String> {
     let path = std::env::var_os("ACPX_CODEX_AUTH_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex").join("auth.json"))
+            std::env::var_os("HOME").map(|home| {
+                std::path::PathBuf::from(home)
+                    .join(".codex")
+                    .join("auth.json")
+            })
         })?;
     let contents = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
@@ -538,7 +621,11 @@ mod tests {
                 .iter()
                 .map(|&key| (key, std::env::var(key).ok()))
                 .collect();
-            Self { _lock: lock, vars, temp_dir }
+            Self {
+                _lock: lock,
+                vars,
+                temp_dir,
+            }
         }
     }
 
@@ -597,8 +684,7 @@ mod tests {
         std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-test-key"}"#)
             .expect("write temp auth file");
 
-        let _guard =
-            EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
             std::env::remove_var("CODEX_API_KEY");
@@ -606,7 +692,10 @@ mod tests {
 
         let result = default_codex_native_auth_method(
             "npx",
-            &["-y".to_string(), "@agentclientprotocol/codex-acp@1.1.2".to_string()],
+            &[
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+            ],
         );
 
         assert_eq!(result.as_deref(), Some("api-key"));

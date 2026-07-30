@@ -78,7 +78,9 @@ async fn spawn_server_with_auth(router: SharedRouter, auth_token: Option<String>
 /// `JoinHandle` so a test can `.abort()` it -- simulating a real gateway
 /// process dying underneath a live connection, for the reconnect
 /// regression test below.
-async fn spawn_server_with_handle(router: SharedRouter) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn spawn_server_with_handle(
+    router: SharedRouter,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -443,7 +445,10 @@ done
         .call("session/new", serde_json::json!({"cwd": "/tmp"}), None)
         .await
         .expect("session/new");
-    let gateway_session_id = new_result["sessionId"].as_str().expect("sessionId").to_string();
+    let gateway_session_id = new_result["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
 
     let prompt_params = serde_json::json!({"sessionId": gateway_session_id, "prompt": []});
     let gateway_for_prompt = &gateway;
@@ -455,13 +460,11 @@ done
 
     let answer_task = async {
         loop {
-            let notification = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                notifications.recv(),
-            )
-            .await
-            .expect("agent request notification arrives promptly")
-            .expect("notification channel stays open");
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), notifications.recv())
+                    .await
+                    .expect("agent request notification arrives promptly")
+                    .expect("notification channel stays open");
             let Some(agent_request) = AgentRequest::from_notification(&notification) else {
                 continue;
             };
@@ -486,7 +489,10 @@ done
 
     let (prompt_result, _) = tokio::join!(prompt_task, answer_task);
     let prompt_result = prompt_result.expect("session/prompt");
-    assert_eq!(prompt_result["chosenOptionId"], serde_json::json!("allow-once"));
+    assert_eq!(
+        prompt_result["chosenOptionId"],
+        serde_json::json!("allow-once")
+    );
 }
 
 /// **acpx client + acpx daemon auth, end to end**: proves
@@ -569,7 +575,10 @@ async fn admin_client_uses_its_own_http_plane_for_enablement_and_custom_crud() {
         .await
         .expect("re-enable registry agent");
     assert!(reenabled.enabled);
-    let listed_agents = client.list_agents().await.expect("list_agents after re-enable");
+    let listed_agents = client
+        .list_agents()
+        .await
+        .expect("list_agents after re-enable");
     assert!(
         listed_agents
             .iter()

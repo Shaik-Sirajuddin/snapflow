@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,6 +25,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"snapshotd/internal/acpnode"
 )
 
 // AdminBind is the fixed loopback address acpx-server's admin plane binds
@@ -31,6 +35,8 @@ import (
 // (unlike panel-rust's own per-provider dev-fallback spawn path, which
 // does need a fresh port per instance).
 const AdminBind = "127.0.0.1:8791"
+
+const maxPortBumpAttempts = 100
 
 // Config drives spawn + generated provisioning file.
 type Config struct {
@@ -45,8 +51,8 @@ type Config struct {
 	// McpURL is the snapshotd Streamable HTTP MCP endpoint
 	// (e.g. http://127.0.0.1:7777/mcp).
 	McpURL string
-	// BackendCmd is optional ACPX_BACKEND_CMD.
-	BackendCmd string
+	// DefaultAcpCommand is optional ACPX_DEFAULT_ACP_COMMAND.
+	DefaultAcpCommand string
 	// DefaultAgentID is optional ACPX_DEFAULT_AGENT_ID (default "default").
 	DefaultAgentID string
 	// ExtraEnv is merged into the child environment.
@@ -66,7 +72,7 @@ type Manager struct {
 	err    error
 }
 
-// WriteConfig writes an ACPX provisioning JSON that registers snapshotd MCP
+// WriteConfig writes an ACPX provisioning JSON that registers the snapflow MCP
 // and a default profile that attaches it.
 func WriteConfig(path, mcpURL, agentID string) error {
 	if agentID == "" {
@@ -77,7 +83,7 @@ func WriteConfig(path, mcpURL, agentID string) error {
 		"mcp_servers": []any{
 			map[string]any{
 				"type":    "http",
-				"name":    "snapshotd",
+				"name":    "snapflow",
 				"url":     mcpURL,
 				"headers": []any{},
 			},
@@ -105,9 +111,9 @@ func WriteConfig(path, mcpURL, agentID string) error {
 				// This profile only exists to auto-attach the snapshotd
 				// MCP server; giving it a name that can never equal a
 				// real `agentID` value keeps it out of that lookup.
-				"name":        "snapshotd-mcp-attach",
+				"name":        "snapflow-mcp-attach",
 				"agent_id":    agentID,
-				"mcp_servers": []string{"snapshotd"},
+				"mcp_servers": []string{"snapflow"},
 			},
 		},
 	}
@@ -248,6 +254,22 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		// ever changes.
 		cfg.HttpBind = "127.0.0.1:8790"
 	}
+	// snapshotd-launch-fix: walk ports if preferred bind is occupied.
+	resolvedBind, err := nextAvailableTCPBind(cfg.HttpBind, maxPortBumpAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("acpxmgr: select HTTP bind: %w", err)
+	}
+	if resolvedBind != cfg.HttpBind {
+		log := cfg.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("acpx HTTP bind is occupied; using next available port",
+			"requested", cfg.HttpBind,
+			"selected", resolvedBind,
+		)
+		cfg.HttpBind = resolvedBind
+	}
 	if cfg.McpURL == "" {
 		return nil, fmt.Errorf("acpxmgr: empty McpURL")
 	}
@@ -291,7 +313,11 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	cmd.Cancel = func() error {
 		return killProcessGroup(cmd.Process.Pid, syscall.SIGTERM)
 	}
-	cmd.Env = append(os.Environ(),
+	// ACP Node/npm: global-first, then product-bundled official Node.
+	// When bundled wins, inject SNAPFLOW_ACP_NODE_HOME + PATH so
+	// agents/install and npx spawns use the same prefix.
+	cmd.Env = append(os.Environ(), acpnode.EnvForAcpx(acpnode.Resolve())...)
+	cmd.Env = append(cmd.Env,
 		"ACPX_CONFIG_FILE="+cfg.ConfigPath,
 		"ACPX_HTTP_BIND="+cfg.HttpBind,
 		// acpx-core's LifecycleConfig defaults (max_sessions_total: 128,
@@ -316,8 +342,8 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	if cfg.DbPath != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DB_PATH="+cfg.DbPath)
 	}
-	if cfg.BackendCmd != "" {
-		cmd.Env = append(cmd.Env, "ACPX_BACKEND_CMD="+cfg.BackendCmd)
+	if cfg.DefaultAcpCommand != "" {
+		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_ACP_COMMAND="+cfg.DefaultAcpCommand)
 	}
 	if cfg.DefaultAgentID != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_AGENT_ID="+cfg.DefaultAgentID)
@@ -456,4 +482,40 @@ func isExpectedExit(err error) bool {
 	return strings.Contains(s, "signal: killed") ||
 		strings.Contains(s, "signal: terminated") ||
 		strings.Contains(s, "context canceled")
+}
+
+// HTTPBind returns the address assigned to the managed acpx-server process
+// (may differ from the requested Config.HttpBind after port-bump).
+func (m *Manager) HTTPBind() string {
+	if m == nil {
+		return ""
+	}
+	return m.cfg.HttpBind
+}
+
+// nextAvailableTCPBind returns bind when free, otherwise tries higher ports.
+func nextAvailableTCPBind(bind string, attempts int) (string, error) {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(bind))
+	if err != nil {
+		return "", fmt.Errorf("invalid TCP bind %q: %w", bind, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid TCP port in %q", bind)
+	}
+	if attempts < 1 {
+		return "", fmt.Errorf("attempts must be positive")
+	}
+	for offset := 0; offset < attempts && port+offset <= 65535; offset++ {
+		candidate := net.JoinHostPort(host, strconv.Itoa(port+offset))
+		listener, err := net.Listen("tcp", candidate)
+		if err == nil {
+			_ = listener.Close()
+			return candidate, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("no available TCP port in %s through %d", bind, port+attempts-1)
 }

@@ -16,11 +16,6 @@ pub enum PersistenceError {
     #[error("persistence connection mutex was poisoned by a prior panic")]
     Poisoned,
 
-    #[error(
-        "unknown transcript direction {0:?} (expected \"client_to_agent\" or \"agent_to_client\")"
-    )]
-    InvalidDirection(String),
-
     #[error("no session found for gateway_session_id {0:?}")]
     SessionNotFound(String),
 

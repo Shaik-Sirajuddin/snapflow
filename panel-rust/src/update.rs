@@ -19,6 +19,7 @@ use crate::msg::{
     ChromeMsg, ComposeMsg, HostMsg, Msg, RequestMsg, SettingsMsg, SkillMsg, TerminalMsg, ThreadMsg,
     UiMsg,
 };
+use slint::Model as _;
 
 pub fn update(model: &mut Model, msg: Msg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
@@ -128,11 +129,29 @@ pub(crate) fn selected_real_index(model: &Model) -> Option<usize> {
         .copied()
 }
 
+// PROF-9 (`profile-only-backend-selection` plan): a thread's agent is
+// "usable" for the purposes of granting it NEW MCP capability -- i.e. not
+// ThreadState::Stale (PROF-7: agent_detected_for_profile came back false at
+// attach time) and not ThreadModel.unauthenticated (PROF-8: the backend's
+// initialize advertised auth methods and none is configured). Fails open
+// (returns true) when idx is out of range, matching the fail-open posture
+// of agent_detected_for_profile itself -- an unresolvable thread should
+// never block an action, only a positively-confirmed-bad one should.
+fn thread_agent_usable(model: &Model, idx: usize) -> bool {
+    let Some(thread) = model.threads.get(idx) else {
+        return true;
+    };
+    !matches!(thread.state, ThreadState::Stale) && !thread.unauthenticated
+}
+
 // setup-followups plan, archive_thread_backend_verify: pub(crate) so a
 // real-backend test can build the exact row shape production actually
 // produces, rather than hand-crafting a fixture that risks silently
 // drifting from what this function really outputs.
-pub(crate) fn format_relative_time(last_activity: Option<std::time::Instant>, state: &ThreadState) -> String {
+pub(crate) fn format_relative_time(
+    last_activity: Option<std::time::Instant>,
+    state: &ThreadState,
+) -> String {
     if matches!(state, ThreadState::Loading | ThreadState::Cancelling) {
         return "now".to_string();
     }
@@ -189,14 +208,17 @@ pub(crate) fn visible_thread_row(
         real_index,
         thread_id,
         session_id: thread.session_id.clone(),
+        // Not the external_snapshot collection path (this helper builds a
+        // single row from already-folded model state, used by e.g. the
+        // sidebar single-row refresh) -- no new agents/list read happens
+        // here, so no new detection info either.
+        agent_detected: None,
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
             relative_time: rel_time.into(),
             status: status.into(),
-            busy: matches!(
-                thread.state,
-                ThreadState::Loading | ThreadState::Cancelling
-            ) && !thread.closed
+            busy: matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                && !thread.closed
                 && !thread.archived,
             open: true,
             closed: thread.closed,
@@ -212,10 +234,7 @@ pub(crate) fn visible_thread_row(
                 .as_ref()
                 .map(|c| c.provider.clone())
                 .unwrap_or_default(),
-            model: cached
-                .as_ref()
-                .map(|c| c.model.clone())
-                .unwrap_or_default(),
+            model: cached.as_ref().map(|c| c.model.clone()).unwrap_or_default(),
             project_path: cached
                 .as_ref()
                 .map(|c| c.project_path.clone())
@@ -224,8 +243,22 @@ pub(crate) fn visible_thread_row(
                 .as_ref()
                 .map(|c| c.project_name.clone())
                 .unwrap_or_default(),
+            project_instance_live: cached
+                .as_ref()
+                .map(|c| c.project_instance_live)
+                .unwrap_or(false),
         },
     })
+}
+
+fn thread_row_dirty(model: &Model, real_index: usize) -> Dirty {
+    Dirty::ThreadRow {
+        thread_id: model
+            .threads
+            .get(real_index)
+            .map(|thread| thread.thread_id.clone())
+            .unwrap_or_default(),
+    }
 }
 
 fn thread_list_dirty_with_keys(model: &mut Model, old_keys: Vec<String>) -> Dirty {
@@ -256,14 +289,13 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
     let mut dirty = vec![Dirty::Scalar(ScalarField::SelectedThread)];
 
     if switched {
-        // Save outgoing draft; restore incoming draft into the active buffer.
+        // Leave A: snapshot list presentation (content + expand) before
+        // installing B — enables A→B→A expand restore without re-project.
         if let Some(prev) = prev_displayed {
+            snapshot_thread_list_ui_cache(model, prev);
             if let Some(thread) = model.threads.get_mut(prev) {
                 thread.compose_draft = std::mem::take(&mut model.compose_text);
             }
-        } else if !model.compose_text.is_empty() {
-            // No prior displayed thread but global compose has text — keep
-            // it on the newly selected thread only after switch.
         }
         model.compose_text = real_idx
             .and_then(|idx| model.threads.get(idx))
@@ -271,34 +303,82 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
             .unwrap_or_default();
         dirty.push(Dirty::Scalar(ScalarField::ComposeText));
 
-        // Force next selected_thread_snapshot to treat this as a switch
-        // (resync messages/terminals/pending even if target cache is empty).
-        model.displayed_thread = None;
+        // Atomic ownership: displayed + shared list become B in this same
+        // sync turn (no multi-frame window where selection is B and list is A).
+        model.displayed_thread = Some(real_idx);
 
-        let old_msg_keys = model.message_model_keys.borrow().clone();
-        if !old_msg_keys.is_empty() {
-            dirty.push(Dirty::MessagesDiff {
-                thread_id: String::new(),
-                ops: crate::dirty::diff_by_id(
-                    &old_msg_keys,
-                    &[],
-                    &Vec::<crate::MessageItem>::new(),
-                ),
-            });
+        // Prefer leave/return cache for B when present; else ThreadModel rows.
+        let target_id = model
+            .threads
+            .get(real_idx)
+            .map(|t| t.thread_id.clone())
+            .unwrap_or_default();
+        if !target_id.is_empty() {
+            if let Some(cache) = model.list_ui_cache.get(&target_id).cloned() {
+                if let Some(thread) = model.threads.get_mut(real_idx) {
+                    // Restore presentation snapshot; frame hydrate may refresh
+                    // content if transcript advanced in background.
+                    thread.transcript_keys = cache.keys;
+                    thread.message_rows = cache.rows;
+                    thread.message_ids = thread
+                        .transcript_keys
+                        .iter()
+                        .filter_map(|key| key.split_once(':').map(|(_, id)| id.to_owned()))
+                        .collect();
+                }
+            }
         }
+
+        model.expanded = model
+            .threads
+            .get(real_idx)
+            .map(|t| t.message_rows.iter().map(|r| r.expanded).collect())
+            .unwrap_or_default();
+        model.list_owner_thread_id = if target_id.is_empty() {
+            None
+        } else {
+            Some(target_id.clone())
+        };
+        model.list_gen = model.list_gen.wrapping_add(1);
+
+        dirty.push(Dirty::MessageListInstall {
+            thread_id: target_id.clone(),
+        });
+
+        // Sibling panes: clear-then-frame-fill for pending/error/terminals
+        // (same isolation class as messages; frame re-hydrates B).
         dirty.push(Dirty::PendingRequest {
-            thread_id: String::new(),
+            thread_id: target_id.clone(),
         });
         dirty.push(Dirty::Error {
-            thread_id: String::new(),
+            thread_id: target_id.clone(),
             detail: crate::dirty::ErrorDetail {
-                message: String::new(),
+                message: model
+                    .threads
+                    .get(real_idx)
+                    .and_then(|t| t.error.clone())
+                    .unwrap_or_default(),
             },
         });
         dirty.push(Dirty::Terminal {
-            id: String::new(),
+            id: model
+                .threads
+                .get(real_idx)
+                .and_then(|t| t.expanded_terminal.as_ref())
+                .map(|t| t.terminal_id.to_string())
+                .unwrap_or_default(),
         });
         dirty.push(Dirty::LocalTerminal);
+        dirty.push(Dirty::Connection {
+            thread_id: target_id,
+        });
+        dirty.push(Dirty::Capabilities {
+            thread_id: model
+                .threads
+                .get(real_idx)
+                .and_then(|t| t.session_id.clone())
+                .unwrap_or_default(),
+        });
     }
 
     let thread_id = real_idx
@@ -312,42 +392,101 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
     )
 }
 
+/// Snapshot the currently displayed list into `list_ui_cache[thread_id]`.
+fn snapshot_thread_list_ui_cache(model: &mut Model, real_idx: usize) {
+    let Some(thread) = model.threads.get(real_idx) else {
+        return;
+    };
+    let thread_id = thread.thread_id.clone();
+    if thread_id.is_empty() {
+        return;
+    }
+    // Prefer live shared model (what user actually sees) over ThreadModel
+    // when this thread owns the list; fall back to ThreadModel rows.
+    let (keys, rows) = if model.list_owner_thread_id.as_deref() == Some(thread_id.as_str())
+        || model.displayed_thread == Some(real_idx)
+    {
+        let keys = model.message_model_keys.borrow().clone();
+        let mut rows = Vec::with_capacity(model.messages_model.row_count());
+        for i in 0..model.messages_model.row_count() {
+            if let Some(row) = model.messages_model.row_data(i) {
+                rows.push(row);
+            }
+        }
+        if rows.is_empty() && !thread.message_rows.is_empty() {
+            (thread.transcript_keys.clone(), thread.message_rows.clone())
+        } else {
+            (keys, rows)
+        }
+    } else {
+        (thread.transcript_keys.clone(), thread.message_rows.clone())
+    };
+    // Keep ThreadModel.message_rows in sync with what we cached so return
+    // install and background patch share one presentation store.
+    if let Some(thread) = model.threads.get_mut(real_idx) {
+        if !rows.is_empty() || keys.is_empty() {
+            thread.transcript_keys = keys.clone();
+            thread.message_rows = rows.clone();
+        }
+    }
+    let gen = model.list_gen;
+    model.list_ui_cache.insert(
+        thread_id,
+        crate::model::ThreadListUiCache { keys, rows, gen },
+    );
+}
+
+/// Re-apply expand flags from prior rows by transcript key after a re-project.
+fn merge_expanded_by_key(
+    old_keys: &[String],
+    old_rows: &[crate::MessageItem],
+    new_keys: &[String],
+    new_rows: &mut [crate::MessageItem],
+) {
+    let mut prior: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    for (key, row) in old_keys.iter().zip(old_rows.iter()) {
+        prior.insert(key.as_str(), row.expanded);
+    }
+    for (key, row) in new_keys.iter().zip(new_rows.iter_mut()) {
+        if let Some(expanded) = prior.get(key.as_str()) {
+            row.expanded = *expanded;
+        }
+    }
+}
+
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
         ThreadMsg::New => {
+            // The panel-level ACPX gateway can create an unscoped deferred
+            // thread before any project is open. Project identity remains
+            // optional metadata and is never inferred from process cwd.
             let old_keys = current_visible_keys(model);
             model.compose_text.clear();
             model.search_query.clear();
             let real_index = model.threads.len();
             let thread_id = format!("thread:{real_index}");
             let display_name = format!("New thread {}", real_index + 1);
-            // Auto-detected by family rather than an enumerated literal
-            // list: `gateway_urls`/`spawn_gateway_process` only ever
-            // recognize two provider keys today ("codex"/"claude" --
-            // see AgentBridge's constructor, which resolves exactly
-            // these two), so any agent id naming the claude family (the
-            // short label "claude" this reducer's own gateway wiring
-            // uses elsewhere, the real registry id "claude-acp", a
-            // hypothetical "claude-code", ...) maps to it; anything else
-            // defaults to codex, same as before. Found live via a real
-            // settings.global.json with default_agent_id: "claude-acp"
-            // (plausibly persisted by a picker backed by the agent
-            // catalog's real registry ids, not the short label), which
-            // an exact-match list previously silently routed to codex.
-            let provider = if model
-                .default_agent_id
-                .to_ascii_lowercase()
-                .contains("claude")
-            {
-                "claude"
+            // PROF-1/PROF-2: the agent id flows through as-is now, same
+            // as `AgentBridge::resolve_provider_for` -- no more collapsing
+            // every id down to "codex"/"claude" by a `contains("claude")`
+            // guess (the exact `normalize_provider` shape PROF-1 deleted
+            // from agent_bridge.rs, just reimplemented independently here
+            // and missed in that pass: a real third agent id such as
+            // "gemini-acp" would still have been forced onto "codex" at
+            // this call site even after agent_bridge.rs itself stopped
+            // normalizing). `model.default_agent_id` is used directly when
+            // set; the same documented last-resort fallback
+            // (`NO_PROVIDER_REQUESTED_FALLBACK`) applies when nothing is
+            // configured at all, never an index/contains-based guess.
+            let provider = if model.default_agent_id.is_empty() {
+                crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned()
             } else {
-                "codex"
-            }
-            .to_owned();
+                model.default_agent_id.clone()
+            };
             // The literal string "default" is a reserved sentinel, never a
             // real profile name -- see settings_file.rs's
             // non_default_sentinel and acpxmgr.go's WriteConfig doc
-            // comment (the "snapshotd-mcp-attach" profile's own agent_id
+            // comment (the "snapflow-mcp-attach" profile's own agent_id
             // is deliberately the placeholder "default", which no real
             // backend is ever registered under). That fix only guards
             // settings loaded from disk into the panel; a raw
@@ -358,9 +497,27 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             // on `session/new` and makes acpx-server try to dial a
             // nonexistent "default" agent forever ("agent default is in
             // crash backoff"). Guard at the point of use too.
+            //
+            // PROF-2: when no named profile is configured, fall back to
+            // `default_agent_id` as the profile name -- acpx's own
+            // `Router::ensure_default_profiles_seeded` auto-fills exactly
+            // one profile per installed registry agent, named after that
+            // agent's own id (`profile.name == agent.id`), specifically so
+            // `_acpx.profile` never requires setup for the common case
+            // (acpx-core/src/profile.rs's `ProfileSource` doc comment).
+            // Without this, a thread with a real `default_agent_id` but no
+            // hand-picked profile silently fell all the way through to
+            // acpx-server's own native/unmanaged-mode default backend
+            // (config.rs's bare `ACPX_BACKEND_CMD` fallback) instead of
+            // the agent the user actually configured -- the "profile name
+            // -> _acpx.profile" wiring the compose picker itself already
+            // relies on, just never reached for the auto-picked case.
             let profile_name = (!model.default_profile.is_empty()
                 && model.default_profile != "default")
-                .then(|| model.default_profile.clone());
+                .then(|| model.default_profile.clone())
+                .or_else(|| {
+                    (!model.default_agent_id.is_empty()).then(|| model.default_agent_id.clone())
+                });
             let permission_profile = (!model.permission_profile.is_empty()
                 && model.permission_profile != "default")
                 .then(|| model.permission_profile.clone());
@@ -373,6 +530,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
+            model.rebuild_thread_indices();
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             // PUI-014: create the thread DEFERRED -- no ACP session opens until
             // the first message is sent, so the provider/profile picker stays
@@ -400,6 +558,12 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             session_id,
             thread_id,
         } => {
+            // A deferred New request can complete after the host closes the
+            // project. Never materialize that late result into an unscoped
+            // thread or let it start an ACP session against process cwd.
+            if matches!(model.active_project, crate::model::ProjectIdentity::None) {
+                return (vec![], vec![]);
+            }
             let old_keys = current_visible_keys(model);
             model.compose_text.clear();
             model.search_query.clear();
@@ -417,6 +581,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
+            model.rebuild_thread_indices();
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             (
                 vec![],
@@ -464,7 +629,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             }
             (
                 vec![Effect::CloseThread { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
+                vec![thread_row_dirty(model, idx)],
             )
         }
         ThreadMsg::DeleteRequested(idx) => {
@@ -491,8 +656,11 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             // thread (sidebar's archived rows wire it as Resume).
             let now_archived = !thread.archived;
             thread.archived = now_archived;
-            let mut effects = vec![Effect::ArchiveThread { real_index: idx, archived: now_archived }];
-            let mut dirty = vec![Dirty::ThreadRow(idx)];
+            let mut effects = vec![Effect::ArchiveThread {
+                real_index: idx,
+                archived: now_archived,
+            }];
+            let mut dirty = vec![thread_row_dirty(model, idx)];
             // Phase 19 pool cap: at most ARCHIVE_POOL_CAP archived
             // threads; beyond it the OLDEST archived thread is quietly
             // dropped -- permanent delete via the existing delete flow
@@ -521,8 +689,10 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                         if let Some(oldest) = model.threads.get_mut(drop_idx) {
                             oldest.closed = true;
                         }
-                        effects.push(Effect::DeleteThread { real_index: drop_idx });
-                        dirty.push(Dirty::ThreadRow(drop_idx));
+                        effects.push(Effect::DeleteThread {
+                            real_index: drop_idx,
+                        });
+                        dirty.push(thread_row_dirty(model, drop_idx));
                     }
                 }
             }
@@ -549,7 +719,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             }
             (
                 vec![Effect::ToggleBackground { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
+                vec![thread_row_dirty(model, idx)],
             )
         }
         ThreadMsg::RecoverSessionAttach {
@@ -560,8 +730,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
         } => {
             let old_keys = current_visible_keys(model);
             model.search_query.clear();
-            let thread_id =
-                thread_id.unwrap_or_else(|| format!("thread:{}", model.threads.len()));
+            let thread_id = thread_id.unwrap_or_else(|| format!("thread:{}", model.threads.len()));
             model.threads.push(ThreadModel {
                 thread_id: thread_id.clone(),
                 display_name: title,
@@ -570,6 +739,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
+            model.rebuild_thread_indices();
             let at = model.threads.len() - 1;
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             (
@@ -587,20 +757,14 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
 
 /// Rebuild transcript + send-queue projection after a queue mutation and
 /// emit the matching `MessagesDiff` dirty set.
-fn rebuild_send_queue_projection(
-    model: &mut Model,
-    idx: usize,
-) -> (String, Vec<Dirty>) {
+fn rebuild_send_queue_projection(model: &mut Model, idx: usize) -> (String, Vec<Dirty>) {
     let expanded = model.expanded.clone();
     let Some(thread) = model.threads.get_mut(idx) else {
         return (String::new(), vec![]);
     };
     let thread_id = thread.thread_id.clone();
     let old_keys = thread.transcript_keys.clone();
-    let in_flight = matches!(
-        thread.state,
-        ThreadState::Loading | ThreadState::Cancelling
-    );
+    let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
     let (rows, keys) = crate::models::message_rows_for_thread_with_state(
         thread.transcript.clone(),
         &expanded,
@@ -613,11 +777,8 @@ fn rebuild_send_queue_projection(
     (
         thread_id.clone(),
         vec![
-            Dirty::ThreadRow(idx),
-            Dirty::MessagesDiff {
-                thread_id,
-                ops,
-            },
+            thread_row_dirty(model, idx),
+            Dirty::MessagesDiff { thread_id, ops },
         ],
     )
 }
@@ -674,10 +835,8 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         // QueuedMessageBar appears immediately.
                         let expanded = model.expanded.clone();
                         let old_keys = thread.transcript_keys.clone();
-                        let in_flight = matches!(
-                            thread.state,
-                            ThreadState::Loading | ThreadState::Cancelling
-                        );
+                        let in_flight =
+                            matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
                         let (rows, keys) = crate::models::message_rows_for_thread_with_state(
                             thread.transcript.clone(),
                             &expanded,
@@ -690,7 +849,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         (
                             vec![],
                             vec![
-                                Dirty::ThreadRow(idx),
+                                thread_row_dirty(model, idx),
                                 Dirty::Scalar(ScalarField::ComposeText),
                                 Dirty::MessagesDiff {
                                     thread_id: thread_id.clone(),
@@ -724,7 +883,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.send_queue.resume();
             (
                 vec![Effect::SendPrompt {
-                    real_index: idx,
+                    thread_id: thread_id.clone(),
                     text,
                 }],
                 vec![
@@ -735,7 +894,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     // rebuild -- "loading should start immediately on
                     // send" was true in `model.threads[idx].state` above,
                     // just not yet visible.
-                    Dirty::ThreadRow(idx),
+                    thread_row_dirty(model, idx),
                     Dirty::Connection { thread_id },
                     Dirty::Scalar(ScalarField::ComposeText),
                 ],
@@ -751,7 +910,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.state = ThreadState::Cancelling;
             (
                 vec![Effect::CancelGeneration { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
+                vec![thread_row_dirty(model, idx)],
             )
         }
         ComposeMsg::GenerationStopped => {
@@ -759,7 +918,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 return (vec![], vec![]);
             };
             thread.state = ThreadState::Idle;
-            (vec![], vec![Dirty::ThreadRow(idx)])
+            (vec![], vec![thread_row_dirty(model, idx)])
         }
         ComposeMsg::QueueCancel { message_index } => {
             let entry_id = {
@@ -849,10 +1008,8 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 let Some(entry_id) = queue_entry_id_at(thread, message_index) else {
                     return (vec![], vec![]);
                 };
-                let is_generating = matches!(
-                    thread.state,
-                    ThreadState::Loading | ThreadState::Cancelling
-                );
+                let is_generating =
+                    matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
                 (entry_id, is_generating)
             };
             let send_now_result = {
@@ -870,7 +1027,9 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
-                    dirty.push(Dirty::Connection { thread_id });
+                    dirty.push(Dirty::Connection {
+                        thread_id: thread_id.clone(),
+                    });
                     let mut effects = Vec::with_capacity(2);
                     if is_generating {
                         // A turn is already in flight -- cancel it. The
@@ -882,11 +1041,70 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         effects.push(Effect::CancelGeneration { real_index: idx });
                     }
                     effects.push(Effect::SendPrompt {
-                        real_index: idx,
+                        thread_id: thread_id.clone(),
                         text: entry.text,
                     });
                     (effects, dirty)
                 }
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
+        }
+        ComposeMsg::QueueFastTrack => {
+            let is_generating = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+            };
+            let fast_track_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.try_fast_track(is_generating)
+            };
+            match fast_track_result {
+                Ok(Some(entry)) => {
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = None;
+                    thread.state = ThreadState::Loading;
+                    let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
+                    dirty.push(Dirty::Connection {
+                        thread_id: thread_id.clone(),
+                    });
+                    let mut effects = Vec::with_capacity(2);
+                    if is_generating {
+                        // Same AbsorbingCancel handoff as QueueSendNow --
+                        // try_fast_track already armed it above.
+                        effects.push(Effect::CancelGeneration { real_index: idx });
+                    }
+                    effects.push(Effect::SendPrompt {
+                        thread_id: thread_id.clone(),
+                        text: entry.text,
+                    });
+                    (effects, dirty)
+                }
+                // Safe no-op: no can_fast_track-eligible entry (queue
+                // empty, or the last mutation wasn't a fresh enqueue) --
+                // the Slint side fires this unconditionally on empty-
+                // compose Return, so this is the expected common case.
                 Ok(None) => (vec![], vec![]),
                 Err(error) => {
                     let message = error.to_string();
@@ -1011,7 +1229,10 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
                     model.expanded_terminal_id = model
                         .open_terminal_ids
                         .get(pos)
-                        .or_else(|| pos.checked_sub(1).and_then(|prev| model.open_terminal_ids.get(prev)))
+                        .or_else(|| {
+                            pos.checked_sub(1)
+                                .and_then(|prev| model.open_terminal_ids.get(prev))
+                        })
                         .cloned();
                 }
             }
@@ -1132,9 +1353,25 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 vec![Dirty::Settings],
             )
         }
-        SettingsMsg::ProfileSelected(profile_name) => {
+        SettingsMsg::ProfileSelected {
+            profile_name,
+            agent_id,
+        } => {
             let Some(idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
+            };
+            // Resolve agent_id before mutably borrowing the thread (may need
+            // available_profiles if UI only sent the profile name).
+            let resolved_agent = if !agent_id.is_empty() {
+                agent_id
+            } else {
+                model
+                    .available_profiles
+                    .iter()
+                    .find(|p| p.name == profile_name)
+                    .map(|p| p.agent_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_default()
             };
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
@@ -1147,24 +1384,58 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             // itself on the very next Dirty::ThreadRow either way. No
             // Effect (unlike ModeSelected/ConfigOptionSelected): nothing
             // to tell the backend yet, since there's no session to send
-            // it to -- open_session_maybe_profiled reads this straight
-            // from the model once the thread actually opens.
+            // it to -- attach_deferred_thread / open_session_maybe_profiled
+            // read provider + profile_name from the model at first send.
             if thread.session_id.is_some() {
                 return (vec![], vec![]);
             }
             thread.profile_name = Some(profile_name);
-            (vec![], vec![Dirty::ThreadRow(idx), Dirty::Capabilities {
-                thread_id: thread.thread_id.clone(),
-            }])
+            // Critical: deferred attach uses thread.provider (agent id), not
+            // profile_name. Leaving provider at create-time default made the
+            // Provider picker a pure cosmetic change (always opened default
+            // agent with profile as a secondary ACPX name).
+            if !resolved_agent.is_empty() {
+                thread.provider = resolved_agent;
+            }
+            let thread_id = thread.thread_id.clone();
+            (
+                vec![],
+                vec![
+                    Dirty::ThreadRow {
+                        thread_id: thread_id.clone(),
+                    },
+                    Dirty::Capabilities { thread_id },
+                ],
+            )
         }
         SettingsMsg::DevModeToggled(enabled) => {
             model.dev_mode = enabled;
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
         }
+        // PROF-9 (`profile-only-backend-selection` plan): block MCP-server
+        // actions that would make NEW capabilities available to an agent
+        // that cannot serve them (create, or turning something on) when
+        // the selected thread's agent is Stale (PROF-7) or unauthenticated
+        // (PROF-8) -- so the user cannot drive MCP against an agent that
+        // cannot serve it. Deliberately NOT blocked: delete (cleanup must
+        // always be reachable, especially precisely when something is
+        // broken), turning something OFF (same reasoning), and
+        // authenticate (that flow is the MCP SERVER's own credentials --
+        // orthogonal to whether the ACP AGENT itself is reachable/
+        // authenticated, and blocking it here would trap a user trying to
+        // fix the MCP side first).
         SettingsMsg::McpServerCreate { name, command } => {
             let Some(idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
             };
+            if !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't add an MCP server: this thread's agent is stale or unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
             (
                 vec![Effect::McpServerCreate {
                     real_index: idx,
@@ -1190,6 +1461,15 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             let Some(idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
             };
+            if enabled && !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't enable this MCP server: this thread's agent is stale or \
+                     unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
             (
                 vec![Effect::McpServerEnabledChanged {
                     real_index: idx,
@@ -1219,6 +1499,14 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             let Some(idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
             };
+            if enabled && !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't enable this tool: this thread's agent is stale or unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
             (
                 vec![Effect::McpServerToolEnabledChanged {
                     real_index: idx,
@@ -1375,31 +1663,39 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
             let Some(real_idx) = model.displayed_thread else {
                 return (vec![], vec![]);
             };
+            if model.expanded.len() <= index {
+                // Grow from row state if needed.
+                let n = model
+                    .threads
+                    .get(real_idx)
+                    .map(|t| t.message_rows.len())
+                    .unwrap_or(0);
+                model.expanded.resize(n.max(index + 1), false);
+            }
             let Some(slot) = model.expanded.get_mut(index) else {
                 return (vec![], vec![]);
             };
             *slot = !*slot;
+            let expanded = *slot;
             let Some(thread) = model.threads.get_mut(real_idx) else {
                 return (vec![], vec![]);
             };
-            let old_keys = thread.transcript_keys.clone();
-            let rows = crate::models::to_message_rows_from_transcript(
-                thread.transcript.clone(),
-                &model.expanded,
-            );
-            thread.message_rows = rows.clone();
-            (
-                vec![],
-                vec![Dirty::MessagesDiff {
-                    thread_id: thread.thread_id.clone(),
-                    ops: crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &rows),
-                }],
-            )
+            // One-row only: do not re-project the whole transcript.
+            if let Some(row) = thread.message_rows.get_mut(index) {
+                row.expanded = expanded;
+            } else {
+                return (vec![], vec![]);
+            }
+            let thread_id = thread.thread_id.clone();
+            // Keep leave/return cache coherent while still on this thread.
+            if let Some(cache) = model.list_ui_cache.get_mut(&thread_id) {
+                if let Some(row) = cache.rows.get_mut(index) {
+                    row.expanded = expanded;
+                }
+            }
+            (vec![], vec![Dirty::MessageRowPatch { thread_id, index }])
         }
-        ChromeMsg::CopyMessageRequested { text } => (
-            vec![Effect::ClipboardWrite { text }],
-            vec![],
-        ),
+        ChromeMsg::CopyMessageRequested { text } => (vec![Effect::ClipboardWrite { text }], vec![]),
         ChromeMsg::ErrorBannerDismissed => {
             let Some(real_idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
@@ -1412,7 +1708,7 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
             (
                 vec![],
                 vec![
-                    Dirty::ThreadRow(real_idx),
+                    thread_row_dirty(model, real_idx),
                     Dirty::Error {
                         thread_id,
                         detail: ErrorDetail {
@@ -1454,10 +1750,105 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             };
             (vec![], vec![Dirty::Theme])
         }
+        HostMsg::LanguageChanged(language) => {
+            model.language = language;
+            (vec![], vec![Dirty::Language])
+        }
         HostMsg::ProjectPathChanged(path) => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = if model.active_project_path.is_some() {
+                "switched"
+            } else if path.is_some() {
+                "opened"
+            } else {
+                "closed"
+            }
+            .to_owned();
+            model.active_project = path
+                .clone()
+                .map(crate::model::ProjectIdentity::Saved)
+                .unwrap_or_default();
             model.active_project_path = path.clone();
             (
                 vec![Effect::SetActiveProjectPath { path }],
+                vec![Dirty::ProjectPath, Dirty::SkillsListDiff(vec![])],
+            )
+        }
+        HostMsg::ProjectCreatedUntitled => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = "created_untitled".to_owned();
+            let id = uuid::Uuid::new_v4().to_string();
+            model.active_project = crate::model::ProjectIdentity::Untitled(id);
+            model.active_project_path = None;
+            (
+                vec![Effect::SetActiveProjectPath { path: None }],
+                vec![Dirty::ProjectPath, Dirty::SkillsListDiff(vec![])],
+            )
+        }
+        HostMsg::ProjectClosed => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = "closed".to_owned();
+            let old_keys = model.message_model_keys.borrow().clone();
+            model.displayed_thread = None;
+            model.list_owner_thread_id = None;
+            model.active_project = crate::model::ProjectIdentity::None;
+            model.active_project_path = None;
+            let clear =
+                crate::dirty::diff_by_id(&old_keys, &[] as &[String], &[] as &[crate::MessageItem]);
+            (
+                vec![Effect::SetActiveProjectPath { path: None }],
+                vec![
+                    Dirty::ProjectPath,
+                    Dirty::MessagesDiff {
+                        thread_id: String::new(),
+                        ops: clear,
+                    },
+                    Dirty::PendingRequest {
+                        thread_id: String::new(),
+                    },
+                    Dirty::Terminal { id: String::new() },
+                    Dirty::LocalTerminal,
+                    Dirty::SkillsListDiff(vec![]),
+                ],
+            )
+        }
+        HostMsg::ProjectPathRenamed { old, new } => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = "saved_as".to_owned();
+            let old_identity = model.active_project.clone();
+            // PISO-7: this is a SEPARATE branch from ProjectPathChanged
+            // above, by design -- rebinding on a bare active-path change
+            // would be unable to tell "Save-As A -> B" apart from "close
+            // A, open B" and would merge two real projects' thread
+            // histories. Only this explicit signal, which the host emits
+            // exclusively for an actual rename, may issue the rebind
+            // effect below.
+            let new_path = (!new.is_empty()).then(|| new.clone());
+            model.active_project = new_path
+                .clone()
+                .map(crate::model::ProjectIdentity::Saved)
+                .unwrap_or_default();
+            model.active_project_path = new_path.clone();
+            let mut effects = vec![Effect::SetActiveProjectPath { path: new_path }];
+            if !old.is_empty() && !new.is_empty() {
+                effects.push(Effect::RenameProjectAssociation {
+                    old,
+                    new,
+                    old_identity,
+                });
+            } else if old.is_empty() && !new.is_empty() {
+                // First Save is a real staging-store migration. The
+                // untitled identity is captured before the model changes to
+                // Saved(new), so the effect can move the correct UUID store
+                // and rebind its previously unscoped thread rows.
+                effects.push(Effect::RenameProjectAssociation {
+                    old,
+                    new,
+                    old_identity,
+                });
+            }
+            (
+                effects,
                 vec![Dirty::ProjectPath, Dirty::SkillsListDiff(vec![])],
             )
         }
@@ -1470,47 +1861,34 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         EffectResultMsg::InitialStateLoaded(Ok(initial)) => {
             // Replacing application state on cold start must not replace the
             // persistent Slint models. Their identity belongs to the panel
-            // lifetime, not to one hydration result.
-            let thread_model = model.thread_model.clone();
-            let messages_model = model.messages_model.clone();
-            let skills_model = model.skills_model.clone();
-            let profiles_model = model.profiles_model.clone();
-            let mcp_servers_model = model.mcp_servers_model.clone();
-            let agent_catalog_model = model.agent_catalog_model.clone();
-            let recoverable_sessions_model = model.recoverable_sessions_model.clone();
-            let terminals_model = model.terminals_model.clone();
-            let thread_keys = model.thread_model_keys.borrow().clone();
-            let message_keys = model.message_model_keys.borrow().clone();
-            let skill_keys = model.skill_model_keys.borrow().clone();
-            let profile_keys = model.profile_model_keys.borrow().clone();
-            let mcp_server_keys = model.mcp_server_model_keys.borrow().clone();
-            let agent_catalog_keys = model.agent_catalog_model_keys.borrow().clone();
-            let recoverable_session_keys = model.recoverable_session_model_keys.borrow().clone();
-            let terminal_keys = model.terminal_model_keys.borrow().clone();
+            // lifetime, not to one hydration result. The inventory lives in
+            // Model::persistent_models/restore_persistent_models so new
+            // model/key-cache pairs have one preservation list to update.
+            let persistent = model.persistent_models();
+            let thread_keys = persistent.thread_model_keys.clone();
             let startup_warnings = initial.startup_warnings.clone();
+            // InitialState is storage/bridge hydration and intentionally does
+            // not own the host lifecycle identity. Preserve the identity that
+            // was bound before hydration instead of letting Model::default()
+            // erase it during the wholesale reducer replacement.
+            let active_project = model.active_project.clone();
+            let active_project_path = model.active_project_path.clone();
             *model = Model::from_initial_state(initial);
-            model.thread_model = thread_model;
-            model.messages_model = messages_model;
-            model.skills_model = skills_model;
-            model.profiles_model = profiles_model;
-            model.mcp_servers_model = mcp_servers_model;
-            model.agent_catalog_model = agent_catalog_model;
-            model.recoverable_sessions_model = recoverable_sessions_model;
-            model.terminals_model = terminals_model;
-            *model.thread_model_keys.borrow_mut() = thread_keys.clone();
-            *model.message_model_keys.borrow_mut() = message_keys;
-            *model.skill_model_keys.borrow_mut() = skill_keys;
-            *model.profile_model_keys.borrow_mut() = profile_keys;
-            *model.mcp_server_model_keys.borrow_mut() = mcp_server_keys;
-            *model.agent_catalog_model_keys.borrow_mut() = agent_catalog_keys;
-            *model.recoverable_session_model_keys.borrow_mut() = recoverable_session_keys;
-            *model.terminal_model_keys.borrow_mut() = terminal_keys;
+            model.active_project = active_project;
+            model.active_project_path = active_project_path;
+            model.restore_persistent_models(persistent);
             let thread_list_dirty = thread_list_dirty_with_keys(model, thread_keys);
             // Cold start: everything is dirty, there is no prior row
             // identity to preserve (see 00-plan.md's known-gap section).
             let mut dirty = vec![
                 thread_list_dirty,
                 Dirty::Scalar(ScalarField::SelectedThread),
+                // The identity is installed before hydration, but the root
+                // Slint property is projection-owned. Without this marker a
+                // valid initial project remained visually "no project" and
+                // disabled the composer/New-thread controls until a later
+                // host lifecycle event.
+                Dirty::ProjectPath,
             ];
             // Non-fatal cold-start failures (settings load, panel-defaults
             // sync, thread-record restoration, ...) previously only
@@ -1533,7 +1911,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             }],
         ),
         EffectResultMsg::ThreadPersisted { real_index, result } => match result {
-            Ok(()) => (vec![], vec![Dirty::ThreadRow(real_index)]),
+            Ok(()) => (vec![], vec![thread_row_dirty(model, real_index)]),
             Err(err) => (
                 vec![],
                 vec![Dirty::Error {
@@ -1588,9 +1966,10 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     if let Some(provider) = provider {
                         thread.provider = provider;
                     }
+                    model.rebuild_thread_indices();
                     (
                         vec![Effect::PersistThread { real_index }],
-                        vec![Dirty::ThreadRow(real_index)],
+                        vec![thread_row_dirty(model, real_index)],
                     )
                 }
                 Err(err) => (
@@ -1660,7 +2039,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         }
         EffectResultMsg::SkillWritten(Err(err)) => {
             model.skill_saving = false;
-            let toast = show_toast(model, "error", format!("Skill save failed: {}", err.message));
+            let toast = show_toast(
+                model,
+                "error",
+                format!("Skill save failed: {}", err.message),
+            );
             (
                 vec![],
                 vec![
@@ -1704,18 +2087,10 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             // Stale-target no-op: either the thread was closed/deleted or
             // the message row was removed while the stream was in flight.
             // Resolve both identities before producing a Dirty marker.
-            let thread_exists = model
-                .threads
-                .iter()
-                .any(|thread| Model::thread_matches_id(thread, &thread_id));
-            if !thread_exists {
+            let Some(target_index) = model.thread_index_for_id(&thread_id) else {
                 return (vec![], vec![]);
-            }
-            let Some(thread) = model
-                .threads
-                .iter_mut()
-                .find(|thread| Model::thread_matches_id(thread, &thread_id))
-            else {
+            };
+            let Some(thread) = model.threads.get_mut(target_index) else {
                 return (vec![], vec![]);
             };
             if !thread.message_ids.iter().any(|id| id == &message_id) {
@@ -1766,16 +2141,30 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     )
                 }
                 Err(err) => {
+                    // Attachment/send failure must leave Loading and refresh
+                    // the send/stop control. Dirty::Error alone only updates
+                    // the banner; without ThreadRow/Connection the chat input
+                    // stays stuck on "Stop response" forever (found live in
+                    // full GUI matrix: open_session WebSocket failure → send
+                    // requested → no prompt → Stop never clears).
                     thread.state = ThreadState::Error;
                     thread.error = Some(err.message.clone());
                     (
                         vec![],
-                        vec![Dirty::Error {
-                            thread_id: thread.thread_id.clone(),
-                            detail: ErrorDetail {
-                                message: err.message,
+                        vec![
+                            Dirty::Error {
+                                thread_id: thread.thread_id.clone(),
+                                detail: ErrorDetail {
+                                    message: err.message,
+                                },
                             },
-                        }],
+                            Dirty::ThreadRow {
+                                thread_id: thread.thread_id.clone(),
+                            },
+                            Dirty::Connection {
+                                thread_id: thread.thread_id.clone(),
+                            },
+                        ],
                     )
                 }
             }
@@ -1785,7 +2174,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             (vec![], vec![Dirty::Settings, toast])
         }
         EffectResultMsg::SettingsSaved(Err(err)) => {
-            let toast = show_toast(model, "error", format!("Settings save failed: {}", err.message));
+            let toast = show_toast(
+                model,
+                "error",
+                format!("Settings save failed: {}", err.message),
+            );
             (
                 vec![],
                 vec![
@@ -1824,6 +2217,21 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 }],
             ),
         },
+        EffectResultMsg::DaemonProjectInstancesLoaded(result) => {
+            // Best-effort background poll (PISO-8) -- a miss (daemon not
+            // running, `snapshotd` binary missing, malformed output, ...)
+            // leaves the previously cached instances in place rather than
+            // clearing a real signal or surfacing a toast/error for a
+            // background poll the user never triggered and cannot act
+            // on. No `Dirty` needed either way: the very next frame's
+            // `ThreadListSnapshot` collection already reads `model.
+            // live_daemon_projects` fresh and its own row-content diff
+            // (`update_frame`'s `changed` check) picks up the change.
+            if let Ok(instances) = result {
+                model.live_daemon_projects = instances;
+            }
+            (vec![], vec![])
+        }
     }
 }
 
@@ -1831,17 +2239,19 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
     for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
-        let target_index = frame
+        let Some(target_index) = frame
             .bridge_event_thread_ids
             .get(event_index)
             .filter(|thread_id| !thread_id.is_empty())
-            .and_then(|thread_id| {
-                model
-                    .threads
-                    .iter()
-                    .position(|thread| Model::thread_matches_id(thread, thread_id))
-            })
-            .unwrap_or(bridge_event.thread_index);
+            .and_then(|thread_id| model.thread_index_for_id(thread_id))
+        else {
+            // A bridge event without a current durable/session identity is
+            // stale or mid-attach. Never guess from its positional slot:
+            // applying it to `thread_index` can mutate another conversation
+            // after a reorder/close. The next frame will retry once binding
+            // hydration makes the identity available.
+            continue;
+        };
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
         };
@@ -1857,17 +2267,59 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 // `ThreadModel::agent_content_this_turn`'s doc comment)
                 // streamed reasoning summaries and then ended with no
                 // message or tool call at all.
+                // Reconnect/status spam is not a real reply either -- if
+                // we counted it, a later hard failure would look like a
+                // successful turn and leave Loading/Error handling wrong.
+                let is_status_only = matches!(
+                    message.kind,
+                    crate::protocol_types::MessageKind::Agent
+                ) && crate::models::agent_text_skips_markdown(&message.text);
                 if matches!(
                     message.kind,
                     crate::protocol_types::MessageKind::Agent
                         | crate::protocol_types::MessageKind::ToolCall
-                ) {
+                ) && !is_status_only
+                {
                     thread.agent_content_this_turn = true;
                 }
                 thread.last_activity_time = Some(std::time::Instant::now());
-                dirty.push(Dirty::MessageAppended {
-                    thread_id: thread.thread_id.clone(),
+                // Hard transport failures often arrive as ordinary agent
+                // *message* text (not AgentEvent::Error) after a reconnect
+                // storm -- e.g. "unexpected status 502 Bad Gateway". Without
+                // this, thread.state stays Loading until TurnEnded, the send
+                // button stays in stop/spinner mode, and the UI feels frozen
+                // even though the event loop is still running.
+                if matches!(message.kind, crate::protocol_types::MessageKind::Agent)
+                    && crate::models::agent_text_is_hard_failure(&message.text)
+                    && matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                {
+                    let failure = message.text.trim().to_owned();
+                    thread.state = ThreadState::Error;
+                    thread.error = Some(failure.clone());
+                    dirty.push(Dirty::Error {
+                        thread_id: thread.thread_id.clone(),
+                        detail: ErrorDetail {
+                            message: failure,
+                        },
+                    });
+                    dirty.push(Dirty::ThreadRow {
+                        thread_id: thread.thread_id.clone(),
+                    });
+                }
+                // One MessageAppended per thread per frame is enough: a
+                // reconnect storm can emit many AgentEvent::Message ticks
+                // before poll drains them; re-diffing the full message
+                // model for each one freezes the UI thread.
+                let thread_id = thread.thread_id.clone();
+                let already = dirty.iter().any(|d| {
+                    matches!(
+                        d,
+                        Dirty::MessageAppended { thread_id: id } if id == &thread_id
+                    )
                 });
+                if !already {
+                    dirty.push(Dirty::MessageAppended { thread_id });
+                }
             }
             crate::protocol_types::AgentEvent::TurnEnded(reason) => {
                 // Captured BEFORE the Idle reset below: only a turn this
@@ -1880,6 +2332,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 let was_generating = matches!(thread.state, ThreadState::Loading);
                 thread.state = ThreadState::Idle;
                 thread.error = None;
+                // PROF-8: a turn that actually completed is proof the
+                // agent is authenticated now (retried successfully, or an
+                // operator fixed the profile) -- clear the persistent
+                // banner rather than requiring manual dismissal.
+                thread.unauthenticated = false;
                 thread.last_activity_time = Some(std::time::Instant::now());
                 crate::trace_host_input(format_args!(
                     "turn ended thread={} reason={:?}",
@@ -1911,20 +2368,36 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 {
                     thread.state = ThreadState::Loading;
                     effects.push(Effect::SendPrompt {
-                        real_index: target_index,
+                        thread_id: thread.thread_id.clone(),
                         text: entry.text,
                     });
                 }
-                dirty.push(Dirty::ThreadRow(target_index));
+                dirty.push(Dirty::ThreadRow {
+                    thread_id: thread.thread_id.clone(),
+                });
             }
             crate::protocol_types::AgentEvent::Error(error) => {
                 thread.state = ThreadState::Error;
                 thread.error = Some(error.clone());
+                // PROF-8: same event, a second real per-thread signal --
+                // see `models::is_backend_requires_authentication_error`'s
+                // doc comment for why this is a substring match and what
+                // guards it.
+                thread.unauthenticated =
+                    crate::models::is_backend_requires_authentication_error(error);
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
                         message: error.clone(),
                     },
+                });
+                // Mirror PromptSent Err: leave Loading/Cancelling in the
+                // visible send/stop control, not only the error banner.
+                dirty.push(Dirty::ThreadRow {
+                    thread_id: thread.thread_id.clone(),
+                });
+                dirty.push(Dirty::Connection {
+                    thread_id: thread.thread_id.clone(),
                 });
             }
             crate::protocol_types::AgentEvent::UsageUpdate { .. } => {
@@ -1940,8 +2413,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::ConfigOptions(_)
             // PUI-003: the agent's slash commands flow through the per-frame
             // snapshot fold (thread.available_commands) like other caps.
-            | crate::protocol_types::AgentEvent::AvailableCommands(_) => {
-                dirty.push(Dirty::ThreadRow(target_index));
+            | crate::protocol_types::AgentEvent::AvailableCommands(_)
+            // PROF-11: the agent's plan/todo list and any live session
+            // title flow through the same per-frame snapshot fold
+            // (thread.plan / thread.session_title).
+            | crate::protocol_types::AgentEvent::PlanUpdate(_)
+            | crate::protocol_types::AgentEvent::SessionInfoUpdate { .. } => {
+                dirty.push(thread_row_dirty(model, target_index));
             }
         }
     }
@@ -1964,6 +2442,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
     }
     if frame.settings_reload_pending {
         dirty.push(Dirty::Settings);
+    }
+    if frame.daemon_projects_refresh_due {
+        // PISO-8 (project-isolation-mlt-binding plan): a real subprocess
+        // spawn + Unix socket dial, executed off the UI thread by
+        // `effect_executor.rs` -- see `Effect::
+        // RefreshDaemonProjectInstances`'s own doc comment.
+        effects.push(Effect::RefreshDaemonProjectInstances);
     }
     if frame.prepend_expanded_rows > 0 {
         let mut expanded = vec![false; frame.prepend_expanded_rows];
@@ -1994,10 +2479,19 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 if thread.session_id.is_none() {
                     if let Some(session_id) = row.session_id.clone() {
                         thread.session_id = Some(session_id);
+                        // PROF-7: same transition, real per-thread state
+                        // (not a render-time heuristic) -- row.agent_detected
+                        // is only ever Some(..) on exactly this fold (see
+                        // external_snapshot's own collection condition), so
+                        // this can't re-fire or clobber a later legitimate
+                        // state change.
+                        if row.agent_detected == Some(false) {
+                            thread.state = ThreadState::Stale;
+                        }
                         effects.push(Effect::PersistThread {
                             real_index: row.real_index,
                         });
-                        dirty.push(Dirty::ThreadRow(row.real_index));
+                        dirty.push(thread_row_dirty(model, row.real_index));
                         dirty.push(Dirty::Capabilities {
                             thread_id: row.thread_id.clone(),
                         });
@@ -2005,6 +2499,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 }
             }
         }
+        // Thread ids/session ids may have been hydrated by the bridge row;
+        // publish those identity changes to the reverse lookup maps before
+        // the next notification or snapshot is routed.
+        model.rebuild_thread_indices();
         // Review-gate fix (phase 32): hydrate bridge-persisted archived
         // flags (restarts previously left every ThreadModel::archived
         // false -- wrong sidebar counters, unenforced pool cap).
@@ -2014,7 +2512,24 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
         }
         model.visible_list_synced = true;
-        if changed {
+        // PISO-2 (project-isolation-mlt-binding plan) stale-async guard:
+        // this snapshot was collected against `snapshot.active_project_
+        // path`, tagged at collection time (see `ThreadListSnapshot::
+        // active_project_path`'s doc comment). `HostMsg::ProjectPathChanged`
+        // updates `model.active_project_path` synchronously, a full
+        // reducer turn before any poll tick can re-collect a snapshot
+        // against the new value -- so a snapshot whose tag disagrees with
+        // the model's CURRENT value describes a project the user has
+        // already left. Applying its visible-list SHAPE would show that
+        // old project's threads next to the new project's indicator, the
+        // exact cross-project leak this plan exists to close. Drop it and
+        // wait for the next tick's snapshot instead of assuming this one
+        // "usually" arrives in order. The per-row hydration above
+        // (session id, archived flags) is thread-scoped, not
+        // project-scoped, so it stays safe to apply unconditionally.
+        let snapshot_matches_active_project =
+            snapshot.active_project_path == model.active_project_path;
+        if changed && snapshot_matches_active_project {
             // `selected_thread` is a *filtered* index into the visible
             // list, so before the visible order is rewritten (recency
             // resort on background activity, archive/resume moving rows
@@ -2033,12 +2548,32 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 &snapshot.visible_thread_ids,
                 &snapshot.rows,
             )));
+            // PISO-2: the first snapshot folded in after a project switch
+            // deliberately starts the user at that project's FIRST
+            // thread, rather than clamping to whichever numeric filtered
+            // index the OLD, unrelated project's selection happened to
+            // sit at (that clamp is still the right fallback for a
+            // same-project list change -- deletion/archive/resort -- so
+            // it stays the default; only a genuine project switch
+            // overrides it). See `Model::synced_project_path`'s doc
+            // comment. An empty new list falls through to the
+            // display-clearing arm below regardless of this choice.
+            let project_switched = model.synced_project_path != snapshot.active_project_path;
             let reanchored = selected_id
-                .and_then(|id| snapshot.visible_thread_ids.iter().position(|key| *key == id))
+                .and_then(|id| {
+                    snapshot
+                        .visible_thread_ids
+                        .iter()
+                        .position(|key| *key == id)
+                })
                 .unwrap_or_else(|| {
-                    model
-                        .selected_thread
-                        .min(snapshot.visible_thread_ids.len().saturating_sub(1))
+                    if project_switched {
+                        0
+                    } else {
+                        model
+                            .selected_thread
+                            .min(snapshot.visible_thread_ids.len().saturating_sub(1))
+                    }
                 });
             if reanchored != model.selected_thread {
                 model.selected_thread = reanchored;
@@ -2065,6 +2600,9 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 }
             }
         }
+        if snapshot_matches_active_project {
+            model.synced_project_path = snapshot.active_project_path.clone();
+        }
     }
     if let Some(snapshot) = frame.settings_gateway_snapshot {
         let changed = model.available_profiles != snapshot.profiles
@@ -2080,6 +2618,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.recovery_provider = snapshot.recovery_provider;
             dirty.push(Dirty::Settings);
         }
+    }
+    if model.agent_operations_in_flight != frame.agent_operations_in_flight {
+        model.agent_operations_in_flight = frame.agent_operations_in_flight;
+        dirty.push(Dirty::Settings);
     }
     if let Some(snapshot) = frame.settings_preferences_snapshot {
         let changed = model.settings_scope != snapshot.scope
@@ -2125,14 +2667,42 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let target_index = if snapshot.thread_id.is_empty() {
             Some(snapshot.real_index)
         } else {
-            model
-                .threads
-                .iter()
-                .position(|thread| Model::thread_matches_id(thread, &snapshot.thread_id))
+            model.thread_index_for_id(&snapshot.thread_id)
         };
         let Some(target_index) = target_index else {
+            // An unknown-identity snapshot can arrive after a deferred or
+            // failed session disappears. Never leave the previous thread's
+            // rows visible under the new selection; clear the shared list
+            // and ownership instead of silently keeping stale content.
+            if model.list_owner_thread_id.is_some() {
+                let old_keys = model.message_model_keys.borrow().clone();
+                model.list_owner_thread_id = None;
+                dirty.push(Dirty::MessagesDiff {
+                    thread_id: String::new(),
+                    ops: crate::dirty::diff_by_id(&old_keys, &[], &[]),
+                });
+            }
             return (effects, dirty);
         };
+        // SCNA-01: distinct from `switched_thread` below -- specifically
+        // whether there was a *real* previously-displayed thread to leave.
+        // `model.displayed_thread` starts `None` before cold-start
+        // hydration's first frame, so that first frame's `switched_thread`
+        // is also true; every restored thread starts idle/error-free (see
+        // `Model::from_initial_state`'s own doc comment), so the
+        // `Dirty::Error` this function pushes below on `switched_thread`
+        // always carries an empty message on that first frame -- but
+        // still unconditionally overwrites `last-error`, silently wiping
+        // any global cold-start warning (InitialState::startup_warnings,
+        // routed through `Dirty::Error{thread_id: "", ..}` a moment
+        // earlier in the same synchronous panel_rust_create call) before
+        // the window is ever shown. Captured before the
+        // `selection_matches`-gated switched_thread below, since that
+        // gate answers a different question (is this snapshot even for
+        // the currently-selected thread) and must not affect this one
+        // (was there a real previous thread to leave, regardless of
+        // whether *this particular* snapshot ends up promoting a switch).
+        let had_prior_displayed_thread = model.displayed_thread.is_some();
         // One-frame stale-collection guard (plan phase 23): the snapshot
         // was collected via `visible_indices[selected_thread]` *before*
         // this same frame's thread-list fold re-anchored the selection, so
@@ -2145,36 +2715,54 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         // actually has selected -- otherwise leave the display alone and
         // let the next tick collect the right thread's snapshot.
         let selection_matches = Some(target_index) == selected_real_index(model);
+        // Owner mismatch covers selection that already set displayed_thread
+        // but list/owner still needs hydrate from a fresh snapshot.
+        let owner_before = model.list_owner_thread_id.clone();
         let switched_thread = selection_matches && model.displayed_thread != Some(target_index);
         if switched_thread {
-            model.expanded.clear();
+            // Rare path: frame promotes display without going through
+            // apply_thread_selection_switch (e.g. cold first paint).
+            if let Some(prev) = model.displayed_thread {
+                snapshot_thread_list_ui_cache(model, prev);
+            }
             model.displayed_thread = Some(target_index);
         }
+        // Build expand vec from existing row flags / model.expanded, not
+        // a hard clear on every switch (that dropped A→B→A expand state).
         let transcript_row_count =
             crate::models::to_message_rows_from_transcript(snapshot.transcript.clone(), &[]).len();
         if model.expanded.len() < transcript_row_count {
             model.expanded.resize(transcript_row_count, false);
         }
         let expanded = model.expanded.clone();
+        // Clone cache expand map before mutably borrowing the thread.
+        let cache_expand = model
+            .threads
+            .get(target_index)
+            .map(|t| t.thread_id.clone())
+            .and_then(|id| model.list_ui_cache.get(&id).cloned());
         if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
+            let old_rows = thread.message_rows.clone();
             // Include send-queue rows (QueuedMessageBar) in the projection.
-            let in_flight = matches!(
-                thread.state,
-                ThreadState::Loading | ThreadState::Cancelling
-            );
-            let (rows, new_keys) = crate::models::message_rows_for_thread_with_state(
+            let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
+            let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
                 snapshot.transcript.clone(),
                 &expanded,
                 &thread.send_queue,
                 in_flight,
             );
+            // Preserve expand-by-key across re-project (live poll + switch).
+            merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
+            if let Some(cache) = cache_expand.as_ref() {
+                merge_expanded_by_key(&cache.keys, &cache.rows, &new_keys, &mut rows);
+            }
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
             // A brand new thread's own cache is empty both before and
-            // after this snapshot, so without `switched_thread` here the
-            // diff below never fires on switch -- the shared
+            // after this snapshot, so without `switched_thread` / owner
+            // mismatch here the diff never fires on switch -- the shared
             // `messages_model` then keeps showing whatever the *previously
             // displayed* thread had (the "new chat shows prefill data from
             // another thread" bug). Any actual thread switch must always
@@ -2190,30 +2778,36 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // real reason. Real content changes are already caught by
             // `thread.transcript != snapshot.transcript` (the raw,
             // ModelRc-free transcript data), and expand/collapse already
-            // dispatches its own `Dirty::MessagesDiff` explicitly (see
+            // dispatches its own `Dirty::MessageRowPatch` (see
             // `ChromeMsg::ToggleExpanded`).
-            let transcript_changed =
-                switched_thread || old_keys != new_keys || thread.transcript != snapshot.transcript;
+            let owner_mismatch =
+                selection_matches && owner_before.as_deref() != Some(thread_id.as_str());
+            let force_list_install = switched_thread || owner_mismatch;
+            let transcript_changed = force_list_install
+                || old_keys != new_keys
+                || thread.transcript != snapshot.transcript;
             // Same "own cache vs. what's actually still on screen" gap as
             // `transcript_changed` above applies to every other
             // per-thread view fragment: force a resync on switch even when
             // the target thread's own diff is a no-op.
             let pending_changed =
-                switched_thread || thread.pending_request != snapshot.pending_request;
-            let terminals_changed = switched_thread
+                force_list_install || thread.pending_request != snapshot.pending_request;
+            let terminals_changed = force_list_install
                 || thread.terminals != snapshot.terminals
                 || thread.expanded_terminal != snapshot.expanded_terminal
                 || thread.open_terminals != snapshot.open_terminals;
             let local_terminal_changed =
-                switched_thread || thread.local_terminal != snapshot.local_terminal;
+                force_list_install || thread.local_terminal != snapshot.local_terminal;
             let local_terminal_output_changed =
                 thread.local_terminal.screen_text != snapshot.local_terminal.screen_text;
             let connection_changed =
-                switched_thread || thread.connection_status != snapshot.connection_status;
-            let capabilities_changed = switched_thread
+                force_list_install || thread.connection_status != snapshot.connection_status;
+            let capabilities_changed = force_list_install
                 || thread.session_modes != snapshot.session_modes
                 || thread.config_options != snapshot.config_options
-                || thread.usage != snapshot.usage;
+                || thread.usage != snapshot.usage
+                || thread.plan != snapshot.plan
+                || thread.session_title != snapshot.session_title;
 
             thread.transcript = snapshot.transcript;
             thread.transcript_keys = new_keys.clone();
@@ -2233,12 +2827,39 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.config_options = snapshot.config_options;
             thread.available_commands = snapshot.available_commands;
             thread.usage = snapshot.usage;
+            thread.plan = snapshot.plan;
+            thread.session_title = snapshot.session_title;
 
             if transcript_changed {
-                dirty.push(Dirty::MessagesDiff {
-                    thread_id: thread_id.clone(),
-                    ops: crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &rows),
-                });
+                if force_list_install {
+                    // Full list ownership install (switch / owner mismatch).
+                    dirty.push(Dirty::MessageListInstall {
+                        thread_id: thread_id.clone(),
+                    });
+                } else {
+                    // Same-thread content change: key-keyed diff only (go-fast).
+                    dirty.push(Dirty::MessagesDiff {
+                        thread_id: thread_id.clone(),
+                        ops: crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &rows),
+                    });
+                }
+            }
+            // Refresh leave/return cache + expand flags when this is the
+            // displayed owner (selection already set displayed_thread).
+            if selection_matches {
+                model.expanded = rows.iter().map(|r| r.expanded).collect();
+                model.list_owner_thread_id = Some(thread_id.clone());
+                if force_list_install {
+                    model.list_gen = model.list_gen.wrapping_add(1);
+                }
+                model.list_ui_cache.insert(
+                    thread_id.clone(),
+                    crate::model::ThreadListUiCache {
+                        keys: new_keys.clone(),
+                        rows: rows.clone(),
+                        gen: model.list_gen,
+                    },
+                );
             }
             if pending_changed {
                 if thread.pending_request.active {
@@ -2299,7 +2920,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             if capabilities_changed {
                 dirty.push(Dirty::Capabilities { thread_id });
             }
-            if switched_thread {
+            // See had_prior_displayed_thread's doc comment above: skip on
+            // cold start's implicit first display (nothing stale to
+            // clear, and thread.error is always None there anyway per
+            // Model::from_initial_state), so a global cold-start warning
+            // banner set moments earlier survives instead of being wiped.
+            if switched_thread && had_prior_displayed_thread {
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
@@ -2317,8 +2943,7 @@ mod tests {
     use super::*;
     use crate::dirty::RowOp;
     use crate::msg::FrameInput;
-    // row_count()/row_data() on the persistent messages_model VecModel.
-    use slint::Model as _;
+    use std::path::Path;
 
     fn model_with_threads(names: &[&str]) -> Model {
         let threads = names
@@ -2330,31 +2955,47 @@ mod tests {
                 ..ThreadModel::default()
             })
             .collect();
-        Model {
+        let mut model = Model {
             threads,
+            // Reducer tests that exercise thread creation/send represent an
+            // already-open project. Keep the no-project contract covered by
+            // dedicated Model::default() tests instead of silently testing
+            // the rejected path through this shared fixture.
+            active_project: crate::model::ProjectIdentity::Saved(
+                "/tmp/update-test-project.mlt".to_owned(),
+            ),
             ..Model::default()
-        }
+        };
+        model.rebuild_thread_indices();
+        model
     }
 
-    /// Dirty set emitted when selection actually changes thread (leak-fix
-    /// clear of compose/pending/error/terminals for the outgoing row).
-    fn thread_switch_dirty() -> Vec<Dirty> {
+    /// Dirty set emitted when selection actually changes thread: atomic
+    /// MessageListInstall for target + sibling pane resync (chat_view §5).
+    fn thread_switch_dirty(target_thread_id: &str) -> Vec<Dirty> {
         vec![
             Dirty::Scalar(ScalarField::SelectedThread),
             Dirty::Scalar(ScalarField::ComposeText),
+            Dirty::MessageListInstall {
+                thread_id: target_thread_id.to_owned(),
+            },
             Dirty::PendingRequest {
-                thread_id: String::new(),
+                thread_id: target_thread_id.to_owned(),
             },
             Dirty::Error {
-                thread_id: String::new(),
+                thread_id: target_thread_id.to_owned(),
                 detail: ErrorDetail {
                     message: String::new(),
                 },
             },
-            Dirty::Terminal {
-                id: String::new(),
-            },
+            Dirty::Terminal { id: String::new() },
             Dirty::LocalTerminal,
+            Dirty::Connection {
+                thread_id: target_thread_id.to_owned(),
+            },
+            Dirty::Capabilities {
+                thread_id: String::new(),
+            },
         ]
     }
 
@@ -2367,7 +3008,7 @@ mod tests {
             Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(1))),
         );
         assert_eq!(model.selected_thread, 1);
-        assert_eq!(dirty, thread_switch_dirty());
+        assert_eq!(dirty, thread_switch_dirty("thread-1"));
     }
 
     #[test]
@@ -2402,7 +3043,7 @@ mod tests {
             Msg::Host(HostMsg::InvokeCommand("previous-thread".to_owned())),
         );
         assert_eq!(model.selected_thread, 0);
-        assert_eq!(dirty, thread_switch_dirty());
+        assert_eq!(dirty, thread_switch_dirty("thread-0"));
     }
 
     #[test]
@@ -2414,7 +3055,7 @@ mod tests {
             Msg::Host(HostMsg::InvokeCommand("next-thread".to_owned())),
         );
         assert_eq!(model.selected_thread, 2);
-        assert_eq!(dirty, thread_switch_dirty());
+        assert_eq!(dirty, thread_switch_dirty("thread-2"));
     }
 
     #[test]
@@ -2442,6 +3083,205 @@ mod tests {
         );
     }
 
+    /// GUI matrix: Open → Save As → switch → close (panel lifecycle identity).
+    #[test]
+    fn gui_matrix_open_save_as_switch_close_bumps_generation_and_reasons() {
+        let mut model = Model::default();
+        assert_eq!(model.project_generation, 0);
+
+        let (_, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/work/a/project.mlt".to_owned(),
+            ))),
+        );
+        assert_eq!(model.project_lifecycle_reason, "opened");
+        assert_eq!(model.project_generation, 1);
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::Saved(_)
+        ));
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathRenamed {
+                old: "/work/a/project.mlt".to_owned(),
+                new: "/work/b/project.mlt".to_owned(),
+            }),
+        );
+        assert_eq!(model.project_lifecycle_reason, "saved_as");
+        assert_eq!(model.project_generation, 2);
+        assert_eq!(
+            model.active_project_path.as_deref(),
+            Some("/work/b/project.mlt")
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::RenameProjectAssociation { old, new, .. }
+                if old == "/work/a/project.mlt" && new == "/work/b/project.mlt"
+        )));
+
+        let gen_before_switch = model.project_generation;
+        let (_, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/work/a/project.mlt".to_owned(),
+            ))),
+        );
+        assert_eq!(model.project_lifecycle_reason, "switched");
+        assert_eq!(model.project_generation, gen_before_switch + 1);
+
+        let (_, dirty) = update(&mut model, Msg::Host(HostMsg::ProjectClosed));
+        assert_eq!(model.project_lifecycle_reason, "closed");
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::None
+        ));
+        assert_eq!(model.active_project_path, None);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::ProjectPath)));
+    }
+
+    /// GUI matrix: untitled staging then first Save emits rename association
+    /// with empty old path so the staging store can move.
+    #[test]
+    fn gui_matrix_untitled_then_first_save_moves_staging_store() {
+        let mut model = Model::default();
+        let (_, _) = update(&mut model, Msg::Host(HostMsg::ProjectCreatedUntitled));
+        assert_eq!(model.project_lifecycle_reason, "created_untitled");
+        let crate::model::ProjectIdentity::Untitled(staging_id) = model.active_project.clone()
+        else {
+            panic!("expected Untitled identity after ProjectCreatedUntitled");
+        };
+        assert!(!staging_id.is_empty());
+        assert_eq!(model.active_project_path, None);
+
+        let old_identity = model.active_project.clone();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathRenamed {
+                old: String::new(),
+                new: "/work/saved/first.mlt".to_owned(),
+            }),
+        );
+        assert_eq!(model.project_lifecycle_reason, "saved_as");
+        assert_eq!(
+            model.active_project_path.as_deref(),
+            Some("/work/saved/first.mlt")
+        );
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::Saved(_)
+        ));
+        assert!(
+            effects.iter().any(|e| match e {
+                Effect::RenameProjectAssociation {
+                    old,
+                    new,
+                    old_identity: oi,
+                } => {
+                    old.is_empty() && new == "/work/saved/first.mlt" && oi == &old_identity
+                }
+                _ => false,
+            }),
+            "first Save must migrate the untitled staging store: {effects:?}"
+        );
+        // Store dirs differ: staging UUID vs .snapflow/<stem>
+        let staging = crate::project_store::project_store_dir(
+            &crate::model::ProjectIdentity::Untitled(staging_id),
+            Path::new("/cache"),
+        );
+        let saved = crate::project_store::project_store_dir(
+            &crate::model::ProjectIdentity::Saved("/work/saved/first.mlt".into()),
+            Path::new("/cache"),
+        );
+        assert_ne!(staging, saved);
+        assert_eq!(
+            saved,
+            Some(std::path::PathBuf::from("/work/saved/.snapflow/first"))
+        );
+    }
+
+    /// GUI matrix: no project open still permits an unscoped deferred thread.
+    #[test]
+    fn gui_matrix_no_project_allows_deferred_thread_and_send() {
+        let mut model = Model::default();
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::None
+        ));
+        let (e1, d1) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(matches!(e1.as_slice(), [Effect::NewThreadDeferred { .. }]));
+        assert!(!d1.is_empty() && model.threads.len() == 1);
+        let (e2, d2) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(
+                "should-attach".into(),
+            ))),
+        );
+        assert!(!e2.is_empty() || !d2.is_empty());
+    }
+
+    /// GUI matrix: A→B switch drops late A thread-list snapshots (view isolation).
+    #[test]
+    fn gui_matrix_project_a_to_b_drops_stale_a_snapshots() {
+        let mut model = model_with_threads(&["a0", "a1", "b0"]);
+        model.active_project_path = Some("/work/b/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/b/project.mlt".to_owned());
+        model.visible_indices = vec![2];
+        model.selected_thread = 0;
+        *model.thread_model_keys.borrow_mut() = vec!["thread-2".to_owned()];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0, 1],
+                    visible_thread_ids: vec!["thread-0".to_owned(), "thread-1".to_owned()],
+                    rows: vec![visible_row(0, "thread-0"), visible_row(1, "thread-1")],
+                    archived_flags: vec![],
+                    active_project_path: Some("/work/a/project.mlt".to_owned()),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.visible_indices, vec![2]);
+        assert!(!dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::ThreadListDiff(_))));
+    }
+
+    /// GUI matrix: initial open sets Saved identity before any session attach
+    /// effect beyond SetActiveProjectPath (attach gate path).
+    #[test]
+    fn gui_matrix_initial_project_sets_identity_before_attach() {
+        let mut model = Model::default();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/projects/demo/cut.mlt".to_owned(),
+            ))),
+        );
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::Saved(ref p) if p == "/projects/demo/cut.mlt"
+        ));
+        // Only path-binding effect — no New/Attach effect is emitted here.
+        assert_eq!(
+            effects,
+            vec![Effect::SetActiveProjectPath {
+                path: Some("/projects/demo/cut.mlt".to_owned())
+            }]
+        );
+        let store =
+            crate::project_store::project_store_dir(&model.active_project, Path::new("/cache"))
+                .expect("saved project must have a store dir");
+        assert_eq!(
+            store,
+            std::path::PathBuf::from("/projects/demo/.snapflow/cut")
+        );
+        assert_ne!(store.as_os_str(), "/projects/demo/cut.mlt");
+    }
+
     #[test]
     fn thread_selected_out_of_range_clamps_to_the_last_thread() {
         // Matches the dispatcher contract: out-of-range selection clamps
@@ -2455,7 +3295,7 @@ mod tests {
                 thread_id: "thread-1".to_owned()
             }]
         );
-        assert_eq!(dirty, thread_switch_dirty());
+        assert_eq!(dirty, thread_switch_dirty("thread-1"));
     }
 
     #[test]
@@ -2491,7 +3331,12 @@ mod tests {
         );
         assert!(model.threads[0].closed);
         assert_eq!(effects, vec![Effect::CloseThread { real_index: 0 }]);
-        assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
+        assert_eq!(
+            dirty,
+            vec![Dirty::ThreadRow {
+                thread_id: "thread-0".to_owned()
+            }]
+        );
     }
 
     /// send_queue.rs's disk persistence (SendQueue::load/send_queue_path)
@@ -2509,6 +3354,8 @@ mod tests {
         }
 
         let mut model = Model::default();
+        model.active_project =
+            crate::model::ProjectIdentity::Saved("/tmp/send-queue-test-project.mlt".to_owned());
         update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
         let thread_id = model.threads[0].thread_id.clone();
         model.threads[0]
@@ -2569,9 +3416,9 @@ mod tests {
                 thread_id: "thread-1".to_owned()
             }]
         );
-        // Selection change also dirties compose/pending/error/terminals so
+        // Selection change also installs target list + sibling panes so
         // the outgoing thread's UI state cannot leak (apply_thread_selection_switch).
-        assert_eq!(dirty, thread_switch_dirty());
+        assert_eq!(dirty, thread_switch_dirty("thread-1"));
     }
 
     #[test]
@@ -2636,18 +3483,32 @@ mod tests {
     #[test]
     fn profile_selected_updates_the_thread_only_while_it_has_no_session() {
         let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex".to_owned();
         let (effects, dirty) = update(
             &mut model,
-            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(
-                "codex-tools".to_owned(),
-            ))),
+            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
+                profile_name: "codex-tools".to_owned(),
+                agent_id: "codex-acp".to_owned(),
+            })),
         );
-        assert_eq!(model.threads[0].profile_name.as_deref(), Some("codex-tools"));
-        assert!(effects.is_empty(), "no backend to notify yet -- nothing to send");
+        assert_eq!(
+            model.threads[0].profile_name.as_deref(),
+            Some("codex-tools")
+        );
+        assert_eq!(
+            model.threads[0].provider, "codex-acp",
+            "Provider picker must update thread.provider (agent id) for deferred attach"
+        );
+        assert!(
+            effects.is_empty(),
+            "no backend to notify yet -- nothing to send"
+        );
         assert_eq!(
             dirty,
             vec![
-                Dirty::ThreadRow(0),
+                Dirty::ThreadRow {
+                    thread_id: "thread-0".to_owned()
+                },
                 Dirty::Capabilities {
                     thread_id: "thread-0".to_owned()
                 }
@@ -2660,37 +3521,74 @@ mod tests {
         model.threads[0].session_id = Some("real-session-1".to_owned());
         let (effects, dirty) = update(
             &mut model,
-            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(
-                "balanced".to_owned(),
-            ))),
+            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
+                profile_name: "balanced".to_owned(),
+                agent_id: "claude-acp".to_owned(),
+            })),
         );
         assert_eq!(
             model.threads[0].profile_name.as_deref(),
             Some("codex-tools"),
             "profile must stay locked once a session has attached"
         );
+        assert_eq!(
+            model.threads[0].provider, "codex-acp",
+            "provider must stay locked once a session has attached"
+        );
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
     }
 
     #[test]
-    fn new_thread_provider_matching_auto_detects_any_claude_family_agent_id() {
-        // Regression test: a real settings.global.json found live this
+    fn profile_selected_resolves_agent_id_from_catalog_when_ui_omits_it() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "stale-default".to_owned();
+        model.available_profiles = vec![crate::gateway_actor::ProfileSummary {
+            name: "claude-profile".to_owned(),
+            agent_id: "claude-acp".to_owned(),
+            allow_terminal_access: false,
+            allow_fs_access: true,
+        }];
+        let _ = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
+                profile_name: "claude-profile".to_owned(),
+                agent_id: String::new(),
+            })),
+        );
+        assert_eq!(
+            model.threads[0].profile_name.as_deref(),
+            Some("claude-profile")
+        );
+        assert_eq!(
+            model.threads[0].provider, "claude-acp",
+            "must resolve agent_id from available_profiles when not sent by UI"
+        );
+    }
+
+    #[test]
+    fn new_thread_provider_passes_any_configured_agent_id_through_unchanged() {
+        // PROF-1/PROF-2: a real settings.global.json found live this
         // session had default_agent_id: "claude-acp" (the real registry
         // agent id, plausibly from a picker backed by the agent catalog)
-        // rather than the short "claude" label this reducer's own
-        // gateway wiring uses everywhere else -- an exact-match list only
+        // rather than the short "claude" label this reducer's gateway
+        // wiring used to special-case -- an exact-match list only
         // recognizing "claude"/"claude-code" silently routed everything
-        // else, including "claude-acp", to codex. Substring-matching the
-        // claude family instead of enumerating every literal variant
-        // means a *hypothetical future* id ("Claude-Opus-Next", picked
-        // case-insensitively) is covered automatically too, without this
-        // match needing to grow a new arm every time one shows up.
+        // else, including "claude-acp", to codex. The fix is no longer a
+        // bigger substring-match list (that still special-cases exactly
+        // one family and mis-routes everyone else, e.g. "gemini-acp"
+        // would still have landed on codex); `provider` now passes
+        // `default_agent_id` through completely unchanged, matching
+        // `AgentBridge::resolve_provider_for`'s own pass-through
+        // contract, so any agent id -- claude family, gemini, or
+        // anything not yet invented -- reaches its own gateway with zero
+        // code changes here.
         for agent_id in [
             "claude",
             "claude-code",
             "claude-acp",
-            "Claude-Opus-Next", // not a real id -- proves this generalizes, not just today's known set
+            "gemini-acp",
+            "Claude-Opus-Next",
         ] {
             let mut model = model_with_threads(&[]);
             model.default_agent_id = agent_id.to_owned();
@@ -2698,12 +3596,48 @@ mod tests {
             assert!(
                 matches!(
                     effects.as_slice(),
-                    [Effect::NewThreadDeferred { provider, .. }] if provider == "claude"
+                    [Effect::NewThreadDeferred { provider, .. }] if provider == agent_id
                 ),
-                "default_agent_id {agent_id:?} must route new threads to the claude provider, \
+                "default_agent_id {agent_id:?} must pass through unchanged as the provider, \
                  got: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn new_thread_with_no_default_profile_falls_back_to_default_agent_id_as_the_profile() {
+        // PROF-2: `Router::ensure_default_profiles_seeded` auto-fills one
+        // profile per installed registry agent, named after that agent's
+        // own id -- so once a real `default_agent_id` is configured but
+        // no profile has been hand-picked, using that same id as
+        // `_acpx.profile` resolves without any `profiles/create` setup.
+        // Before this, an unset `default_profile` always meant
+        // native/unmanaged mode (`profile_name: None`) even when a real
+        // default agent WAS configured, silently ignoring it for session
+        // binding purposes.
+        let mut model = model_with_threads(&[]);
+        model.default_agent_id = "codex-acp".to_owned();
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert_eq!(
+            model.threads[0].profile_name.as_deref(),
+            Some("codex-acp"),
+            "with no explicit default_profile, the configured default_agent_id must be used \
+             as the profile name"
+        );
+    }
+
+    #[test]
+    fn new_thread_with_neither_default_profile_nor_default_agent_id_stays_unprofiled() {
+        // The genuine "nothing configured at all" case: no known agent id
+        // to request a profile for, so the session must still open
+        // native/unmanaged (profile_name stays None) rather than guessing
+        // -- passing the bare gateway-routing fallback label
+        // (`NO_PROVIDER_REQUESTED_FALLBACK`, not a real registry agent
+        // id) as `_acpx.profile` would make session/new fail outright
+        // instead of degrading gracefully.
+        let mut model = model_with_threads(&[]);
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert_eq!(model.threads[0].profile_name, None);
     }
 
     #[test]
@@ -2749,7 +3683,12 @@ mod tests {
         assert_eq!(follow_up, vec![Effect::PersistThread { real_index: 1 }]);
         assert_eq!(model.threads[1].thread_id, "durable-new");
         assert_eq!(model.threads[1].session_id.as_deref(), Some("session-new"));
-        assert_eq!(dirty, vec![Dirty::ThreadRow(1)]);
+        assert_eq!(
+            dirty,
+            vec![Dirty::ThreadRow {
+                thread_id: "durable-new".to_owned()
+            }]
+        );
     }
 
     #[test]
@@ -2757,7 +3696,7 @@ mod tests {
         // Regression test: "agent default is in crash backoff". The
         // literal string "default" is a reserved acpx-server sentinel
         // (see acpxmgr.go's WriteConfig doc comment: the
-        // "snapshotd-mcp-attach" profile's own agent_id is deliberately
+        // "snapflow-mcp-attach" profile's own agent_id is deliberately
         // the placeholder "default", which no real backend is ever
         // registered under). A settings form re-saved without ever
         // touching the profile dropdown could land that literal string in
@@ -2780,16 +3719,61 @@ mod tests {
             }],
         );
         // PUI-014: the profile/permission are now read from the model thread at
-        // attach time, so the "default" sentinel must be filtered to None BEFORE
+        // attach time, so the "default" sentinel must be filtered out BEFORE
         // it is stored -- otherwise it would reach session/new at first send.
+        // PROF-2: the sentinel being filtered doesn't mean `profile_name`
+        // stays `None` here -- `default_agent_id` ("codex", a real,
+        // non-sentinel value) is the documented fallback once the
+        // explicit `default_profile` is filtered out, so the thread still
+        // gets a usable profile binding instead of silently falling back
+        // to native/unmanaged mode.
         assert_eq!(
-            model.threads[1].profile_name, None,
-            "a literal \"default\" profile must never be stored (would reach session/new)"
+            model.threads[1].profile_name.as_deref(),
+            Some("codex"),
+            "the literal \"default\" sentinel must never be stored, but default_agent_id is a \
+             real fallback and must still be used"
         );
         assert_eq!(
             model.threads[1].permission_profile, None,
             "a literal \"default\" permission-profile must never be stored"
         );
+    }
+
+    #[test]
+    fn no_project_allows_deferred_new_send_and_ignores_late_attach_results() {
+        let mut model = Model::default();
+
+        let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::NewThreadDeferred { .. }]
+        ));
+        assert!(!dirty.is_empty());
+        assert_eq!(model.threads.len(), 1);
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(
+                "blocked".to_owned(),
+            ))),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::SendPrompt { .. }]));
+        assert!(!dirty.is_empty());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::NewResolved {
+                display_name: "late".to_owned(),
+                provider: "codex-acp".to_owned(),
+                profile_name: None,
+                permission_profile: None,
+                session_id: Some("late-session".to_owned()),
+                thread_id: Some("late-thread".to_owned()),
+            })),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.threads.len(), 1);
     }
 
     #[test]
@@ -2845,7 +3829,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "hi".to_owned()
             }]
         );
@@ -2857,7 +3841,9 @@ mod tests {
         // re-render that row -- it only caught up whenever some
         // unrelated event later forced a full thread-list rebuild.
         assert!(
-            dirty.contains(&Dirty::ThreadRow(0)),
+            dirty.contains(&Dirty::ThreadRow {
+                thread_id: "thread-0".to_owned()
+            }),
             "sending a message must immediately dirty this thread's row so the loading \
              spinner/pulse starts right away, got: {dirty:?}"
         );
@@ -2875,7 +3861,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 2,
+                thread_id: "thread-2".to_owned(),
                 text: "hi".to_owned(),
             }]
         );
@@ -2938,18 +3924,21 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-1".to_owned()],
                 ..FrameInput::default()
             }),
         );
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "queued".to_owned(),
             }]
         );
         assert_eq!(model.threads[0].state, ThreadState::Loading);
-        assert!(dirty.contains(&Dirty::ThreadRow(0)));
+        assert!(dirty.contains(&Dirty::ThreadRow {
+            thread_id: "thread-0".to_owned()
+        }));
     }
 
     #[test]
@@ -2968,13 +3957,17 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
         // State stays Idle (user can just re-send), but the empty turn
         // is called out via the error surface.
         assert_eq!(model.threads[0].state, ThreadState::Idle);
-        let error = model.threads[0].error.as_deref().expect("empty-turn notice set");
+        let error = model.threads[0]
+            .error
+            .as_deref()
+            .expect("empty-turn notice set");
         assert!(error.contains("without a response"), "got: {error}");
         assert!(
             dirty.iter().any(|d| matches!(d, Dirty::Error { .. })),
@@ -3019,7 +4012,9 @@ mod tests {
             Some("stay")
         );
         assert!(
-            dirty.iter().any(|d| matches!(d, Dirty::MessagesDiff { .. })),
+            dirty
+                .iter()
+                .any(|d| matches!(d, Dirty::MessagesDiff { .. })),
             "cancel must rebuild message rows, got {dirty:?}"
         );
     }
@@ -3036,6 +4031,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3120,7 +4116,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "go now".to_owned(),
             }]
         );
@@ -3163,7 +4159,7 @@ mod tests {
             vec![
                 Effect::CancelGeneration { real_index: 0 },
                 Effect::SendPrompt {
-                    real_index: 0,
+                    thread_id: "thread-0".to_owned(),
                     text: "steer me".to_owned(),
                 },
             ]
@@ -3184,8 +4180,104 @@ mod tests {
             .send_queue
             .on_generation_stopped(false)
             .unwrap();
-        assert!(popped.is_none(), "AbsorbingCancel must swallow this Stopped event");
+        assert!(
+            popped.is_none(),
+            "AbsorbingCancel must swallow this Stopped event"
+        );
         assert_eq!(model.threads[0].send_queue.len(), 1);
+    }
+
+    #[test]
+    fn queue_fast_track_while_idle_sends_immediately() {
+        // SCNA-03: Return on an empty compose box right after enqueuing
+        // (can_fast_track armed by enqueue itself) sends immediately.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0]
+            .send_queue
+            .enqueue("go now".to_owned(), false)
+            .expect("queue");
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SendPrompt {
+                thread_id: "thread-0".to_owned(),
+                text: "go now".to_owned(),
+            }]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Connection { .. })));
+    }
+
+    #[test]
+    fn queue_fast_track_while_generating_cancels_then_sends_and_arms_absorbing_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("front".to_owned(), false)
+            .expect("queue");
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::CancelGeneration { real_index: 0 },
+                Effect::SendPrompt {
+                    thread_id: "thread-0".to_owned(),
+                    text: "front".to_owned(),
+                },
+            ]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        // The eventual TurnEnded from the cancel above must not also
+        // auto-drain -- AbsorbingCancel swallows it once, same
+        // contract as QueueSendNow.
+        let popped = model.threads[0]
+            .send_queue
+            .on_generation_stopped(false)
+            .unwrap();
+        assert!(
+            popped.is_none(),
+            "AbsorbingCancel must swallow this Stopped event"
+        );
+    }
+
+    #[test]
+    fn queue_fast_track_is_a_safe_no_op_when_nothing_is_eligible() {
+        // No enqueue just happened (can_fast_track never armed) -- the
+        // Slint side fires this unconditionally on empty-compose Return,
+        // so this is the expected common case, not an error.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0]
+            .send_queue
+            .enqueue("already queued earlier".to_owned(), false)
+            .expect("queue");
+        // Consume the fast-track eligibility some other way (matches how
+        // any queue mutation other than a fresh enqueue leaves nothing
+        // eligible) -- send_now clears it same as try_fast_track would.
+        let entry_id = model.threads[0]
+            .send_queue
+            .first_id()
+            .expect("one entry queued");
+        model.threads[0]
+            .send_queue
+            .send_now(entry_id, false)
+            .expect("send_now");
+        assert!(model.threads[0].send_queue.is_empty());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
     }
 
     #[test]
@@ -3196,16 +4288,12 @@ mod tests {
             .send_queue
             .enqueue("waiting".to_owned(), false)
             .expect("queue");
-        let (effects, dirty) = update(
-            &mut model,
-            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)),
-        );
-        assert_eq!(
-            effects,
-            vec![Effect::CancelGeneration { real_index: 0 }]
-        );
+        let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)));
+        assert_eq!(effects, vec![Effect::CancelGeneration { real_index: 0 }]);
         assert_eq!(model.threads[0].state, ThreadState::Cancelling);
-        assert!(dirty.contains(&Dirty::ThreadRow(0)));
+        assert!(dirty.contains(&Dirty::ThreadRow {
+            thread_id: "thread-0".to_owned()
+        }));
         // Paused: TurnEnded must not auto-drain.
         let (effects2, _) = update(
             &mut model,
@@ -3214,6 +4302,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3243,6 +4332,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3280,14 +4370,16 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 1,
+                thread_id: "target-id".to_owned(),
                 text: "queued".to_owned(),
             }]
         );
         assert_eq!(model.threads[0].thread_id, "other-id");
         assert_eq!(model.threads[1].thread_id, "target-id");
         assert_eq!(model.threads[1].state, ThreadState::Loading);
-        assert!(dirty.contains(&Dirty::ThreadRow(1)));
+        assert!(dirty.contains(&Dirty::ThreadRow {
+            thread_id: "target-id".to_owned()
+        }));
     }
 
     #[test]
@@ -3314,6 +4406,8 @@ mod tests {
                     session_modes: None,
                     config_options: Vec::new(),
                     available_commands: Vec::new(),
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3321,6 +4415,73 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn frame_event_with_unknown_identity_does_not_use_positional_fallback() {
+        let mut model = model_with_threads(&["first", "second"]);
+        model.threads[1].state = ThreadState::Loading;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 1,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("stale".to_owned()),
+                }],
+                bridge_event_thread_ids: vec!["unknown-thread".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.threads[1].state, ThreadState::Loading);
+    }
+
+    #[test]
+    fn unknown_identity_snapshot_clears_previous_shared_message_list() {
+        let mut model = model_with_threads(&["a"]);
+        model.displayed_thread = Some(0);
+        model.list_owner_thread_id = Some("thread-0".to_owned());
+        model.messages_model.push(crate::MessageItem {
+            text: "stale previous thread content".into(),
+            ..Default::default()
+        });
+        *model.message_model_keys.borrow_mut() = vec!["assistant:stale".to_owned()];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-that-no-longer-exists".to_owned(),
+                    real_index: 99,
+                    transcript: Vec::new(),
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: Vec::new(),
+                    expanded_terminal: None,
+                    open_terminals: Vec::new(),
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: "Unavailable".to_owned(),
+                    session_modes: None,
+                    config_options: Vec::new(),
+                    available_commands: Vec::new(),
+                    plan: Vec::new(),
+                    session_title: None,
+                    usage: (0, 0),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.list_owner_thread_id, None);
+        assert!(dirty.iter().any(|item| matches!(
+            item,
+            Dirty::MessagesDiff { thread_id, .. } if thread_id.is_empty()
+        )));
+        crate::sync::apply_message_ops(&model, "", &[]);
+        assert_eq!(model.messages_model.row_count(), 0);
+        assert!(model.message_model_keys.borrow().is_empty());
     }
 
     #[test]
@@ -3511,6 +4672,9 @@ mod tests {
         let mcp_servers_model = model.mcp_servers_model.clone();
         let agent_catalog_model = model.agent_catalog_model.clone();
         let recoverable_sessions_model = model.recoverable_sessions_model.clone();
+        let commands_model = model.commands_model.clone();
+        let open_terminals_model = model.open_terminals_model.clone();
+        *model.open_terminal_model_keys.borrow_mut() = vec!["terminal-1".to_owned()];
         let (_, dirty) = update(
             &mut model,
             Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
@@ -3520,6 +4684,7 @@ mod tests {
                         provider: "codex".to_owned(),
                         session_id: None,
                         profile_name: None,
+                        project_path: None,
                     }],
                     thread_ids: vec!["thread-1".to_owned()],
                     selected_thread_id: None,
@@ -3537,6 +4702,15 @@ mod tests {
             &mcp_servers_model,
             &model.mcp_servers_model
         ));
+        assert!(std::rc::Rc::ptr_eq(&commands_model, &model.commands_model));
+        assert!(std::rc::Rc::ptr_eq(
+            &open_terminals_model,
+            &model.open_terminals_model
+        ));
+        assert_eq!(
+            model.open_terminal_model_keys.borrow().as_slice(),
+            ["terminal-1"]
+        );
         assert!(std::rc::Rc::ptr_eq(
             &agent_catalog_model,
             &model.agent_catalog_model
@@ -3618,12 +4792,14 @@ mod tests {
             pending_request: crate::PendingRequestItem::default(),
             terminals: vec![],
             expanded_terminal: None,
-                    open_terminals: vec![],
+            open_terminals: vec![],
             local_terminal: crate::LocalTerminalItem::default(),
             connection_status: String::new(),
             session_modes: None,
             config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
             usage: (0, 0),
         };
 
@@ -3635,9 +4811,10 @@ mod tests {
             }),
         );
         assert!(
-            first_dirty
-                .iter()
-                .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
+            first_dirty.iter().any(|item| matches!(
+                item,
+                Dirty::MessagesDiff { .. } | Dirty::MessageListInstall { .. }
+            )),
             "first tick should populate the shared model: {first_dirty:?}"
         );
 
@@ -3649,9 +4826,10 @@ mod tests {
             }),
         );
         assert!(
-            !second_dirty
-                .iter()
-                .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
+            !second_dirty.iter().any(|item| matches!(
+                item,
+                Dirty::MessagesDiff { .. } | Dirty::MessageListInstall { .. }
+            )),
             "second tick with an unchanged snapshot must not resync: {second_dirty:?}"
         );
     }
@@ -3700,6 +4878,7 @@ mod tests {
             profile_name: None,
             permission_profile: None,
             background_session: None,
+            project_path: None,
         };
         let input = FrameInput {
             thread_record_snapshots: vec![record.clone()],
@@ -3714,6 +4893,64 @@ mod tests {
         );
         let (effects, _) = update(&mut model, Msg::Frame(input));
         assert!(effects.is_empty());
+    }
+
+    // PISO-8 (project-isolation-mlt-binding plan): the throttle flag is the
+    // ONLY thing that queues the background poll -- update_frame must
+    // never spawn it on every tick (that would mean a real subprocess
+    // spawn 60-90x/sec, exactly what the plan's data-path discipline note
+    // forbids on this path).
+    #[test]
+    fn daemon_projects_refresh_due_queues_the_refresh_effect_only_when_true() {
+        let mut model = Model::default();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Frame(crate::msg::FrameInput {
+                daemon_projects_refresh_due: true,
+                ..crate::msg::FrameInput::default()
+            }),
+        );
+        assert_eq!(effects, vec![Effect::RefreshDaemonProjectInstances]);
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Frame(crate::msg::FrameInput {
+                daemon_projects_refresh_due: false,
+                ..crate::msg::FrameInput::default()
+            }),
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn daemon_project_instances_loaded_replaces_model_on_ok_and_keeps_previous_on_err() {
+        let mut model = Model::default();
+        let instance = crate::agent_bridge::DaemonProjectInstance {
+            project_path: "/work/b/project.mlt".to_string(),
+            headless: true,
+        };
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::DaemonProjectInstancesLoaded(Ok(vec![
+                instance.clone(),
+            ]))),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.live_daemon_projects, vec![instance.clone()]);
+
+        // A failed poll (daemon unreachable, ...) must not clear the
+        // previously cached instances or surface an error toast for a
+        // background poll the user never triggered.
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::DaemonProjectInstancesLoaded(Err(
+                crate::effect::EffectError::new("connection refused"),
+            ))),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.live_daemon_projects, vec![instance]);
     }
 
     #[test]
@@ -3733,7 +4970,9 @@ mod tests {
                 clear_selected_thread: false,
                 settings_gateway_snapshot: None,
                 settings_preferences_snapshot: None,
+                agent_operations_in_flight: Vec::new(),
                 skills_snapshot: None,
+                daemon_projects_refresh_due: false,
             }),
         );
         assert!(effects.is_empty());
@@ -3773,7 +5012,9 @@ mod tests {
                     connection_status: "Live connection".to_owned(),
                     session_modes: None,
                     config_options: vec![],
-            available_commands: vec![],
+                    available_commands: vec![],
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3790,7 +5031,9 @@ mod tests {
         assert_eq!(model.threads[0].connection_status, "Live connection");
         assert!(dirty.iter().any(|item| matches!(
             item,
-            Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-0"
+            Dirty::MessagesDiff { thread_id, .. }
+                | Dirty::MessageListInstall { thread_id }
+                if thread_id == "thread-0"
         )));
         assert!(dirty.iter().any(|item| matches!(
             item,
@@ -3799,7 +5042,74 @@ mod tests {
     }
 
     #[test]
-    fn switching_to_a_thread_with_a_coincidentally_unchanged_transcript_still_resyncs_the_shared_model() {
+    fn cold_starts_first_displayed_thread_snapshot_never_clears_a_global_error_banner() {
+        // SCNA-01 regression: model.displayed_thread starts None before
+        // cold-start hydration's first Frame. That first frame's own
+        // "switched_thread" (None -> Some(0)) used to unconditionally
+        // push Dirty::Error{thread_id: "thread-0", message: ""}
+        // (thread.error is always None on a freshly-restored thread),
+        // silently wiping out any InitialState::startup_warnings banner
+        // set moments earlier in the same synchronous cold-start call,
+        // before the window was ever shown. The fix: skip that push when
+        // there was no real previously-displayed thread to leave.
+        let mut model = model_with_threads(&["thread"]);
+        assert_eq!(model.displayed_thread, None);
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-0".to_owned(),
+                    real_index: 0,
+                    ..crate::msg::ThreadFrameSnapshot::default()
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.displayed_thread, Some(0));
+        assert!(
+            !dirty.iter().any(|item| matches!(item, Dirty::Error { .. })),
+            "the first-ever displayed-thread snapshot must not emit a Dirty::Error, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_thread_switch_still_clears_the_outgoing_threads_error_banner() {
+        // Companion to the cold-start regression above: once a thread has
+        // genuinely been displayed before, switching away from it must
+        // still clear/refresh the error banner for the incoming thread --
+        // this is the original leak_audit_report behavior the
+        // had_prior_displayed_thread guard must not disable.
+        let mut model = model_with_threads(&["first", "second"]);
+        model.threads[0].session_id = Some("thread-0-session".to_owned());
+        model.displayed_thread = Some(0);
+        // phase-23's selection_matches gate requires the snapshot's target
+        // to actually be the currently-selected thread, not just any
+        // thread -- otherwise switched_thread is false regardless of this
+        // test's own guard, for an unrelated reason.
+        model.selected_thread = 1;
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    ..crate::msg::ThreadFrameSnapshot::default()
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            dirty.iter().any(|item| matches!(
+                item,
+                Dirty::Error { thread_id, .. } if thread_id == "thread-1"
+            )),
+            "a genuine thread switch must still refresh the error banner, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn switching_to_a_thread_with_a_coincidentally_unchanged_transcript_still_resyncs_the_shared_model(
+    ) {
         // Regression test: "starting a new chat shows prefill data [from
         // the previous thread]". `transcript_changed` used to compare the
         // *target* thread's own transcript against its own previously
@@ -3856,7 +5166,9 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
-            available_commands: vec![],
+                    available_commands: vec![],
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3864,26 +5176,29 @@ mod tests {
         );
 
         assert_eq!(model.displayed_thread, Some(1));
-        let ops = dirty
-            .iter()
-            .find_map(|item| match item {
-                Dirty::MessagesDiff { thread_id, ops } if thread_id == "thread-1" => {
-                    Some(ops.clone())
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "switching to the new thread must resync the shared messages model even \
-                     though thread-1's own transcript diff is a no-op -- otherwise thread-0's \
-                     messages stay on screen as bogus 'prefill' data: {dirty:?}"
-                )
-            });
+        let installed = dirty.iter().any(|item| {
+            matches!(
+                item,
+                Dirty::MessageListInstall { thread_id } if thread_id == "thread-1"
+            )
+        });
+        let ops = dirty.iter().find_map(|item| match item {
+            Dirty::MessagesDiff { thread_id, ops } if thread_id == "thread-1" => Some(ops.clone()),
+            _ => None,
+        });
+        assert!(
+            installed || ops.is_some(),
+            "switching to the new thread must resync the shared messages model even \
+             though thread-1's own transcript diff is a no-op -- otherwise thread-0's \
+             messages stay on screen as bogus 'prefill' data: {dirty:?}"
+        );
 
-        // The marker alone doesn't prove anything ends up on screen --
-        // actually apply it, the same way sync() would, and check the
-        // *shared* model, not per-thread state.
-        crate::sync::apply_message_ops(&model, "thread-1", &ops);
+        // Apply the same way sync() would, and check the *shared* model.
+        if installed {
+            crate::sync::install_message_list_snapshot(&model, "thread-1");
+        } else if let Some(ops) = ops {
+            crate::sync::apply_message_ops(&model, "thread-1", &ops);
+        }
         assert_eq!(
             model.messages_model.row_count(),
             0,
@@ -3928,7 +5243,9 @@ mod tests {
                     connection_status: "Live".to_owned(),
                     session_modes: None,
                     config_options: vec![],
-            available_commands: vec![],
+                    available_commands: vec![],
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3940,7 +5257,9 @@ mod tests {
         assert_eq!(model.threads[2].transcript, transcript);
         assert!(dirty.iter().any(|item| matches!(
             item,
-            Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-1"
+            Dirty::MessagesDiff { thread_id, .. }
+                | Dirty::MessageListInstall { thread_id }
+                if thread_id == "thread-1"
         )));
     }
 
@@ -4088,6 +5407,7 @@ mod tests {
             real_index: 4,
             thread_id: "durable-thread-4".to_owned(),
             session_id: None,
+            agent_detected: None,
             item: crate::ThreadItem {
                 name: "filtered".into(),
                 ..crate::ThreadItem::default()
@@ -4101,6 +5421,7 @@ mod tests {
                     visible_thread_ids: vec!["durable-thread-4".to_owned()],
                     rows: vec![row.clone()],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4114,11 +5435,227 @@ mod tests {
         ));
     }
 
+    /// PROF-7: the actual state-setting deliverable -- when the frame fold
+    /// hydrates a just-attached thread's `session_id` (the same
+    /// `session_id.is_none()` transition `frame_thread_list_snapshot_uses_
+    /// durable_ids_as_row_keys` above exercises) and the row's
+    /// `agent_detected` says the bound agent was NOT found installed, the
+    /// thread's state becomes `ThreadState::Stale` -- a real per-thread
+    /// state written once at attach time, not a render-time heuristic.
+    #[test]
+    fn session_attach_with_agent_not_detected_marks_the_thread_stale() {
+        let mut model = model_with_threads(&["Restored Thread"]);
+        assert_eq!(model.threads[0].session_id, None);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(false),
+            item: crate::ThreadItem::default(),
+        };
+        update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                    active_project_path: None,
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.threads[0].session_id.as_deref(),
+            Some("real-session-id")
+        );
+        assert_eq!(
+            model.threads[0].state,
+            ThreadState::Stale,
+            "an attach whose agent_detected read false must mark the thread Stale"
+        );
+    }
+
+    /// Companion: the SAME transition, but `agent_detected: Some(true)`
+    /// (or `None`, e.g. native/unmanaged mode) must leave the thread's
+    /// state alone -- Stale is only ever set, never assumed.
+    #[test]
+    fn session_attach_with_agent_detected_or_unknown_does_not_mark_stale() {
+        for agent_detected in [Some(true), None] {
+            let mut model = model_with_threads(&["Restored Thread"]);
+            let row = crate::models::VisibleThreadItem {
+                real_index: 0,
+                thread_id: "thread-0".to_owned(),
+                session_id: Some("real-session-id".to_owned()),
+                agent_detected,
+                item: crate::ThreadItem::default(),
+            };
+            update(
+                &mut model,
+                Msg::Frame(FrameInput {
+                    thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                        visible_indices: vec![0],
+                        visible_thread_ids: vec!["thread-0".to_owned()],
+                        rows: vec![row],
+                        archived_flags: vec![],
+                        active_project_path: None,
+                    }),
+                    ..FrameInput::default()
+                }),
+            );
+            assert_eq!(
+                model.threads[0].state,
+                ThreadState::Idle,
+                "agent_detected={agent_detected:?} must never produce Stale"
+            );
+        }
+    }
+
+    /// PROF-9: creating an MCP server, or turning one (or a tool) ON, must
+    /// be blocked with a toast -- not sent as a real Effect -- when the
+    /// selected thread's agent is Stale or unauthenticated. Delete,
+    /// turning something OFF, and Authenticate must NOT be blocked (see
+    /// the doc comment on the McpServer* match arms in `update_settings`
+    /// for why).
+    #[test]
+    fn mcp_server_create_and_enable_are_blocked_for_a_stale_or_unauthenticated_thread() {
+        for make_unusable in [
+            (|t: &mut ThreadModel| t.state = ThreadState::Stale) as fn(&mut ThreadModel),
+            (|t: &mut ThreadModel| t.unauthenticated = true) as fn(&mut ThreadModel),
+        ] {
+            let mut model = model_with_threads(&["Thread"]);
+            make_unusable(&mut model.threads[0]);
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+                    name: "srv".to_owned(),
+                    command: "cmd".to_owned(),
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "McpServerCreate must not reach a real Effect when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+            assert_eq!(model.toast_kind, "error");
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+                    name: "srv".to_owned(),
+                    enabled: true,
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "enabling must be blocked when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+                    server_name: "srv".to_owned(),
+                    tool_name: "tool".to_owned(),
+                    enabled: true,
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "enabling a tool must be blocked when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+        }
+    }
+
+    /// Companion: a healthy thread (Idle, not unauthenticated) must never
+    /// be blocked, and delete / disable / authenticate must always pass
+    /// through regardless of thread health.
+    #[test]
+    fn mcp_server_actions_pass_through_for_a_healthy_thread_and_delete_disable_authenticate_always_pass(
+    ) {
+        let mut model = model_with_threads(&["Thread"]);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert!(!model.threads[0].unauthenticated);
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+                name: "srv".to_owned(),
+                command: "cmd".to_owned(),
+            })),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::McpServerCreate { .. }]
+        ));
+
+        // Now make the thread unusable and confirm delete/disable/authenticate
+        // still go through as real Effects.
+        model.threads[0].state = ThreadState::Stale;
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerDelete {
+                name: "srv".to_owned(),
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerDelete { .. }]),
+            "delete must always be reachable, even for an unusable agent"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+                name: "srv".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerEnabledChanged { .. }]),
+            "turning a server OFF must always be reachable"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+                server_name: "srv".to_owned(),
+                tool_name: "tool".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::McpServerToolEnabledChanged { .. }]
+            ),
+            "turning a tool OFF must always be reachable"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerAuthenticate {
+                name: "srv".to_owned(),
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerAuthenticate { .. }]),
+            "authenticate is the MCP server's own credentials, orthogonal to agent health"
+        );
+    }
+
     fn visible_row(real_index: usize, thread_id: &str) -> crate::models::VisibleThreadItem {
         crate::models::VisibleThreadItem {
             real_index,
             thread_id: thread_id.to_owned(),
             session_id: None,
+            agent_detected: None,
             item: crate::ThreadItem::default(),
         }
     }
@@ -4158,6 +5695,7 @@ mod tests {
                         visible_row(1, "thread-1"),
                     ],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4192,6 +5730,7 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned()],
                     rows: vec![row],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4219,6 +5758,7 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned(), "thread-1".to_owned()],
                     rows: vec![visible_row(0, "thread-0"), visible_row(1, "thread-1")],
                     archived_flags: vec![true, false],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4248,6 +5788,7 @@ mod tests {
                     visible_thread_ids: vec![],
                     rows: vec![],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4267,8 +5808,7 @@ mod tests {
         let mut model = model_with_threads(&["a", "b"]);
         model.visible_indices = vec![0, 1];
         model.selected_thread = 1;
-        *model.thread_model_keys.borrow_mut() =
-            vec!["thread-0".to_owned(), "thread-1".to_owned()];
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned(), "thread-1".to_owned()];
 
         let (_, _) = update(
             &mut model,
@@ -4278,12 +5818,112 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned()],
                     rows: vec![visible_row(0, "thread-0")],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
         );
 
         assert_eq!(model.selected_thread, 0, "gone thread clamps selection");
+    }
+
+    // PISO-2 (project-isolation-mlt-binding plan): rebind the visible
+    // thread list and the active chat on a project switch.
+
+    #[test]
+    fn project_switch_reanchors_selection_to_the_new_projects_first_thread_not_a_numeric_clamp() {
+        // Four threads, two per project. Project A is active with
+        // thread-1 (filtered index 1) selected. Switching to project B
+        // must land on thread-2 (B's first thread, filtered index 0) --
+        // NOT on thread-3, which is what a plain `selected_thread.min(new
+        // len - 1)` clamp (1.min(1) == 1) would have picked, purely
+        // because 1 was the old numeric position.
+        let mut model = model_with_threads(&["a", "b", "c", "d"]);
+        model.active_project_path = Some("/work/a/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/a/project.mlt".to_owned());
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 1; // thread-1
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned(), "thread-1".to_owned()];
+
+        // The user switches the open MLT project to B.
+        model.active_project_path = Some("/work/b/project.mlt".to_owned());
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![2, 3],
+                    visible_thread_ids: vec!["thread-2".to_owned(), "thread-3".to_owned()],
+                    rows: vec![visible_row(2, "thread-2"), visible_row(3, "thread-3")],
+                    archived_flags: vec![],
+                    active_project_path: Some("/work/b/project.mlt".to_owned()),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.selected_thread, 0,
+            "must land on B's first thread (thread-2), not a numeric clamp"
+        );
+        assert_eq!(selected_real_index(&model), 2);
+        assert_eq!(
+            model.synced_project_path.as_deref(),
+            Some("/work/b/project.mlt")
+        );
+        assert!(dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));
+    }
+
+    #[test]
+    fn a_thread_list_snapshot_collected_for_an_already_left_project_is_dropped() {
+        // The snapshot was collected while project A was active, but by
+        // the time it's folded in the user has already switched to B (a
+        // later `HostMsg::ProjectPathChanged` updated `active_project_
+        // path` first). Applying A's visible-list shape now would show A's
+        // threads under B's indicator -- the cross-project leak this plan
+        // exists to close. The fold must drop it, not assume it "usually"
+        // arrives before the switch.
+        let mut model = model_with_threads(&["a", "b"]);
+        model.active_project_path = Some("/work/b/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/b/project.mlt".to_owned());
+        model.visible_indices = vec![1];
+        model.selected_thread = 0; // thread-1, B's only thread
+        *model.thread_model_keys.borrow_mut() = vec!["thread-1".to_owned()];
+        let stale_rows = vec![visible_row(0, "thread-0")];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: stale_rows,
+                    archived_flags: vec![],
+                    active_project_path: Some("/work/a/project.mlt".to_owned()),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.visible_indices,
+            vec![1],
+            "stale project-A snapshot must not overwrite B's visible list"
+        );
+        assert_eq!(model.selected_thread, 0);
+        assert_eq!(
+            model.synced_project_path.as_deref(),
+            Some("/work/b/project.mlt"),
+            "a dropped snapshot must not mark B as synced against A's shape"
+        );
+        assert!(
+            !dirty
+                .iter()
+                .any(|item| matches!(item, Dirty::ThreadListDiff(_))),
+            "no list diff should be emitted for a snapshot that was dropped"
+        );
     }
 
     #[test]
@@ -4339,7 +5979,10 @@ mod tests {
                 detail: "codex-acp: no such file or directory".to_owned(),
             }),
         );
-        assert!(effects.is_empty(), "a toast-only result produces no further effects");
+        assert!(
+            effects.is_empty(),
+            "a toast-only result produces no further effects"
+        );
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
         assert!(
             !dirty.iter().any(|d| matches!(d, Dirty::Error { .. })),
@@ -4347,7 +5990,9 @@ mod tests {
         );
         assert_eq!(model.toast_kind, "error");
         assert!(model.toast_message.contains("create"));
-        assert!(model.toast_message.contains("codex-acp: no such file or directory"));
+        assert!(model
+            .toast_message
+            .contains("codex-acp: no such file or directory"));
     }
 
     #[test]
@@ -4362,10 +6007,12 @@ mod tests {
         model.active_skill_content = "old body".to_owned();
         let (effects, dirty) = update(
             &mut model,
-            Msg::Ui(crate::msg::UiMsg::Skill(crate::msg::SkillMsg::ContentEdited {
-                path: "/skills/demo/SKILL.md".into(),
-                content: "old body plus a typed delta".to_owned(),
-            })),
+            Msg::Ui(crate::msg::UiMsg::Skill(
+                crate::msg::SkillMsg::ContentEdited {
+                    path: "/skills/demo/SKILL.md".into(),
+                    content: "old body plus a typed delta".to_owned(),
+                },
+            )),
         );
         assert_eq!(model.active_skill_content, "old body plus a typed delta");
         assert!(model.skill_saving);
@@ -4440,7 +6087,9 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
-            available_commands: vec![],
+                    available_commands: vec![],
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -4468,7 +6117,10 @@ mod tests {
         let mut model = model_with_threads(&["a"]);
         assert!(model.open_terminal_ids.is_empty());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand("t1".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand("t1".to_owned()))),
+        );
 
         assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
         assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
@@ -4480,7 +6132,10 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
         model.expanded_terminal_id = Some("t2".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand("t1".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand("t1".to_owned()))),
+        );
 
         assert_eq!(
             model.open_terminal_ids,
@@ -4496,10 +6151,16 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
         model.expanded_terminal_id = Some("t1".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab("t2".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab("t2".to_owned()))),
+        );
 
         assert_eq!(model.expanded_terminal_id, Some("t2".to_owned()));
-        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned(), "t2".to_owned()]);
+        assert_eq!(
+            model.open_terminal_ids,
+            vec!["t1".to_owned(), "t2".to_owned()]
+        );
     }
 
     #[test]
@@ -4510,7 +6171,9 @@ mod tests {
 
         update(
             &mut model,
-            Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab("never-opened".to_owned()))),
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab(
+                "never-opened".to_owned(),
+            ))),
         );
 
         assert_eq!(
@@ -4527,9 +6190,15 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned(), "t3".to_owned()];
         model.expanded_terminal_id = Some("t2".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))),
+        );
 
-        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned(), "t3".to_owned()]);
+        assert_eq!(
+            model.open_terminal_ids,
+            vec!["t1".to_owned(), "t3".to_owned()]
+        );
         assert_eq!(
             model.expanded_terminal_id,
             Some("t3".to_owned()),
@@ -4543,7 +6212,10 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
         model.expanded_terminal_id = Some("t2".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))),
+        );
 
         assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
         assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
@@ -4555,7 +6227,10 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
         model.expanded_terminal_id = Some("t1".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))),
+        );
 
         assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
         assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
@@ -4567,7 +6242,10 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned()];
         model.expanded_terminal_id = Some("t1".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t1".to_owned()))));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t1".to_owned()))),
+        );
 
         assert!(model.open_terminal_ids.is_empty());
         assert_eq!(
@@ -4582,12 +6260,152 @@ mod tests {
         model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned(), "t3".to_owned()];
         model.expanded_terminal_id = Some("t2".to_owned());
 
-        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)));
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)),
+        );
 
         assert!(
             model.open_terminal_ids.is_empty(),
             "the overlay-wide Close/Escape path must close every tab, not just the active one"
         );
         assert_eq!(model.expanded_terminal_id, None);
+    }
+
+    // --- chat_view_audit §5 isolation + presentation e2e (reducer/sync) ---
+
+    #[test]
+    fn selection_switch_atomically_sets_displayed_owner_and_installs_target_list() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        model.list_owner_thread_id = Some("thread-0".to_owned());
+        model.threads[0].transcript_keys = vec!["assistant:a1".to_owned()];
+        model.threads[0].message_rows = vec![crate::MessageItem {
+            text: "from A".into(),
+            expanded: true,
+            ..crate::MessageItem::default()
+        }];
+        model.threads[1].transcript_keys = vec!["assistant:b1".to_owned()];
+        model.threads[1].message_rows = vec![crate::MessageItem {
+            text: "from B".into(),
+            ..crate::MessageItem::default()
+        }];
+        model
+            .messages_model
+            .push(model.threads[0].message_rows[0].clone());
+        *model.message_model_keys.borrow_mut() = vec!["assistant:a1".to_owned()];
+
+        let (_, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+
+        assert_eq!(model.displayed_thread, Some(1));
+        assert_eq!(model.list_owner_thread_id.as_deref(), Some("thread-1"));
+        assert!(dirty.iter().any(|d| matches!(
+            d,
+            Dirty::MessageListInstall { thread_id } if thread_id == "thread-1"
+        )));
+        // Leave cache for A must capture expand.
+        let cache_a = model
+            .list_ui_cache
+            .get("thread-0")
+            .expect("leave A should snapshot cache");
+        assert_eq!(cache_a.rows[0].text, "from A");
+        assert!(cache_a.rows[0].expanded);
+
+        crate::sync::install_message_list_snapshot(&model, "thread-1");
+        assert_eq!(model.messages_model.row_count(), 1);
+        assert_eq!(model.messages_model.row_data(0).unwrap().text, "from B");
+    }
+
+    #[test]
+    fn expand_survives_thread_switch_leave_and_return() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.selected_thread = 0;
+        model.displayed_thread = Some(0);
+        model.list_owner_thread_id = Some("thread-0".to_owned());
+        model.threads[0].transcript_keys = vec!["thinking:t1".to_owned()];
+        model.threads[0].message_rows = vec![crate::MessageItem {
+            text: "thought".into(),
+            kind: "thinking".into(),
+            expanded: false,
+            ..crate::MessageItem::default()
+        }];
+        model
+            .messages_model
+            .push(model.threads[0].message_rows[0].clone());
+        *model.message_model_keys.borrow_mut() = vec!["thinking:t1".to_owned()];
+        model.expanded = vec![false];
+
+        // Expand on A.
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(0))),
+        );
+        assert!(matches!(
+            dirty.as_slice(),
+            [Dirty::MessageRowPatch {
+                thread_id,
+                index: 0
+            }] if thread_id == "thread-0"
+        ));
+        assert!(model.threads[0].message_rows[0].expanded);
+        crate::sync::apply_message_row_patch(&model, "thread-0", 0);
+        assert!(model.messages_model.row_data(0).unwrap().expanded);
+
+        // A → B
+        let _ = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        crate::sync::install_message_list_snapshot(&model, "thread-1");
+        assert_eq!(model.displayed_thread, Some(1));
+
+        // B → A: cache must restore expanded thought.
+        let _ = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(0))));
+        assert!(
+            model
+                .list_ui_cache
+                .get("thread-0")
+                .is_some_and(|c| { c.rows.first().is_some_and(|r| r.expanded) }),
+            "cache[A] must keep expand after leave"
+        );
+        // Selection restores from cache into ThreadModel then install.
+        assert!(
+            model.threads[0].message_rows[0].expanded,
+            "return to A must restore expanded on ThreadModel from cache"
+        );
+        crate::sync::install_message_list_snapshot(&model, "thread-0");
+        assert!(
+            model.messages_model.row_data(0).unwrap().expanded,
+            "shared list must show expanded after return install"
+        );
+    }
+
+    #[test]
+    fn toggle_expanded_is_one_row_patch_not_full_messages_diff() {
+        let mut model = model_with_threads(&["only"]);
+        model.displayed_thread = Some(0);
+        model.threads[0].message_rows = vec![
+            crate::MessageItem {
+                text: "t".into(),
+                kind: "thinking".into(),
+                ..crate::MessageItem::default()
+            },
+            crate::MessageItem {
+                text: "a".into(),
+                ..crate::MessageItem::default()
+            },
+        ];
+        model.expanded = vec![false, false];
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(0))),
+        );
+        assert!(
+            !dirty.iter().any(|d| matches!(
+                d,
+                Dirty::MessagesDiff { .. } | Dirty::MessageListInstall { .. }
+            )),
+            "expand must not full-rebuild list: {dirty:?}"
+        );
+        assert!(dirty
+            .iter()
+            .any(|d| matches!(d, Dirty::MessageRowPatch { index: 0, .. })));
     }
 }

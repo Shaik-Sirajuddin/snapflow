@@ -115,6 +115,11 @@ pub struct FfiBackend {
     /// going through `snapshotd`), in which case `file_import` skips the
     /// containment check entirely rather than rejecting everything.
     project_root: Option<PathBuf>,
+    /// Guards the real disk-load/bind so a 2nd/3rd MCP client's
+    /// `project.select` (Router.Bind fans every session's bind onto the
+    /// same pooled connection) is a safe no-op, not a reload that would
+    /// discard in-memory edits.
+    opened: bool,
 }
 
 // SAFETY: `main_window` is never dereferenced directly on whatever thread
@@ -337,6 +342,7 @@ impl FfiBackend {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             job_children: HashMap::new(),
             project_root,
+            opened: false,
         }
     }
 
@@ -469,23 +475,93 @@ impl Backend for FfiBackend {
     fn project_select(&mut self, project_id: &str) -> BackendResult<ProjectState> {
         // No multi-project routing in-process: the currently-open project
         // *is* the one project this Qt process has. Any project_id binds.
+        //
+        // One-time open: Router.Bind sends project.select on every session
+        // attach (including 2nd/3rd MCP clients on an already-live project).
+        // Only the first call may load from disk; later calls are no-ops
+        // that still return current ProjectState.
+        if !self.opened {
+            // Set first so a failed open below does not retry-loop on every
+            // subsequent select (matches plan sketch).
+            self.opened = true;
+            if let Some(root) = self.project_root.as_ref() {
+                let mlt_file_name = std::env::var("SNAPSHOT_PROJECT_MLT_FILENAME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "project.mlt".to_string());
+                let mlt_path = root.join(&mlt_file_name);
+                if let Some(path_str) = mlt_path.to_str() {
+                    if let Ok(c_path) = CString::new(path_str) {
+                        let rc = if mlt_path.exists() {
+                            unsafe { ffi::sap_open_project(self.main_window, c_path.as_ptr()) }
+                        } else {
+                            // Bind-only fallback: same as FfiBackend::new.
+                            let set_rc = unsafe {
+                                ffi::sap_set_project_file(self.main_window, c_path.as_ptr())
+                            };
+                            // Brand-new folder-type projects: set
+                            // MLT.projectFolder before first save so
+                            // kSnapflowProjectFolder=1 is written.
+                            // SNAPSHOT_PROJECT_TYPE is set by procmgr from
+                            // registry.Project.ProjectType.
+                            if set_rc == 0 {
+                                let ptype = std::env::var("SNAPSHOT_PROJECT_TYPE")
+                                    .unwrap_or_else(|_| "folder".to_string());
+                                if ptype == "folder" {
+                                    if let Some(root_str) = root.to_str() {
+                                        if let Ok(c_root) = CString::new(root_str) {
+                                            let _ = unsafe {
+                                                ffi::sap_set_project_folder(
+                                                    self.main_window,
+                                                    c_root.as_ptr(),
+                                                )
+                                            };
+                                        }
+                                    }
+                                } else if ptype == "file" {
+                                    let _ = unsafe {
+                                        ffi::sap_set_project_folder(
+                                            self.main_window,
+                                            std::ptr::null(),
+                                        )
+                                    };
+                                }
+                            }
+                            set_rc
+                        };
+                        if rc != 0 {
+                            return Err(BackendError::InvalidParams("project open failed".into()));
+                        }
+                    }
+                }
+            }
+        }
         self.project_get_state(project_id)
     }
 
     fn project_exit(&mut self) -> BackendResult<()> {
-        // No real primitive wired yet (would mean closing/quitting the live
-        // GUI session out from under its user) -- idempotent no-op, matching
-        // the same documented choice already made for MockBackend/server.rs.
+        // Intentionally unchanged (idempotent no-op): MCP project.exit is
+        // handled entirely by sapproxy.Router.Unbind on the daemon side and
+        // never reaches this method while other sessions may remain bound.
+        // sap_close_project exists on the C++ side for a later idle-reset
+        // path, not for session-scoped close.
         Ok(())
     }
 
     fn project_get_state(&mut self, project_id: &str) -> BackendResult<ProjectState> {
         let (undo_depth, redo_depth) = self.undo_redo_depth()?;
+        let project_type = match unsafe { ffi::sap_is_project_folder(self.main_window) } {
+            1 => "folder".to_string(),
+            0 => "file".to_string(),
+            _ => String::new(),
+        };
         Ok(ProjectState {
             project_id: project_id.to_string(),
             dirty: undo_depth > 0,
             undo_depth,
             redo_depth,
+            opened: self.opened,
+            project_type,
         })
     }
 

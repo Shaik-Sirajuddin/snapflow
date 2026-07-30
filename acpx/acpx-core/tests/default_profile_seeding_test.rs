@@ -5,12 +5,25 @@
 //! comment on that method for the full rationale. Uses the bundled
 //! fallback registry (`acpx-registry/registry.fallback.json`: claude-acp/
 //! codex-acp/gemini, all npx-distributed) -- no live network dependency,
-//! same as `agents_gateway_native_test.rs`. Node/npm are present in this
-//! environment (verified there too), so all three detect as `installed`.
+//! same as `agents_gateway_native_test.rs`.
+//!
+//! After `agents-install-runtime`, npx agents are `Installed` only when a
+//! ready marker exists under `~/.acpx/adapters/<id>/`. Tests write markers
+//! under a temp HOME (without a real package pre-fetch) so seeding is
+//! isolated and offline.
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::Router;
 use serde_json::json;
+
+/// Mark the three fallback registry agents ready under `$HOME/.acpx/adapters`.
+fn mark_fallback_agents_ready() {
+    let adapters = acpx_registry::default_adapters_dir();
+    for id in ["claude-acp", "codex-acp", "gemini"] {
+        acpx_registry::write_ready_marker(&adapters, id, "npx", "test-marker")
+            .expect("write ready marker");
+    }
+}
 
 /// Stand-in backend that answers any request with a fixed `session/new`
 /// result, or `{"ok": true}` otherwise -- same pattern used throughout
@@ -40,6 +53,11 @@ fn stand_in_backend_spec() -> SpawnSpec {
 /// box.
 #[tokio::test]
 async fn profiles_list_auto_seeds_one_profile_per_installed_registry_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    mark_fallback_agents_ready();
+
     let mut router = Router::new("codex-acp");
 
     let list = router
@@ -69,6 +87,11 @@ async fn profiles_list_auto_seeds_one_profile_per_installed_registry_agent() {
     assert_eq!(codex_profile["agent_id"], json!("codex-acp"));
     assert_eq!(codex_profile["provider"], json!(null));
     assert_eq!(codex_profile["key_ref"], json!(null));
+
+    match prev {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
 }
 
 /// Re-running `profiles/list` doesn't duplicate already-seeded profiles
@@ -76,6 +99,11 @@ async fn profiles_list_auto_seeds_one_profile_per_installed_registry_agent() {
 /// name-collision guard silently no-ops the repeat).
 #[tokio::test]
 async fn repeated_profiles_list_calls_do_not_duplicate_seeded_profiles() {
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    mark_fallback_agents_ready();
+
     let mut router = Router::new("codex-acp");
 
     for _ in 0..3 {
@@ -94,6 +122,11 @@ async fn repeated_profiles_list_calls_do_not_duplicate_seeded_profiles() {
         .filter(|p| p["name"] == json!("codex-acp"))
         .count();
     assert_eq!(codex_count, 1, "seeding must be idempotent: {profiles:?}");
+
+    match prev {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
 }
 
 /// An explicitly created profile that happens to share a name with a
@@ -151,6 +184,11 @@ async fn explicit_profile_with_registry_agent_name_is_not_overwritten_by_seeding
 /// and network-free rather than actually invoking `npx`.
 #[tokio::test]
 async fn session_new_resolves_auto_seeded_profile_with_no_prior_provisioning() {
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    mark_fallback_agents_ready();
+
     let mut router = Router::new("unrelated-default");
     router.register_agent("codex-acp", stand_in_backend_spec());
 
@@ -172,4 +210,9 @@ async fn session_new_resolves_auto_seeded_profile_with_no_prior_provisioning() {
         response["result"]["sessionId"].as_str().is_some(),
         "{response:?}"
     );
+
+    match prev {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
 }

@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
@@ -8,7 +9,7 @@ export component NamePromptDialog inherits Rectangle {
     in-out property <bool> open: false;
     in property <string> title: "";
     in property <string> field-accessible-label: "";
-    in property <string> confirm-label: "Save";
+    in property <string> confirm-label: Strings.save-label;
     in property <string> initial-value: "";
     property <string> draft: "";
     callback confirmed(string);
@@ -100,7 +101,7 @@ export component NamePromptDialog inherits Rectangle {
                 cancel-touch := TouchArea {
                     mouse-cursor: pointer;
                     accessible-role: button;
-                    accessible-label: "Cancel";
+                    accessible-label: Strings.cancel;
                     accessible-action-default => {
                         root.open = false;
                         root.cancelled();
@@ -111,7 +112,7 @@ export component NamePromptDialog inherits Rectangle {
                     }
                     changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
-                        text: "Cancel";
+                        text: Strings.cancel;
                         color: Theme.text-secondary;
                         font-size: 10px * Theme.font-scale;
                         vertical-alignment: center;

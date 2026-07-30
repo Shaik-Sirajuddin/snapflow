@@ -6,8 +6,9 @@
 //! interactive controls.
 
 use crate::raw::{ClientError, GatewayClient};
-use crate::ws::{GatewayNotification, GatewayWsClient};
-use std::sync::{Arc, RwLock};
+use crate::ws::{GatewayNotification, GatewayWsClient, SessionSubscription};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -34,6 +35,9 @@ const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// gateway that's mid-restart gets a little more time on each retry
 /// rather than being hammered at a fixed interval.
 const RECONNECT_BACKOFF_STEP: Duration = Duration::from_millis(500);
+/// Bound the first WebSocket handshake too. A delayed initial handshake must
+/// degrade to a later bounded request error, not strand thread actors.
+const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Gateway {
     base_url: String,
@@ -44,6 +48,14 @@ pub struct Gateway {
     // runtime -- and it lets `mode()`/`subscribe()` stay synchronous
     // (matching their existing signatures; no ripple to every caller).
     websocket: RwLock<Option<Arc<GatewayWsClient>>>,
+    session_replays: Mutex<HashMap<String, SessionReplay>>,
+}
+
+#[derive(Clone)]
+struct SessionReplay {
+    _method: String,
+    params: serde_json::Value,
+    profile: Option<String>,
 }
 
 /// A live agent-initiated request relayed from the gateway (see
@@ -96,11 +108,16 @@ impl Gateway {
     pub async fn connect(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         let http = GatewayClient::new(base_url.clone());
-        let websocket = GatewayWsClient::connect(&base_url).await.ok();
+        let websocket =
+            tokio::time::timeout(INITIAL_CONNECT_TIMEOUT, GatewayWsClient::connect(&base_url))
+                .await
+                .ok()
+                .and_then(Result::ok);
         Self {
             base_url,
             http,
             websocket: RwLock::new(websocket),
+            session_replays: Mutex::new(HashMap::new()),
         }
     }
 
@@ -110,6 +127,7 @@ impl Gateway {
             http: GatewayClient::new(base_url.clone()),
             base_url,
             websocket: RwLock::new(None),
+            session_replays: Mutex::new(HashMap::new()),
         }
     }
 
@@ -155,19 +173,98 @@ impl Gateway {
             )
             .await;
             if let Ok(Ok(client)) = attempt_result {
-                *self.websocket.write().expect("gateway websocket lock poisoned") = Some(client);
+                *self
+                    .websocket
+                    .write()
+                    .expect("gateway websocket lock poisoned") = Some(client);
                 return true;
             }
             if attempt < RECONNECT_MAX_ATTEMPTS {
                 tokio::time::sleep(RECONNECT_BACKOFF_STEP * attempt).await;
             }
         }
-        *self.websocket.write().expect("gateway websocket lock poisoned") = None;
+        *self
+            .websocket
+            .write()
+            .expect("gateway websocket lock poisoned") = None;
         false
     }
 
     pub fn subscribe(&self) -> Option<broadcast::Receiver<GatewayNotification>> {
         self.current_websocket().map(|client| client.subscribe())
+    }
+
+    /// Subscribes to notifications for one ACP session on the shared
+    /// WebSocket. Responses still use the pending request map; only live
+    /// notifications are demultiplexed here.
+    pub fn subscribe_session(&self, session_id: &str) -> Option<SessionSubscription> {
+        self.current_websocket()
+            .map(|client| client.subscribe_session(session_id))
+    }
+
+    /// Records the idempotent session operation needed to re-establish the
+    /// server-side WebSocket watch after a reconnect. The caller should invoke
+    /// this before sending `session/load`/`session/resume`, so an early replay
+    /// notification cannot arrive before the local receiver exists.
+    pub fn register_session_replay(
+        &self,
+        session_id: impl Into<String>,
+        method: impl Into<String>,
+        params: serde_json::Value,
+        profile: Option<String>,
+    ) {
+        self.session_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                session_id.into(),
+                SessionReplay {
+                    _method: method.into(),
+                    params,
+                    profile,
+                },
+            );
+    }
+
+    pub fn unregister_session_replay(&self, session_id: &str) {
+        self.session_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+    }
+
+    /// Re-establishes one registered session binding on the current
+    /// WebSocket. Reconnects deliberately use `session/resume`, not the
+    /// originally registered `session/load`: the panel owns its local
+    /// transcript and should not ask the gateway to replay it. The caller
+    /// must install its local `subscribe_session` receiver
+    /// before invoking this method.
+    pub async fn rehydrate_session(&self, session_id: &str) -> Result<(), ClientError> {
+        let replay = self
+            .session_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .cloned();
+        let Some(replay) = replay else {
+            return Ok(());
+        };
+        let Some(client) = self.current_websocket() else {
+            return Err(ClientError::WebSocket(
+                "no WebSocket available for session rehydration".to_owned(),
+            ));
+        };
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "cwd": replay.params.get("cwd").cloned().unwrap_or_default(),
+        });
+        client
+            .call(
+                "session/resume",
+                with_profile(params, replay.profile.as_deref()),
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Resolves when the *current* WebSocket connection dies, or
@@ -264,9 +361,7 @@ impl Gateway {
                     )),
                 }
             }
-            None => {
-                self.call_after_reconnect(method, params, profile).await
-            }
+            None => self.call_after_reconnect(method, params, profile).await,
         }
     }
 
@@ -368,21 +463,19 @@ impl Gateway {
             )
         };
         let result = match self.current_websocket() {
-            Some(websocket) => {
-                match websocket.call("acpx/agent_response", params.clone()).await {
-                    Err(ClientError::WebSocket(_)) => {
-                        if self.reconnect().await {
-                            match self.current_websocket() {
-                                Some(client) => client.call("acpx/agent_response", params).await?,
-                                None => return Err(no_interactive_connection()),
-                            }
-                        } else {
-                            return Err(no_interactive_connection());
+            Some(websocket) => match websocket.call("acpx/agent_response", params.clone()).await {
+                Err(ClientError::WebSocket(_)) => {
+                    if self.reconnect().await {
+                        match self.current_websocket() {
+                            Some(client) => client.call("acpx/agent_response", params).await?,
+                            None => return Err(no_interactive_connection()),
                         }
+                    } else {
+                        return Err(no_interactive_connection());
                     }
-                    other => other?,
                 }
-            }
+                other => other?,
+            },
             None => {
                 if self.reconnect().await {
                     match self.current_websocket() {
@@ -481,5 +574,28 @@ mod tests {
             with_profile(serde_json::json!({"cwd": "/tmp"}), None),
             serde_json::json!({"cwd": "/tmp"})
         );
+    }
+
+    #[test]
+    fn failed_session_binding_can_be_removed_from_replay_registry() {
+        let gateway = Gateway::http_degraded("http://127.0.0.1:1");
+        gateway.register_session_replay(
+            "failed-session",
+            "session/load",
+            serde_json::json!({"sessionId": "failed-session", "cwd": "/tmp"}),
+            None,
+        );
+        assert!(gateway
+            .session_replays
+            .lock()
+            .expect("replay registry lock")
+            .contains_key("failed-session"));
+
+        gateway.unregister_session_replay("failed-session");
+        assert!(!gateway
+            .session_replays
+            .lock()
+            .expect("replay registry lock")
+            .contains_key("failed-session"));
     }
 }

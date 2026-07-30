@@ -10,12 +10,17 @@
 # captures screenshots.
 set -euo pipefail
 
+# shellcheck source=host_e2e_admin_provision.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_e2e_admin_provision.sh"
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state_dir="${PANEL_HOST_E2E_STATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/panel-host-e2e.XXXXXX")}"
 keep_state="${PANEL_HOST_E2E_KEEP_STATE:-0}"
 display="${PANEL_HOST_E2E_DISPLAY:-:109}"
 screen="${PANEL_HOST_E2E_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_HOST_E2E_GATEWAY_PORT:-18790}"
+admin_port="${PANEL_HOST_E2E_ADMIN_PORT:-18791}"
+admin_token="panel-host-e2e-admin-token-$$"
 dock_width="${PANEL_HOST_E2E_DOCK_WIDTH:-}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
@@ -60,9 +65,10 @@ xvfb_pid="$!"
 export DISPLAY="$display"
 
 ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_BACKEND_CMD="$agent_bin" \
 ACPX_DEFAULT_AGENT_ID="codex" \
 ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+ACPX_ADMIN_TOKEN="$admin_token" \
+ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
 RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
 "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
 server_pid="$!"
@@ -74,6 +80,13 @@ for _ in $(seq 1 80); do
     sleep 0.1
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
+
+# PROF-4 (profile-only-backend-selection plan): registers rui-mock-agent as
+# a real admin-plane profile and points the panel's own settings at it,
+# replacing the old ACPX_BACKEND_CMD + native-mode approach -- see
+# host_e2e_admin_provision.sh's own doc comment for the full mechanism and
+# why it can't just reuse ACPX_DEFAULT_AGENT_ID's "codex" id directly.
+provision_mock_profile_via_admin "$gateway_port" "$admin_port" "$admin_token" "$agent_bin" "$state_dir"
 
 start_shotcut() {
     shotcut_run=$((shotcut_run + 1))

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -159,6 +160,8 @@ func (s *connSink) closeSink() {
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	sessionID := uuid.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	sink := &connSink{out: make(chan any, 64)}
 	writerDone := make(chan struct{})
@@ -185,7 +188,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			sink.sendResponse(errorResponse(nil, CodeParseError, "parse error: "+err.Error()))
 			continue
 		}
-		resp := s.handle(context.Background(), sessionID, sink, req)
+		resp := s.handle(ctx, sessionID, sink, req)
 		sink.sendResponse(resp)
 	}
 
@@ -215,6 +218,9 @@ func (s *Server) handle(ctx context.Context, sessionID string, sink sapproxy.Sin
 			return errorResponse(req.ID, CodeInternalError, err.Error())
 		}
 		resp := resultResponse(req.ID, result)
+		if req.Method == "daemon.subscribeProjects" && subscriptionUsesPush(result) {
+			go s.watchProjects(ctx, sink)
+		}
 		log.Debug("sdp response", "session", sessionID, "method", req.Method, "result", debugJSON(resp.Result))
 		return resp
 	}
@@ -231,6 +237,64 @@ func (s *Server) handle(ctx context.Context, sessionID string, sink sapproxy.Sin
 	}
 	log.Debug("sdp response", "session", sessionID, "method", req.Method, "result", string(result))
 	return Response{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+// subscriptionUsesPush deliberately checks the returned wire shape instead
+// of depending on daemon's concrete type. This keeps the SDP transport
+// usable with fake handlers and makes the notification behavior part of the
+// protocol rather than a daemon-package implementation detail.
+func subscriptionUsesPush(result any) bool {
+	value, ok := result.(map[string]any)
+	if !ok {
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			return false
+		}
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			return false
+		}
+	}
+	mode, _ := value["mode"].(string)
+	return mode == "push"
+}
+
+// watchProjects provides push semantics over the existing newline-delimited
+// SDP connection. The registry is sampled at a modest bounded interval so
+// this works for every Handler implementation without adding a second
+// cross-package event-bus interface. Only changed authoritative snapshots are
+// sent; the initial snapshot is already part of subscribeProjects' response.
+func (s *Server) watchProjects(ctx context.Context, sink sapproxy.Sink) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	previous := s.projectSnapshot(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			current := s.projectSnapshot(ctx)
+			if current == "" {
+				continue
+			}
+			if current == previous {
+				continue
+			}
+			previous = current
+			sink.Notify("daemon.projectsChanged", json.RawMessage(current))
+		}
+	}
+}
+
+func (s *Server) projectSnapshot(ctx context.Context) string {
+	result, err := s.Handler.Dispatch(ctx, "daemon.listProjects", json.RawMessage(`{}`))
+	if err != nil {
+		return ""
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
 }
 
 // debugJSON best-effort-marshals v for a Debug log field; only used on the

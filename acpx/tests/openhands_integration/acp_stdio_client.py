@@ -81,7 +81,7 @@ class AcpStdioClient:
 
         `env_overrides` merges onto (does not replace) the current
         process's environment -- lets a caller point `ACPX_SERVER_BIN`/
-        `ACPX_BACKEND_CMD` at something other than the wrapper script's
+        `ACPX_DEFAULT_ACP_COMMAND` at something other than the wrapper script's
         own default without needing a second wrapper script per variant.
         """
         env = os.environ.copy()

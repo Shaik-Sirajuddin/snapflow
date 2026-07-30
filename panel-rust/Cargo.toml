@@ -10,7 +10,7 @@ default = []
 ui-dev-viewer = ["dep:slint-interpreter", "dep:spin_on", "dep:notify"]
 
 [dependencies]
-slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
+slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std", "gettext"] }
 # `runtime_gate_full_matrix` (video-generation-e2e-harness plan): Slint's own
 # official MCP UI-introspection/automation server (`mcp_server::init()`,
 # called from `panel_rust_create` right after `set_platform`, see lib.rs).
@@ -50,6 +50,7 @@ vt100 = "0.15"
 # default-app-opener dependency first (none present), so this is the
 # one new dependency rather than hand-rolling per-OS Command branching.
 opener = "0.7"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 # Windows CI runners have no system sqlite3.lib (link.exe: LNK1181 cannot
@@ -70,6 +71,21 @@ i-slint-backend-testing = "1.17.1"
 # why production code goes through the transport-neutral `Gateway`
 # facade, not raw HTTP).
 reqwest = { version = "0.12", features = ["json"] }
+# PROF-4 (profile-only-backend-selection plan): e2e harnesses provision
+# their mock backend as a real admin-plane custom agent + profile now,
+# instead of the removed ACPX_BACKEND_CMD env-var write (see
+# agent_bridge.rs's own PROF-3 comment) -- `acpx_client::ext::admin::
+# AdminClient::create_custom_agent` takes an `acpx_proto::admin::
+# CustomAgentSpec` by value, so that type needs to be nameable here too.
+acpx-proto = { path = "../acpx/acpx-proto" }
+# PROF-5: the ACPX_BACKEND_CMD/ACPX_DEFAULT_ACP_COMMAND regression guard
+# (tests/backend_cmd_env_write_regression_test.rs) matches on the real
+# `.env("NAME", ...)` call shape, not a bare substring, so legitimate
+# prose mentions (doc comments explaining the history/rationale) don't
+# fail it -- and that shape can span multiple lines (found live: one real
+# call site was exactly this and fooled an earlier hand-rolled grep), so
+# the match needs `\s*` between tokens, not literal adjacency.
+regex = "1"
 
 [build-dependencies]
 slint-build = "1.17.1"

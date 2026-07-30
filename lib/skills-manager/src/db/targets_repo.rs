@@ -42,6 +42,7 @@ impl TargetsRepo {
         Ok(rows)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn list_for_skill(
         conn: &Connection,
         skill_id: &str,
@@ -70,8 +71,12 @@ impl TargetsRepo {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete(conn: &Connection, target_id: &str) -> Result<(), SkillError> {
-        conn.execute("DELETE FROM skill_targets WHERE id = ?1", params![target_id])?;
+        conn.execute(
+            "DELETE FROM skill_targets WHERE id = ?1",
+            params![target_id],
+        )?;
         Ok(())
     }
 
@@ -99,6 +104,7 @@ impl TargetsRepo {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete_for_vendor(conn: &Connection, vendor_id: &str) -> Result<(), SkillError> {
         conn.execute(
             "DELETE FROM skill_targets WHERE vendor_id = ?1",

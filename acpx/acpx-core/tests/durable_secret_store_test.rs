@@ -267,7 +267,7 @@ async fn rotate_master_key_reencrypts_every_secret_and_keeps_it_resolvable() {
 async fn without_enable_durable_config_nothing_survives_a_restart() {
     // Back-compat guard: `with_persistence` alone (no `enable_durable_
     // config`) must keep behaving exactly as it always did -- sessions/
-    // transcripts persist, but profiles/providers/mcp_servers/secrets
+    // message transcripts persist in Panel-Rust, but profiles/providers/mcp_servers/secrets
     // stay in-memory-only, matching every pre-existing caller's
     // expectations.
     let dir = tempfile::tempdir().expect("tempdir");
