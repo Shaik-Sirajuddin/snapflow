@@ -48,9 +48,17 @@ pub struct SessionPaginateParams {
 
 impl SessionPaginateParams {
     pub fn effective_limit(&self) -> u32 {
-        self.limit
-            .unwrap_or(OLDER_HISTORY_LIMIT)
-            .min(MAX_HISTORY_LIMIT)
+        let default = if self.before.is_none() {
+            INITIAL_HISTORY_LIMIT
+        } else {
+            OLDER_HISTORY_LIMIT
+        };
+        let maximum = if self.before.is_none() {
+            INITIAL_HISTORY_LIMIT
+        } else {
+            MAX_HISTORY_LIMIT
+        };
+        self.limit.unwrap_or(default).min(maximum)
     }
 }
 
@@ -176,18 +184,24 @@ mod tests {
     }
 
     #[test]
-    fn pagination_is_bounded_to_forty_and_defaults_to_forty() {
+    fn pagination_defaults_to_fifty_then_bounds_older_pages_to_forty() {
         let default = SessionPaginateParams {
             session_id: "s1".into(),
             before: None,
             limit: None,
         };
-        assert_eq!(default.effective_limit(), 40);
+        assert_eq!(default.effective_limit(), 50);
         let oversized = SessionPaginateParams {
+            limit: Some(500),
+            ..default.clone()
+        };
+        assert_eq!(oversized.effective_limit(), 50);
+        let older = SessionPaginateParams {
+            before: Some("10".into()),
             limit: Some(500),
             ..default
         };
-        assert_eq!(oversized.effective_limit(), 40);
+        assert_eq!(older.effective_limit(), 40);
     }
 
     #[test]

@@ -3681,7 +3681,7 @@ impl Router {
         self.spawn_state_revision_for_event(gateway_session_id.clone());
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let response = {
+        let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             write_backend_value_locked(&mut backend, &request).await?;
@@ -3696,6 +3696,15 @@ impl Router {
                 .await?;
             attach_updates(response, notifications, agent_requests)
         };
+        if matches!(method.as_str(), "session/load" | "session/resume") {
+            enrich_native_session_result(
+                &mut response,
+                serde_json::json!({
+                    "serverPersistence": true,
+                    "queueSubscribeMethod": "acpx/sessions/queue/subscribe"
+                }),
+            );
+        }
         self.sessions.touch(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
@@ -4646,11 +4655,22 @@ impl Router {
             }
             other => return Err(RouterError::UnknownMethod(other.to_string())),
         };
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": result,
-        }))
+        });
+        if method == "session/list" {
+            enrich_native_session_result(
+                &mut response,
+                serde_json::json!({
+                    "background": true,
+                    "subscribeMethod": "acpx/sessions/subscribe",
+                    "queueSubscribeMethod": "acpx/sessions/queue/subscribe"
+                }),
+            );
+        }
+        Ok(response)
     }
 }
 
@@ -7912,7 +7932,16 @@ async fn dispatch_proxied_shared(
             .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
             .await?;
     }
-    let response = response_result?;
+    let mut response = response_result?;
+    if matches!(method.as_str(), "session/load" | "session/resume") {
+        enrich_native_session_result(
+            &mut response,
+            serde_json::json!({
+                "serverPersistence": true,
+                "queueSubscribeMethod": "acpx/sessions/queue/subscribe"
+            }),
+        );
+    }
     mark_successful_recovery_retry(persistence.clone(), &gateway_session_id, &method).await?;
 
     spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
@@ -7939,6 +7968,19 @@ async fn dispatch_proxied_shared(
         }
     }
     Ok(response)
+}
+
+/// Adds only namespaced ACPX metadata to a native ACP result. Native fields
+/// and method names remain untouched, so an ACP-only client can ignore this
+/// object while ACPX clients learn which background/queue streams to attach.
+fn enrich_native_session_result(response: &mut serde_json::Value, metadata: serde_json::Value) {
+    let Some(result) = response
+        .get_mut("result")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    result.insert("_acpx".to_owned(), metadata);
 }
 
 /// [`dispatch_shared`]'s `session/fork` path. Mirrors

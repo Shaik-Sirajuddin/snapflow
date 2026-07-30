@@ -2020,13 +2020,14 @@ async fn run_thread_actor(
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
                 };
+                let request_limit = before.as_ref().map(|_| 40);
                 let result = client
                     .call(
                         "acpx/sessions/paginate",
                         serde_json::json!({
                             "sessionId": sid,
                             "before": before,
-                            "limit": 40
+                            "limit": request_limit
                         }),
                         None,
                     )
