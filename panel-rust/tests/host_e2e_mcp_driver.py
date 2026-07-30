@@ -171,6 +171,42 @@ def wait_for_accessible_label_prefix(client, root_handle, prefix, timeout=10, ma
     raise RuntimeError(f"no element with accessibleLabel starting {prefix!r} appeared in time")
 
 
+def accessible_label_count(client, root_handle, label, max_elements=600):
+    return len(find_elements_by_accessible_label(client, root_handle, label, max_elements))
+
+
+def wait_for_accessible_label_count(client, root_handle, label, minimum, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if accessible_label_count(client, root_handle, label) >= minimum:
+                return
+        except McpError as error:
+            if "Invalid element handle" not in str(error):
+                raise
+            root_handle = get_root_element(client)[1]
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"expected at least {minimum} elements with accessibleLabel={label!r}"
+    )
+
+
+def wait_for_accessible_label_count_at_most(client, root_handle, label, maximum, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if accessible_label_count(client, root_handle, label) <= maximum:
+                return
+        except McpError as error:
+            if "Invalid element handle" not in str(error):
+                raise
+            root_handle = get_root_element(client)[1]
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"expected at most {maximum} elements with accessibleLabel={label!r}"
+    )
+
+
 def set_text(client, element_handle, text):
     client.call_tool(
         "set_element_value", {"elementHandle": element_handle, "value": text}
@@ -233,6 +269,13 @@ def wait_for_prompt_texts(event_log, expected_texts, timeout=10):
 def scenario_send_now(args):
     client = McpClient(args.mcp_url)
     client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    # Production cold-starts intentionally have no synthetic chat session
+    # without a project identity. Create the deferred session through the
+    # real UI so this queue scenario is valid for both a fresh panel and a
+    # restored panel, rather than assuming a fixture thread exists.
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
     window_handle, root_handle = get_root_element(client)
 
     compose_handle = find_element_by_qualified_id(
@@ -309,6 +352,9 @@ def scenario_fast_track(args):
     client.wait_until_up()
     window_handle, root_handle = get_root_element(client)
 
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+
     compose_handle = find_element_by_qualified_id(
         client, window_handle, "ChatInputLayout::compose"
     )
@@ -346,6 +392,149 @@ def scenario_fast_track(args):
     print(
         "PASS fast_track scenario: empty-compose Return fast-tracked the queued "
         "message instead of sending an empty prompt"
+    )
+
+
+def scenario_queue_auto_drain(args):
+    """Verify the server-owned queue is visible, then drains after a turn."""
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+
+    set_text(client, compose_handle, "slow auto-drain turn one")
+    press_return(client, window_handle)
+    wait_for_prompt_texts(args.event_log, ["slow auto-drain turn one"], timeout=args.timeout)
+
+    set_text(client, compose_handle, "auto-drain queued turn two")
+    press_return(client, window_handle)
+    # The front queued row is rendered as "Stop sending" while the active
+    # turn is still in flight; later rows use "Cancel queued message".
+    wait_for_accessible_label_count(
+        client, root_handle, "Stop sending", 1, timeout=args.timeout
+    )
+
+    # The slow mock turn completes on its own. The ACPX dispatcher must then
+    # issue the queued prompt without another UI action.
+    wait_for_prompt_texts(
+        args.event_log,
+        ["slow auto-drain turn one", "auto-drain queued turn two"],
+        timeout=max(args.timeout, 30),
+    )
+    wait_for_accessible_label_count_at_most(
+        client, root_handle, "Stop sending", 0, timeout=args.timeout
+    )
+    wait_for_accessible_label_count_at_most(
+        client, root_handle, "Cancel queued message", 0, timeout=args.timeout
+    )
+    print(
+        "PASS queue_auto_drain scenario: queued row appeared in Slint MCP, "
+        "was sent automatically after the active turn, and disappeared"
+    )
+
+
+def scenario_queue_preload(args):
+    """Leave a paused, visible server queue for the shell restart phase."""
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+    set_text(client, compose_handle, "slow restart preload turn one")
+    press_return(client, window_handle)
+    wait_for_prompt_texts(args.event_log, ["slow restart preload turn one"], timeout=args.timeout)
+    set_text(client, compose_handle, "restart preloaded queued turn two")
+    press_return(client, window_handle)
+    wait_for_accessible_label_count(
+        client, root_handle, "Stop sending", 1, timeout=args.timeout
+    )
+    print("PASS queue_preload scenario: active turn and visible queued row prepared for restart")
+
+
+def scenario_queue_after_restart(args):
+    """Validate queue snapshot/reconnect projection after server restart."""
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    wait_for_accessible_label_count(
+        client, root_handle, "Stop sending", 1, timeout=max(args.timeout, 30)
+    )
+    wait_for_prompt_texts(
+        args.event_log,
+        ["slow restart preload turn one", "restart preloaded queued turn two"],
+        timeout=max(args.timeout, 30),
+    )
+    wait_for_accessible_label_count_at_most(
+        client, root_handle, "Stop sending", 0, timeout=args.timeout
+    )
+    wait_for_accessible_label_count_at_most(
+        client, root_handle, "Cancel queued message", 0, timeout=args.timeout
+    )
+    print(
+        "PASS queue_after_restart scenario: resumed UI received the persisted queue, "
+        "dispatched it after resume, and removed the row"
+    )
+
+
+def scenario_queue_background(args):
+    """Verify a queue callback remains visible after switching chats."""
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+    set_text(client, compose_handle, "slow background turn one")
+    press_return(client, window_handle)
+    wait_for_prompt_texts(args.event_log, ["slow background turn one"], timeout=args.timeout)
+    set_text(client, compose_handle, "background queued turn two")
+    press_return(client, window_handle)
+    wait_for_accessible_label_count(
+        client, root_handle, "Stop sending", 1, timeout=args.timeout
+    )
+
+    # Create/select another chat, then return to the first one. The first
+    # queue row must come from the subscribed background-session projection,
+    # not a local file reload tied only to the selected chat.
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+    expand_handle = wait_for_accessible_label(
+        client, root_handle, "Expand thread sidebar", timeout=args.timeout
+    )
+    click(client, expand_handle)
+    first_thread = wait_for_accessible_label(client, root_handle, "New thread 1", timeout=args.timeout)
+    click(client, first_thread)
+    collapse_handle = wait_for_accessible_label(
+        client, root_handle, "Collapse thread sidebar", timeout=args.timeout
+    )
+    click(client, collapse_handle)
+    window_handle, root_handle = get_root_element(client)
+    wait_for_accessible_label_count(
+        client, root_handle, "Stop sending", 1, timeout=args.timeout
+    )
+    wait_for_prompt_texts(
+        args.event_log,
+        ["slow background turn one", "background queued turn two"],
+        timeout=max(args.timeout, 30),
+    )
+    wait_for_accessible_label_count_at_most(
+        client, root_handle, "Stop sending", 0, timeout=args.timeout
+    )
+    print(
+        "PASS queue_background scenario: background queue state survived chat switching, "
+        "auto-dispatched, and cleared in the selected UI"
     )
 
 
@@ -930,6 +1119,10 @@ def scenario_pool_switch_between_threads_preserves_session_routing(args):
 SCENARIOS = {
     "send-now": scenario_send_now,
     "fast-track": scenario_fast_track,
+    "queue-auto-drain": scenario_queue_auto_drain,
+    "queue-preload": scenario_queue_preload,
+    "queue-after-restart": scenario_queue_after_restart,
+    "queue-background": scenario_queue_background,
     "rename": scenario_rename,
     "startup-warning": scenario_startup_warning,
     "mid-session-write-failure": scenario_mid_session_write_failure,

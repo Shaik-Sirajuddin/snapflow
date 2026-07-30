@@ -27,7 +27,14 @@ gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
 admin_port="${PANEL_HOST_E2E_MCP_ADMIN_PORT:-18797}"
 admin_token="panel-host-e2e-mcp-admin-token-$$"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
-scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|rename|startup-warning|mid-session-write-failure|real-agent-smoke>}"
+scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|queue-auto-drain|queue-restart|rename|startup-warning|mid-session-write-failure|real-agent-smoke>}"
+project_path="${PANEL_HOST_E2E_MCP_PROJECT_PATH:-}"
+
+if [[ "$scenario" == "queue-restart" ]]; then
+    # The custom mock profile inherits this durable state file from acpx-server
+    # so the replacement backend can answer the resumed session after restart.
+    export RUI_MOCK_AGENT_STATE_FILE="${PANEL_HOST_E2E_MCP_STATE_FILE:-$state_dir/acpx/mock-agent-state.json}"
+fi
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
 agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"
@@ -98,6 +105,7 @@ else
     ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
     ACPX_DEFAULT_AGENT_ID="codex" \
     ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+    ACPX_STORAGE_DIR="$state_dir/acpx/storage" \
     ACPX_ADMIN_TOKEN="$admin_token" \
     ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
     RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
@@ -123,6 +131,11 @@ if [[ "$scenario" == "startup-warning" ]]; then
     chmod 555 "$state_dir/panel"
 fi
 
+shotcut_project_args=()
+if [[ -n "$project_path" ]]; then
+    shotcut_project_args+=("$project_path")
+fi
+
 env \
 SLINT_MCP_PORT="$mcp_port" \
 RUI_PANEL_INPUT_TRACE=1 \
@@ -130,7 +143,7 @@ QSG_RENDER_LOOP=basic \
 RUI_ACP_CACHE_DIR="$state_dir/panel" \
 RUI_ACPX_CODEX_URL="http://127.0.0.1:$gateway_port" \
 RUI_ACPX_CLAUDE_URL="http://127.0.0.1:$gateway_port" \
-"$shotcut_bin" --appdata "$state_dir/shotcut" --noupgrade \
+"$shotcut_bin" --appdata "$state_dir/shotcut" --noupgrade "${shotcut_project_args[@]}" \
     >"$state_dir/shotcut.stdout.log" \
     2>"$state_dir/shotcut.stderr.log" &
 shotcut_pid="$!"
@@ -154,6 +167,49 @@ if [[ "$scenario" == "real-agent-smoke" ]]; then
     # agent's near-instant scripted replies.
     driver_args+=(--timeout "${PANEL_HOST_E2E_MCP_REAL_AGENT_TIMEOUT:-90}")
 fi
-python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" "${driver_args[@]}" "$scenario"
+
+if [[ "$scenario" == "queue-restart" ]]; then
+    # Phase 1 leaves one authoritative queue row visible while the first turn
+    # is active. Pause it before replacing acpx-server so restart cannot
+    # consume the row before the preload assertion.
+    python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" \
+        "${driver_args[@]}" queue-preload
+    session_id="$(sed -n 's/.*attachment: thread=.*session=Some("\([^"]*\)").*/\1/p' \
+        "$state_dir/shotcut.stdout.log" | tail -1)"
+    [[ -n "$session_id" ]] || { echo 'queue-restart: no ACPX session id in panel trace' >&2; exit 1; }
+    pause_response="$(curl --fail --silent -X POST "http://127.0.0.1:$gateway_port/rpc" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"session/queue\",\"params\":{\"sessionId\":\"$session_id\",\"operation\":\"pause\",\"idempotencyKey\":\"host-restart-pause\"}}")"
+    printf '%s' "$pause_response" | rg -q '"error"' && { echo "queue-restart: pause failed: $pause_response" >&2; exit 1; }
+
+    kill "$server_pid"
+    wait "$server_pid" || true
+    server_pid=""
+    ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
+    ACPX_DEFAULT_AGENT_ID="codex" \
+    ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+    ACPX_STORAGE_DIR="$state_dir/acpx/storage" \
+    ACPX_ADMIN_TOKEN="$admin_token" \
+    ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
+    RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
+    "$server_bin" <"$fifo" >"$state_dir/acpx/server.restart.stdout.log" \
+        2>"$state_dir/acpx/server.restart.stderr.log" &
+    server_pid="$!"
+    for _ in $(seq 1 80); do
+        if curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
+    resume_response="$(curl --fail --silent -X POST "http://127.0.0.1:$gateway_port/rpc" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"session/queue\",\"params\":{\"sessionId\":\"$session_id\",\"operation\":\"resume\",\"idempotencyKey\":\"host-restart-resume\"}}")"
+    printf '%s' "$resume_response" | rg -q '"error"' && { echo "queue-restart: resume failed: $resume_response" >&2; exit 1; }
+    python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" \
+        "${driver_args[@]}" queue-after-restart
+else
+    python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" "${driver_args[@]}" "$scenario"
+fi
 
 printf 'backend events: %s/acpx/backend-events.jsonl\n' "$state_dir"

@@ -511,7 +511,9 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 provider: provider.clone(),
                 profile_name: profile_name.clone(),
                 permission_profile: permission_profile.clone(),
-                send_queue: new_thread_send_queue(&thread_id),
+                // ACPX owns durable queue state in production; this is only
+                // the in-memory Slint projection until queue callbacks arrive.
+                send_queue: crate::send_queue::SendQueue::new(),
                 ..ThreadModel::default()
             });
             model.rebuild_thread_indices();
@@ -562,7 +564,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 profile_name,
                 permission_profile,
                 session_id,
-                send_queue: new_thread_send_queue(&thread_id),
+                send_queue: crate::send_queue::SendQueue::new(),
                 ..ThreadModel::default()
             });
             model.rebuild_thread_indices();
@@ -720,7 +722,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 display_name: title,
                 provider: provider.clone(),
                 session_id: Some(session_id.clone()),
-                send_queue: new_thread_send_queue(&thread_id),
+                send_queue: crate::send_queue::SendQueue::new(),
                 ..ThreadModel::default()
             });
             model.rebuild_thread_indices();
@@ -767,22 +769,6 @@ fn rebuild_send_queue_projection(model: &mut Model, idx: usize) -> (String, Vec<
     )
 }
 
-/// A brand-new thread's send queue, wired to persist to
-/// `<thread_id>.sendqueue.jsonl` going forward -- `send_queue.rs`'s own
-/// module doc describes this persistence, but nothing previously called
-/// `SendQueue::load`/`send_queue_path` outside that file's own tests, so
-/// every `ThreadModel::default()` silently kept `persist_path: None` and
-/// a queued-but-unsent message never survived a restart. Uses
-/// `new_with_path` (no I/O) rather than `load`, since a genuinely new
-/// thread has nothing to load; `Model::from_initial_state`'s cold-start
-/// path is the one that actually restores prior queue content from disk.
-fn new_thread_send_queue(thread_id: &str) -> crate::send_queue::SendQueue {
-    crate::send_queue::SendQueue::new_with_path(crate::send_queue::send_queue_path(
-        &crate::agent_bridge::resolve_cache_dir(),
-        thread_id,
-    ))
-}
-
 fn queue_entry_id_at(
     thread: &ThreadModel,
     message_index: usize,
@@ -791,6 +777,14 @@ fn queue_entry_id_at(
     let raw = key.strip_prefix("queue:")?;
     let n: u64 = raw.parse().ok()?;
     Some(crate::send_queue::QueueEntryId(n))
+}
+
+/// ACPX queue operations are keyed by the remote ACP session id, while the
+/// panel's `thread_id` is only a local UI identity. Keep the local fallback
+/// for the short pre-attachment window, but use the bound remote id as soon
+/// as `session/new`/`session/resume` has completed.
+fn queue_session_id<'a>(thread: &'a ThreadModel) -> &'a str {
+    thread.session_id.as_deref().unwrap_or(&thread.thread_id)
 }
 
 fn queue_mutation(
@@ -848,7 +842,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         let effects = if server_queue {
                             vec![queue_mutation(
                                 idx,
-                                &thread_id,
+                                queue_session_id(thread),
                                 "enqueue",
                                 Some(entry_id),
                                 Some(format!("queue-{}", entry_id.0)),
@@ -899,8 +893,8 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             // Sending resumes auto-processing after a manual stop.
             let server_queue = thread.server_queue;
             thread.send_queue.resume();
-            let resume_effect =
-                server_queue.then(|| queue_mutation(idx, &thread_id, "resume", None, None, None));
+            let resume_effect = server_queue
+                .then(|| queue_mutation(idx, queue_session_id(thread), "resume", None, None, None));
             (
                 [
                     resume_effect,
@@ -939,7 +933,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 if server_queue {
                     vec![
                         Effect::CancelGeneration { real_index: idx },
-                        queue_mutation(idx, &thread.thread_id, "pause", None, None, None),
+                        queue_mutation(idx, queue_session_id(thread), "pause", None, None, None),
                     ]
                 } else {
                     vec![Effect::CancelGeneration { real_index: idx }]
@@ -972,11 +966,10 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             };
             match remove_result {
                 Ok(Some(_)) => {
-                    let thread_id = model.threads[idx].thread_id.clone();
                     let effects = if model.threads[idx].server_queue {
                         vec![queue_mutation(
                             idx,
-                            &thread_id,
+                            queue_session_id(&model.threads[idx]),
                             "cancel",
                             Some(entry_id),
                             model.threads[idx]
@@ -1074,6 +1067,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
+                    let queue_session_id = queue_session_id(thread).to_owned();
                     let server_queue = thread.server_queue;
                     let remote_entry_id =
                         thread.send_queue.remote_id_for(entry.id).map(str::to_owned);
@@ -1096,7 +1090,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     if server_queue {
                         effects.push(queue_mutation(
                             idx,
-                            &thread_id,
+                            &queue_session_id,
                             "sendNow",
                             Some(entry.id),
                             remote_entry_id,
@@ -1147,6 +1141,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
+                    let queue_session_id = queue_session_id(thread).to_owned();
                     let server_queue = thread.server_queue;
                     let remote_entry_id =
                         thread.send_queue.remote_id_for(entry.id).map(str::to_owned);
@@ -1165,7 +1160,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     if server_queue {
                         effects.push(queue_mutation(
                             idx,
-                            &thread_id,
+                            &queue_session_id,
                             "sendNow",
                             Some(entry.id),
                             remote_entry_id,
@@ -3375,14 +3370,11 @@ mod tests {
         );
     }
 
-    /// send_queue.rs's disk persistence (SendQueue::load/send_queue_path)
-    /// previously had zero call sites outside its own tests -- every
-    /// thread's queue was `SendQueue::default()` (persist_path: None), so
-    /// a queued-but-unsent message was silently lost on restart despite
-    /// the fully-built persistence layer. This proves the wiring actually
-    /// round-trips through a real file, the same way a restart would.
+    /// Production server queues must not create a competing panel JSONL
+    /// file. The queue remains an in-memory UI projection and its mutation
+    /// is sent to ACPX, which owns durable storage and restart recovery.
     #[test]
-    fn a_new_threads_send_queue_persists_and_reloads_after_a_simulated_restart() {
+    fn a_new_thread_queue_does_not_write_panel_jsonl() {
         let cache_dir = tempfile::tempdir().expect("cache dir");
         let previous = std::env::var("RUI_ACP_CACHE_DIR").ok();
         unsafe {
@@ -3399,18 +3391,15 @@ mod tests {
             .enqueue("queued across a restart".to_owned(), false)
             .expect("enqueue must persist, not silently no-op");
 
-        // Simulate a restart: load a fresh SendQueue for the same
-        // thread_id the same way cold-start hydration does in lib.rs.
         let path = crate::send_queue::send_queue_path(
             &crate::agent_bridge::resolve_cache_dir(),
             &thread_id,
         );
-        let reloaded = crate::send_queue::SendQueue::load(path).expect("reload queue from disk");
-        assert_eq!(reloaded.len(), 1);
-        assert_eq!(
-            reloaded.first().map(|entry| entry.text.as_str()),
-            Some("queued across a restart")
+        assert!(
+            !path.exists(),
+            "server-owned queue must not create panel JSONL"
         );
+        assert_eq!(model.threads[0].send_queue.len(), 1);
 
         match previous {
             Some(value) => unsafe { std::env::set_var("RUI_ACP_CACHE_DIR", value) },
