@@ -79,6 +79,10 @@ pub struct InitialState {
     /// the same as `threads`/`thread_ids`; a missing/short entry falls
     /// back to an empty in-memory-only queue.
     pub send_queues: Vec<crate::send_queue::SendQueue>,
+    /// ACPX owns queue persistence and dispatch for production sessions.
+    /// Kept explicit so pure reducer tests can continue to exercise the
+    /// legacy local queue contract.
+    pub server_queue: bool,
 }
 
 /// One thread's `Model`-side state -- the former parallel-array fields in
@@ -120,6 +124,7 @@ pub struct ThreadModel {
     /// showed nothing at all, indistinguishable from a hang.
     pub agent_content_this_turn: bool,
     pub send_queue: SendQueue,
+    pub server_queue: bool,
     /// Per-thread compose draft (leak_audit_report §2.5 / §4.2). The
     /// global `Model::compose_text` is only the *active* buffer for the
     /// displayed thread; switching saves/restores via this field.
@@ -432,6 +437,7 @@ impl Default for ThreadModel {
             unauthenticated: false,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
+            server_queue: false,
             compose_draft: String::new(),
             closed: false,
             archived: false,
@@ -543,6 +549,7 @@ impl Model {
                     .unwrap_or(ThreadState::Idle),
                 session_id: spec.session_id,
                 send_queue: initial.send_queues.get(idx).cloned().unwrap_or_default(),
+                server_queue: initial.server_queue,
                 ..ThreadModel::default()
             })
             .collect();
@@ -580,6 +587,7 @@ mod tests {
             thread_states: vec![],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: false,
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -610,6 +618,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: false,
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -641,6 +650,7 @@ mod tests {
             thread_states: vec![ThreadState::Error],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: false,
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(

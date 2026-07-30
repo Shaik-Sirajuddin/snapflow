@@ -861,6 +861,11 @@ impl PanelSingleton {
         self.start_send_prompt(real_idx, text, bridge);
     }
 
+    pub(crate) fn execute_queue_mutation_real(&self, real_idx: usize, params: serde_json::Value) {
+        let Some(bridge) = &self.bridge else { return };
+        bridge.mutate_queue(real_idx, params);
+    }
+
     fn start_send_prompt(&self, idx: usize, text: &str, bridge: &AgentBridge) {
         if bridge.thread_closed(idx) {
             trace_host_input(format_args!(
@@ -1831,6 +1836,7 @@ fn panel_rust_create_with_initial_identity(
                 vec![ThreadState::Error; initial_specs.len()]
             },
             startup_warnings,
+            server_queue: true,
         };
         let mut model = model::Model::default();
         let thread_model = Rc::new(VecModel::default());

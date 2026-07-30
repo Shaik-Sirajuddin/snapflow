@@ -793,6 +793,28 @@ fn queue_entry_id_at(
     Some(crate::send_queue::QueueEntryId(n))
 }
 
+fn queue_mutation(
+    real_index: usize,
+    thread_id: &str,
+    operation: &str,
+    entry_id: Option<crate::send_queue::QueueEntryId>,
+    text: Option<String>,
+) -> Effect {
+    let stable_id = entry_id
+        .map(|id| id.0.to_string())
+        .unwrap_or_else(|| "none".into());
+    Effect::MutateQueue {
+        real_index,
+        params: serde_json::json!({
+            "sessionId": thread_id,
+            "idempotencyKey": format!("panel:{thread_id}:{operation}:{stable_id}"),
+            "operation": operation,
+            "queueEntryId": entry_id.map(|id| format!("queue-{}", id.0)),
+            "text": text,
+        }),
+    }
+}
+
 fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty>) {
     let idx = selected_real_index(model);
     match msg {
@@ -803,8 +825,9 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             };
             let thread_id = thread.thread_id.clone();
             if matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling) {
+                let server_queue = thread.server_queue;
                 return match thread.send_queue.enqueue(text, false) {
-                    Ok(_) => {
+                    Ok(entry_id) => {
                         // Rebuild message projection with queue rows so
                         // QueuedMessageBar appears immediately.
                         let expanded = model.expanded.clone();
@@ -820,8 +843,25 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
                         thread.message_rows = rows;
                         thread.transcript_keys = keys;
+                        let effects = if server_queue {
+                            vec![queue_mutation(
+                                idx,
+                                &thread_id,
+                                "enqueue",
+                                Some(entry_id),
+                                Some(
+                                    thread
+                                        .send_queue
+                                        .entry_by_id(entry_id)
+                                        .map(|entry| entry.text.clone())
+                                        .unwrap_or_default(),
+                                ),
+                            )]
+                        } else {
+                            vec![]
+                        };
                         (
-                            vec![],
+                            effects,
                             vec![
                                 thread_row_dirty(model, idx),
                                 Dirty::Scalar(ScalarField::ComposeText),
@@ -854,12 +894,21 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.agent_content_this_turn = false;
             thread.last_activity_time = Some(std::time::Instant::now());
             // Sending resumes auto-processing after a manual stop.
+            let server_queue = thread.server_queue;
             thread.send_queue.resume();
+            let resume_effect =
+                server_queue.then(|| queue_mutation(idx, &thread_id, "resume", None, None));
             (
-                vec![Effect::SendPrompt {
-                    thread_id: thread_id.clone(),
-                    text,
-                }],
+                [
+                    resume_effect,
+                    Some(Effect::SendPrompt {
+                        thread_id: thread_id.clone(),
+                        text,
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 vec![
                     // Without this, the sidebar spinner and the chat
                     // area's live-tail pulse (both driven by this row's
@@ -880,10 +929,18 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             };
             // Manual stop freezes the queue until the user re-engages
             // (SendQueue::pause / resume).
+            let server_queue = thread.server_queue;
             thread.send_queue.pause();
             thread.state = ThreadState::Cancelling;
             (
-                vec![Effect::CancelGeneration { real_index: idx }],
+                if server_queue {
+                    vec![
+                        Effect::CancelGeneration { real_index: idx },
+                        queue_mutation(idx, &thread.thread_id, "pause", None, None),
+                    ]
+                } else {
+                    vec![Effect::CancelGeneration { real_index: idx }]
+                },
                 vec![thread_row_dirty(model, idx)],
             )
         }
@@ -912,8 +969,20 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             };
             match remove_result {
                 Ok(Some(_)) => {
+                    let thread_id = model.threads[idx].thread_id.clone();
+                    let effects = if model.threads[idx].server_queue {
+                        vec![queue_mutation(
+                            idx,
+                            &thread_id,
+                            "cancel",
+                            Some(entry_id),
+                            None,
+                        )]
+                    } else {
+                        vec![]
+                    };
                     let (_thread_id, dirty) = rebuild_send_queue_projection(model, idx);
-                    (vec![], dirty)
+                    (effects, dirty)
                 }
                 Ok(None) => (vec![], vec![]),
                 Err(error) => {
@@ -922,6 +991,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
+                    let server_queue = thread.server_queue;
                     thread.error = Some(message.clone());
                     (
                         vec![],
@@ -1005,7 +1075,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         thread_id: thread_id.clone(),
                     });
                     let mut effects = Vec::with_capacity(2);
-                    if is_generating {
+                    if is_generating && !server_queue {
                         // A turn is already in flight -- cancel it. The
                         // resulting Stopped/TurnEnded event is absorbed by
                         // the queue's AbsorbingCancel state (armed by
@@ -1014,10 +1084,20 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         // new one.
                         effects.push(Effect::CancelGeneration { real_index: idx });
                     }
-                    effects.push(Effect::SendPrompt {
-                        thread_id: thread_id.clone(),
-                        text: entry.text,
-                    });
+                    if server_queue {
+                        effects.push(queue_mutation(
+                            idx,
+                            &thread_id,
+                            "sendNow",
+                            Some(entry.id),
+                            Some(entry.text),
+                        ));
+                    } else {
+                        effects.push(Effect::SendPrompt {
+                            thread_id: thread_id.clone(),
+                            text: entry.text,
+                        });
+                    }
                     (effects, dirty)
                 }
                 Ok(None) => (vec![], vec![]),
@@ -1027,6 +1107,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
+                    let server_queue = thread.server_queue;
                     thread.error = Some(message.clone());
                     (
                         vec![],
@@ -1064,15 +1145,25 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         thread_id: thread_id.clone(),
                     });
                     let mut effects = Vec::with_capacity(2);
-                    if is_generating {
+                    if is_generating && !server_queue {
                         // Same AbsorbingCancel handoff as QueueSendNow --
                         // try_fast_track already armed it above.
                         effects.push(Effect::CancelGeneration { real_index: idx });
                     }
-                    effects.push(Effect::SendPrompt {
-                        thread_id: thread_id.clone(),
-                        text: entry.text,
-                    });
+                    if server_queue {
+                        effects.push(queue_mutation(
+                            idx,
+                            &thread_id,
+                            "sendNow",
+                            Some(entry.id),
+                            Some(entry.text),
+                        ));
+                    } else {
+                        effects.push(Effect::SendPrompt {
+                            thread_id: thread_id.clone(),
+                            text: entry.text,
+                        });
+                    }
                     (effects, dirty)
                 }
                 // Safe no-op: no can_fast_track-eligible entry (queue
@@ -4572,6 +4663,7 @@ mod tests {
                     thread_states: vec![],
                     startup_warnings: vec![],
                     send_queues: vec![],
+                    server_queue: false,
                 },
             ))),
         );
@@ -4619,6 +4711,7 @@ mod tests {
                         "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
                     ],
                     send_queues: vec![],
+                    server_queue: false,
                 },
             ))),
         );

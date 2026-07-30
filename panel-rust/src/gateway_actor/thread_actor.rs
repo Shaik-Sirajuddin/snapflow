@@ -154,6 +154,10 @@ enum Command {
         before: Option<String>,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    QueueMutation {
+        params: serde_json::Value,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     ListSessions {
         agent_id: Option<String>,
         resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
@@ -462,6 +466,16 @@ impl AcpxThreadHandle {
     pub async fn paginate_history(&self, before: Option<String>) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::PaginateHistory { before, resp })
             .await
+    }
+
+    pub async fn mutate_queue(&self, mut params: serde_json::Value) -> Result<(), AcpxThreadError> {
+        self.call(|resp| {
+            if !params.get("sessionId").is_some() {
+                params["sessionId"] = serde_json::Value::Null;
+            }
+            Command::QueueMutation { params, resp }
+        })
+        .await
     }
 
     /// Gateway-aggregated `session/list` -- every session across every
@@ -2026,6 +2040,19 @@ async fn run_thread_actor(
                         });
                         Ok(())
                     });
+                let _ = resp.send(result);
+            }
+            Command::QueueMutation { mut params, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                params["sessionId"] = serde_json::Value::String(sid);
+                let result = client
+                    .call("session/queue", params, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(AcpxThreadError::from);
                 let _ = resp.send(result);
             }
             Command::ListSessions { agent_id, resp } => {

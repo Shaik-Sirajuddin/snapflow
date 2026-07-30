@@ -83,6 +83,12 @@ pub enum Effect {
         thread_id: String,
         text: String,
     },
+    /// Mutate the ACPX server-owned FIFO. The server broadcasts the
+    /// resulting authoritative queue projection back to every client.
+    MutateQueue {
+        real_index: usize,
+        params: serde_json::Value,
+    },
     CancelGeneration {
         real_index: usize,
     },

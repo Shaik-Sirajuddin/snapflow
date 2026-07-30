@@ -495,6 +495,9 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     panel.execute_send_prompt_real(real_index, &text);
                 }
             }
+            Effect::MutateQueue { real_index, params } => {
+                panel.execute_queue_mutation_real(real_index, params);
+            }
             Effect::CancelGeneration { real_index } => {
                 panel.execute_cancel_generation_real(real_index);
             }
