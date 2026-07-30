@@ -437,7 +437,7 @@ impl Default for ThreadModel {
             unauthenticated: false,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
-            server_queue: false,
+            server_queue: true,
             compose_draft: String::new(),
             closed: false,
             archived: false,
@@ -587,7 +587,7 @@ mod tests {
             thread_states: vec![],
             startup_warnings: vec![],
             send_queues: vec![],
-            server_queue: false,
+            server_queue: true,
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -618,7 +618,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
-            server_queue: false,
+            server_queue: true,
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -650,7 +650,7 @@ mod tests {
             thread_states: vec![ThreadState::Error],
             startup_warnings: vec![],
             send_queues: vec![],
-            server_queue: false,
+            server_queue: true,
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(
@@ -685,6 +685,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
         });
 
         assert_eq!(model.thread_index_for_id("thread-second"), Some(1));

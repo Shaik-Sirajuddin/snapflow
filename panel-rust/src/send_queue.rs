@@ -19,7 +19,7 @@
 //! JSONL with tombstones, without the bookkeeping.
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,7 @@ pub struct SendQueue {
     can_fast_track: bool,
     next_id: u64,
     persist_path: Option<PathBuf>,
+    remote_ids: HashMap<QueueEntryId, String>,
 }
 
 impl Default for SendQueue {
@@ -72,6 +73,7 @@ impl Default for SendQueue {
             can_fast_track: false,
             next_id: 0,
             persist_path: None,
+            remote_ids: HashMap::new(),
         }
     }
 }
@@ -93,6 +95,7 @@ impl SendQueue {
     {
         self.entries.clear();
         self.next_id = 0;
+        self.remote_ids.clear();
         for text in entries {
             let id = self.next_id();
             self.entries.push_back(QueueEntry {
@@ -107,6 +110,23 @@ impl SendQueue {
             ProcessingState::AutoProcess
         };
         self.can_fast_track = false;
+    }
+
+    /// Replaces the UI projection while retaining authoritative server ids.
+    pub fn replace_remote_items<I>(&mut self, entries: I, paused: bool)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let entries: Vec<(String, String)> = entries.into_iter().collect();
+        self.replace_remote(entries.iter().map(|(_, text)| text.clone()), paused);
+        for (index, (remote_id, _)) in entries.into_iter().enumerate() {
+            self.remote_ids
+                .insert(QueueEntryId(index as u64), remote_id);
+        }
+    }
+
+    pub fn remote_id_for(&self, id: QueueEntryId) -> Option<&str> {
+        self.remote_ids.get(&id).map(String::as_str)
     }
 
     /// In-memory only, no restart survival -- used by callers that manage

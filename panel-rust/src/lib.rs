@@ -1804,26 +1804,11 @@ fn panel_rust_create_with_initial_identity(
             .map(|record| record.thread_id.clone())
             .chain((restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")))
             .collect();
-        // Each thread's send queue persists to its own
-        // <thread_id>.sendqueue.jsonl (see send_queue.rs's module doc) --
-        // restore it here (real disk I/O, so it belongs in this cold-start
-        // collection step, never inside update()'s pure reducer). A
-        // missing/corrupt file falls back to an empty queue still wired
-        // to persist going forward, same posture as this function's other
-        // cache reads.
-        let cache_dir = resolve_cache_dir();
-        let initial_send_queues: Vec<send_queue::SendQueue> = initial_thread_ids
-            .iter()
-            .map(|thread_id| {
-                let path = send_queue::send_queue_path(&cache_dir, thread_id);
-                send_queue::SendQueue::load(path.clone()).unwrap_or_else(|error| {
-                    eprintln!(
-                        "panel-rust: failed to restore send queue for thread {thread_id:?}: {error}"
-                    );
-                    send_queue::SendQueue::new_with_path(path)
-                })
-            })
-            .collect();
+        // ACPX owns the durable queue JSONL. The panel starts with an empty
+        // projection and hydrates it from the queue subscription; restoring
+        // a panel-local sendqueue file would create a second authority and
+        // could replay stale prompts after an ACPX restart.
+        let initial_send_queues = vec![send_queue::SendQueue::default(); initial_thread_ids.len()];
         let initial = model::InitialState {
             threads: initial_specs.clone(),
             thread_ids: initial_thread_ids,

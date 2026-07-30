@@ -435,6 +435,10 @@ pub struct AgentBridge {
     // bridge that started with zero threads; see
     // `NO_PROVIDER_REQUESTED_FALLBACK` for that narrower case.
     default_provider: Option<String>,
+    /// Production ACPX sessions keep canonical transcript/queue state on
+    /// acpx-server. Legacy cache-backed constructors leave this false for
+    /// focused local-store tests and compatibility callers.
+    server_owned_persistence: bool,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
     // Client-local PTY terminals -- v1 keeps this to at most one per
@@ -2581,6 +2585,7 @@ fn spawn_background_attachment(
     profile_name: Option<String>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
+    server_owned_persistence: bool,
     // acpx-client-session-lease-pool: whether `handle` was constructed
     // with a pool (`build_slot`'s `pool_for` returned `Some` at spawn
     // time) -- `false` for every call site not yet cut over (currently
@@ -2711,7 +2716,9 @@ fn spawn_background_attachment(
                 &session_id,
                 remote_sessions.as_deref(),
             );
-            let resume_result = if has_cached_transcript && !cache_is_stale {
+            let resume_result = if server_owned_persistence {
+                handle.reattach_session(session_id.clone(), cwd.clone()).await
+            } else if has_cached_transcript && !cache_is_stale {
                 match handle.reattach_session(session_id.clone(), cwd.clone()).await {
                     Ok(()) => Ok(()),
                     Err(reattach_error) => {
@@ -2757,7 +2764,7 @@ fn spawn_background_attachment(
                     .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
                 persist_thread_snapshot(store.as_ref(), &slot, now_token());
 
-                if requested_session_id.is_some() {
+                if requested_session_id.is_some() && !server_owned_persistence {
                     let mut cached_index = 0usize;
                     let mut replayed_any = false;
                     while let Ok(ev) = events_rx.try_recv() {
@@ -2779,6 +2786,11 @@ fn spawn_background_attachment(
                     }
                     if replayed_any {
                         refresh_transcript(&slot);
+                    }
+                }
+                if server_owned_persistence {
+                    if let Err(error) = handle.paginate_history(None).await {
+                        eprintln!("panel-rust: initial remote history page failed for {:?}: {error}", slot.thread_id);
                     }
                 }
                 complete_attachment(&slot, None);
@@ -2823,7 +2835,7 @@ impl AgentBridge {
                 provision_gateway(provider, Some(&cache_dir_for_resolver))
                     .map_err(BridgeError::Gateway)
             },
-            Some(cache_dir),
+            None,
         )
     }
 
@@ -2850,7 +2862,8 @@ impl AgentBridge {
 
     /// Production constructor for durable panel thread records. The caller
     /// provides each thread's persisted provider/session/profile binding;
-    /// cached transcript paging still comes from the local JSONL store.
+    /// transcript paging is server-owned; the local-store constructor remains
+    /// available for tests and explicit compatibility callers.
     pub fn new_with_thread_specs(thread_specs: &[ThreadSpec]) -> Result<Self, BridgeError> {
         Self::new_with_thread_specs_and_initial_cwd(thread_specs, None)
     }
@@ -2887,7 +2900,7 @@ impl AgentBridge {
                 provision_gateway(provider, Some(&cache_dir_for_resolver))
                     .map_err(BridgeError::Gateway)
             },
-            Some(cache_dir),
+            None,
             initial_cwd,
             initial_project_path,
         )
@@ -3023,6 +3036,7 @@ impl AgentBridge {
         // it schedules then run on the runtime's own worker threads for the
         // rest of the process's life, well past this guard's drop.
         let _guard = runtime.enter();
+        let server_owned_persistence = cache_dir.is_none();
         for (idx, spec) in thread_specs.iter().enumerate() {
             let thread_id = slug(&spec.display_name);
 
@@ -3142,6 +3156,7 @@ impl AgentBridge {
                 spec.profile_name.clone(),
                 attachment_gate,
                 session_cwd_override.clone(),
+                server_owned_persistence,
                 // acpx-client-session-lease-pool: bulk cold-start restore
                 // is not yet cut over to the pool (SQL binding hydration
                 // isn't built yet either -- see meta.json) -- unchanged
@@ -3196,6 +3211,7 @@ impl AgentBridge {
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
             resolve_gateway,
             default_provider,
+            server_owned_persistence: cache_dir.is_none(),
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_cwd_override,
@@ -3678,6 +3694,7 @@ impl AgentBridge {
             profile.map(str::to_string),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
+            self.server_owned_persistence,
             uses_pool,
         );
         Ok(())
@@ -3727,6 +3744,7 @@ impl AgentBridge {
             profile.map(str::to_string),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
+            self.server_owned_persistence,
             uses_pool,
         );
 

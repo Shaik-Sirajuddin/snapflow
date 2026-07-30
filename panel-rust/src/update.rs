@@ -798,6 +798,7 @@ fn queue_mutation(
     thread_id: &str,
     operation: &str,
     entry_id: Option<crate::send_queue::QueueEntryId>,
+    remote_entry_id: Option<String>,
     text: Option<String>,
 ) -> Effect {
     let stable_id = entry_id
@@ -809,7 +810,8 @@ fn queue_mutation(
             "sessionId": thread_id,
             "idempotencyKey": format!("panel:{thread_id}:{operation}:{stable_id}"),
             "operation": operation,
-            "queueEntryId": entry_id.map(|id| format!("queue-{}", id.0)),
+            "queueEntryId": remote_entry_id
+                .or_else(|| entry_id.map(|id| format!("queue-{}", id.0))),
             "text": text,
         }),
     }
@@ -849,6 +851,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                                 &thread_id,
                                 "enqueue",
                                 Some(entry_id),
+                                Some(format!("queue-{}", entry_id.0)),
                                 Some(
                                     thread
                                         .send_queue
@@ -897,7 +900,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             let server_queue = thread.server_queue;
             thread.send_queue.resume();
             let resume_effect =
-                server_queue.then(|| queue_mutation(idx, &thread_id, "resume", None, None));
+                server_queue.then(|| queue_mutation(idx, &thread_id, "resume", None, None, None));
             (
                 [
                     resume_effect,
@@ -936,7 +939,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 if server_queue {
                     vec![
                         Effect::CancelGeneration { real_index: idx },
-                        queue_mutation(idx, &thread.thread_id, "pause", None, None),
+                        queue_mutation(idx, &thread.thread_id, "pause", None, None, None),
                     ]
                 } else {
                     vec![Effect::CancelGeneration { real_index: idx }]
@@ -976,6 +979,10 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                             &thread_id,
                             "cancel",
                             Some(entry_id),
+                            model.threads[idx]
+                                .send_queue
+                                .remote_id_for(entry_id)
+                                .map(str::to_owned),
                             None,
                         )]
                     } else {
@@ -1068,6 +1075,8 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     };
                     let thread_id = thread.thread_id.clone();
                     let server_queue = thread.server_queue;
+                    let remote_entry_id =
+                        thread.send_queue.remote_id_for(entry.id).map(str::to_owned);
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
@@ -1090,6 +1099,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                             &thread_id,
                             "sendNow",
                             Some(entry.id),
+                            remote_entry_id,
                             Some(entry.text),
                         ));
                     } else {
@@ -1107,7 +1117,6 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
-                    let server_queue = thread.server_queue;
                     thread.error = Some(message.clone());
                     (
                         vec![],
@@ -1139,6 +1148,8 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     };
                     let thread_id = thread.thread_id.clone();
                     let server_queue = thread.server_queue;
+                    let remote_entry_id =
+                        thread.send_queue.remote_id_for(entry.id).map(str::to_owned);
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
@@ -1157,6 +1168,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                             &thread_id,
                             "sendNow",
                             Some(entry.id),
+                            remote_entry_id,
                             Some(entry.text),
                         ));
                     } else {
@@ -2318,7 +2330,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             crate::protocol_types::AgentEvent::QueueChanged { items, paused } => {
                 thread
                     .send_queue
-                    .replace_remote(items.iter().map(|item| item.text.clone()), *paused);
+                    .replace_remote_items(
+                        items.iter().map(|item| {
+                            (item.queue_entry_id.clone(), item.text.clone())
+                        }),
+                        *paused,
+                    );
                 dirty.push(Dirty::ThreadRow {
                     thread_id: thread.thread_id.clone(),
                 });
@@ -4664,7 +4681,7 @@ mod tests {
                     thread_states: vec![],
                     startup_warnings: vec![],
                     send_queues: vec![],
-                    server_queue: false,
+                    server_queue: true,
                 },
             ))),
         );
@@ -4712,7 +4729,7 @@ mod tests {
                         "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
                     ],
                     send_queues: vec![],
-                    server_queue: false,
+                    server_queue: true,
                 },
             ))),
         );
