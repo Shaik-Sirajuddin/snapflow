@@ -532,10 +532,27 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
             }),
         "Compose::SendRequested must produce at most one SendPrompt plus optional queue effects"
     );
-    // Do not compare against the pre-reducer thread id here. Deferred
-    // session attachment can bind/update the selected thread while the send
-    // reducer is running, making that snapshot stale and causing a false
-    // debug-build panic. The reducer is authoritative for the effect target.
+    // Check the reducer's post-update selected session, rather than the
+    // pre-update filtered row. Deferred attachment may bind/reorder a row
+    // while this reducer runs; the post-update model is the authoritative
+    // target and keeps this invariant meaningful in debug builds.
+    let expected_thread_id = {
+        let model = panel.model.borrow();
+        panel
+            .real_index(filtered_idx)
+            .and_then(|real_idx| model.threads.get(real_idx))
+            .map(|thread| thread.thread_id.clone())
+    };
+    debug_assert!(
+        effects.iter().all(|effect| {
+            matches!(
+                effect,
+                crate::effect::Effect::SendPrompt { thread_id, .. }
+                    if Some(thread_id) == expected_thread_id.as_ref()
+            ) || !matches!(effect, crate::effect::Effect::SendPrompt { .. })
+        }),
+        "send effect must target the selected post-reducer session"
+    );
     execute_effects(panel, effects);
 }
 

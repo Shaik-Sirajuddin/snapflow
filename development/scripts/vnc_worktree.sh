@@ -354,12 +354,10 @@ PY
         QT_QUICK_BACKEND=software
         QSG_RENDER_LOOP=basic
         RUI_ACP_CACHE_DIR="$state_dir/panel"
-        RUI_ACPX_CODEX_URL="http://127.0.0.1:$gateway_port"
-        RUI_ACPX_CLAUDE_URL="http://127.0.0.1:$gateway_port"
-        # Persisted panel profiles may use ids such as `claude-acp`, which
-        # do not match the two legacy provider aliases above. Route every
-        # provider through this worktree gateway and prevent panel-rust from
-        # spawning a competing internal acpx-server.
+        # Development VNC harness only: route every persisted provider profile
+        # through this worktree gateway and prevent panel-rust from spawning a
+        # competing internal acpx-server. Production config does not export
+        # provider-specific localhost URLs.
         RUI_ACPX_DEFAULT_URL="http://127.0.0.1:$gateway_port"
         RUI_ACPX_NO_AUTOSPAWN=1
         SNAPSHOTD_HOME="$snapshotd_home"

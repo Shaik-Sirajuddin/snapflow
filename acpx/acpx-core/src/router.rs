@@ -6997,23 +6997,37 @@ async fn run_recovery_candidate(
         }
     };
 
-    store
-        .update_recovery_status(
-            record.gateway_session_id.clone(),
-            RecoveryStatus::Restored,
-            None,
+    let gateway_session_id = record.gateway_session_id.clone();
+    let (queue_store, tenant_id, gateway_session_id) = {
+        let mut router = router.lock().await;
+        // See `dispatch_session_new`'s identical cancellation.
+        let supervisor_key_for_cancel = job.entry.agent_id.clone();
+        router.sessions.insert(
+            &job.tenant_id,
+            acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            job.entry,
+        );
+        router.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
+        job.admission.commit();
+        (
+            router.queue_store(),
+            job.tenant_id.clone(),
+            gateway_session_id,
         )
+    };
+    if let Some(queue_store) = queue_store {
+        queue_store
+            .recover_inflight(gateway_session_id.clone())
+            .await?;
+        spawn_queue_dispatcher(
+            router.clone(),
+            tenant_id.clone(),
+            gateway_session_id.clone(),
+        );
+    }
+    store
+        .update_recovery_status(gateway_session_id, RecoveryStatus::Restored, None)
         .await?;
-    let mut router = router.lock().await;
-    // See `dispatch_session_new`'s identical cancellation.
-    let supervisor_key_for_cancel = job.entry.agent_id.clone();
-    router.sessions.insert(
-        &job.tenant_id,
-        acpx_proto::session::GatewaySessionId(record.gateway_session_id),
-        job.entry,
-    );
-    router.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
-    job.admission.commit();
     Ok(true)
 }
 
@@ -7443,8 +7457,26 @@ fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, sessi
                 }
             });
             if let Err(error) = dispatch_proxied_shared(&router, &tenant_id, request).await {
-                tracing::warn!(%session_id, %error, "queued prompt failed");
+                tracing::warn!(%session_id, %error, queue_entry_id = %item.queue_entry_id, "queued prompt failed; returning entry to FIFO");
+                match store.release(session_id.clone(), &item).await {
+                    Ok(event) => hub.publish(event).await,
+                    Err(release_error) => tracing::error!(
+                        %session_id,
+                        %release_error,
+                        queue_entry_id = %item.queue_entry_id,
+                        "queued prompt failed and durable requeue also failed"
+                    ),
+                }
                 break;
+            }
+            match store.complete(session_id.clone(), &item).await {
+                Ok(event) => hub.publish(event).await,
+                Err(error) => tracing::error!(
+                    %session_id,
+                    %error,
+                    queue_entry_id = %item.queue_entry_id,
+                    "queued prompt completed but durable completion record failed"
+                ),
             }
         }
         let mut active_sessions = active

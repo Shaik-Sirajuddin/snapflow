@@ -13,8 +13,34 @@ use tokio::sync::{broadcast, Mutex};
 use super::transcripts::{TranscriptError, TranscriptStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+enum QueueRecordOperation {
+    Enqueue,
+    SendNow,
+    Cancel,
+    Pause,
+    Resume,
+    /// Durable dispatch reservation. An unresolved claim is recovered back
+    /// into the FIFO after a daemon restart.
+    Claim,
+    Complete,
+    Release,
+}
+
+impl From<QueueOperation> for QueueRecordOperation {
+    fn from(operation: QueueOperation) -> Self {
+        match operation {
+            QueueOperation::Enqueue => Self::Enqueue,
+            QueueOperation::SendNow => Self::SendNow,
+            QueueOperation::Cancel => Self::Cancel,
+            QueueOperation::Pause => Self::Pause,
+            QueueOperation::Resume => Self::Resume,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueueRecord {
-    operation: QueueOperation,
+    operation: QueueRecordOperation,
     #[serde(default)]
     item: Option<QueueItem>,
     #[serde(default)]
@@ -83,43 +109,16 @@ impl QueueStore {
         let result = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(root.as_path())?;
             let records = read_records(&path)?;
-            let mut queue = Vec::new();
-            let mut paused = false;
-            for record in records {
-                match record.operation {
-                    QueueOperation::Enqueue => {
-                        if let Some(item) = record.item {
-                            if !queue.iter().any(|current: &QueueItem| {
-                                current.idempotency_key == item.idempotency_key
-                            }) {
-                                queue.push(item);
-                            }
-                        }
-                    }
-                    QueueOperation::SendNow => {
-                        if let Some(item) = record.item {
-                            queue.retain(|current| {
-                                current.idempotency_key != item.idempotency_key
-                                    && current.queue_entry_id != item.queue_entry_id
-                            });
-                            queue.insert(0, item);
-                        }
-                    }
-                    QueueOperation::Cancel => {
-                        if let Some(entry_id) = record.queue_entry_id {
-                            queue.retain(|item| item.queue_entry_id != entry_id);
-                        }
-                    }
-                    QueueOperation::Pause => paused = true,
-                    QueueOperation::Resume => paused = false,
-                }
-            }
+            let replay = replay_records(records);
+            let mut queue = replay.queue;
+            let claimed = replay.claimed;
+            let mut paused = replay.paused;
 
             let duplicate = if matches!(
                 task_params.operation,
                 QueueOperation::Enqueue | QueueOperation::SendNow
             ) {
-                queue.iter().find(|item| {
+                queue.iter().chain(claimed.iter()).find(|item| {
                     item.idempotency_key == task_params.idempotency_key
                         || task_params.queue_entry_id.as_deref()
                             == Some(item.queue_entry_id.as_str())
@@ -171,7 +170,7 @@ impl QueueStore {
                 item.position = position as u32;
             }
             let record = QueueRecord {
-                operation: task_params.operation,
+                operation: task_params.operation.into(),
                 item: queue_entry_id.as_ref().and_then(|id| {
                     queue
                         .iter()
@@ -223,8 +222,8 @@ impl QueueStore {
         .map_err(|error| TranscriptError::Task(error.to_string()))??;
         Ok(QueueSnapshot {
             session_id,
-            queue: result.0,
-            paused: result.1,
+            queue: result.queue,
+            paused: result.paused,
         })
     }
 
@@ -243,24 +242,24 @@ impl QueueStore {
         let result = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(root.as_path())?;
             let records = read_records(&path)?;
-            let (mut queue, paused) = replay_records(records);
-            if paused || queue.is_empty() {
+            let mut replay = replay_records(records);
+            if replay.paused || replay.queue.is_empty() {
                 return Ok::<_, TranscriptError>(None);
             }
-            let item = queue.remove(0);
-            for (position, item) in queue.iter_mut().enumerate() {
+            let item = replay.queue.remove(0);
+            for (position, item) in replay.queue.iter_mut().enumerate() {
                 item.position = position as u32;
             }
             append_record(
                 &path,
                 &QueueRecord {
-                    operation: QueueOperation::Cancel,
-                    item: None,
+                    operation: QueueRecordOperation::Claim,
+                    item: Some(item.clone()),
                     idempotency_key: format!("dispatch:{}", item.idempotency_key),
                     queue_entry_id: Some(item.queue_entry_id.clone()),
                 },
             )?;
-            Ok(Some((item, queue, paused)))
+            Ok(Some((item, replay.queue, replay.paused)))
         })
         .await
         .map_err(|error| TranscriptError::Task(error.to_string()))??;
@@ -276,6 +275,96 @@ impl QueueStore {
                 idempotency_key: String::new(),
             },
         )))
+    }
+
+    /// Mark a successfully dispatched entry complete. The claim remains in
+    /// the log until this record is durable, so a failed prompt dispatch can
+    /// never silently consume the user's text.
+    pub async fn complete(
+        &self,
+        session_id: impl Into<String>,
+        item: &QueueItem,
+    ) -> Result<QueueStateEvent, TranscriptError> {
+        self.finish_claim(session_id.into(), item, QueueRecordOperation::Complete)
+            .await
+    }
+
+    /// Return a failed dispatch to the front of the FIFO for a later retry.
+    pub async fn release(
+        &self,
+        session_id: impl Into<String>,
+        item: &QueueItem,
+    ) -> Result<QueueStateEvent, TranscriptError> {
+        self.finish_claim(session_id.into(), item, QueueRecordOperation::Release)
+            .await
+    }
+
+    async fn finish_claim(
+        &self,
+        session_id: String,
+        item: &QueueItem,
+        operation: QueueRecordOperation,
+    ) -> Result<QueueStateEvent, TranscriptError> {
+        let actor = self.actor(&session_id).await;
+        let _guard = actor.lock().await;
+        let path = self.path(&session_id)?;
+        let root = Arc::clone(&self.root);
+        let entry_id = item.queue_entry_id.clone();
+        let item = item.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(root.as_path())?;
+            append_record(
+                &path,
+                &QueueRecord {
+                    operation,
+                    item: Some(item),
+                    idempotency_key: format!("dispatch:{entry_id}"),
+                    queue_entry_id: Some(entry_id),
+                },
+            )?;
+            Ok::<_, TranscriptError>(replay_records(read_records(&path)?))
+        })
+        .await
+        .map_err(|error| TranscriptError::Task(error.to_string()))??;
+        let state = result;
+        Ok(QueueStateEvent {
+            session_id,
+            queue: state.queue,
+            paused: state.paused,
+            idempotency_key: String::new(),
+        })
+    }
+
+    /// Convert unresolved dispatch claims left by a crashed daemon back into
+    /// queued entries before the recovered session's dispatcher starts.
+    pub async fn recover_inflight(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<(), TranscriptError> {
+        let session_id = session_id.into();
+        let actor = self.actor(&session_id).await;
+        let _guard = actor.lock().await;
+        let path = self.path(&session_id)?;
+        let root = Arc::clone(&self.root);
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(root.as_path())?;
+            let state = replay_records(read_records(&path)?);
+            for item in state.claimed {
+                append_record(
+                    &path,
+                    &QueueRecord {
+                        operation: QueueRecordOperation::Release,
+                        item: Some(item.clone()),
+                        idempotency_key: format!("recovery:{}", item.idempotency_key),
+                        queue_entry_id: Some(item.queue_entry_id),
+                    },
+                )?;
+            }
+            Ok::<_, TranscriptError>(())
+        })
+        .await
+        .map_err(|error| TranscriptError::Task(error.to_string()))??;
+        Ok(())
     }
 }
 
@@ -331,12 +420,20 @@ fn read_records(path: &std::path::Path) -> Result<Vec<QueueRecord>, TranscriptEr
         .collect()
 }
 
-fn replay_records(records: Vec<QueueRecord>) -> (Vec<QueueItem>, bool) {
+#[derive(Debug, Default)]
+struct QueueReplayState {
+    queue: Vec<QueueItem>,
+    paused: bool,
+    claimed: Vec<QueueItem>,
+}
+
+fn replay_records(records: Vec<QueueRecord>) -> QueueReplayState {
     let mut queue = Vec::new();
     let mut paused = false;
+    let mut claimed: Vec<QueueItem> = Vec::new();
     for record in records {
         match record.operation {
-            QueueOperation::Enqueue => {
+            QueueRecordOperation::Enqueue => {
                 if let Some(item) = record.item {
                     if !queue
                         .iter()
@@ -346,7 +443,7 @@ fn replay_records(records: Vec<QueueRecord>) -> (Vec<QueueItem>, bool) {
                     }
                 }
             }
-            QueueOperation::SendNow => {
+            QueueRecordOperation::SendNow => {
                 if let Some(item) = record.item {
                     queue.retain(|current| {
                         current.idempotency_key != item.idempotency_key
@@ -355,19 +452,49 @@ fn replay_records(records: Vec<QueueRecord>) -> (Vec<QueueItem>, bool) {
                     queue.insert(0, item);
                 }
             }
-            QueueOperation::Cancel => {
+            QueueRecordOperation::Cancel => {
                 if let Some(entry_id) = record.queue_entry_id {
                     queue.retain(|item| item.queue_entry_id != entry_id);
+                    claimed.retain(|item| item.queue_entry_id != entry_id);
                 }
             }
-            QueueOperation::Pause => paused = true,
-            QueueOperation::Resume => paused = false,
+            QueueRecordOperation::Pause => paused = true,
+            QueueRecordOperation::Resume => paused = false,
+            QueueRecordOperation::Claim => {
+                if let Some(item) = record.item {
+                    queue.retain(|current| current.queue_entry_id != item.queue_entry_id);
+                    claimed.retain(|current| current.queue_entry_id != item.queue_entry_id);
+                    claimed.push(item);
+                }
+            }
+            QueueRecordOperation::Complete => {
+                if let Some(entry_id) = record.queue_entry_id {
+                    claimed.retain(|item| item.queue_entry_id != entry_id);
+                }
+            }
+            QueueRecordOperation::Release => {
+                if let Some(entry_id) = record.queue_entry_id {
+                    if let Some(index) = claimed
+                        .iter()
+                        .position(|item| item.queue_entry_id == entry_id)
+                    {
+                        let item = claimed.remove(index);
+                        queue.insert(0, item);
+                    } else if let Some(item) = record.item {
+                        queue.insert(0, item);
+                    }
+                }
+            }
         }
     }
     for (position, item) in queue.iter_mut().enumerate() {
         item.position = position as u32;
     }
-    (queue, paused)
+    QueueReplayState {
+        queue,
+        paused,
+        claimed,
+    }
 }
 
 fn append_record(path: &std::path::Path, record: &QueueRecord) -> Result<(), TranscriptError> {
@@ -379,6 +506,69 @@ fn append_record(path: &std::path::Path, record: &QueueRecord) -> Result<(), Tra
     serde_json::to_writer(&mut file, record)?;
     file.write_all(b"\n")?;
     file.sync_data()?;
+    drop(file);
+    compact_if_needed(path)?;
+    Ok(())
+}
+
+const COMPACTION_RECORD_LIMIT: usize = 128;
+
+fn compact_if_needed(path: &std::path::Path) -> Result<(), TranscriptError> {
+    let records = read_records(path)?;
+    if records.len() <= COMPACTION_RECORD_LIMIT {
+        return Ok(());
+    }
+    let state = replay_records(records);
+    let temporary = path.with_extension("queue.jsonl.compact");
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        for item in state.queue {
+            write_record(
+                &mut file,
+                &QueueRecord {
+                    operation: QueueRecordOperation::Enqueue,
+                    item: Some(item.clone()),
+                    idempotency_key: item.idempotency_key,
+                    queue_entry_id: Some(item.queue_entry_id),
+                },
+            )?;
+        }
+        for item in state.claimed {
+            write_record(
+                &mut file,
+                &QueueRecord {
+                    operation: QueueRecordOperation::Claim,
+                    item: Some(item.clone()),
+                    idempotency_key: format!("dispatch:{}", item.idempotency_key),
+                    queue_entry_id: Some(item.queue_entry_id),
+                },
+            )?;
+        }
+        if state.paused {
+            write_record(
+                &mut file,
+                &QueueRecord {
+                    operation: QueueRecordOperation::Pause,
+                    item: None,
+                    idempotency_key: "compact:pause".into(),
+                    queue_entry_id: None,
+                },
+            )?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok::<_, TranscriptError>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_record(file: &mut std::fs::File, record: &QueueRecord) -> Result<(), TranscriptError> {
+    use std::io::Write;
+    serde_json::to_writer(&mut *file, record)?;
+    file.write_all(b"\n")?;
     Ok(())
 }
 
@@ -526,6 +716,98 @@ mod tests {
             .0;
         assert_eq!(urgent.queue[0].text, "urgent");
         assert_eq!(urgent.queue[1].text, "first");
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_releases_claim_back_to_fifo() {
+        let directory = tempdir().unwrap();
+        let store = QueueStore::new(directory.path());
+        store
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "a".into(),
+                    operation: QueueOperation::Enqueue,
+                    queue_entry_id: None,
+                    text: Some("must retry".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let (item, _) = store.take_next("s1").await.unwrap().unwrap();
+        assert!(store.snapshot("s1").await.unwrap().queue.is_empty());
+        store.release("s1", &item).await.unwrap();
+        let snapshot = store.snapshot("s1").await.unwrap();
+        assert_eq!(snapshot.queue.len(), 1);
+        assert_eq!(snapshot.queue[0].text, "must retry");
+    }
+
+    #[tokio::test]
+    async fn unresolved_claim_is_recovered_after_restart() {
+        let directory = tempdir().unwrap();
+        let store = QueueStore::new(directory.path());
+        store
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "a".into(),
+                    operation: QueueOperation::Enqueue,
+                    queue_entry_id: None,
+                    text: Some("survives dispatcher crash".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = store.take_next("s1").await.unwrap().unwrap();
+
+        let restarted = QueueStore::new(directory.path());
+        restarted.recover_inflight("s1").await.unwrap();
+        let snapshot = restarted.snapshot("s1").await.unwrap();
+        assert_eq!(snapshot.queue[0].text, "survives dispatcher crash");
+    }
+
+    #[tokio::test]
+    async fn queue_log_compacts_without_changing_projection() {
+        let directory = tempdir().unwrap();
+        let store = QueueStore::new(directory.path());
+        for index in 0..140 {
+            store
+                .mutate(
+                    "s1",
+                    QueueMutationParams {
+                        session_id: "s1".into(),
+                        idempotency_key: format!("key-{index}"),
+                        operation: QueueOperation::Enqueue,
+                        queue_entry_id: None,
+                        text: Some(format!("message-{index}")),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for index in 0..35 {
+            store
+                .mutate(
+                    "s1",
+                    QueueMutationParams {
+                        session_id: "s1".into(),
+                        idempotency_key: format!("cancel-{index}"),
+                        operation: QueueOperation::Cancel,
+                        queue_entry_id: Some(format!("queue-key-{index}")),
+                        text: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let line_count = std::fs::read_to_string(directory.path().join("s1.queue.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(line_count <= COMPACTION_RECORD_LIMIT);
+        assert_eq!(store.snapshot("s1").await.unwrap().queue.len(), 105);
     }
 
     #[tokio::test]
