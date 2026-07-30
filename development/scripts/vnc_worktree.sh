@@ -373,7 +373,7 @@ PY
     if [ "${VNC_SHARED:-0}" = "1" ]; then
         DISPLAY="$vnc_display" "$SHARED_VNC" workspace-place \
             "$worktree_dir" "$shotcut_pid" "$workspace_id" \
-            || echo "warning: could not place Snapflow pid $shotcut_pid on workspace $workspace_id" >&2
+            || die "could not place Snapflow pid $shotcut_pid on workspace $workspace_id"
     fi
 
     cat > "$state_dir/connect.env" <<EOF
