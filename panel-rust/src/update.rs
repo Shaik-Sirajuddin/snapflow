@@ -305,17 +305,16 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
 
         // Atomic ownership: displayed + shared list become B in this same
         // sync turn (no multi-frame window where selection is B and list is A).
-        model.displayed_thread = Some(real_idx);
+        model.displayed_thread = real_idx;
 
         // Prefer leave/return cache for B when present; else ThreadModel rows.
-        let target_id = model
-            .threads
-            .get(real_idx)
+        let target_id = real_idx
+            .and_then(|idx| model.threads.get(idx))
             .map(|t| t.thread_id.clone())
             .unwrap_or_default();
         if !target_id.is_empty() {
             if let Some(cache) = model.list_ui_cache.get(&target_id).cloned() {
-                if let Some(thread) = model.threads.get_mut(real_idx) {
+                if let Some(thread) = real_idx.and_then(|idx| model.threads.get_mut(idx)) {
                     // Restore presentation snapshot; frame hydrate may refresh
                     // content if transcript advanced in background.
                     thread.transcript_keys = cache.keys;
@@ -329,9 +328,8 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
             }
         }
 
-        model.expanded = model
-            .threads
-            .get(real_idx)
+        model.expanded = real_idx
+            .and_then(|idx| model.threads.get(idx))
             .map(|t| t.message_rows.iter().map(|r| r.expanded).collect())
             .unwrap_or_default();
         model.list_owner_thread_id = if target_id.is_empty() {
@@ -353,17 +351,15 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
         dirty.push(Dirty::Error {
             thread_id: target_id.clone(),
             detail: crate::dirty::ErrorDetail {
-                message: model
-                    .threads
-                    .get(real_idx)
+                message: real_idx
+                    .and_then(|idx| model.threads.get(idx))
                     .and_then(|t| t.error.clone())
                     .unwrap_or_default(),
             },
         });
         dirty.push(Dirty::Terminal {
-            id: model
-                .threads
-                .get(real_idx)
+            id: real_idx
+                .and_then(|idx| model.threads.get(idx))
                 .and_then(|t| t.expanded_terminal.as_ref())
                 .map(|t| t.terminal_id.to_string())
                 .unwrap_or_default(),
@@ -373,9 +369,8 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
             thread_id: target_id,
         });
         dirty.push(Dirty::Capabilities {
-            thread_id: model
-                .threads
-                .get(real_idx)
+            thread_id: real_idx
+                .and_then(|idx| model.threads.get(idx))
                 .and_then(|t| t.session_id.clone())
                 .unwrap_or_default(),
         });
@@ -5866,7 +5861,7 @@ mod tests {
             model.selected_thread, 0,
             "must land on B's first thread (thread-2), not a numeric clamp"
         );
-        assert_eq!(selected_real_index(&model), 2);
+        assert_eq!(selected_real_index(&model), Some(2));
         assert_eq!(
             model.synced_project_path.as_deref(),
             Some("/work/b/project.mlt")
