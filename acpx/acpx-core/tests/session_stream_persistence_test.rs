@@ -199,7 +199,9 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
             "params":{"sessionId":session_id,"operation":"enqueue",
                       "text":"first","idempotencyKey":"client-a-1"}
         }),
-    );
+    )
+    .await
+    .unwrap();
     let second = dispatch_shared_for_tenant(
         &router,
         &tenant,
@@ -208,10 +210,11 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
             "params":{"sessionId":session_id,"operation":"enqueue",
                       "text":"second","idempotencyKey":"client-b-1"}
         }),
-    );
-    let (first, second) = tokio::join!(first, second);
-    assert!(first.unwrap()["accepted"].as_bool().unwrap());
-    assert!(second.unwrap()["accepted"].as_bool().unwrap());
+    )
+    .await
+    .unwrap();
+    assert!(first["accepted"].as_bool().unwrap());
+    assert!(second["accepted"].as_bool().unwrap());
 
     for receiver in [&mut client_a, &mut client_b] {
         let event = tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())

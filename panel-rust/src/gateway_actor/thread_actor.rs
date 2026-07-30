@@ -1502,11 +1502,7 @@ fn spawn_session_live_forwarder(
             // server watch is explicitly established through the queue
             // extension rather than piggybacking on session/resume.
             let queue_subscription = client
-                .call(
-                    "acpx/sessions/queue/subscribe",
-                    serde_json::json!({ "sessionIds": [session_id.clone()] }),
-                    None,
-                )
+                .subscribe_queue_sessions(std::slice::from_ref(&session_id), None)
                 .await;
             if let Ok(response) = queue_subscription {
                 if let Some(snapshots) =

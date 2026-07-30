@@ -7,7 +7,7 @@
 
 use crate::raw::{ClientError, GatewayClient};
 use crate::ws::{GatewayNotification, GatewayWsClient, SessionSubscription};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -49,6 +49,7 @@ pub struct Gateway {
     // (matching their existing signatures; no ripple to every caller).
     websocket: RwLock<Option<Arc<GatewayWsClient>>>,
     session_replays: Mutex<HashMap<String, SessionReplay>>,
+    queue_subscriptions: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -118,6 +119,7 @@ impl Gateway {
             http,
             websocket: RwLock::new(websocket),
             session_replays: Mutex::new(HashMap::new()),
+            queue_subscriptions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -128,6 +130,7 @@ impl Gateway {
             base_url,
             websocket: RwLock::new(None),
             session_replays: Mutex::new(HashMap::new()),
+            queue_subscriptions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -177,6 +180,23 @@ impl Gateway {
                     .websocket
                     .write()
                     .expect("gateway websocket lock poisoned") = Some(client);
+                let session_ids = self
+                    .queue_subscriptions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(client) = self.current_websocket() {
+                    if !session_ids.is_empty() {
+                        let _ = client
+                            .call(
+                                "acpx/sessions/queue/subscribe",
+                                serde_json::json!({ "sessionIds": session_ids }),
+                            )
+                            .await;
+                    }
+                }
                 return true;
             }
             if attempt < RECONNECT_MAX_ATTEMPTS {
@@ -200,6 +220,30 @@ impl Gateway {
     pub fn subscribe_session(&self, session_id: &str) -> Option<SessionSubscription> {
         self.current_websocket()
             .map(|client| client.subscribe_session(session_id))
+    }
+
+    /// Registers and establishes the separate server-owned queue stream for
+    /// explicit session ids. The registry is replayed on every WebSocket
+    /// reconnect, so queue callbacks cannot silently stop after a gateway
+    /// restart while the panel still holds the same session actors.
+    pub async fn subscribe_queue_sessions(
+        &self,
+        session_ids: &[String],
+        cursor: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        {
+            let mut subscriptions = self
+                .queue_subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            subscriptions.extend(session_ids.iter().cloned());
+        }
+        self.call(
+            "acpx/sessions/queue/subscribe",
+            serde_json::json!({ "sessionIds": session_ids, "cursor": cursor }),
+            None,
+        )
+        .await
     }
 
     /// Records the idempotent session operation needed to re-establish the
@@ -249,11 +293,6 @@ impl Gateway {
         let Some(replay) = replay else {
             return Ok(());
         };
-        let Some(client) = self.current_websocket() else {
-            return Err(ClientError::WebSocket(
-                "no WebSocket available for session rehydration".to_owned(),
-            ));
-        };
         let params = serde_json::json!({
             "sessionId": session_id,
             "cwd": replay.params.get("cwd").cloned().unwrap_or_default(),
@@ -262,12 +301,13 @@ impl Gateway {
         // session so queued-state notifications cannot be missed during the
         // reconnect window. Queue events intentionally do not ride through
         // native session/resume.
-        client
-            .call(
-                "acpx/sessions/queue/subscribe",
-                serde_json::json!({ "sessionIds": [session_id] }),
-            )
+        self.subscribe_queue_sessions(&[session_id.to_owned()], None)
             .await?;
+        let Some(client) = self.current_websocket() else {
+            return Err(ClientError::WebSocket(
+                "no WebSocket available for session rehydration".to_owned(),
+            ));
+        };
         client
             .call(
                 "session/resume",

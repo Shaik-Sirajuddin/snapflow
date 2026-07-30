@@ -32,7 +32,14 @@ pub async fn subscribe_queue(
     gateway: &Gateway,
     params: QueueSubscribeParams,
 ) -> Result<QueueSubscribeResult, ClientError> {
-    call_typed(gateway, "acpx/sessions/queue/subscribe", params).await
+    let result = gateway
+        .subscribe_queue_sessions(&params.session_ids, params.cursor.as_deref())
+        .await?;
+    serde_json::from_value(result).map_err(|error| {
+        ClientError::WebSocket(format!(
+            "invalid acpx/sessions/queue/subscribe response: {error}"
+        ))
+    })
 }
 
 pub async fn mutate_queue(
