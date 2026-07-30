@@ -1968,6 +1968,57 @@ mod tests {
         assert!(rows[0].tools.iter().next().is_none());
     }
 
+    /// `tools_search_blob` is what the Settings page search bar matches
+    /// against (see `mcp_servers_view.slint`'s widened predicate) --
+    /// verify it actually joins every real discovered tool's name and
+    /// description, and skips empty descriptions rather than leaving a
+    /// stray blank line that would still (harmlessly, but confusingly)
+    /// match an empty query.
+    #[test]
+    fn tools_search_blob_joins_real_tool_names_and_descriptions() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![
+                crate::protocol_types::McpToolInfo {
+                    name: "read_file".to_string(),
+                    description: Some("Reads a file from disk".to_string()),
+                },
+                crate::protocol_types::McpToolInfo {
+                    name: "ping".to_string(),
+                    description: None,
+                },
+            ],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(
+            rows[0].tools_search_blob.as_str(),
+            "read_file\nReads a file from disk\nping"
+        );
+    }
+
+    #[test]
+    fn tools_search_blob_is_empty_when_no_tools_have_ever_been_fetched() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows[0].tools_search_blob.as_str(), "");
+    }
+
     #[test]
     fn parse_kv_lines_splits_on_first_separator_and_skips_malformed_lines() {
         let parsed = parse_kv_lines(
