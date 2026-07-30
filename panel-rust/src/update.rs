@@ -2235,6 +2235,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     ops: Vec::new(),
                 });
             }
+            crate::protocol_types::AgentEvent::HistoryPage { .. } => {
+                dirty.push(Dirty::MessagesDiff {
+                    thread_id: thread.thread_id.clone(),
+                    ops: Vec::new(),
+                });
+            }
             crate::protocol_types::AgentEvent::TurnEnded(reason) => {
                 // Captured BEFORE the Idle reset below: only a turn this
                 // session itself was generating on (Loading, and a

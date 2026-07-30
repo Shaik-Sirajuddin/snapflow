@@ -84,6 +84,10 @@ pub struct QueueItemInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Message(ChatMessage),
+    HistoryPage {
+        messages: Vec<ChatMessage>,
+        next_cursor: Option<String>,
+    },
     QueueChanged {
         items: Vec<QueueItemInfo>,
         paused: bool,

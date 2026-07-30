@@ -176,6 +176,8 @@ struct ThreadSlot {
     /// paging further back. Meaningless (always `0`) once
     /// `older_available` is `false`.
     oldest_loaded_index: Mutex<usize>,
+    /// Server continuation cursor for remote transcript pagination.
+    history_cursor: Mutex<Option<String>>,
     /// Live interactive requests (`session/request_permission`,
     /// `fs/read_text_file`, `fs/write_text_file`, `terminal/create`)
     /// awaiting a UI decision -- populated by
@@ -2453,6 +2455,27 @@ fn spawn_event_forwarder(
                         }
                     }
                 }
+                AgentEvent::HistoryPage {
+                    messages,
+                    next_cursor,
+                } => {
+                    let mut history = slot_for_task
+                        .history
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let mut prepended = messages.clone();
+                    prepended.extend(history.drain(..));
+                    *history = prepended;
+                    *slot_for_task
+                        .history_cursor
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = next_cursor.clone();
+                    *slot_for_task
+                        .older_available
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = next_cursor.is_some();
+                    refresh_transcript(&slot_for_task);
+                }
                 AgentEvent::TurnEnded(_) => {
                     persist_thread_snapshot(store_for_task.as_ref(), &slot_for_task, now_token());
                     slot_for_task
@@ -3050,6 +3073,7 @@ impl AgentBridge {
                 acp_session_id: Mutex::new(None),
                 older_available: Mutex::new(older_available),
                 oldest_loaded_index: Mutex::new(oldest_loaded_index),
+                history_cursor: Mutex::new(None),
                 pending_requests: Mutex::new(runtime_snapshot.pending_requests),
                 usage: Mutex::new((0, 0)),
                 terminal_buffers: Mutex::new(
@@ -3498,6 +3522,7 @@ impl AgentBridge {
             acp_session_id: Mutex::new(None),
             older_available: Mutex::new(older_available),
             oldest_loaded_index: Mutex::new(oldest_loaded_index),
+            history_cursor: Mutex::new(None),
             pending_requests: Mutex::new(runtime_snapshot.pending_requests),
             usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(
@@ -3838,6 +3863,7 @@ impl AgentBridge {
             acp_session_id: Mutex::new(None),
             older_available: Mutex::new(false),
             oldest_loaded_index: Mutex::new(0),
+            history_cursor: Mutex::new(None),
             pending_requests: Mutex::new(Vec::new()),
             usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(HashMap::new()),
@@ -4772,6 +4798,33 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
+        if self.store.is_none()
+            && slot
+                .acp_session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
+            let before = slot
+                .history_cursor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if !*slot
+                .older_available
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+            {
+                return false;
+            }
+            let handle = Arc::clone(&slot.handle);
+            self.runtime.handle().spawn(async move {
+                if let Err(error) = handle.paginate_history(before).await {
+                    eprintln!("panel-rust: remote history pagination failed: {error}");
+                }
+            });
+            return true;
+        }
         let Some(store) = &self.store else {
             return false;
         };

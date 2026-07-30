@@ -150,6 +150,10 @@ enum Command {
         text: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    PaginateHistory {
+        before: Option<String>,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     ListSessions {
         agent_id: Option<String>,
         resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
@@ -450,6 +454,14 @@ impl AcpxThreadHandle {
     pub async fn send_prompt(&self, text: impl Into<String>) -> Result<(), AcpxThreadError> {
         let text = text.into();
         self.call(|resp| Command::SendPrompt { text, resp }).await
+    }
+
+    /// Fetch one server-owned transcript page and emit it through the normal
+    /// actor event stream. The first page is server-bounded to 50 and older
+    /// pages to 40; callers pass only the continuation cursor they received.
+    pub async fn paginate_history(&self, before: Option<String>) -> Result<(), AcpxThreadError> {
+        self.call(|resp| Command::PaginateHistory { before, resp })
+            .await
     }
 
     /// Gateway-aggregated `session/list` -- every session across every
@@ -1975,6 +1987,46 @@ async fn run_thread_actor(
                         let _ = resp.send(Err(e.into()));
                     }
                 }
+            }
+            Command::PaginateHistory { before, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let result = client
+                    .call(
+                        "acpx/sessions/paginate",
+                        serde_json::json!({
+                            "sessionId": sid,
+                            "before": before,
+                            "limit": 40
+                        }),
+                        None,
+                    )
+                    .await
+                    .map_err(AcpxThreadError::from)
+                    .and_then(|page| {
+                        let messages = page
+                            .get("messages")
+                            .and_then(|messages| messages.as_array())
+                            .map(|messages| {
+                                messages
+                                    .iter()
+                                    .filter_map(classify_raw_update)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let next_cursor = page
+                            .get("nextCursor")
+                            .and_then(|cursor| cursor.as_str())
+                            .map(str::to_owned);
+                        let _ = event_tx.send(AgentEvent::HistoryPage {
+                            messages,
+                            next_cursor,
+                        });
+                        Ok(())
+                    });
+                let _ = resp.send(result);
             }
             Command::ListSessions { agent_id, resp } => {
                 let result = match agent_id {
