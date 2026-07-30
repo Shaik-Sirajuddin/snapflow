@@ -11,7 +11,7 @@ use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
 use crate::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    PersistenceStore,
+    PersistenceStore, TranscriptStore,
 };
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
@@ -124,11 +124,6 @@ pub fn classify(method: &str) -> MethodClass {
         // meant a real client had no way to ever pick a non-default model
         // for a claude-agent-acp-backed profile through the gateway.
         | "session/set_config_option"
-        | "acpx/sessions/subscribe"
-        | "acpx/sessions/paginate"
-        | "acpx/sessions/sync"
-        | "acpx/sessions/queue/subscribe"
-        | "session/queue"
         // **Phase 9 addition:** `session/delete` -- real, stable v1 ACP
         // method (`DeleteSessionRequest`/`DeleteSessionResponse`, `x-side:
         // agent`, carries `sessionId`) found entirely unclassified during
@@ -149,7 +144,15 @@ pub fn classify(method: &str) -> MethodClass {
         // See `MethodClass::SessionFork`'s doc comment for why this is
         // neither `Proxied` nor `Hybrid`.
         "session/fork" => MethodClass::SessionFork,
-        "agents/list" | "agents/install" | "agents/status" | "session/list" => {
+        "agents/list"
+        | "agents/install"
+        | "agents/status"
+        | "session/list"
+        | "acpx/sessions/subscribe"
+        | "acpx/sessions/paginate"
+        | "acpx/sessions/sync"
+        | "acpx/sessions/queue/subscribe"
+        | "session/queue" => {
             MethodClass::GatewayNative
         }
         // `acpx_native_models_list_endpoint` (worktree-consolidation-and-
@@ -310,6 +313,7 @@ pub struct Router {
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
     persistence: Option<PersistenceStore>,
+    transcripts: Option<TranscriptStore>,
     /// Durable admin-plane read stores. They remain absent for
     /// in-memory-only routers, preserving the legacy default behavior.
     agent_enablement: Option<AgentEnablement>,
@@ -734,6 +738,10 @@ pub enum RouterError {
     BackendSessionNewError(serde_json::Value),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
+    #[error("transcript: {0}")]
+    Transcript(#[from] crate::persistence::TranscriptError),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Supervisor(#[from] acpx_conductor::supervisor::SupervisorError),
     #[error(transparent)]
@@ -1016,6 +1024,7 @@ impl Router {
             registry_cache: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
+            transcripts: None,
             agent_enablement: None,
             custom_agents: None,
             materialized_custom_agents: HashSet::new(),
@@ -1352,6 +1361,11 @@ impl Router {
     /// to persist metadata adjacent to a native gateway session.
     pub fn persistence_store(&self) -> Option<PersistenceStore> {
         self.persistence.clone()
+    }
+
+    pub fn with_transcript_store(mut self, transcripts: TranscriptStore) -> Self {
+        self.transcripts = Some(transcripts);
+        self
     }
 
     /// Override native session limits. Server configuration should validate
@@ -4156,6 +4170,22 @@ impl Router {
             | "acpx/sessions/sync"
             | "acpx/sessions/queue/subscribe"
             | "session/queue" => {
+                if method == "acpx/sessions/paginate" {
+                    let store = self
+                        .transcripts
+                        .as_ref()
+                        .ok_or(RouterError::NotImplemented("server transcript storage"))?;
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::SessionPaginateParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    let page = store
+                        .paginate(typed.session_id, typed.before.as_deref(), typed.limit)
+                        .await?;
+                    return Ok(serde_json::to_value(page)?);
+                }
                 return Err(RouterError::NotImplemented("session stream extensions"));
             }
             "agents/list" => {

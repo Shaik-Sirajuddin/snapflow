@@ -21,10 +21,12 @@
 pub mod error;
 pub mod sessions;
 pub mod store;
+pub mod transcripts;
 
 pub use error::PersistenceError;
 pub use sessions::{RecoveryStatusCounts, SessionRecord};
 pub use store::PersistenceStore;
+pub use transcripts::{TranscriptError, TranscriptStore};
 
 /// Single source of truth for the sqlite schema, loaded via `include_str!`
 /// per `03-crate-and-folder-layout.md`. Applied via `execute_batch` on every
