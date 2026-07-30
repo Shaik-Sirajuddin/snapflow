@@ -4913,6 +4913,40 @@ impl AgentBridge {
         });
     }
 
+    /// Fire-and-forget mutation of the ACPX server-owned per-session queue.
+    /// The server returns the authoritative projection through the queue
+    /// callback stream; this method intentionally does not mutate the local
+    /// queue a second time.
+    pub fn mutate_queue(&self, idx: usize, params: serde_json::Value) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let slot = slot.clone();
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = wait_for_attachment(&slot).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("session attachment failed: {error}")),
+                    });
+                return;
+            }
+            if let Err(error) = handle.mutate_queue(params).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("queue mutation failed: {error}")),
+                    });
+            }
+        });
+    }
+
     /// Returns a completed attachment failure without waiting. The UI uses
     /// this to reject a send before it appends a user message or marks the
     /// thread as generating; the background wait remains the final race-safe

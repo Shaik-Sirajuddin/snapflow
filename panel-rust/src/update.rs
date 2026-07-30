@@ -991,7 +991,6 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
-                    let server_queue = thread.server_queue;
                     thread.error = Some(message.clone());
                     (
                         vec![],
@@ -1068,6 +1067,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
+                    let server_queue = thread.server_queue;
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
@@ -1138,6 +1138,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
+                    let server_queue = thread.server_queue;
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);

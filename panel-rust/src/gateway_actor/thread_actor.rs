@@ -1501,13 +1501,26 @@ fn spawn_session_live_forwarder(
             // queue notifications share the local demultiplexer, but the
             // server watch is explicitly established through the queue
             // extension rather than piggybacking on session/resume.
-            let _ = client
+            let queue_subscription = client
                 .call(
                     "acpx/sessions/queue/subscribe",
                     serde_json::json!({ "sessionIds": [session_id.clone()] }),
                     None,
                 )
                 .await;
+            if let Ok(response) = queue_subscription {
+                if let Some(snapshots) =
+                    response.get("snapshots").and_then(|value| value.as_array())
+                {
+                    for snapshot in snapshots {
+                        let _ = live_tx.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "acpx/session/queue",
+                            "params": snapshot,
+                        }));
+                    }
+                }
+            }
             if rehydrate_after_connect {
                 if let Err(error) = client.rehydrate_session(&session_id).await {
                     eprintln!("panel-rust: session rehydration failed for {session_id}: {error}");
