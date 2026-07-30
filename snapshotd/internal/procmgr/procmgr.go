@@ -419,6 +419,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		}
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
 	}
+
 	pi := registry.ProcessInstance{
 		ID:               instanceID,
 		ProjectID:        projectID,

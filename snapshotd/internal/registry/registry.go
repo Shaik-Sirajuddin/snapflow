@@ -348,14 +348,6 @@ func (r *Registry) ListProcessInstancesByProject(projectID string) ([]ProcessIns
 	return out, nil
 }
 
-func (r *Registry) NextGeneration(projectID string) (int64, error) {
-	var row struct{ Max int64 }
-	if err := r.db.Model(&ProcessInstance{}).Where("project_id = ?", projectID).Select("COALESCE(MAX(generation), 0) AS max").Scan(&row).Error; err != nil {
-		return 0, err
-	}
-	return row.Max + 1, nil
-}
-
 func (r *Registry) UpdateProcessInstanceStatus(id, status string) error {
 	return r.db.Model(&ProcessInstance{}).Where("id = ?", id).Updates(map[string]any{
 		"status":               status,

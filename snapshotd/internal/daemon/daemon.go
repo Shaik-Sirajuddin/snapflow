@@ -66,9 +66,8 @@ type Daemon struct {
 	// gracefully -- (*os.Process).Signal on Windows supports neither
 	// SIGTERM nor any other POSIX signal delivered from a separate process,
 	// so a PID+signal-based `stop` command can never work there.
-	stopCh       chan struct{}
-	stopOnce     sync.Once
-	projectLocks sync.Map // canonical project root -> *sync.Mutex
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 type RegisterExternalInstanceParams struct {
