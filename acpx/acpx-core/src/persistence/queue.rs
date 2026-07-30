@@ -1,7 +1,7 @@
 //! Durable per-session FIFO prompt queue.
 
 use acpx_proto::session_stream::{
-    QueueItem, QueueMutationParams, QueueMutationResult, QueueOperation,
+    QueueItem, QueueMutationParams, QueueMutationResult, QueueOperation, QueueSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -187,6 +187,29 @@ impl QueueStore {
             idempotency_key: params.idempotency_key,
         };
         Ok((response, event))
+    }
+
+    /// Read the authoritative queue projection for reconnect/preload without
+    /// creating a JSONL record or a broadcast echo.
+    pub async fn snapshot(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<QueueSnapshot, TranscriptError> {
+        let session_id = session_id.into();
+        let actor = self.actor(&session_id).await;
+        let _guard = actor.lock().await;
+        let path = self.path(&session_id)?;
+        let result = tokio::task::spawn_blocking(move || {
+            let records = read_records(&path)?;
+            Ok::<_, TranscriptError>(replay_records(records))
+        })
+        .await
+        .map_err(|error| TranscriptError::Task(error.to_string()))??;
+        Ok(QueueSnapshot {
+            session_id,
+            queue: result.0,
+            paused: result.1,
+        })
     }
 
     /// Atomically claim the FIFO head for the server dispatcher. The entry

@@ -107,6 +107,16 @@ pub struct QueueSubscribeResult {
     pub session_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub snapshots: Vec<QueueSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueSnapshot {
+    pub session_id: String,
+    pub queue: Vec<QueueItem>,
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

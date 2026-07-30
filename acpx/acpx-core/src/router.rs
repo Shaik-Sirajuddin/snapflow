@@ -4286,6 +4286,7 @@ impl Router {
                         acpx_proto::session_stream::QueueSubscribeResult {
                             session_ids: typed.session_ids,
                             cursor: typed.cursor,
+                            snapshots: Vec::new(),
                         },
                     )?);
                 }
@@ -7172,7 +7173,7 @@ pub async fn dispatch_shared_for_tenant(
         MethodClass::GatewayNative
             if method == "acpx/sessions/subscribe" || method == "acpx/sessions/queue/subscribe" =>
         {
-            dispatch_session_stream_subscribe_shared(&method, request).await
+            dispatch_session_stream_subscribe_shared(router, &method, request).await
         }
         // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
         // plan.** `agents/install` is a genuine (potentially many-second,
@@ -7279,6 +7280,7 @@ async fn dispatch_session_sync_shared(
 }
 
 async fn dispatch_session_stream_subscribe_shared(
+    router: &SharedRouterHandle,
     method: &str,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
@@ -7299,10 +7301,23 @@ async fn dispatch_session_stream_subscribe_shared(
     }
     let typed: acpx_proto::session_stream::QueueSubscribeParams =
         serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let store = router.lock().await.queue_store();
+    let mut snapshots = Vec::with_capacity(typed.session_ids.len());
+    if let Some(store) = store {
+        for session_id in &typed.session_ids {
+            snapshots.push(
+                store
+                    .snapshot(session_id.clone())
+                    .await
+                    .map_err(RouterError::from)?,
+            );
+        }
+    }
     Ok(serde_json::to_value(
         acpx_proto::session_stream::QueueSubscribeResult {
             session_ids: typed.session_ids,
             cursor: typed.cursor,
+            snapshots,
         },
     )?)
 }
