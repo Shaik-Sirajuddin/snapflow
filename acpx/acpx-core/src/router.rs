@@ -7216,7 +7216,7 @@ pub async fn dispatch_shared_for_tenant(
         MethodClass::GatewayNative
             if method == "acpx/sessions/subscribe" || method == "acpx/sessions/queue/subscribe" =>
         {
-            dispatch_session_stream_subscribe_shared(router, &method, request).await
+            dispatch_session_stream_subscribe_shared(router, tenant_id, &method, request).await
         }
         // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
         // plan.** `agents/install` is a genuine (potentially many-second,
@@ -7324,6 +7324,7 @@ async fn dispatch_session_sync_shared(
 
 async fn dispatch_session_stream_subscribe_shared(
     router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     method: &str,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
@@ -7354,6 +7355,10 @@ async fn dispatch_session_stream_subscribe_shared(
                     .await
                     .map_err(RouterError::from)?,
             );
+            // A reconnect is also a liveness signal. Re-arm the dispatcher
+            // so a queue left behind by a transient backend/dispatcher
+            // failure does not wait for another mutation before progressing.
+            spawn_queue_dispatcher(router.clone(), tenant_id.clone(), session_id.clone());
         }
     }
     Ok(serde_json::to_value(

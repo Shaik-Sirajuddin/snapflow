@@ -241,6 +241,18 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
     .unwrap();
     assert!(resumed["accepted"].as_bool().unwrap());
 
+    let subscription = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":6, "method":"acpx/sessions/queue/subscribe",
+            "params":{"sessionIds":[session_id]}
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription["snapshots"][0]["sessionId"], session_id);
+
     for receiver in [&mut client_a, &mut client_b] {
         let event = tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())
             .await
