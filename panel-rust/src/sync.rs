@@ -904,6 +904,12 @@ fn sync_model_dropdown_for_provider(
     component.set_config_trigger_label(
         crate::models::current_config_trigger_label(&thread.config_options).into(),
     );
+    component.set_permission_mode_dropdown_entries(
+        crate::models::to_permission_mode_dropdown_entries(thread.config_options.clone()),
+    );
+    component.set_permission_mode_trigger_label(
+        crate::models::current_permission_mode_trigger_label(&thread.config_options).into(),
+    );
     sync_commands_model(model, thread);
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
 }

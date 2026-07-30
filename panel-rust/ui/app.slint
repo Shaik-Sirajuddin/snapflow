@@ -206,6 +206,8 @@ export component ChatPanel inherits Window {
     // Reasoning effort dropdown (separate from model).
     in-out property <[DropdownEntry]> reasoning-dropdown-entries: [];
     in-out property <string> reasoning-trigger-label: "";
+    in-out property <[DropdownEntry]> permission-mode-dropdown-entries: [];
+    in-out property <string> permission-mode-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence.
     in-out property <[DropdownEntry]> profile-dropdown-entries: [];
     in-out property <string> profile-trigger-label: "";
@@ -613,6 +615,8 @@ export component ChatPanel inherits Window {
                 config-trigger-label: config-trigger-label;
                 reasoning-dropdown-entries: reasoning-dropdown-entries;
                 reasoning-trigger-label: reasoning-trigger-label;
+                permission-mode-dropdown-entries: permission-mode-dropdown-entries;
+                permission-mode-trigger-label: permission-mode-trigger-label;
                 profile-dropdown-entries: profile-dropdown-entries;
                 profile-trigger-label: profile-trigger-label;
                 active-thread-has-session: active-thread-has-session;
