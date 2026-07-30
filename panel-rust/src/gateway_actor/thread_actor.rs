@@ -2314,6 +2314,38 @@ mod capability_parsing_tests {
     use serde_json::json;
 
     #[test]
+    fn queue_notifications_are_forwarded_as_typed_callbacks() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0",
+                "method": "acpx/session/queue",
+                "params": {
+                    "sessionId": "s1",
+                    "paused": false,
+                    "queue": [{
+                        "queueEntryId": "q1",
+                        "idempotencyKey": "k1",
+                        "text": "follow up",
+                        "state": "queued",
+                        "position": 0
+                    }]
+                }
+            })],
+            Some("s1"),
+            &events_tx,
+        );
+        match events_rx.try_recv().expect("queue callback") {
+            AgentEvent::QueueChanged { items, paused } => {
+                assert!(!paused);
+                assert_eq!(items[0].queue_entry_id, "q1");
+                assert_eq!(items[0].text, "follow up");
+            }
+            other => panic!("expected queue callback, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_session_modes_reads_current_and_available() {
         let modes = json!({
             "currentModeId": "ask",
