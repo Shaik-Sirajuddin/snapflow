@@ -24,6 +24,12 @@ import { StatusDot } from "../../../base/status_dot.slint";
 component MultilineField inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <string> field-accessible-label: "";
+    // Same ghost-hint convention `TextField.placeholder` now uses --
+    // this component had no placeholder support either, so the env-var
+    // and header boxes below rendered as blank boxes with only a
+    // separate static caption above them, no inline example of the
+    // expected `KEY=VALUE` shape.
+    in property <string> placeholder: "";
     out property <bool> has-focus: input.has-focus;
 
     height: 64px;
@@ -32,6 +38,19 @@ component MultilineField inherits Rectangle {
     border-color: Theme.border-default;
     border-radius: Theme.radius-sm;
     clip: true;
+
+    if root.placeholder != "" && root.text == "" : Text {
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-family: Theme.font-mono;
+        font-size: 10px * Theme.font-scale;
+        x: Metrics.pad-md;
+        y: Metrics.pad-xs;
+        width: parent.width - 2 * Metrics.pad-md;
+        height: parent.height - 2 * Metrics.pad-xs;
+        wrap: word-wrap;
+        vertical-alignment: top;
+    }
 
     input := TextInput {
         accessible-label: root.field-accessible-label;
@@ -416,6 +435,7 @@ export component McpServersView inherits Rectangle {
                     horizontal-stretch: 1;
                     text <=> root.form-name;
                     field-accessible-label: "MCP server name";
+                    placeholder: "e.g. filesystem";
                 }
                 Button {
                     label: "Stdio";
@@ -444,6 +464,7 @@ export component McpServersView inherits Rectangle {
                 command-field := TextField {
                     text <=> root.form-command;
                     field-accessible-label: "Command";
+                    placeholder: "e.g. npx @modelcontextprotocol/server-filesystem";
                     changed has-focus => {
                         root.stdio-fields-focused = self.has-focus
                             || args-field.has-focus || env-field.has-focus;
@@ -452,6 +473,7 @@ export component McpServersView inherits Rectangle {
                 args-field := TextField {
                     text <=> root.form-args;
                     field-accessible-label: "Arguments, space-separated";
+                    placeholder: "e.g. --root /home/user/projects";
                     changed has-focus => {
                         root.stdio-fields-focused = self.has-focus
                             || command-field.has-focus || env-field.has-focus;
@@ -465,6 +487,7 @@ export component McpServersView inherits Rectangle {
                 env-field := MultilineField {
                     text <=> root.form-env;
                     field-accessible-label: "Environment variables, one KEY=VALUE per line";
+                    placeholder: "API_KEY=sk-...\nDEBUG=1";
                     changed has-focus => {
                         root.stdio-fields-focused = self.has-focus
                             || command-field.has-focus || args-field.has-focus;
@@ -477,6 +500,7 @@ export component McpServersView inherits Rectangle {
                 url-field := TextField {
                     text <=> root.form-url;
                     field-accessible-label: "URL";
+                    placeholder: "e.g. https://example.com/mcp";
                     changed has-focus => {
                         root.http-fields-focused = self.has-focus
                             || headers-field.has-focus || oauth-field.has-focus;
@@ -490,6 +514,7 @@ export component McpServersView inherits Rectangle {
                 headers-field := MultilineField {
                     text <=> root.form-headers;
                     field-accessible-label: "Headers, one Header-Name: value per line";
+                    placeholder: "Authorization: Bearer ...";
                     changed has-focus => {
                         root.http-fields-focused = self.has-focus
                             || url-field.has-focus || oauth-field.has-focus;
@@ -498,6 +523,7 @@ export component McpServersView inherits Rectangle {
                 oauth-field := TextField {
                     text <=> root.form-oauth-client-id;
                     field-accessible-label: "OAuth client id (optional -- leave blank to use dynamic client registration)";
+                    placeholder: "optional -- blank uses dynamic client registration";
                     changed has-focus => {
                         root.http-fields-focused = self.has-focus
                             || url-field.has-focus || headers-field.has-focus;
@@ -511,6 +537,7 @@ export component McpServersView inherits Rectangle {
                     horizontal-stretch: 1;
                     text <=> root.form-timeout;
                     field-accessible-label: "Timeout in seconds (optional)";
+                    placeholder: "timeout in seconds (optional)";
                 }
                 Button {
                     label: root.editing-name == "" ? "Add" : "Save";
