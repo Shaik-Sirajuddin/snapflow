@@ -10,9 +10,11 @@
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::{dispatch_shared, Router, SharedRouterHandle};
 use acpx_core::TenantId;
+use acpx_core::TranscriptStore;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 const STAND_IN_STREAMING_BACKEND_SCRIPT: &str = r#"
@@ -100,6 +102,42 @@ async fn a_subscribed_session_receives_updates_live_and_the_response_carries_no_
     // subscribed client must never see the same update twice.
     assert!(prompt_response["_acpx"].get("updates").is_none());
     assert_eq!(prompt_response["result"]["stopReason"], json!("end_turn"));
+}
+
+#[tokio::test]
+async fn shared_live_updates_are_persisted_in_the_server_transcript_store() {
+    let directory = tempdir().unwrap();
+    let mut router = Router::new("persisting-streaming-agent")
+        .with_transcript_store(TranscriptStore::new(directory.path()));
+    router.register_agent(
+        "persisting-streaming-agent",
+        stand_in_streaming_backend_spec(),
+    );
+    let router = Arc::new(Mutex::new(router));
+    let created = dispatch_shared(
+        &router,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}),
+    )
+    .await
+    .unwrap();
+    let session_id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    let _ = dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"session/prompt",
+            "params":{"sessionId":session_id,"prompt":[{"type":"text","text":"hi"}]}
+        }),
+    )
+    .await
+    .unwrap();
+    let store = { router.lock().await.transcript_store().unwrap() };
+    let messages = store.read_all(&session_id).await.unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["params"]["update"]["content"]["text"], "Hello");
+    assert_eq!(
+        messages[1]["params"]["update"]["content"]["text"],
+        ", world"
+    );
 }
 
 #[tokio::test]

@@ -258,6 +258,16 @@ impl Gateway {
             "sessionId": session_id,
             "cwd": replay.params.get("cwd").cloned().unwrap_or_default(),
         });
+        // Re-establish the independent queue watch before resuming the ACP
+        // session so queued-state notifications cannot be missed during the
+        // reconnect window. Queue events intentionally do not ride through
+        // native session/resume.
+        client
+            .call(
+                "acpx/sessions/queue/subscribe",
+                serde_json::json!({ "sessionIds": [session_id] }),
+            )
+            .await?;
         client
             .call(
                 "session/resume",

@@ -5618,6 +5618,15 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
     }
+    // The server transcript is authoritative for every live update. Clone
+    // only the already-owned frame while releasing the router lock before
+    // the JSONL append; transport subscribers remain a delivery concern.
+    let transcript_store = { ctx.router.lock().await.transcript_store() };
+    if let Some(store) = transcript_store {
+        if let Err(error) = store.append(&gateway_id.0, vec![translated.clone()]).await {
+            tracing::warn!(session_id = %gateway_id.0, %error, "failed to persist live session update");
+        }
+    }
     ctx.notification_hub
         .publish(&tenant_id, &gateway_id.0, translated)
         .await
@@ -7324,6 +7333,23 @@ async fn dispatch_queue_mutation_shared(
         acpx_proto::session_stream::QueueOperation::Enqueue
             | acpx_proto::session_stream::QueueOperation::SendNow
     ) {
+        if operation == acpx_proto::session_stream::QueueOperation::SendNow {
+            // Steering is server-owned: cancel the active backend turn first,
+            // then the single dispatcher promotes the newly-fronted entry.
+            // The dispatcher absorbs the resulting cancelled prompt result,
+            // preventing a second queue drain.
+            let _ = dispatch_session_cancel_shared(
+                router,
+                tenant_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("queue-cancel:{}", result.idempotency_key),
+                    "method": "session/cancel",
+                    "params": {"sessionId": result.session_id}
+                }),
+            )
+            .await;
+        }
         spawn_queue_dispatcher(router.clone(), tenant_id.clone(), result.session_id.clone());
     }
     Ok(serde_json::to_value(result)?)

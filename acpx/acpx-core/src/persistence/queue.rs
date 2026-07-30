@@ -110,10 +110,18 @@ impl QueueStore {
                 }
             }
 
-            let duplicate = queue.iter().find(|item| {
-                item.idempotency_key == task_params.idempotency_key
-                    || task_params.queue_entry_id.as_deref() == Some(item.queue_entry_id.as_str())
-            });
+            let duplicate = if matches!(
+                task_params.operation,
+                QueueOperation::Enqueue | QueueOperation::SendNow
+            ) {
+                queue.iter().find(|item| {
+                    item.idempotency_key == task_params.idempotency_key
+                        || task_params.queue_entry_id.as_deref()
+                            == Some(item.queue_entry_id.as_str())
+                })
+            } else {
+                None
+            };
             let queue_entry_id = duplicate
                 .map(|item| item.queue_entry_id.clone())
                 .or_else(|| task_params.queue_entry_id.clone())
@@ -398,5 +406,45 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.queue[0].text, "survives restart");
         assert!(snapshot.paused);
+    }
+
+    #[tokio::test]
+    async fn send_now_reorders_and_cancel_absorbs_a_queued_entry() {
+        let store = QueueStore::new(tempdir().unwrap().path());
+        for (key, text) in [("a", "first"), ("b", "second"), ("c", "urgent")] {
+            store
+                .mutate(
+                    "s1",
+                    QueueMutationParams {
+                        session_id: "s1".into(),
+                        idempotency_key: key.into(),
+                        operation: if key == "c" {
+                            QueueOperation::SendNow
+                        } else {
+                            QueueOperation::Enqueue
+                        },
+                        queue_entry_id: None,
+                        text: Some(text.into()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let (snapshot, _) = store
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "cancel-b".into(),
+                    operation: QueueOperation::Cancel,
+                    queue_entry_id: Some("queue-b".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.queue[0].text, "urgent");
+        assert_eq!(snapshot.queue.len(), 2);
+        assert!(!snapshot.queue.iter().any(|item| item.text == "second"));
     }
 }
