@@ -147,6 +147,48 @@ impl TranscriptStore {
             messages: canonical.into_iter().skip(start).collect(),
         })
     }
+
+    /// Apply a reconciliation patch without rewriting the already matched
+    /// prefix. The suffix is replaced atomically via a sibling temporary
+    /// file, then renamed over the session JSONL file.
+    pub async fn apply_patch(
+        &self,
+        session_id: impl Into<String>,
+        patch: &SessionTranscriptPatch,
+    ) -> Result<(), TranscriptError> {
+        let session_id = session_id.into();
+        let path = self.path_for(&session_id)?;
+        let root = Arc::clone(&self.root);
+        let patch = patch.clone();
+        run_blocking(move || {
+            std::fs::create_dir_all(root.as_path())?;
+            let existing = read_lines(&path)?;
+            let start = patch.start_index.min(existing.len() as u64) as usize;
+            let replace_end = start
+                .saturating_add(patch.replace_count as usize)
+                .min(existing.len());
+            let mut merged = Vec::with_capacity(
+                start + patch.messages.len() + existing.len().saturating_sub(replace_end),
+            );
+            merged.extend_from_slice(&existing[..start]);
+            merged.extend(patch.messages);
+            merged.extend_from_slice(&existing[replace_end..]);
+
+            let temp = path.with_extension("jsonl.tmp");
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&temp)?;
+                for message in merged {
+                    serde_json::to_writer(&mut file, &message)?;
+                    file.write_all(b"\n")?;
+                }
+                file.sync_data()?;
+            }
+            std::fs::rename(temp, path)?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn parse_cursor(cursor: &str) -> Result<usize, TranscriptError> {

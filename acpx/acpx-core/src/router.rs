@@ -1363,6 +1363,10 @@ impl Router {
         self.persistence.clone()
     }
 
+    pub fn transcript_store(&self) -> Option<TranscriptStore> {
+        self.transcripts.clone()
+    }
+
     pub fn with_transcript_store(mut self, transcripts: TranscriptStore) -> Self {
         self.transcripts = Some(transcripts);
         self
@@ -4174,7 +4178,8 @@ impl Router {
                     let store = self
                         .transcripts
                         .as_ref()
-                        .ok_or(RouterError::NotImplemented("server transcript storage"))?;
+                        .ok_or(RouterError::NotImplemented("server transcript storage"))?
+                        .clone();
                     let params = request
                         .get("params")
                         .cloned()
@@ -4185,6 +4190,52 @@ impl Router {
                         .paginate(typed.session_id, typed.before.as_deref(), typed.limit)
                         .await?;
                     return Ok(serde_json::to_value(page)?);
+                }
+                if method == "acpx/sessions/sync" {
+                    let store = self
+                        .transcripts
+                        .as_ref()
+                        .ok_or(RouterError::NotImplemented("server transcript storage"))?
+                        .clone();
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::SessionSyncParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    let session_id = typed.session_id.clone();
+                    let load_response = self
+                        .dispatch_proxied(
+                            tenant_id,
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request.get("id").cloned().unwrap_or(serde_json::json!(0)),
+                                "method": "session/load",
+                                "params": {"sessionId": session_id}
+                            }),
+                        )
+                        .await?;
+                    let canonical = load_response
+                        .get("_acpx")
+                        .and_then(|extension| extension.get("updates"))
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let patch = store
+                        .patch_against(
+                            &typed.session_id,
+                            typed.known_message_count,
+                            typed.last_matched_message_id.as_deref(),
+                            canonical,
+                        )
+                        .await?;
+                    store.apply_patch(&typed.session_id, &patch).await?;
+                    let result = acpx_proto::session_stream::SessionSyncResult {
+                        session_id: typed.session_id,
+                        patch,
+                        cursor: None,
+                    };
+                    return Ok(serde_json::to_value(result)?);
                 }
                 return Err(RouterError::NotImplemented("session stream extensions"));
             }
@@ -7031,6 +7082,12 @@ pub async fn dispatch_shared_for_tenant(
         {
             dispatch_session_list_real_shared(router, tenant_id, request).await
         }
+        MethodClass::GatewayNative if method == "acpx/sessions/paginate" => {
+            dispatch_session_paginate_shared(router, tenant_id, request).await
+        }
+        MethodClass::GatewayNative if method == "acpx/sessions/sync" => {
+            dispatch_session_sync_shared(router, tenant_id, request).await
+        }
         // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
         // plan.** `agents/install` is a genuine (potentially many-second,
         // real network/filesystem) download+extract, not the cheap/local
@@ -7059,6 +7116,80 @@ pub async fn dispatch_shared_for_tenant(
                 .await
         }
     }
+}
+
+async fn dispatch_session_paginate_shared(
+    router: &SharedRouterHandle,
+    _tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let store = router
+        .lock()
+        .await
+        .transcript_store()
+        .ok_or(RouterError::NotImplemented("server transcript storage"))?;
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::SessionPaginateParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let page = store
+        .paginate(typed.session_id, typed.before.as_deref(), typed.limit)
+        .await?;
+    Ok(serde_json::to_value(page)?)
+}
+
+async fn dispatch_session_sync_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let store = router
+        .lock()
+        .await
+        .transcript_store()
+        .ok_or(RouterError::NotImplemented("server transcript storage"))?;
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::SessionSyncParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let session_id = typed.session_id.clone();
+    let load_response = dispatch_proxied_shared(
+        router,
+        tenant_id,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(serde_json::json!(0)),
+            "method": "session/load",
+            "params": {"sessionId": session_id}
+        }),
+    )
+    .await?;
+    let canonical = load_response
+        .get("_acpx")
+        .and_then(|extension| extension.get("updates"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let patch = store
+        .patch_against(
+            &typed.session_id,
+            typed.known_message_count,
+            typed.last_matched_message_id.as_deref(),
+            canonical,
+        )
+        .await?;
+    store.apply_patch(&typed.session_id, &patch).await?;
+    Ok(serde_json::to_value(
+        acpx_proto::session_stream::SessionSyncResult {
+            session_id: typed.session_id,
+            patch,
+            cursor: None,
+        },
+    )?)
 }
 
 /// [`dispatch_shared_for_tenant`]'s `agents/install` path -- resolves the
