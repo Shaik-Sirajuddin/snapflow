@@ -48,6 +48,7 @@ export component SettingsRow inherits Rectangle {
         padding-right: Metrics.space-4;
         spacing: Metrics.space-4;
         alignment: center;
+        cross-axis-alignment: center;
 
         VerticalLayout {
             alignment: center;
@@ -74,6 +75,7 @@ export component SettingsRow inherits Rectangle {
         HorizontalLayout {
             horizontal-stretch: 0;
             alignment: end;
+            cross-axis-alignment: center;
             // `gap-md`, up from `gap-sm` -- MCP server rows in particular
             // pack several trailing items (status line, Connect, Tools
             // count, enable Toggle, Remove) and read as too cramped at

@@ -31,9 +31,41 @@ case "$os" in
   Linux)  platform="linux" ;;
   Darwin) platform="macos" ;;
   *)
-    die "unsupported OS: $os. Only Linux and macOS builds are published (see .github/workflows/); on Windows, download a release asset manually from https://github.com/$REPO/releases"
+    die "unsupported OS: $os. On Windows, use scripts/install.ps1 instead: irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex"
     ;;
 esac
+
+# Persist daemon discovery settings outside SNAPSHOTD_HOME so relocating the
+# daemon state does not also relocate the panel's discovery metadata. Both
+# snapshotd (Go) and panel-rust read this small KEY=value file. Explicit env
+# values win; otherwise an existing file value is preserved across upgrades.
+case "$platform" in
+  linux)
+    runtime_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/snapflow"
+    ;;
+  macos)
+    runtime_config_dir="$HOME/Library/Application Support/Snapflow"
+    ;;
+esac
+runtime_config_file="$runtime_config_dir/runtime.env"
+read_runtime_value() {
+  [ -f "$runtime_config_file" ] || return 0
+  sed -n "s/^$1=//p" "$runtime_config_file" | head -n1
+}
+runtime_home="${SNAPSHOTD_HOME:-$(read_runtime_value SNAPSHOTD_HOME)}"
+runtime_home="${runtime_home:-$HOME/.snapshotd}"
+runtime_mcp_addr="${SNAPSHOTD_MCP_SSE_ADDR:-$(read_runtime_value SNAPSHOTD_MCP_SSE_ADDR)}"
+runtime_mcp_addr="${runtime_mcp_addr:-127.0.0.1:7777}"
+mkdir -p "$runtime_config_dir"
+old_umask="$(umask)"
+umask 077
+{
+  echo "# Snapflow daemon runtime configuration; managed by scripts/install.sh"
+  echo "SNAPSHOTD_HOME=$runtime_home"
+  echo "SNAPSHOTD_MCP_SSE_ADDR=$runtime_mcp_addr"
+} > "$runtime_config_file"
+umask "$old_umask"
+info "Persisted daemon discovery config -> $runtime_config_file"
 
 arch="$(uname -m)"
 case "$arch" in
@@ -206,6 +238,33 @@ case "$platform" in
     fi
     ;;
 esac
+
+# ── ACP Node/npm (global-first; official bundle only if system missing).
+# scripts/lib/acp-node-runtime.sh: never forces Node onto the user shell
+# PATH; only materializes $INSTALL_DIR/runtime/node for ACP/acpx children.
+# Failures are non-fatal so a Node CDN outage does not block snapflow
+# install (doctor / `runtime install node` can retry later).
+ACP_NODE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/acp-node-runtime.sh"
+if [ ! -f "$ACP_NODE_LIB" ]; then
+  # install.sh may be curl'd alone; try next to INSTALL_DIR copy if present.
+  ACP_NODE_LIB="$INSTALL_DIR/scripts/lib/acp-node-runtime.sh"
+fi
+if [ -f "$ACP_NODE_LIB" ]; then
+  # shellcheck source=lib/acp-node-runtime.sh
+  SNAPFLOW_INSTALL_DIR="$INSTALL_DIR"
+  export SNAPFLOW_INSTALL_DIR
+  # shellcheck disable=SC1090
+  . "$ACP_NODE_LIB"
+  info "Ensuring ACP Node/npm (global-first; bundle only if needed)..."
+  if acp_node_ensure 0; then
+    info "ACP Node ready (source=$(acp_node_resolve_source))"
+  else
+    echo "note: ACP Node ensure failed -- agents needing node/npm will not work until" >&2
+    echo "  system Node is installed or: bash $ACP_NODE_LIB ensure" >&2
+  fi
+else
+  echo "note: acp-node-runtime.sh not found; skipping ACP Node bootstrap." >&2
+fi
 
 # ── Make snapflowd/snapflow usable immediately, not just after a new shell.
 # A curl|bash subprocess can't mutate the calling interactive shell's PATH

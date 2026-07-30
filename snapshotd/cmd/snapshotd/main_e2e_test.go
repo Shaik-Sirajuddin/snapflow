@@ -73,6 +73,13 @@ func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
 	}
+	// `daemon.launch`/the CLI open path intentionally rejects an existing
+	// project directory that has no .mlt.  Creating a new project is a
+	// separate, explicit `project.create` operation; this test exercises
+	// launch/list/close for an existing project.
+	if err := os.WriteFile(filepath.Join(projectDir, "project.mlt"), []byte("<mlt/>\n"), 0o644); err != nil {
+		t.Fatalf("create project mlt: %v", err)
+	}
 
 	serveCmd := exec.CommandContext(context.Background(), snapshotdBin, "serve", "--no-mcp")
 	serveCmd.Env = append(os.Environ(),
@@ -116,6 +123,14 @@ func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
 	listOut := runCLI(t, snapshotdBin, homeDir, "list")
 	if !strings.Contains(listOut, launched.ID) {
 		t.Fatalf("expected list output to contain launched instance id %q, got: %q", launched.ID, listOut)
+	}
+
+	// PISO-8: listProjects is the other half of correlating an instance to
+	// a real, displayable project path -- ProcessInstance only carries a
+	// ProjectID, not a RootDir, so the panel needs both bare subcommands.
+	listProjectsOut := runCLI(t, snapshotdBin, homeDir, "listProjects")
+	if !strings.Contains(listProjectsOut, projectDir) {
+		t.Fatalf("expected listProjects output to contain the launched project's root dir %q, got: %q", projectDir, listProjectsOut)
 	}
 
 	// close the instance, then list reflects it's no longer live.

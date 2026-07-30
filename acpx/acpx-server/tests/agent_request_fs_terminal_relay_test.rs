@@ -68,7 +68,10 @@ done
 }
 
 fn stand_in_backend_spec(read_path: &str) -> SpawnSpec {
-    SpawnSpec::new("sh", vec!["-c".to_string(), stand_in_backend_script(read_path)])
+    SpawnSpec::new(
+        "sh",
+        vec!["-c".to_string(), stand_in_backend_script(read_path)],
+    )
 }
 
 async fn spawn_server(router: SharedRouter) -> SocketAddr {

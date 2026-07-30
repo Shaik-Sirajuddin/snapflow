@@ -58,11 +58,7 @@ fn write_stand_in_backend_script(path: &std::path::Path) {
     .expect("write stand-in backend script");
 }
 
-async fn seed_session(
-    store: &PersistenceStore,
-    gateway_session_id: &str,
-    age: Duration,
-) {
+async fn seed_session(store: &PersistenceStore, gateway_session_id: &str, age: Duration) {
     let created_at_unix_nanos = unix_time_nanos() - age.as_nanos() as i64;
     store
         .record_session_with_recovery(
@@ -166,7 +162,10 @@ async fn recovery_disabled_spawn_shape_recovers_nothing_from_a_stale_database() 
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env(
+            "ACPX_DEFAULT_ACP_COMMAND",
+            format!("sh {}", script_path.display()),
+        )
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")
@@ -202,12 +201,7 @@ async fn recovery_enabled_with_max_age_only_recovers_the_recent_session() {
     let database = unique_temp_path("acpx-recovery-bounded-test.sqlite");
     {
         let store = PersistenceStore::open(&database).expect("seed database");
-        seed_session(
-            &store,
-            "old-session",
-            Duration::from_secs(2 * 24 * 60 * 60),
-        )
-        .await;
+        seed_session(&store, "old-session", Duration::from_secs(2 * 24 * 60 * 60)).await;
         seed_session(&store, "recent-session", Duration::from_secs(5 * 60)).await;
     }
 
@@ -232,7 +226,10 @@ async fn recovery_enabled_with_max_age_only_recovers_the_recent_session() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env(
+            "ACPX_DEFAULT_ACP_COMMAND",
+            format!("sh {}", script_path.display()),
+        )
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")

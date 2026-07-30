@@ -175,25 +175,30 @@ async fn wait_for_default_model(
 async fn editing_the_bridge_config_file_hot_reloads_without_a_restart() {
     let addr = ephemeral_addr().await;
     let script_path = write_temp_file("acpx-hot-reload-stand-in-agent", STAND_IN_AGENT_SCRIPT);
-    let bridge_config_path =
-        write_temp_file("acpx-hot-reload-bridge-config", &bridge_config_json("stand-in/v1"));
+    let bridge_config_path = write_temp_file(
+        "acpx-hot-reload-bridge-config",
+        &bridge_config_json("stand-in/v1"),
+    );
     let db_path = write_temp_file("acpx-hot-reload-db", "");
     std::fs::remove_file(&db_path).expect("clear placeholder db file");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("python3 {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .env("ACPX_ACP_BRIDGE_ENABLED", "1")
-        .env(
-            "ACPX_ACP_BRIDGE_CONFIG_FILE",
-            bridge_config_path.display().to_string(),
-        )
-        .env("ACPX_DB_PATH", db_path.display().to_string())
-        .env_remove("ACPX_AUTH_TOKEN")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("python3 {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_ACP_BRIDGE_ENABLED", "1")
+    .env(
+        "ACPX_ACP_BRIDGE_CONFIG_FILE",
+        bridge_config_path.display().to_string(),
+    )
+    .env("ACPX_DB_PATH", db_path.display().to_string())
+    .env_remove("ACPX_AUTH_TOKEN")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let child = cmd.spawn().expect("spawn real acpx-server binary");
     let guard = ServerGuard {
         child,
@@ -242,7 +247,8 @@ async fn editing_the_bridge_config_file_hot_reloads_without_a_restart() {
     std::fs::write(&bridge_config_path, bridge_config_json("stand-in/v2"))
         .expect("overwrite bridge config file");
 
-    let reloaded = wait_for_default_model(&client, addr, "stand-in/v2", Duration::from_secs(5)).await;
+    let reloaded =
+        wait_for_default_model(&client, addr, "stand-in/v2", Duration::from_secs(5)).await;
     assert!(
         reloaded["models"]
             .as_array()
@@ -285,25 +291,30 @@ async fn editing_the_bridge_config_file_hot_reloads_without_a_restart() {
 async fn an_invalid_config_edit_is_rejected_and_the_previous_config_stays_live() {
     let addr = ephemeral_addr().await;
     let script_path = write_temp_file("acpx-hot-reload-stand-in-agent", STAND_IN_AGENT_SCRIPT);
-    let bridge_config_path =
-        write_temp_file("acpx-hot-reload-bridge-config", &bridge_config_json("stand-in/v1"));
+    let bridge_config_path = write_temp_file(
+        "acpx-hot-reload-bridge-config",
+        &bridge_config_json("stand-in/v1"),
+    );
     let db_path = write_temp_file("acpx-hot-reload-db", "");
     std::fs::remove_file(&db_path).expect("clear placeholder db file");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("python3 {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .env("ACPX_ACP_BRIDGE_ENABLED", "1")
-        .env(
-            "ACPX_ACP_BRIDGE_CONFIG_FILE",
-            bridge_config_path.display().to_string(),
-        )
-        .env("ACPX_DB_PATH", db_path.display().to_string())
-        .env_remove("ACPX_AUTH_TOKEN")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("python3 {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_ACP_BRIDGE_ENABLED", "1")
+    .env(
+        "ACPX_ACP_BRIDGE_CONFIG_FILE",
+        bridge_config_path.display().to_string(),
+    )
+    .env("ACPX_DB_PATH", db_path.display().to_string())
+    .env_remove("ACPX_AUTH_TOKEN")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let child = cmd.spawn().expect("spawn real acpx-server binary");
     let guard = ServerGuard {
         child,

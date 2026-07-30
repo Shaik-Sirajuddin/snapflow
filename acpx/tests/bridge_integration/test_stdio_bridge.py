@@ -64,7 +64,7 @@ class StdioBridgeTest(unittest.IsolatedAsyncioTestCase):
         probe.close()
         await probe.wait_closed()
         env = os.environ | {
-            "ACPX_BACKEND_CMD": f"sh {self.backend}",
+            "ACPX_DEFAULT_ACP_COMMAND": f"sh {self.backend}",
             "ACPX_DEFAULT_AGENT_ID": "default",
             "ACPX_HTTP_BIND": f"127.0.0.1:{port}",
             "ACPX_ACP_BRIDGE_ENABLED": "1",

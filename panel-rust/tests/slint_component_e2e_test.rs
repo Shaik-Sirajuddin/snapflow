@@ -1,8 +1,8 @@
 use i_slint_backend_testing::ElementHandle;
 use panel_rust::{
-    AgentCatalogEntry, ChatPanel, DropdownEntry, LocalTerminalItem, McpServerOption,
-    MessageItem, PendingRequestItem, ProfileOption, RemoteSessionOption,
-    SkillOption, TerminalItem, TextUtil, ThreadItem,
+    AgentCatalogEntry, ChatPanel, DropdownEntry, LocalTerminalItem, McpServerOption, MessageItem,
+    PendingRequestItem, ProfileOption, RemoteSessionOption, SkillOption, TerminalItem, TextUtil,
+    ThreadItem,
 };
 use slint::platform::{Key, WindowEvent};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -27,6 +27,10 @@ fn settle_sidebar_expand(panel: &ChatPanel) {
 fn sample_open_thread(name: &str) -> ThreadItem {
     ThreadItem {
         name: name.into(),
+        // Added to ThreadItem after this fixture was written; the field is
+        // required, so this target stopped compiling. It went unnoticed
+        // because `cargo test --lib` and single-target runs never build it.
+        relative_time: "now".into(),
         status: "idle".into(),
         busy: false,
         open: true,
@@ -40,6 +44,7 @@ fn sample_open_thread(name: &str) -> ThreadItem {
         project_path: "".into(),
         profile_name: "".into(),
         has_session: false,
+        project_instance_live: false,
     }
 }
 
@@ -127,10 +132,9 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         });
     }
 
-    let expand_sidebar =
-        ElementHandle::find_by_accessible_label(&panel, "Expand thread sidebar")
-            .next()
-            .expect("sidebar expansion control must be accessible");
+    let expand_sidebar = ElementHandle::find_by_accessible_label(&panel, "Expand thread sidebar")
+        .next()
+        .expect("sidebar expansion control must be accessible");
     // This button is built on the shared IconButton primitive
     // (icon_button.slint), whose own `touch := TouchArea` (with
     // accessible-role/label) is what's actually exposed to accessibility
@@ -139,10 +143,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     // that's the element that actually declares accessible-role. This
     // assertion previously expected "Sidebar::sidebar-toggle", stale from
     // before this button was refactored onto IconButton.
-    assert_eq!(
-        expand_sidebar.id().as_deref(),
-        Some("IconButton::touch")
-    );
+    assert_eq!(expand_sidebar.id().as_deref(), Some("IconButton::touch"));
     expand_sidebar.invoke_accessible_default_action();
     assert!(panel.get_sidebar_expanded());
 
@@ -176,7 +177,9 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     // are_addressable_and_dispatch_typed_values`'s own comment on this
     // exact Slint-testing gotcha). Same fix: grow the window before
     // looking up anything inside the sheet.
-    panel.window().set_size(slint::LogicalSize::new(900.0, 1000.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1000.0));
     let save_settings = ElementHandle::find_by_accessible_label(&panel, "Save chat settings")
         .next()
         .expect("settings save control must be accessible");
@@ -219,12 +222,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     assert!(panel.get_background_override_set());
     assert!(panel.get_background_override());
 
-    let background_override_value = ElementHandle::find_by_accessible_label(
-        &panel,
-        "Toggle selected chat background session",
-    )
-    .next()
-    .expect("background override value control must be accessible");
+    let background_override_value =
+        ElementHandle::find_by_accessible_label(&panel, "Toggle selected chat background session")
+            .next()
+            .expect("background override value control must be accessible");
     assert_eq!(
         background_override_value.id().as_deref(),
         Some("Toggle::touch")
@@ -239,7 +240,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         .expect("send control must be accessible");
     // compose/send-stop-button moved into their own ChatInputLayout
     // component since this assertion was written.
-    assert_eq!(send.id().as_deref(), Some("ChatInputLayout::send-stop-button"));
+    assert_eq!(
+        send.id().as_deref(),
+        Some("ChatInputLayout::send-stop-button")
+    );
     send.invoke_accessible_default_action();
     assert_eq!(sent_text.take(), "render a title card");
 
@@ -248,11 +252,19 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         .expect("compose input must be accessible");
     assert_eq!(compose.id().as_deref(), Some("ChatInputLayout::compose"));
     compose.invoke_accessible_default_action();
-    assert!(panel.get_compose_has_focus(), "composer should accept focus");
+    assert!(
+        panel.get_compose_has_focus(),
+        "composer should accept focus"
+    );
 
     // A streamed transcript projection changes the message model beneath the
     // composer. It must never focus the new message/card and interrupt input.
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        tool_group_len: 0,
         kind: "agent".into(),
         text: "streamed response".into(),
         markdown_lines: Default::default(),
@@ -263,6 +275,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         raw_output: "".into(),
         queued: false,
         can_edit: false,
+        can_send_now: false,
         sending: false,
         first_use: false,
     }])));
@@ -322,20 +335,43 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     assert_eq!(selected_permission_option.take(), "reject");
 
     panel.set_terminals(ModelRc::new(VecModel::from(vec![TerminalItem {
+        title: "".into(),
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        last_command: "".into(),
+        started_at: "".into(),
+        active: false,
         terminal_id: "build-42".into(),
         output: "building\n".into(),
         truncated: false,
         has_exited: false,
         exit_code: 0,
     }])));
-    let expand_terminal = ElementHandle::find_by_accessible_label(&panel, "Expand terminal build-42")
-        .next()
-        .expect("terminal expand control must be accessible");
-    assert_eq!(expand_terminal.id().as_deref(), Some("TerminalCard::terminal-expand"));
+    let expand_terminal =
+        ElementHandle::find_by_accessible_label(&panel, "Expand terminal build-42")
+            .next()
+            .expect("terminal expand control must be accessible");
+    // SCNA-11: TerminalCard's header is TerminalHeader, which inherits
+    // HoverSurface directly (terminal_header.slint) rather than exposing
+    // its own separately-named clickable element -- there is no
+    // "TerminalCard::terminal-expand" id in the current component tree
+    // (this assertion predates that refactor). HoverSurface::touch is
+    // the real, current id of the single accessible-label match.
+    assert_eq!(expand_terminal.id().as_deref(), Some("HoverSurface::touch"));
     expand_terminal.invoke_accessible_default_action();
     assert_eq!(expanded_terminal.take(), "build-42");
 
     panel.set_expanded_terminal(TerminalItem {
+        title: "".into(),
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        last_command: "".into(),
+        started_at: "".into(),
+        active: false,
         terminal_id: "build-42".into(),
         output: "building\n".into(),
         truncated: false,
@@ -346,7 +382,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Close terminal overlay")
             .next()
             .expect("terminal overlay close control must be accessible");
-    assert_eq!(close_terminal_overlay.id().as_deref(), Some("Button::touch"));
+    assert_eq!(
+        close_terminal_overlay.id().as_deref(),
+        Some("Button::touch")
+    );
     close_terminal_overlay.invoke_accessible_default_action();
     assert_eq!(terminal_overlay_close_count.get(), 1);
     assert!(
@@ -367,7 +406,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Expand local terminal")
             .next()
             .expect("local terminal expand control must be accessible");
-    assert_eq!(expand_local_terminal.id().as_deref(), Some("IconButton::touch"));
+    assert_eq!(
+        expand_local_terminal.id().as_deref(),
+        Some("IconButton::touch")
+    );
     expand_local_terminal.invoke_accessible_default_action();
     assert!(panel.get_local_terminal_overlay_open());
     let close_local_overlay =
@@ -460,7 +502,8 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
 
     {
         let mode_selection = mode_selection.clone();
-        panel.on_mode_selected(move |mode_id| mode_selection.borrow_mut().push(mode_id.to_string()));
+        panel
+            .on_mode_selected(move |mode_id| mode_selection.borrow_mut().push(mode_id.to_string()));
     }
     {
         let config_selection = config_selection.clone();
@@ -579,6 +622,10 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         fs_enabled: true,
     }])));
     panel.set_available_mcp_servers(ModelRc::new(VecModel::from(vec![McpServerOption {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
         name: "media-fs".into(),
         command: "node server.js".into(),
         status_line: "".into(),
@@ -605,6 +652,7 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         version: "1.0".into(),
         status: "not installed".into(),
         enabled: true,
+        loading: false,
     }])));
     panel.set_recoverable_sessions(ModelRc::new(VecModel::from(vec![RemoteSessionOption {
         session_id: "orphan-session-1".into(),
@@ -622,7 +670,9 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     // window's small default size), so the window is explicitly grown
     // here to fit everything without needing to also simulate scrolling
     // partway through the assertions below.
-    panel.window().set_size(slint::LogicalSize::new(900.0, 1600.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1600.0));
     // Profile chips/MCP servers/agent-install all moved into their own
     // tabbed views (agents_view.slint / mcp_servers_view.slint) since
     // this test was written against the single-scroll settings_sheet.slint
@@ -636,7 +686,10 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     // shared-component wrapper), so its id is whatever Slint assigns an
     // anonymous element -- just confirm it resolves, don't pin the exact
     // generated string.
-    assert!(profile.id().is_some(), "profile chip element must have an id");
+    assert!(
+        profile.id().is_some(),
+        "profile chip element must have an id"
+    );
     profile.invoke_accessible_default_action();
     assert_eq!(panel.get_default_profile(), "codex-tools");
 
@@ -674,7 +727,10 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         ElementHandle::find_by_accessible_label(&panel, "Confirm delete profile codex-tools")
             .next()
             .expect("profile delete-confirm control must be accessible once armed");
-    assert_eq!(confirm_profile_delete.id().as_deref(), Some("Button::touch"));
+    assert_eq!(
+        confirm_profile_delete.id().as_deref(),
+        Some("Button::touch")
+    );
     confirm_profile_delete.invoke_accessible_default_action();
     assert_eq!(&*deleted_profile.borrow(), &["codex-tools".to_owned()]);
 
@@ -690,10 +746,9 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     let _ = &created_profile;
 
     panel.set_settings_active_section("mcp_servers".into());
-    let remove_mcp =
-        ElementHandle::find_by_accessible_label(&panel, "Remove MCP server media-fs")
-            .next()
-            .expect("MCP delete must be accessible");
+    let remove_mcp = ElementHandle::find_by_accessible_label(&panel, "Remove MCP server media-fs")
+        .next()
+        .expect("MCP delete must be accessible");
     assert_eq!(remove_mcp.id().as_deref(), Some("Button::touch"));
     remove_mcp.invoke_accessible_default_action();
     assert_eq!(&*removed_mcp.borrow(), &["media-fs"]);
@@ -716,24 +771,22 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     assert_eq!(mcp_name.id().as_deref(), Some("TextField::field-input"));
     mcp_name.invoke_accessible_default_action();
     for key in "review".chars() {
-        panel
-            .window()
-            .dispatch_event(WindowEvent::KeyPressed { text: key.to_string().into() });
+        panel.window().dispatch_event(WindowEvent::KeyPressed {
+            text: key.to_string().into(),
+        });
     }
 
     // Label gained an " or URL" suffix since this assertion was written
     // (mcp_servers_view.slint now supports remote/URL-based servers too).
-    let mcp_command = ElementHandle::find_by_accessible_label(
-        &panel,
-        "New MCP server command or URL",
-    )
-        .next()
-        .expect("MCP command input must be accessible");
+    let mcp_command =
+        ElementHandle::find_by_accessible_label(&panel, "New MCP server command or URL")
+            .next()
+            .expect("MCP command input must be accessible");
     mcp_command.invoke_accessible_default_action();
     for key in "node server.js".chars() {
-        panel
-            .window()
-            .dispatch_event(WindowEvent::KeyPressed { text: key.to_string().into() });
+        panel.window().dispatch_event(WindowEvent::KeyPressed {
+            text: key.to_string().into(),
+        });
     }
 
     let add_mcp = ElementHandle::find_by_accessible_label(&panel, "Add MCP server")
@@ -777,10 +830,12 @@ fn connection_status_is_exposed_to_accessibility() {
     // certain roles do) -- the status is folded into `accessible-label`
     // itself instead, per that established convention (see
     // `chat_area.slint`'s connection-status element).
-    let status =
-        ElementHandle::find_by_accessible_label(&panel, "Connection status: HTTP fallback - approvals unavailable")
-            .next()
-            .expect("connection state must be exposed");
+    let status = ElementHandle::find_by_accessible_label(
+        &panel,
+        "Connection status: HTTP fallback - approvals unavailable",
+    )
+    .next()
+    .expect("connection state must be exposed");
     assert!(status
         .accessible_label()
         .as_deref()
@@ -806,7 +861,9 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     settle_sidebar_expand(&panel);
     panel.set_threads(ModelRc::new(VecModel::from(vec![sample_open_thread(
         "Fix timeline crash",
@@ -846,12 +903,10 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
             .is_none(),
         "the arm control must disappear once armed"
     );
-    let cancel_close = ElementHandle::find_by_accessible_label(
-        &panel,
-        "Cancel close thread Fix timeline crash",
-    )
-    .next()
-    .expect("cancel-close control must be accessible once armed");
+    let cancel_close =
+        ElementHandle::find_by_accessible_label(&panel, "Cancel close thread Fix timeline crash")
+            .next()
+            .expect("cancel-close control must be accessible once armed");
     cancel_close.invoke_accessible_default_action();
     assert_eq!(closed_index.get(), -1, "cancel must not fire the callback");
     // Cancelling re-shows the plain arm control.
@@ -865,12 +920,10 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
             .next()
             .expect("close-arm control must still be accessible");
     close_arm.invoke_accessible_default_action();
-    let confirm_close = ElementHandle::find_by_accessible_label(
-        &panel,
-        "Confirm close thread Fix timeline crash",
-    )
-    .next()
-    .expect("confirm-close control must be accessible once armed");
+    let confirm_close =
+        ElementHandle::find_by_accessible_label(&panel, "Confirm close thread Fix timeline crash")
+            .next()
+            .expect("confirm-close control must be accessible once armed");
     confirm_close.invoke_accessible_default_action();
     assert_eq!(
         closed_index.get(),
@@ -898,12 +951,10 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
             .next()
             .expect("delete-arm control must be accessible on a closed thread");
     delete_arm.invoke_accessible_default_action();
-    let confirm_delete = ElementHandle::find_by_accessible_label(
-        &panel,
-        "Confirm delete thread Fix timeline crash",
-    )
-    .next()
-    .expect("confirm-delete control must be accessible once armed");
+    let confirm_delete =
+        ElementHandle::find_by_accessible_label(&panel, "Confirm delete thread Fix timeline crash")
+            .next()
+            .expect("confirm-delete control must be accessible once armed");
     confirm_delete.invoke_accessible_default_action();
     assert_eq!(
         deleted_index.get(),
@@ -922,7 +973,9 @@ fn sidebar_thread_archive_and_rename_controls_are_addressable_and_dispatch() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     settle_sidebar_expand(&panel);
     panel.set_threads(ModelRc::new(VecModel::from(vec![sample_open_thread(
         "Fix timeline crash",
@@ -980,20 +1033,25 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 1000.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1000.0));
     panel.set_agent_catalog(ModelRc::new(VecModel::from(vec![AgentCatalogEntry {
         id: "claude".into(),
         name: "Claude".into(),
         version: "1.0".into(),
         status: "installed".into(),
         enabled: true,
+        loading: false,
     }])));
 
     let set_enabled_calls = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
     {
         let set_enabled_calls = set_enabled_calls.clone();
         panel.on_agent_set_enabled(move |id, enabled| {
-            set_enabled_calls.borrow_mut().push((id.to_string(), enabled));
+            set_enabled_calls
+                .borrow_mut()
+                .push((id.to_string(), enabled));
         });
     }
 
@@ -1009,7 +1067,10 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
         .expect("enabled agent's disable toggle must be accessible");
     assert_eq!(disable_toggle.id().as_deref(), Some("Toggle::touch"));
     disable_toggle.invoke_accessible_default_action();
-    assert_eq!(&*set_enabled_calls.borrow(), &[("claude".to_owned(), false)]);
+    assert_eq!(
+        &*set_enabled_calls.borrow(),
+        &[("claude".to_owned(), false)]
+    );
 
     // Rust/lib.rs owns re-populating agent_catalog after the real
     // agents/set_enabled round trip (see dispatch_agent_set_enabled) --
@@ -1020,6 +1081,7 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
         version: "1.0".into(),
         status: "installed".into(),
         enabled: false,
+        loading: false,
     }])));
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Disable Claude")
@@ -1049,12 +1111,14 @@ fn agents_settings_search_filters_catalog_cards() {
     // Production installs this at panel construct; bare ChatPanel::new
     // does not — without it matches-filter can only exact-match and the
     // search bar looks broken (every card disappears for any substring).
-    panel.global::<TextUtil>().on_contains_ci(|haystack, needle| {
-        haystack
-            .to_lowercase()
-            .contains(&needle.to_lowercase())
-    });
-    panel.window().set_size(slint::LogicalSize::new(900.0, 1000.0));
+    panel
+        .global::<TextUtil>()
+        .on_contains_ci(|haystack, needle| {
+            haystack.to_lowercase().contains(&needle.to_lowercase())
+        });
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1000.0));
     panel.set_agent_catalog(ModelRc::new(VecModel::from(vec![
         AgentCatalogEntry {
             id: "claude".into(),
@@ -1062,6 +1126,7 @@ fn agents_settings_search_filters_catalog_cards() {
             version: "1.0".into(),
             status: "installed".into(),
             enabled: true,
+            loading: false,
         },
         AgentCatalogEntry {
             id: "codex".into(),
@@ -1069,6 +1134,7 @@ fn agents_settings_search_filters_catalog_cards() {
             version: "1.0".into(),
             status: "installed".into(),
             enabled: true,
+            loading: false,
         },
         AgentCatalogEntry {
             id: "gemini".into(),
@@ -1076,6 +1142,7 @@ fn agents_settings_search_filters_catalog_cards() {
             version: "1.0".into(),
             status: "available".into(),
             enabled: false,
+            loading: false,
         },
     ])));
     panel.set_settings_open(true);
@@ -1129,9 +1196,16 @@ fn thread_search_box_accepts_real_typed_keystrokes_and_dispatches_search_changed
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(true);
     panel.set_threads(ModelRc::new(VecModel::from(vec![ThreadItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        relative_time: "now".into(),
         name: "Fix timeline crash".into(),
         status: "idle".into(),
         busy: false,
@@ -1146,6 +1220,7 @@ fn thread_search_box_accepts_real_typed_keystrokes_and_dispatches_search_changed
         project_path: "".into(),
         profile_name: "".into(),
         has_session: false,
+        project_instance_live: false,
     }])));
 
     let search_changes = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -1211,7 +1286,9 @@ fn skill_selection_opens_the_editor_and_close_returns_to_chat() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(true);
     panel.set_available_skills(ModelRc::new(VecModel::from(vec![SkillOption {
         name: "release-checklist".into(),
@@ -1292,7 +1369,9 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
     let profile_selection = Rc::new(RefCell::new(Vec::<String>::new()));
     {
         let profile_selection = profile_selection.clone();
-        panel.on_profile_selected(move |id| profile_selection.borrow_mut().push(id.to_string()));
+        panel.on_profile_selected(move |id, agent| {
+            profile_selection.borrow_mut().push(format!("{id}|{agent}"));
+        });
     }
 
     // Provider picker: label = agent_id, id = profile name for session open.
@@ -1322,17 +1401,16 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
         .next()
         .expect("provider option must be accessible once the dropdown is open");
     select_profile.invoke_accessible_default_action();
-    assert_eq!(&*profile_selection.borrow(), &["codex-tools"]);
+    assert_eq!(&*profile_selection.borrow(), &["codex-tools|codex-acp"]);
 
     // Once a session attaches, the picker must be genuinely locked, not
     // merely re-labelled -- SearchableDropdown.enabled: false disables
     // its own accessible-action-default, so invoking it must not open
     // the popup at all. Trigger shows "codex-acp ›".
     panel.set_active_thread_has_session(true);
-    let profile_trigger_locked =
-        ElementHandle::find_by_accessible_label(&panel, "codex-acp ›")
-            .next()
-            .expect("locked trigger must still show the chosen provider as its label");
+    let profile_trigger_locked = ElementHandle::find_by_accessible_label(&panel, "codex-acp ›")
+        .next()
+        .expect("locked trigger must still show the chosen provider as its label");
     profile_trigger_locked.invoke_accessible_default_action();
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "claude-acp")
@@ -1342,7 +1420,7 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
     );
     assert_eq!(
         &*profile_selection.borrow(),
-        &["codex-tools"],
+        &["codex-tools|codex-acp"],
         "no further profile-selected calls once locked"
     );
 }
@@ -1505,7 +1583,10 @@ fn composer_fast_mode_toggle_dispatches_config_option() {
         .expect("toggle label flips when enabled");
     disable.invoke_accessible_default_action();
     assert_eq!(
-        selected.borrow().last().map(|(a, b)| (a.as_str(), b.as_str())),
+        selected
+            .borrow()
+            .last()
+            .map(|(a, b)| (a.as_str(), b.as_str())),
         Some(("fastMode", "off"))
     );
 }
@@ -1520,7 +1601,9 @@ fn thinking_block_is_collapsed_by_default_and_expands_on_click() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
 
     let toggled = Rc::new(Cell::new(None::<i32>));
     {
@@ -1531,6 +1614,12 @@ fn thinking_block_is_collapsed_by_default_and_expands_on_click() {
     }
 
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "thinking".into(),
         text: "I should check the timeline first".into(),
         expanded: false,
@@ -1551,6 +1640,12 @@ fn thinking_block_is_collapsed_by_default_and_expands_on_click() {
     // Simulate the reducer flipping expanded (same path ChromeMsg::
     // ToggleExpanded takes) and prove the control label swaps to Collapse.
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "thinking".into(),
         text: "I should check the timeline first".into(),
         expanded: true,
@@ -1581,7 +1676,9 @@ fn newly_added_skill_appears_in_the_skills_list() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(true);
     panel.set_available_skills(ModelRc::new(VecModel::from(vec![])));
 
@@ -1607,10 +1704,9 @@ fn newly_added_skill_appears_in_the_skills_list() {
         started_from: "".into(),
     }])));
 
-    let skill_row =
-        ElementHandle::find_by_accessible_label(&panel, "Open skill voice-embedding")
-            .next()
-            .expect("newly added skill must appear in the Skills list without a manual reload");
+    let skill_row = ElementHandle::find_by_accessible_label(&panel, "Open skill voice-embedding")
+        .next()
+        .expect("newly added skill must appear in the Skills list without a manual reload");
     assert_eq!(
         skill_row.accessible_label().unwrap_or_default(),
         "Open skill voice-embedding"
@@ -1625,7 +1721,9 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(true);
     panel.set_available_skills(ModelRc::new(VecModel::from(vec![
         SkillOption {
@@ -1710,15 +1808,19 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(false);
 
     // Real markdown-lines path (not just fallback text): bold run mixed
     // with plain so MarkdownView's per-run HorizontalLayout is exercised.
     let lines = VecModel::from(vec![panel_rust::MarkdownLine {
+        plain_text: "".into(),
         kind: "p".into(),
         runs: ModelRc::new(VecModel::from(vec![
             panel_rust::MarkdownRun {
+                link: "".into(),
                 text: "Hello ".into(),
                 bold: false,
                 italic: false,
@@ -1726,6 +1828,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 strike: false,
             },
             panel_rust::MarkdownRun {
+                link: "".into(),
                 text: "agent".into(),
                 bold: true,
                 italic: false,
@@ -1733,6 +1836,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 strike: false,
             },
             panel_rust::MarkdownRun {
+                link: "".into(),
                 text: " body".into(),
                 bold: false,
                 italic: false,
@@ -1745,6 +1849,12 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
         code_block_id: -1,
     }]);
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "agent".into(),
         text: "Hello agent body".into(),
         markdown_lines: ModelRc::new(lines),
@@ -1754,7 +1864,9 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
     }])));
 
     // Force a geometry pass.
-    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
 
     // Geometry proof (ElementHandle has no text-content getter): short
     // single-line Text boxes in the message band. Centered stretch-layout

@@ -1,4 +1,4 @@
-//! Sqlite-backed persistence for session metadata + transcripts, written
+//! Sqlite-backed persistence for session metadata, written
 //! asynchronously off the routing hot path. Phase 2 step 10.
 //!
 //! ## Driver choice: `rusqlite` (with the `bundled` feature)
@@ -21,12 +21,10 @@
 pub mod error;
 pub mod sessions;
 pub mod store;
-pub mod transcripts;
 
 pub use error::PersistenceError;
 pub use sessions::{RecoveryStatusCounts, SessionRecord};
 pub use store::PersistenceStore;
-pub use transcripts::{Direction, TranscriptRecord};
 
 /// Single source of truth for the sqlite schema, loaded via `include_str!`
 /// per `03-crate-and-folder-layout.md`. Applied via `execute_batch` on every

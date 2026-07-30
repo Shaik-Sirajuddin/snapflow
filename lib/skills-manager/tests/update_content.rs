@@ -31,7 +31,8 @@ fn register(manager: &SkillManager, vendor_id: &str, source: &std::path::Path) -
 }
 
 #[test]
-fn updating_with_genuinely_different_content_is_live_through_an_existing_symlink_with_no_extra_sync() {
+fn updating_with_genuinely_different_content_is_live_through_an_existing_symlink_with_no_extra_sync(
+) {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager_at(dir.path());
     let source = write_skill(dir.path(), "commit", "original instructions");
@@ -84,7 +85,10 @@ fn updating_with_unchanged_content_is_a_no_op() {
 
     let after = manager.list_skills(None).unwrap()[0].clone();
     assert_eq!(before.content_hash, after.content_hash);
-    assert_eq!(before.updated_at, after.updated_at, "no-op must not touch updated_at either");
+    assert_eq!(
+        before.updated_at, after.updated_at,
+        "no-op must not touch updated_at either"
+    );
 }
 
 #[test]
@@ -119,7 +123,9 @@ fn copy_mode_target_reflects_the_update_only_after_the_next_sync_all() {
         "---\nname: commit\ndescription: test skill\n---\nv2",
     )
     .unwrap();
-    manager.update_content("codex-acp", &skill_id, &source).unwrap();
+    manager
+        .update_content("codex-acp", &skill_id, &source)
+        .unwrap();
 
     // Copy-mode target is stale until the next sync_all -- unlike symlink
     // mode, its bytes are a physically separate copy.
@@ -134,4 +140,3 @@ fn copy_mode_target_reflects_the_update_only_after_the_next_sync_all() {
     let copied_v2 = fs::read_to_string(target_path.join("SKILL.md")).unwrap();
     assert!(copied_v2.contains("v2"));
 }
-

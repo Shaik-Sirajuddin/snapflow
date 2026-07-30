@@ -1,4 +1,5 @@
 import { Theme } from "../../../tokens/theme.slint";
+import { Strings } from "../../../tokens/strings.slint";
 import { FilterSearchBar } from "../../../base/filter_search_bar.slint";
 
 // Settings page — thin wrap of shared FilterSearchBar with settings defaults.
@@ -8,6 +9,6 @@ export component SettingsSearchBar inherits FilterSearchBar {
     show-icon: false;
     icon-trailing: false;
     bar-bg: Theme.bg-tertiary;
-    placeholder: "Search settings...";
-    bar-accessible-label: "Search settings";
+    placeholder: Strings.search-settings-ellipsis;
+    bar-accessible-label: Strings.search-settings;
 }

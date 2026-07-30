@@ -43,11 +43,11 @@ pub enum ProviderStoreError {
 }
 
 /// In-memory CRUD store for [`ProviderConfig`]s, keyed by `name`. Not
-/// persisted to sqlite (unlike sessions/transcripts) -- provider/profile
+/// persisted to sqlite (unlike Panel-Rust's message transcripts) -- provider/profile
 /// config is gateway startup/runtime configuration, not session history;
 /// see `05-open-risks.md`'s key-storage-mechanism note for why secrets
 /// (this store's `base_url`s are not secret, but paired keys are) stay out
-/// of the same persistence path as transcripts for now.
+/// of the same persistence path as session metadata for now.
 #[derive(Debug, Default)]
 pub struct ProviderStore {
     providers: HashMap<String, ProviderConfig>,

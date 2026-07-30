@@ -1,5 +1,5 @@
 import { Theme } from "tokens/theme.slint";
-import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, McpServerFormData, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, PlanEntryItem, ConfigOptionRow, DropdownEntry, McpServerOption, McpServerFormData, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
@@ -97,6 +97,19 @@ export component ChatPanel inherits Window {
     // the thread list. Rendered as a dismissible banner in chat_area.
     in property <string> last-error: "";
     callback error-banner-dismissed();
+    // PROF-8: the displayed thread's agent is reachable but not
+    // authenticated (acpx-core's BackendRequiresAuthentication) --
+    // persistent yellow strip, not a dismissible failure banner; clears
+    // itself once a turn actually completes (see update.rs's TurnEnded
+    // handling).
+    in property <bool> agent-unauthenticated: false;
+    // PROF-11: the displayed thread's agent-reported execution plan/todo
+    // list and any live-pushed session title -- see
+    // `ChatArea.plan-entries`/`ChatArea.live-session-title`'s doc
+    // comments for the wire origin and why the title is a suffix, never
+    // a replacement for the durable thread name.
+    in property <[PlanEntryItem]> plan-entries: [];
+    in property <string> live-session-title: "";
     // Phase 28: shared action-feedback toast (one popup for error/info/
     // status of user actions -- sync.rs's Dirty::Toast arm drives these).
     // `toast-seq` bumps on every show so the auto-hide timer restarts
@@ -171,6 +184,10 @@ export component ChatPanel inherits Window {
     // Empty string means no project is open. Sidebar rows use this to
     // decide whether a thread's own project-path differs from "here".
     in property <string> active-project-path: "";
+    in property <bool> project-open: false;
+    // The panel-level ACPX connection is usable even before a project or
+    // thread exists; this gates chat creation/input, not project metadata.
+    in property <bool> gateway-ready: false;
     callback skill-content-edited(string, string /* path, new content */);
     callback skill-copy-path-requested(string);
     callback skill-open-in-editor-requested(string, string /* editor name, path */);
@@ -235,6 +252,7 @@ export component ChatPanel inherits Window {
     callback thread-rename-requested(int, string);
     callback search-submitted(string, bool, bool);
     callback send-requested();
+    callback queue-fast-track-requested();
     callback stop-requested();
     callback queue-cancel-requested(int);
     callback queue-edit-requested(int);
@@ -286,7 +304,8 @@ export component ChatPanel inherits Window {
     callback local-terminal-close-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
-    callback profile-selected(string);
+    callback profile-selected(string, string);
+    callback configure-provider-requested();
     callback thread-toggle-background(int);
     property <int> rename-thread-index: -1;
     property <string> rename-thread-draft: "";
@@ -461,6 +480,8 @@ export component ChatPanel inherits Window {
                 // again to reveal the chat or skill editor.
                 threads: threads;
                 selected-thread: selected-thread;
+                project-open: root.project-open;
+                gateway-ready: root.gateway-ready;
                 compact: compact;
                 narrow: root.narrow;
                 expanded: sidebar-expanded;
@@ -506,6 +527,7 @@ export component ChatPanel inherits Window {
                 }
             }
             chat-area := ChatArea {
+                no-project: !root.gateway-ready;
                 visible: root.active-pane == "chat";
                 x: sidebar.width;
                 y: 0px;
@@ -538,7 +560,8 @@ export component ChatPanel inherits Window {
                     ? threads[selected-thread].provider
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
-                inputs-enabled: !(threads.length > 0 && threads[selected-thread].archived);
+                inputs-enabled: root.gateway-ready
+                    && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 // Phase 16: project indicator from the selected thread's
@@ -553,12 +576,16 @@ export component ChatPanel inherits Window {
                 connection-status: connection-status;
                 last-error: last-error;
                 error-banner-dismissed => { error-banner-dismissed(); }
+                agent-unauthenticated: agent-unauthenticated;
+                plan-entries: plan-entries;
+                live-session-title: live-session-title;
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"
                         || threads[selected-thread].status == "cancelling"
                     : false;
                 compose-text <=> compose-text;
                 send-requested => { send-requested(); }
+                queue-fast-track-requested => { queue-fast-track-requested(); }
                 stop-requested => { stop-requested(); }
                 queue-cancel-requested(i) => { queue-cancel-requested(i); }
                 queue-edit-requested(i) => { queue-edit-requested(i); }
@@ -610,7 +637,12 @@ export component ChatPanel inherits Window {
                 file-options: file-options;
                 mode-selected(id) => { mode-selected(id); }
                 config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
-                profile-selected(id) => { profile-selected(id); }
+                profile-selected(id, agent) => { profile-selected(id, agent); }
+                configure-provider-requested => {
+                    root.settings-active-section = "agents";
+                    root.open-settings();
+                    root.configure-provider-requested();
+                }
                 context-view-requested => { context-view-requested(); }
                 // Compose owns focus for typing -- re-dispatch panel chords
                 // so Ctrl+B/N/K/, and Escape still work while composing.

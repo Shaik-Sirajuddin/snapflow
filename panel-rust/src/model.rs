@@ -18,8 +18,39 @@ use crate::protocol_types::{AvailableCommandInfo, ConfigOptionInfo, SessionModes
 use crate::send_queue::SendQueue;
 use slint::VecModel;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+/// Stable lifecycle identity for the project currently owned by the panel.
+/// An untitled project is real state, not an empty path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum ProjectIdentity {
+    #[default]
+    None,
+    Untitled(String),
+    Saved(String),
+}
+
+impl ProjectIdentity {
+    pub fn saved_path(&self) -> Option<&str> {
+        match self {
+            Self::Saved(path) => Some(path),
+            Self::None | Self::Untitled(_) => None,
+        }
+    }
+}
+
+/// Leave/return snapshot for one thread's chat list presentation.
+/// Rows include `MessageItem.expanded` so expand state survives A→B→A.
+/// Not a Slint tree cache — host-owned values installed into the shared
+/// `messages_model` on switch (see chat_view_audit_report §5).
+#[derive(Debug, Clone, Default)]
+pub struct ThreadListUiCache {
+    pub keys: Vec<String>,
+    pub rows: Vec<crate::MessageItem>,
+    #[allow(dead_code)]
+    pub gen: u64,
+}
 
 /// Result of `Effect::LoadInitialState` -- the same data
 /// `panel_rust_create` reads from `PanelStateStore` today (thread
@@ -66,6 +97,19 @@ pub struct ThreadModel {
     pub state: ThreadState,
     pub last_activity_time: Option<std::time::Instant>,
     pub error: Option<String>,
+    /// PROF-8 (`profile-only-backend-selection` plan): the agent is
+    /// reachable but its backend advertised ACP `authMethods` with no
+    /// `auth_method_id` configured for the session's profile -- acpx-core
+    /// rejects `session/new` outright rather than proceeding
+    /// (`RouterError::BackendRequiresAuthentication`). Distinct from
+    /// `error`/`ThreadState::Error`: this is a persistent condition the
+    /// chat top bar shows as a yellow strip (not a dismissible red
+    /// failure banner), and it clears itself once a turn actually
+    /// completes, not on manual dismissal. See
+    /// `models::is_backend_requires_authentication_error`'s doc comment
+    /// for how it's detected and why that detection is fragile by
+    /// necessity.
+    pub unauthenticated: bool,
     /// Whether any *visible agent output* (an agent message or tool call
     /// -- deliberately not thinking/thought chunks) has arrived since
     /// this thread's latest prompt was sent. Lets `update()`'s
@@ -110,6 +154,19 @@ pub struct ThreadModel {
     pub available_commands: Vec<AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list, from a live ACP `plan` session/update. Empty means no plan
+    /// notification has arrived yet (or the backend never sends one),
+    /// same capability-gating convention as `config_options`/
+    /// `available_commands` above.
+    pub plan: Vec<crate::protocol_types::PlanEntryInfo>,
+    /// PROF-11: the most recently pushed live session title, from a
+    /// `session_info_update` session/update. Deliberately separate from
+    /// the durable, user-editable `display_name` above -- see
+    /// `crate::agent_bridge::ThreadSlot::session_title`'s doc comment for
+    /// why an agent-pushed title must never silently overwrite what the
+    /// user typed.
+    pub session_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -131,12 +188,29 @@ pub struct SkillEditorState {
 #[derive(Clone, Default)]
 pub struct Model {
     pub threads: Vec<ThreadModel>,
+    /// O(1) durable identity -> `threads` index lookup for bridge/effect
+    /// routing. The vector remains the source of insertion/display order.
+    pub(crate) thread_id_index: HashMap<String, usize>,
+    /// O(1) remote ACP session -> `threads` index lookup. A session can be
+    /// absent while a newly-created thread is still pre-attach.
+    pub(crate) session_id_index: HashMap<String, usize>,
     pub selected_thread: usize,
     pub compose_text: String,
     pub search_query: String,
     pub visible_indices: Vec<usize>,
+    /// Index-parallel expand flags for the *currently displayed* list only.
+    /// Durable expand lives on each `MessageItem.expanded` and in
+    /// `list_ui_cache` / `ThreadModel.message_rows` across switches.
     pub expanded: Vec<bool>,
     pub displayed_thread: Option<usize>,
+    /// Who currently owns `messages_model` (durable thread id). Must match
+    /// the displayed thread after every install; used to refuse cross-thread
+    /// writes and detect owner mismatch after selection.
+    pub list_owner_thread_id: Option<String>,
+    /// Bumps on every full list install (switch / cold hydrate).
+    pub list_gen: u64,
+    /// Per-thread list presentation cache for leave/return (content + expand).
+    pub list_ui_cache: HashMap<String, ThreadListUiCache>,
     pub expanded_terminal_id: Option<String>,
     /// Terminal-tabs phase: every terminal id currently pinned open as a
     /// full-view tab, in the order tabs were first opened (not
@@ -146,11 +220,53 @@ pub struct Model {
     /// `None`/empty together (see `update_terminal`'s `Expand`/
     /// `CloseTab`/`CloseOverlay` arms, which keep the two in lockstep).
     pub open_terminal_ids: Vec<String>,
-    pub local_terminal_last_text: String,
     pub active_project_path: Option<String>,
+    /// Lifecycle identity; `active_project_path` remains as a UI/compatibility
+    /// projection until the per-project store migration is complete.
+    pub active_project: ProjectIdentity,
+    /// Monotonic lifecycle generation; every host project transition bumps
+    /// this before any asynchronous snapshot/control-client work starts.
+    pub project_generation: u64,
+    pub project_lifecycle_reason: String,
+    /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
+    /// path` value the currently-applied thread list (`visible_indices`/
+    /// `thread_rows`) was actually synced against -- distinct from
+    /// `active_project_path` itself, which flips the INSTANT `HostMsg::
+    /// ProjectPathChanged` arrives, one full reducer turn before the next
+    /// poll tick's `ThreadListSnapshot` (collected against the new value)
+    /// can land and get folded in. `update_frame`'s stale-snapshot guard
+    /// compares an incoming snapshot's own tagged `active_project_path`
+    /// against `Model::active_project_path` (drop if they disagree -- an
+    /// in-flight fetch for a project the user has since left); this field
+    /// is compared instead against the snapshot's tag to detect "this
+    /// fold is the first one for a NEW project" so the selection reanchor
+    /// can jump to that project's first thread instead of clamping to
+    /// whatever numeric index the old, unrelated project's selection
+    /// happened to be at (see `update_frame`'s `if let Some(snapshot) =
+    /// frame.thread_list_snapshot` block).
+    pub synced_project_path: Option<String>,
+    /// PISO-8 (project-isolation-mlt-binding plan): every project with a
+    /// currently-live snapshotd instance, as of the last successful
+    /// `Effect::RefreshDaemonProjectInstances` poll (throttled, see
+    /// `FrameInput::daemon_projects_refresh_due`). A failed poll leaves
+    /// this at its previous value rather than clearing it -- see
+    /// `EffectResultMsg::DaemonProjectInstancesLoaded`'s doc comment.
+    /// Read directly (not via a `Dirty`) by `ExternalSnapshotSource::
+    /// collect_thread_list_snapshot`'s next tick, same as `active_
+    /// project_path` itself.
+    pub live_daemon_projects: Vec<crate::agent_bridge::DaemonProjectInstance>,
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
     pub theme_variant: String,
+    // language-switch-sync plan: a QSettings locale code (e.g. "fr",
+    // "zh_CN") pushed from Qt -- both once at ChatRustDock construction
+    // (cold-start seed, mirroring updateProjectPath's own construction-
+    // time call) and live on every later Settings > Language switch
+    // (mirroring producerOpened's live-signal wiring). "" (Default)
+    // means no push has happened yet -- sync() only calls
+    // select_bundled_translation when this is non-empty; absent that
+    // call, @tr() strings simply show their literal English source text.
+    pub language: String,
     pub settings_open: bool,
     pub settings_scope: String,
     pub default_profile: String,
@@ -163,6 +279,7 @@ pub struct Model {
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub agent_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot
@@ -225,6 +342,81 @@ pub struct Model {
     pub open_terminal_model_keys: RefCell<Vec<String>>,
 }
 
+/// The Slint-facing models and their identity caches survive reducer
+/// hydration. Keep this inventory in one place: `InitialStateLoaded` can
+/// replace all ordinary TEA fields without accidentally replacing a live
+/// VecModel or dropping its paired key cache.
+pub(crate) struct PersistentModels {
+    pub(crate) thread_model: Rc<VecModel<crate::ThreadItem>>,
+    pub(crate) thread_model_keys: Vec<String>,
+    pub(crate) messages_model: Rc<VecModel<crate::MessageItem>>,
+    pub(crate) message_model_keys: Vec<String>,
+    pub(crate) skills_model: Rc<VecModel<crate::SkillOption>>,
+    pub(crate) skill_model_keys: Vec<std::path::PathBuf>,
+    pub(crate) commands_model: Rc<VecModel<crate::SkillOption>>,
+    pub(crate) profiles_model: Rc<VecModel<crate::ProfileOption>>,
+    pub(crate) profile_model_keys: Vec<String>,
+    pub(crate) mcp_servers_model: Rc<VecModel<crate::McpServerOption>>,
+    pub(crate) mcp_server_model_keys: Vec<String>,
+    pub(crate) agent_catalog_model: Rc<VecModel<crate::AgentCatalogEntry>>,
+    pub(crate) agent_catalog_model_keys: Vec<String>,
+    pub(crate) recoverable_sessions_model: Rc<VecModel<crate::RemoteSessionOption>>,
+    pub(crate) recoverable_session_model_keys: Vec<String>,
+    pub(crate) terminals_model: Rc<VecModel<crate::TerminalItem>>,
+    pub(crate) terminal_model_keys: Vec<String>,
+    pub(crate) open_terminals_model: Rc<VecModel<crate::TerminalItem>>,
+    pub(crate) open_terminal_model_keys: Vec<String>,
+}
+
+impl Model {
+    pub(crate) fn persistent_models(&self) -> PersistentModels {
+        PersistentModels {
+            thread_model: self.thread_model.clone(),
+            thread_model_keys: self.thread_model_keys.borrow().clone(),
+            messages_model: self.messages_model.clone(),
+            message_model_keys: self.message_model_keys.borrow().clone(),
+            skills_model: self.skills_model.clone(),
+            skill_model_keys: self.skill_model_keys.borrow().clone(),
+            commands_model: self.commands_model.clone(),
+            profiles_model: self.profiles_model.clone(),
+            profile_model_keys: self.profile_model_keys.borrow().clone(),
+            mcp_servers_model: self.mcp_servers_model.clone(),
+            mcp_server_model_keys: self.mcp_server_model_keys.borrow().clone(),
+            agent_catalog_model: self.agent_catalog_model.clone(),
+            agent_catalog_model_keys: self.agent_catalog_model_keys.borrow().clone(),
+            recoverable_sessions_model: self.recoverable_sessions_model.clone(),
+            recoverable_session_model_keys: self.recoverable_session_model_keys.borrow().clone(),
+            terminals_model: self.terminals_model.clone(),
+            terminal_model_keys: self.terminal_model_keys.borrow().clone(),
+            open_terminals_model: self.open_terminals_model.clone(),
+            open_terminal_model_keys: self.open_terminal_model_keys.borrow().clone(),
+        }
+    }
+
+    pub(crate) fn restore_persistent_models(&mut self, persistent: PersistentModels) {
+        self.thread_model = persistent.thread_model;
+        *self.thread_model_keys.borrow_mut() = persistent.thread_model_keys;
+        self.messages_model = persistent.messages_model;
+        *self.message_model_keys.borrow_mut() = persistent.message_model_keys;
+        self.skills_model = persistent.skills_model;
+        *self.skill_model_keys.borrow_mut() = persistent.skill_model_keys;
+        self.commands_model = persistent.commands_model;
+        self.profiles_model = persistent.profiles_model;
+        *self.profile_model_keys.borrow_mut() = persistent.profile_model_keys;
+        self.mcp_servers_model = persistent.mcp_servers_model;
+        *self.mcp_server_model_keys.borrow_mut() = persistent.mcp_server_model_keys;
+        self.agent_catalog_model = persistent.agent_catalog_model;
+        *self.agent_catalog_model_keys.borrow_mut() = persistent.agent_catalog_model_keys;
+        self.recoverable_sessions_model = persistent.recoverable_sessions_model;
+        *self.recoverable_session_model_keys.borrow_mut() =
+            persistent.recoverable_session_model_keys;
+        self.terminals_model = persistent.terminals_model;
+        *self.terminal_model_keys.borrow_mut() = persistent.terminal_model_keys;
+        self.open_terminals_model = persistent.open_terminals_model;
+        *self.open_terminal_model_keys.borrow_mut() = persistent.open_terminal_model_keys;
+    }
+}
+
 impl Default for ThreadModel {
     fn default() -> Self {
         Self {
@@ -237,6 +429,7 @@ impl Default for ThreadModel {
             state: ThreadState::Idle,
             last_activity_time: Some(std::time::Instant::now()),
             error: None,
+            unauthenticated: false,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
             compose_draft: String::new(),
@@ -257,13 +450,68 @@ impl Default for ThreadModel {
             config_options: Vec::new(),
             available_commands: Vec::new(),
             usage: (0, 0),
+            plan: Vec::new(),
+            session_title: None,
         }
     }
 }
 
 impl Model {
-    pub(crate) fn thread_matches_id(thread: &ThreadModel, id: &str) -> bool {
-        id.is_empty() || thread.thread_id == id || thread.session_id.as_deref() == Some(id)
+    /// Rebuild the identity indices after a structural or identity change.
+    /// Durable ids and session ids are intentionally indexed separately so a
+    /// durable id always wins when an incoming identifier could match both.
+    pub(crate) fn rebuild_thread_indices(&mut self) {
+        self.thread_id_index.clear();
+        self.session_id_index.clear();
+        for (index, thread) in self.threads.iter().enumerate() {
+            if !thread.thread_id.is_empty() {
+                self.thread_id_index
+                    .entry(thread.thread_id.clone())
+                    .or_insert(index);
+            }
+            if let Some(session_id) = thread.session_id.as_deref().filter(|id| !id.is_empty()) {
+                self.session_id_index
+                    .entry(session_id.to_owned())
+                    .or_insert(index);
+            }
+        }
+    }
+
+    /// Resolve an incoming durable thread or remote session identity. The
+    /// map entry is validated against the vector because `threads` is still a
+    /// public ordered vector and a few legacy/test callers mutate it
+    /// directly; those callers get a correct linear fallback until the next
+    /// normal reducer rebuilds the indices.
+    pub(crate) fn thread_index_for_id(&self, id: &str) -> Option<usize> {
+        if id.is_empty() {
+            return None;
+        }
+        if let Some(index) = self.thread_id_index.get(id).copied() {
+            if self
+                .threads
+                .get(index)
+                .is_some_and(|thread| thread.thread_id == id)
+            {
+                return Some(index);
+            }
+        }
+        if let Some(index) = self.session_id_index.get(id).copied() {
+            if self
+                .threads
+                .get(index)
+                .is_some_and(|thread| thread.session_id.as_deref() == Some(id))
+            {
+                return Some(index);
+            }
+        }
+        self.threads
+            .iter()
+            .position(|thread| thread.thread_id == id)
+            .or_else(|| {
+                self.threads
+                    .iter()
+                    .position(|thread| thread.session_id.as_deref() == Some(id))
+            })
     }
 
     /// Folds `Effect::LoadInitialState`'s result into a fresh `Model` --
@@ -307,12 +555,14 @@ impl Model {
             })
             .unwrap_or(0);
         let thread_count = threads.len();
-        Self {
+        let mut model = Self {
             threads,
             selected_thread,
             visible_indices: (0..thread_count).collect(),
             ..Self::default()
-        }
+        };
+        model.rebuild_thread_indices();
+        model
     }
 }
 
@@ -344,12 +594,14 @@ mod tests {
                     provider: "codex".to_owned(),
                     session_id: Some("sess-1".to_owned()),
                     profile_name: None,
+                    project_path: None,
                 },
                 ThreadSpec {
                     display_name: "Refactor filters".to_owned(),
                     provider: "claude".to_owned(),
                     session_id: Some("sess-2".to_owned()),
                     profile_name: Some("default".to_owned()),
+                    project_path: None,
                 },
             ],
             thread_ids: vec!["thread-1".to_owned(), "thread-2".to_owned()],
@@ -381,6 +633,7 @@ mod tests {
                 provider: "codex".to_owned(),
                 session_id: Some("sess-1".to_owned()),
                 profile_name: Some("balanced".to_owned()),
+                project_path: None,
             }],
             thread_ids: vec!["thread-1".to_owned()],
             selected_thread_id: None,
@@ -395,5 +648,37 @@ mod tests {
             Some("workspace")
         );
         assert_eq!(model.threads[0].state, ThreadState::Error);
+    }
+
+    #[test]
+    fn thread_identity_indices_resolve_durable_and_session_ids() {
+        let model = Model::from_initial_state(InitialState {
+            threads: vec![
+                ThreadSpec {
+                    display_name: "First".to_owned(),
+                    provider: "codex".to_owned(),
+                    session_id: Some("session-first".to_owned()),
+                    profile_name: None,
+                    project_path: None,
+                },
+                ThreadSpec {
+                    display_name: "Second".to_owned(),
+                    provider: "claude".to_owned(),
+                    session_id: Some("session-second".to_owned()),
+                    profile_name: None,
+                    project_path: None,
+                },
+            ],
+            thread_ids: vec!["thread-first".to_owned(), "thread-second".to_owned()],
+            selected_thread_id: None,
+            permission_profiles: vec![None, None],
+            thread_states: vec![ThreadState::Idle, ThreadState::Idle],
+            startup_warnings: vec![],
+            send_queues: vec![],
+        });
+
+        assert_eq!(model.thread_index_for_id("thread-second"), Some(1));
+        assert_eq!(model.thread_index_for_id("session-first"), Some(0));
+        assert_eq!(model.thread_index_for_id("missing"), None);
     }
 }

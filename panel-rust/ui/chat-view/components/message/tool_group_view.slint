@@ -18,8 +18,10 @@ export component ToolGroupView inherits Rectangle {
     in property <bool> show-header: true;
     in property <bool> loading: false;
     in property <bool> default-expanded: false;
+    // This is only an initial/default value. The parent derives it from the
+    // live tail, so changing it during streaming must not overwrite a user's
+    // explicit collapse/expand choice.
     in-out property <bool> expanded: default-expanded;
-    changed default-expanded => { expanded = default-expanded; }
     in-out property <bool> maximized: false;
     callback open-group-full-view();
 
@@ -58,6 +60,7 @@ export component ToolGroupView inherits Rectangle {
         // Top Header Bar: label + tool count badge + Fullscreen button + Top-Right Expand/Collapse toggle button
         if root.show-header : HorizontalLayout {
             spacing: Metrics.space-2;
+            cross-axis-alignment: center;
 
             VerticalLayout {
                 alignment: center;

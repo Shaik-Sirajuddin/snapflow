@@ -17,9 +17,9 @@
 //! (default `<ACPX_DB_PATH>.keyring`); `ACPX_MASTER_KEYRING_ROTATE=1`
 //! triggers a one-shot key rotation on that startup.
 //!
-//! One agent is registered today (`ServerConfig::default_agent_id`,
-//! spawned via `ACPX_BACKEND_CMD`); Phase 3's profile store is what lets
-//! `session/new`'s `_acpx.profile` select among more than one.
+//! One agent is registered at startup (`ServerConfig::default_agent_id`,
+//! spawned via `ACPX_DEFAULT_ACP_COMMAND`); `session/new`'s `_acpx.profile`
+//! (or `_acpx.agentId`) selects among more agents on demand.
 
 mod config;
 mod provisioning;
@@ -57,12 +57,16 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    if let Some(bin_dir) = acpx_core::detect::prepare_node_runtime_path() {
+        tracing::info!(path = %bin_dir.display(), "using discovered Node runtime prefix");
+    }
+
     let config = ServerConfig::from_env();
     tracing::info!(
         default_agent_id = %config.default_agent_id,
         native_auth_method_id = ?config.native_auth_method_id,
-        program = %config.backend.program,
-        args = ?config.backend.args,
+        program = %config.default_acp_command.program,
+        args = ?config.default_acp_command.args,
         http_bind_addr = ?config.http_bind_addr,
         admin_bind_addr = ?config.admin_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
@@ -101,7 +105,10 @@ async fn main() -> anyhow::Result<()> {
             config.stream_replay_buffer_size,
             config.stream_idle_retention,
         ));
-    router.register_agent(config.default_agent_id.clone(), config.backend.clone());
+    router.register_agent(
+        config.default_agent_id.clone(),
+        config.default_acp_command.clone(),
+    );
 
     let db_path = std::env::var("ACPX_DB_PATH").unwrap_or_else(|_| {
         let path = default_db_path();

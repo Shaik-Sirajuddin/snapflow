@@ -17,6 +17,15 @@ import (
 	"time"
 )
 
+// DefaultIdleTTL is the default lifetime of an application session after its
+// last request. The sweep interval is intentionally separate: it only bounds
+// how quickly an already-expired entry is physically removed.
+const DefaultIdleTTL = time.Hour
+
+// DefaultSweepInterval controls how often the in-memory store scans for idle
+// entries. It is not the session expiry duration.
+const DefaultSweepInterval = time.Hour
+
 // ErrNotFound is returned when a session id has no live entry (never
 // existed, or expired).
 var ErrNotFound = errors.New("session: not found")

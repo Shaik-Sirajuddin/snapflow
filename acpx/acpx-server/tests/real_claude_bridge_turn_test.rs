@@ -101,7 +101,9 @@ fn extract_message_text(response: &Value) -> String {
         return text;
     };
     for update in updates {
-        if update.pointer("/params/update/sessionUpdate").and_then(Value::as_str)
+        if update
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
             != Some("agent_message_chunk")
         {
             continue;
@@ -172,9 +174,7 @@ async fn real_bridge_claude_prompt_round_trip_uses_ambient_oauth() {
     wait_for_listener(addr).await;
 
     let client = reqwest::Client::new();
-    let rpc = |method: &'static str, params: Value, id: i64| {
-        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-    };
+    let rpc = |method: &'static str, params: Value, id: i64| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
 
     let new_response = client
         .post(format!("http://{addr}/acp/rpc"))

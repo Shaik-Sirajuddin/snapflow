@@ -2,7 +2,10 @@
 
 package health
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 
 // PIDAlive on Windows: os.FindProcess opens a handle to the process and
 // fails if it does not exist; there is no portable signal-0 equivalent, so
@@ -17,4 +20,21 @@ func PIDAlive(pid int) bool {
 		return false
 	}
 	return true
+}
+
+// Windows has no portable start-time identity in this small health package;
+// keep the wire contract usable while conservatively requiring a live PID.
+func ProcessStartIdentity(pid int) (string, error) {
+	if !PIDAlive(pid) {
+		return "", fmt.Errorf("pid %d is not alive", pid)
+	}
+	return fmt.Sprintf("%d", pid), nil
+}
+
+func ProcessIdentityMatches(pid int, start string) bool {
+	if pid != os.Getpid() {
+		return false
+	}
+	actual, err := ProcessStartIdentity(pid)
+	return err == nil && actual == start
 }

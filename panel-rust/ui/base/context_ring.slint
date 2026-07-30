@@ -1,9 +1,15 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Session context usage indicator -- circular ring + percentage.
 // Hover reveals a small card with used/full token counts.
 // Ratio is 0.0..1.0; token counts are display-only (Rust/host may leave
 // them at 0 until real session accounting is wired).
+//
+// Hover card paints UPWARD out of this 24px band (same as SearchableDropdown
+// popups). Hosts that clip the row-2 strip must include `has-hover` in their
+// clip gate — see chat_input_layout.slint `row2-host.clip`.
 export component ContextRing inherits Rectangle {
     in property <float> ratio: 0.0;
     in property <int> used-tokens: 0;
@@ -14,6 +20,10 @@ export component ContextRing inherits Rectangle {
     in property <length> size: 24px;
     // Opens the future context-breakdown surface (host may no-op).
     callback context-view-requested();
+    // Re-exported so the compose row host can disable clipping while the
+    // hover card is visible (otherwise the card is painted above the ring
+    // and immediately cut off by row2-host's closed-state clip).
+    out property <bool> has-hover: hit.has-hover;
 
     property <int> pct: Math.round(Math.min(1.0, Math.max(0.0, ratio)) * 100);
     property <color> ring-color:
@@ -27,6 +37,8 @@ export component ContextRing inherits Rectangle {
     preferred-height: size;
     horizontal-stretch: 0;
     vertical-stretch: 0;
+    // Hover card is a free-positioned child outside this box — never clip it.
+    clip: false;
     // Inset for the percentage so it doesn't touch the ring stroke.
     property <length> num-pad: size * 0.18;
 
@@ -73,22 +85,33 @@ export component ContextRing inherits Rectangle {
         height: parent.height - 2 * root.num-pad;
     }
 
+    // Fill the 24×24 ring — without explicit size the hit target can collapse
+    // to zero and has-hover never fires (compose-row hover broken).
     hit := TouchArea {
+        width: 100%;
+        height: 100%;
         mouse-cursor: pointer;
         accessible-role: button;
-        accessible-label: "Session context " + root.pct + " percent";
+        accessible-label: Strings.session-context + " " + root.pct + " percent";
         accessible-action-default => { root.context-view-requested(); }
         clicked => { root.context-view-requested(); }
+        changed has-hover => {
+            CursorHost.kind = self.has-hover ? "pointer" : "default";
+        }
     }
 
-    // Hover card: used / full context.
-    if hit.has-hover : Rectangle {
+    // Hover card: used / full context. Mounted always (`visible:`) like
+    // SearchableDropdown's popup-panel so id/out-property stay stable and
+    // hosts can react to has-hover for clip gating without recreating the
+    // element every hover edge.
+    hover-card := Rectangle {
+        visible: hit.has-hover;
         // The ring lives at the bottom-right end of the compose controls.
         // Open upward and align the card's right edge to the ring so it
         // cannot spill off the chat's bottom or right edge.
         x: parent.width - self.width;
         y: -self.height - 8px;
-        z: 1000;
+        z: 9000;
         width: 168px;
         height: 64px;
         background: Theme.bg-card;
@@ -102,7 +125,7 @@ export component ContextRing inherits Rectangle {
             padding: 8px;
             spacing: 3px;
             Text {
-                text: "Session context";
+                text: Strings.session-context;
                 color: Theme.text-secondary;
                 font-size: 9px * Theme.font-scale;
                 font-weight: 700;

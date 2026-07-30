@@ -7,16 +7,27 @@
 //! this deliberate shape match.
 
 use crate::gateway_actor::classify_raw_update;
+use crate::gateway_actor::session_opener::GatewaySessionOpener;
 use crate::protocol_types::AgentEvent;
 use crate::protocol_types::{
     AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
     TerminalCreatedEvent, TerminalOutputEvent,
 };
+use acpx_client::pool::{OpenSpec, PoolKey, ProjectSessionPool, SessionLease};
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
+
+/// The shared, project-scoped lease pool a thread actor optionally
+/// acquires/releases against -- `None` for every pre-existing caller
+/// (`spawn_acpx_thread`/`spawn_acpx_thread_with_gateway`/
+/// `spawn_acpx_thread_with_delayed_gateway`), which keeps their exact
+/// pre-lease-pool `OpenSession`/`ReattachSession` behavior unchanged. Only
+/// the `_with_pool` constructors (see below) enable
+/// [`Command::AcquireAndAttach`].
+pub type SharedSessionPool = Arc<ProjectSessionPool<GatewaySessionOpener>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum AcpxThreadError {
@@ -28,6 +39,41 @@ pub enum AcpxThreadError {
     Gateway(#[from] ClientError),
     #[error("gateway response for session/new had no sessionId field")]
     MissingSessionId,
+    #[error("this thread actor was not constructed with a session lease pool")]
+    NoPoolConfigured,
+    #[error("session lease pool error: {0}")]
+    Pool(String),
+}
+
+impl AcpxThreadError {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Gateway(error) if error.is_transient())
+    }
+
+    pub(crate) fn is_authentication_or_capacity(&self) -> bool {
+        matches!(self, Self::Gateway(error) if error.is_authentication_or_capacity())
+    }
+}
+
+fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
+    attempt < 4
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(AcpxThreadError::is_transient)
+}
+
+/// Result of [`AcpxThreadHandle::acquire_and_attach`]. `resumed_from_saved`
+/// distinguishes a session the pool resumed from a persisted id (which
+/// already carries capability/config info from its `session/resume`
+/// response, emitted as the usual capability events) from one the pool
+/// freshly created (whose capabilities are not yet known to this actor --
+/// callers should fall back to `models/list` per the plan's capability-
+/// loading precedence rather than expect capability events for that case).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedSession {
+    pub session_id: String,
+    pub resumed_from_saved: bool,
 }
 
 /// A summary of a session the bound gateway already knows about, from
@@ -81,6 +127,24 @@ enum Command {
         session_id: String,
         cwd: PathBuf,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// acpx-client-session-lease-pool: acquires an exclusive lease from
+    /// this actor's configured [`SharedSessionPool`] (see
+    /// [`AcpxThreadError::NoPoolConfigured`] if none was), then wires this
+    /// actor up to whatever session the pool handed back exactly like
+    /// [`Command::ReattachSession`] (a resumed saved session) or
+    /// [`Command::OpenSession`] minus the RPC itself (a session the pool
+    /// already created via `GatewaySessionOpener::create` -- see this
+    /// arm's handler for why no second `session/new` is sent). Replaces
+    /// both of those commands for a pool-aware caller; never mix pool-
+    /// acquired and directly-opened sessions on the same actor.
+    AcquireAndAttach {
+        key: PoolKey,
+        thread_id: String,
+        saved_session_id: Option<String>,
+        cwd: PathBuf,
+        mcp_servers: Vec<serde_json::Value>,
+        resp: oneshot::Sender<Result<AttachedSession, AcpxThreadError>>,
     },
     SendPrompt {
         text: String,
@@ -221,6 +285,11 @@ enum Command {
     ListAgents {
         resp:
             oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
+    },
+    /// `models/list` for one agent, safe before a session exists.
+    ListModels {
+        agent_id: String,
+        resp: oneshot::Sender<Result<Vec<ConfigOptionInfo>, AcpxThreadError>>,
     },
     /// `agents/status` for one agent id.
     AgentStatus {
@@ -366,6 +435,31 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ReattachSession {
             session_id,
             cwd,
+            resp,
+        })
+        .await
+    }
+
+    /// acpx-client-session-lease-pool: acquire+attach via this actor's
+    /// configured pool. Fails with [`AcpxThreadError::NoPoolConfigured`]
+    /// if this handle was created by a non-pool-aware constructor (see
+    /// [`spawn_acpx_thread_with_pool`]).
+    pub async fn acquire_and_attach(
+        &self,
+        key: PoolKey,
+        thread_id: impl Into<String>,
+        saved_session_id: Option<String>,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<serde_json::Value>,
+    ) -> Result<AttachedSession, AcpxThreadError> {
+        let thread_id = thread_id.into();
+        let cwd = cwd.into();
+        self.call(|resp| Command::AcquireAndAttach {
+            key,
+            thread_id,
+            saved_session_id,
+            cwd,
+            mcp_servers,
             resp,
         })
         .await
@@ -586,6 +680,15 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListAgents { resp }).await
     }
 
+    /// `models/list` for an agent-scoped pre-session model catalog.
+    pub async fn list_models(
+        &self,
+        agent_id: String,
+    ) -> Result<Vec<ConfigOptionInfo>, AcpxThreadError> {
+        self.call(|resp| Command::ListModels { agent_id, resp })
+            .await
+    }
+
     /// `agents/status` for one agent id. Typed `AgentCatalogEntry`, same
     /// reasoning as `list_agents`.
     pub async fn agent_status(
@@ -676,7 +779,7 @@ impl AcpxThreadHandle {
 /// instead of this one.
 pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
     let base_url = base_url.into();
-    let (handle, gateway_setter) = spawn_acpx_thread_pending();
+    let (handle, gateway_setter) = spawn_acpx_thread_pending(None);
     tokio::spawn(async move {
         let gateway = Arc::new(Gateway::connect(base_url).await);
         gateway_setter.set_gateway(gateway);
@@ -701,7 +804,7 @@ pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
 /// never blocks another thread's cancel/respond/prompt call from
 /// completing on the same shared connection.
 pub fn spawn_acpx_thread_with_gateway(gateway: Arc<Gateway>) -> AcpxThreadHandle {
-    let (handle, gateway_setter) = spawn_acpx_thread_pending();
+    let (handle, gateway_setter) = spawn_acpx_thread_pending(None);
     gateway_setter.set_gateway(gateway);
     handle
 }
@@ -710,7 +813,31 @@ pub fn spawn_acpx_thread_with_gateway(gateway: Arc<Gateway>) -> AcpxThreadHandle
 /// returned setter. Commands may be submitted before delivery; its workers
 /// wait for the shared gateway rather than failing the command.
 pub fn spawn_acpx_thread_with_delayed_gateway() -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
-    spawn_acpx_thread_pending()
+    spawn_acpx_thread_pending(None)
+}
+
+/// acpx-client-session-lease-pool: same as
+/// [`spawn_acpx_thread_with_gateway`], but the returned handle also
+/// accepts [`Command::AcquireAndAttach`] against `pool` -- the caller is
+/// expected to have acquired/shared one [`SharedSessionPool`] per project
+/// (see the plan's "pool is keyed by canonical project directory, agent
+/// id, and provider/profile" -- one pool instance per project, not per
+/// thread).
+pub fn spawn_acpx_thread_with_gateway_and_pool(
+    gateway: Arc<Gateway>,
+    pool: SharedSessionPool,
+) -> AcpxThreadHandle {
+    let (handle, gateway_setter) = spawn_acpx_thread_pending(Some(pool));
+    gateway_setter.set_gateway(gateway);
+    handle
+}
+
+/// acpx-client-session-lease-pool: pool-aware counterpart to
+/// [`spawn_acpx_thread_with_delayed_gateway`].
+pub fn spawn_acpx_thread_with_delayed_gateway_and_pool(
+    pool: SharedSessionPool,
+) -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
+    spawn_acpx_thread_pending(Some(pool))
 }
 
 /// Shared plumbing for both public constructors above: sets up every
@@ -723,7 +850,13 @@ pub fn spawn_acpx_thread_with_delayed_gateway() -> (AcpxThreadHandle, AcpxThread
 /// channel seeded once) since four independent tasks (main loop, cancel
 /// worker, respond worker, plus this function's own caller) all need to
 /// read the same connected `Gateway` exactly once.
-fn spawn_acpx_thread_pending() -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
+///
+/// `pool` is `None` for every legacy (non-lease-pool) caller -- only the
+/// main command loop consults it (cancel/respond workers never touch
+/// lease state), so it is threaded only into [`run_thread_actor`].
+fn spawn_acpx_thread_pending(
+    pool: Option<SharedSessionPool>,
+) -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
     let (respond_tx, respond_rx) = mpsc::unbounded_channel();
@@ -735,6 +868,7 @@ fn spawn_acpx_thread_pending() -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
         cmd_rx,
         event_tx,
         session_tx,
+        pool,
     ));
     tokio::spawn(run_cancel_worker(gateway_rx.clone(), cancel_rx, session_rx));
     tokio::spawn(run_respond_worker(gateway_rx, respond_rx));
@@ -819,8 +953,23 @@ async fn run_respond_worker(
 /// [`spawn_out_of_band_notification_forwarder`]'s job now (see that
 /// function's doc comment for why they were split out of this
 /// function).
-fn forward_updates(updates: &[serde_json::Value], event_tx: &mpsc::UnboundedSender<AgentEvent>) {
+fn forward_updates(
+    updates: &[serde_json::Value],
+    active_session_id: Option<&str>,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
     for update in updates {
+        let Some(active_session_id) = active_session_id else {
+            continue;
+        };
+        if update
+            .get("params")
+            .and_then(|params| params.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            != Some(active_session_id)
+        {
+            continue;
+        }
         if let Some(msg) = classify_raw_update(update) {
             let _ = event_tx.send(AgentEvent::Message(msg));
         } else if let Some(event) = parse_capability_update(update) {
@@ -848,8 +997,14 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
         .and_then(|k| k.as_str())?
     {
         "usage_update" => {
-            let used = session_update.get("used").and_then(|v| v.as_i64()).unwrap_or(0);
-            let size = session_update.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+            let used = session_update
+                .get("used")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let size = session_update
+                .get("size")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             Some(AgentEvent::UsageUpdate { used, size })
         }
         "current_mode_update" => {
@@ -866,8 +1021,59 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
             let commands = parse_available_commands(session_update.get("availableCommands")?);
             Some(AgentEvent::AvailableCommands(commands))
         }
+        // PROF-11: the agent's self-reported execution plan/todo list.
+        // Wire field is `entries: [{content, priority, status}]` -- the
+        // stable, always-replace `Plan` shape, not the unstable
+        // `plan_update`/`plan_removed` partial-mutation variants (this
+        // crate does not enable ACP's `unstable_plan_operations`
+        // feature, so those are never sent). An entries array that's
+        // present-but-empty still produces `Some(vec![])`, meaningfully
+        // different from "no plan notification at all" for a UI
+        // deciding whether to show a plan panel.
+        "plan" => {
+            let entries = parse_plan_entries(session_update.get("entries")?);
+            Some(AgentEvent::PlanUpdate(entries))
+        }
+        // PROF-11: a live session title/updated_at push. Both wire
+        // fields are ACP's 3-state `MaybeUndefined` (present-with-value
+        // / present-null / field-absent); collapsed here to a plain
+        // `Option<String>` (absent and explicit-null both read `None`)
+        // -- see `AgentEvent::SessionInfoUpdate`'s doc comment for why
+        // that's an accepted simplification for now.
+        "session_info_update" => Some(AgentEvent::SessionInfoUpdate {
+            title: session_update
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            updated_at: session_update
+                .get("updatedAt")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+        }),
         _ => None,
     }
+}
+
+/// PROF-11: parse a `plan` session/update's `entries` array into
+/// [`PlanEntryInfo`]s. Same tolerant convention as
+/// `parse_available_commands`: skip any entry missing `content`,
+/// `priority`, or `status` rather than failing the whole parse.
+fn parse_plan_entries(value: &serde_json::Value) -> Vec<crate::protocol_types::PlanEntryInfo> {
+    value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(crate::protocol_types::PlanEntryInfo {
+                        content: entry.get("content")?.as_str()?.to_string(),
+                        priority: entry.get("priority")?.as_str()?.to_string(),
+                        status: entry.get("status")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// PUI-003: parse an `available_commands_update`'s `availableCommands`
@@ -1012,6 +1218,47 @@ fn parse_config_options(list: &serde_json::Value) -> Option<Vec<ConfigOptionInfo
     )
 }
 
+fn parse_model_catalog(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let Some(models) = value
+        .get("catalogs")
+        .and_then(|catalogs| catalogs.as_array())
+        .and_then(|catalogs| catalogs.first())
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(|models| models.as_array())
+    else {
+        return Vec::new();
+    };
+    let options = models
+        .iter()
+        .filter_map(|model| {
+            Some(ConfigOptionValue {
+                value: model.get("value")?.as_str()?.to_owned(),
+                name: model
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: model
+                    .get("description")
+                    .and_then(|description| description.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        return Vec::new();
+    }
+    vec![ConfigOptionInfo {
+        id: "model".to_owned(),
+        name: "Model".to_owned(),
+        description: None,
+        category: Some("model".to_owned()),
+        kind: "select".to_owned(),
+        current_value: None,
+        options,
+    }]
+}
+
 /// Emits [`AgentEvent::SessionModes`]/[`AgentEvent::ConfigOptions`] for
 /// whichever of a `session/new`/`session/load`/`session/resume`
 /// response's `modes`/`configOptions` fields are actually present --
@@ -1053,7 +1300,7 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
 /// `session/prompt` has already completed, and no further command was
 /// ever queued, so the push was silently lost.
 ///
-/// **Why this doesn't double-deliver.** `client.subscribe()` (an
+/// **Why this doesn't double-deliver.** `client.subscribe_session()` (an
 /// `acpx_client::ws::GatewayWsClient` broadcast channel) hands back a
 /// fresh, independent `broadcast::Receiver` on every call -- this task's
 /// subscription and `run_thread_actor`'s own are two separate receivers
@@ -1063,11 +1310,15 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
 /// (fed by `run_thread_actor`'s own subscription) only recognizes
 /// `session/update`-shaped frames now; this task only recognizes
 /// `acpx/agent_request`/`acpx/terminal_output`-shaped frames. A `None`
-/// from `client.subscribe()` (HTTP degraded mode -- no live push channel
+/// from `client.subscribe_session()` (HTTP degraded mode -- no live push channel
 /// at all) makes this a no-op, matching every other live-only code path
 /// in this crate.
-fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc::UnboundedSender<AgentEvent>) {
-    if client.subscribe().is_none() {
+fn spawn_out_of_band_notification_forwarder(
+    client: Arc<Gateway>,
+    mut session_rx: watch::Receiver<Option<String>>,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    if client.mode() == acpx_client::TransportMode::HttpDegraded {
         // HTTP-degraded mode with no live push channel at all -- matches
         // every other live-only code path in this crate; there is no
         // connection to reconnect either, so this stays a no-op rather
@@ -1083,17 +1334,29 @@ fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc
         // killed/restarted gateway process used to permanently strand a
         // live thread with no recovery short of restarting the whole app).
         loop {
-            let Some(mut notifications) = client.subscribe() else {
+            let session_id = loop {
+                if let Some(session_id) = session_rx.borrow().clone() {
+                    break session_id;
+                }
+                if session_rx.changed().await.is_err() {
+                    return;
+                }
+            };
+            let Some(mut notifications) = client.subscribe_session(&session_id) else {
                 if !client.reconnect().await {
                     return;
                 }
                 continue;
             };
+            let mut session_changed = false;
             loop {
                 tokio::select! {
                     update = notifications.recv() => {
                         match update {
                             Ok(update) => {
+                                if update.get("params").and_then(|p| p.get("sessionId")).and_then(serde_json::Value::as_str) != Some(session_id.as_str()) {
+                                    continue;
+                                }
                                 if let Some(request) = AgentRequest::from_notification(&update) {
                                     let method = request.method().unwrap_or_default().to_string();
                                     let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
@@ -1114,8 +1377,16 @@ fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc
                     // Notices the connection dying even during a quiet
                     // period with no notifications in flight to
                     // otherwise trigger this via `recv()`'s own Closed.
+                    result = session_rx.changed() => {
+                        if result.is_err() { return; }
+                        session_changed = true;
+                        break;
+                    }
                     _ = client.wait_for_disconnect() => break,
                 }
+            }
+            if session_changed {
+                continue;
             }
             if !client.reconnect().await {
                 return;
@@ -1203,48 +1474,90 @@ fn parse_terminal_created(value: &serde_json::Value) -> Option<TerminalCreatedEv
     })
 }
 
+fn spawn_session_live_forwarder(
+    client: Arc<Gateway>,
+    mut session_rx: watch::Receiver<Option<String>>,
+    live_tx: mpsc::UnboundedSender<serde_json::Value>,
+) {
+    tokio::spawn(async move {
+        let mut rehydrate_after_connect = false;
+        loop {
+            let session_id = loop {
+                if let Some(session_id) = session_rx.borrow().clone() {
+                    break session_id;
+                }
+                if session_rx.changed().await.is_err() {
+                    return;
+                }
+            };
+            let Some(mut notifications) = client.subscribe_session(&session_id) else {
+                if !client.reconnect().await {
+                    return;
+                }
+                continue;
+            };
+            if rehydrate_after_connect {
+                if let Err(error) = client.rehydrate_session(&session_id).await {
+                    eprintln!("panel-rust: session rehydration failed for {session_id}: {error}");
+                }
+                rehydrate_after_connect = false;
+            }
+            let mut session_changed = false;
+            loop {
+                tokio::select! {
+                    update = notifications.recv() => match update {
+                        Ok(update) => {
+                            if update.get("params").and_then(|p| p.get("sessionId")).and_then(serde_json::Value::as_str) == Some(session_id.as_str()) {
+                                let _ = live_tx.send(update);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    result = session_rx.changed() => {
+                        if result.is_err() { return; }
+                        session_changed = true;
+                        break;
+                    }
+                    _ = client.wait_for_disconnect() => break,
+                }
+            }
+            if session_changed {
+                continue;
+            }
+            if !client.reconnect().await {
+                return;
+            }
+            rehydrate_after_connect = true;
+        }
+    });
+}
+
 async fn run_thread_actor(
     mut gateway_rx: watch::Receiver<Option<Arc<Gateway>>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     session_tx: watch::Sender<Option<String>>,
+    pool: Option<SharedSessionPool>,
 ) {
     let client = await_gateway(&mut gateway_rx).await;
-    spawn_out_of_band_notification_forwarder(Arc::clone(&client), event_tx.clone());
+    spawn_out_of_band_notification_forwarder(
+        Arc::clone(&client),
+        session_tx.subscribe(),
+        event_tx.clone(),
+    );
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
-    if client.subscribe().is_some() {
-        // See spawn_out_of_band_notification_forwarder's doc comment --
-        // same "reconnect and resubscribe rather than die forever on the
-        // first disconnect" shape, for this actor's own live_rx feed
-        // (session/update frames `forward_updates` below drains).
-        let live_client = Arc::clone(&client);
-        tokio::spawn(async move {
-            loop {
-                let Some(mut live_notifications) = live_client.subscribe() else {
-                    if !live_client.reconnect().await {
-                        return;
-                    }
-                    continue;
-                };
-                loop {
-                    tokio::select! {
-                        update = live_notifications.recv() => {
-                            match update {
-                                Ok(update) => { let _ = live_tx.send(update); }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                        _ = live_client.wait_for_disconnect() => break,
-                    }
-                }
-                if !live_client.reconnect().await {
-                    return;
-                }
-            }
-        });
-    }
+    spawn_session_live_forwarder(Arc::clone(&client), session_tx.subscribe(), live_tx);
     let mut session_id: Option<String> = None;
+    // acpx-client-session-lease-pool: set only by `Command::
+    // AcquireAndAttach`, and only meaningful when `pool.is_some()`. Turn
+    // lifecycle (`SendPrompt`) and detach (`CloseSession`/`DeleteSession`/
+    // `Shutdown`) below consult this to keep the pool's view of this
+    // session's lease state in sync with what this actor is actually
+    // doing. Commands run one at a time on this same loop, so there is
+    // never a concurrent `SendPrompt` racing a `CloseSession`/`Shutdown`
+    // for the same lease.
+    let mut current_lease: Option<SessionLease> = None;
 
     // Keep forwarding live session updates even while the user is idle.
     // `session/load` is allowed to replay after its RPC response; waiting
@@ -1253,7 +1566,7 @@ async fn run_thread_actor(
     loop {
         let cmd = tokio::select! {
             Some(update) = live_rx.recv() => {
-                forward_updates(&[update], &event_tx);
+                forward_updates(&[update], session_id.as_deref(), &event_tx);
                 continue;
             }
             command = cmd_rx.recv() => match command {
@@ -1280,6 +1593,16 @@ async fn run_thread_actor(
                     {
                         Ok(value) => match value.get("sessionId").and_then(|s| s.as_str()) {
                             Some(sid) => {
+                                client.register_session_replay(
+                                    sid,
+                                    "session/load",
+                                    serde_json::json!({
+                                        "sessionId": sid,
+                                        "cwd": cwd.to_string_lossy(),
+                                        "mcpServers": mcp_servers.clone(),
+                                    }),
+                                    profile.clone(),
+                                );
                                 session_id = Some(sid.to_string());
                                 let _ = session_tx.send(Some(sid.to_string()));
                                 emit_capability_events(&value, &event_tx);
@@ -1289,10 +1612,13 @@ async fn run_thread_actor(
                         },
                         Err(e) => Err(e.into()),
                     };
-                    if result.is_ok() || attempt == 4 {
+                    if !should_retry(&result, attempt) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ))
+                    .await;
                 }
                 let _ = resp.send(result);
             }
@@ -1314,6 +1640,11 @@ async fn run_thread_actor(
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": mcp_servers,
                 });
+                // Register both the local receiver and the replay contract
+                // before `session/load`: ACPX may begin replaying updates
+                // before the RPC response is written.
+                client.register_session_replay(&sid, "session/load", params.clone(), None);
+                let mut early_notifications = client.subscribe_session(&sid);
                 // Match session/new's bounded retry. A relaunched panel can
                 // race an acpx-server that is still accepting its socket but
                 // has not finished restoring its sqlite-backed registry.
@@ -1328,7 +1659,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx);
                             // A session/load replay is allowed to start
                             // before its RPC response, but a busy real
                             // host can schedule the WS reader just after
@@ -1341,10 +1672,23 @@ async fn run_thread_actor(
                             )
                             .await
                             {
-                                forward_updates(&[update], &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx);
                             }
                             while let Ok(update) = live_rx.try_recv() {
-                                forward_updates(&[update], &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx);
+                            }
+                            if let Some(notifications) = early_notifications.as_mut() {
+                                if let Ok(Ok(update)) = tokio::time::timeout(
+                                    std::time::Duration::from_millis(500),
+                                    notifications.recv(),
+                                )
+                                .await
+                                {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
+                                while let Ok(update) = notifications.try_recv() {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
                             }
                             session_id = Some(sid.clone());
                             let _ = session_tx.send(Some(sid.clone()));
@@ -1352,10 +1696,19 @@ async fn run_thread_actor(
                         }
                         Err(e) => Err(e.into()),
                     };
-                    if result.is_ok() || attempt == 4 {
+                    if !should_retry(&result, attempt) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                if result.is_err() {
+                    // A failed resume must not become a durable replay
+                    // contract. Otherwise a later reconnect can reattach a
+                    // session that this actor never successfully activated.
+                    client.unregister_session_replay(&sid);
                 }
                 let _ = resp.send(result);
             }
@@ -1368,6 +1721,8 @@ async fn run_thread_actor(
                     "sessionId": sid,
                     "cwd": cwd.to_string_lossy(),
                 });
+                client.register_session_replay(&sid, "session/resume", params.clone(), None);
+                let mut early_notifications = client.subscribe_session(&sid);
                 let mut result = Err(AcpxThreadError::ActorGone);
                 for attempt in 0..5 {
                     result = match client
@@ -1376,17 +1731,173 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx);
+                            if let Some(notifications) = early_notifications.as_mut() {
+                                if let Ok(Ok(update)) = tokio::time::timeout(
+                                    std::time::Duration::from_millis(250),
+                                    notifications.recv(),
+                                )
+                                .await
+                                {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
+                                while let Ok(update) = notifications.try_recv() {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
+                            }
                             session_id = Some(sid.clone());
                             let _ = session_tx.send(Some(sid.clone()));
                             Ok(())
                         }
                         Err(error) => Err(error.into()),
                     };
-                    if result.is_ok() || attempt == 4 {
+                    if !should_retry(&result, attempt) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                if result.is_err() {
+                    // A failed resume must not remain as a durable replay
+                    // contract in the shared Gateway.
+                    client.unregister_session_replay(&sid);
+                }
+                let _ = resp.send(result);
+            }
+            Command::AcquireAndAttach {
+                key,
+                thread_id,
+                saved_session_id,
+                cwd,
+                mcp_servers,
+                resp,
+            } => {
+                let Some(pool) = pool.as_ref() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoPoolConfigured));
+                    continue;
+                };
+                let lease = match pool
+                    .acquire(key, thread_id, OpenSpec { saved_session_id })
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(err) => {
+                        let _ = resp.send(Err(AcpxThreadError::Pool(err.to_string())));
+                        continue;
+                    }
+                };
+                let sid = lease.session_id.clone();
+                let result: Result<AttachedSession, AcpxThreadError> = if lease.resumed_from_saved {
+                    // Same wire behavior as `Command::ReattachSession`
+                    // above (no history replay, `session/resume`) --
+                    // duplicated rather than factored out because it
+                    // shares this loop's local `live_rx`/`session_id`/
+                    // `session_tx` state, which a standalone helper fn
+                    // can't borrow across this `select!`-driven loop as
+                    // cleanly as an inline arm can.
+                    let params = serde_json::json!({
+                        "sessionId": sid,
+                        "cwd": cwd.to_string_lossy(),
+                    });
+                    client.register_session_replay(&sid, "session/resume", params.clone(), None);
+                    let mut early_notifications = client.subscribe_session(&sid);
+                    let mut attempt_result = Err(AcpxThreadError::ActorGone);
+                    for attempt in 0..5 {
+                        attempt_result = match client
+                            .call_with_updates("session/resume", params.clone(), None)
+                            .await
+                        {
+                            Ok((value, updates)) => {
+                                emit_capability_events(&value, &event_tx);
+                                forward_updates(&updates, Some(&sid), &event_tx);
+                                if let Some(notifications) = early_notifications.as_mut() {
+                                    if let Ok(Ok(update)) = tokio::time::timeout(
+                                        std::time::Duration::from_millis(250),
+                                        notifications.recv(),
+                                    )
+                                    .await
+                                    {
+                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                    }
+                                    while let Ok(update) = notifications.try_recv() {
+                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                    }
+                                }
+                                Ok(())
+                            }
+                            Err(error) => Err(error.into()),
+                        };
+                        if !should_retry(&attempt_result, attempt) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            100 * u64::from(attempt + 1),
+                        ))
+                        .await;
+                    }
+                    match attempt_result {
+                        Ok(()) => Ok(AttachedSession {
+                            session_id: sid.clone(),
+                            resumed_from_saved: true,
+                        }),
+                        Err(error) => {
+                            // Invalidation happens once, in the shared
+                            // `match &result { Err(_) => .. }` below, not
+                            // here -- avoids a redundant second
+                            // `pool.invalidate` call for the same lease.
+                            client.unregister_session_replay(&sid);
+                            Err(error)
+                        }
+                    }
+                } else {
+                    // `GatewaySessionOpener::create` already ran
+                    // `session/new` for this session -- no second RPC
+                    // here, just local notification wiring so future
+                    // reconnects can rehydrate it. `lease.capabilities`
+                    // carries that `session/new` response's configOptions/
+                    // sessionModes (see `SessionLease::capabilities`'s doc
+                    // comment) -- emitted here exactly like the resumed
+                    // branch above, so ChatInput's model/mode/agent
+                    // dropdowns populate for a freshly pool-created session
+                    // too, not just a resumed one. Only falls through to
+                    // `models/list` (the caller's own responsibility) when
+                    // the opener genuinely didn't report a response.
+                    if let Some(value) = lease.capabilities.as_ref() {
+                        emit_capability_events(value, &event_tx);
+                    }
+                    client.register_session_replay(
+                        &sid,
+                        "session/load",
+                        serde_json::json!({
+                            "sessionId": sid,
+                            "cwd": cwd.to_string_lossy(),
+                            "mcpServers": mcp_servers,
+                        }),
+                        None,
+                    );
+                    let _ = client.subscribe_session(&sid);
+                    Ok(AttachedSession {
+                        session_id: sid.clone(),
+                        resumed_from_saved: false,
+                    })
+                };
+                match &result {
+                    Ok(_) => {
+                        session_id = Some(sid.clone());
+                        let _ = session_tx.send(Some(sid));
+                        current_lease = Some(lease);
+                    }
+                    Err(_) => {
+                        // Acquired but never usably attached -- must not
+                        // linger in the pool as a leasable idle entry.
+                        if let Err(pool_error) = pool.invalidate(&lease).await {
+                            eprintln!(
+                                "panel-rust: pool.invalidate after failed attach for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"
+                            );
+                        }
+                    }
                 }
                 let _ = resp.send(result);
             }
@@ -1395,6 +1906,24 @@ async fn run_thread_actor(
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
                 };
+                // acpx-client-session-lease-pool: mark the lease's turn
+                // active for the whole prompt round trip so a concurrent
+                // `release`/`invalidate` attempt from elsewhere (there is
+                // none today -- this actor is the sole owner of its
+                // lease -- but the pool itself enforces this regardless)
+                // is rejected while a turn is genuinely in flight. Marked
+                // finished again below in both the success and error
+                // arms: a transport error still ends *this* attempt at a
+                // turn, and leaving it `ActiveTurn` forever would
+                // permanently block release/reacquisition of an otherwise
+                // healthy session over one failed prompt.
+                if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref()) {
+                    if let Err(pool_error) = pool.mark_turn_started(lease).await {
+                        eprintln!(
+                            "panel-rust: pool.mark_turn_started for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"
+                        );
+                    }
+                }
                 let params = serde_json::json!({
                     "sessionId": sid,
                     "prompt": [{"type": "text", "text": text}],
@@ -1405,7 +1934,7 @@ async fn run_thread_actor(
                     tokio::select! {
                         update = live_rx.recv() => {
                             if let Some(update) = update {
-                                forward_updates(&[update], &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx);
                             }
                         }
                         result = &mut prompt => break result,
@@ -1413,7 +1942,7 @@ async fn run_thread_actor(
                 };
                 match outcome {
                     Ok((result, updates)) => {
-                        forward_updates(&updates, &event_tx);
+                        forward_updates(&updates, Some(&sid), &event_tx);
                         // A resumed WS subscription can receive a burst of
                         // final notifications just after the prompt response.
                         // Keep draining until the stream is briefly quiet,
@@ -1427,7 +1956,7 @@ async fn run_thread_actor(
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
                                 Ok(Some(update)) => {
-                                    forward_updates(&[update], &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx);
                                     wait = std::time::Duration::from_millis(75);
                                 }
                                 Ok(None) | Err(_) => break,
@@ -1438,10 +1967,24 @@ async fn run_thread_actor(
                             .and_then(|s| s.as_str())
                             .unwrap_or("end_turn")
                             .to_string();
+                        if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref()) {
+                            if let Err(pool_error) = pool.mark_turn_finished(lease).await {
+                                eprintln!(
+                                    "panel-rust: pool.mark_turn_finished for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"
+                                );
+                            }
+                        }
                         let _ = event_tx.send(AgentEvent::TurnEnded(stop_reason));
                         let _ = resp.send(Ok(()));
                     }
                     Err(e) => {
+                        if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.as_ref()) {
+                            if let Err(pool_error) = pool.mark_turn_finished(lease).await {
+                                eprintln!(
+                                    "panel-rust: pool.mark_turn_finished (after prompt error) for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"
+                                );
+                            }
+                        }
                         let _ = event_tx.send(AgentEvent::Error(e.to_string()));
                         let _ = resp.send(Err(e.into()));
                     }
@@ -1512,6 +2055,30 @@ async fn run_thread_actor(
                     params["_acpx"] = serde_json::json!({ "bg": true });
                 }
                 let result = client.call("session/close", params, None).await;
+                client.unregister_session_replay(&sid);
+                // acpx-client-session-lease-pool: a *background* close
+                // keeps the gateway-side session alive for a later
+                // resume (see this command's own doc comment) -- exactly
+                // the condition under which this session should become
+                // idle and reusable by a different thread, not
+                // invalidated. A non-background close is explicit
+                // teardown from this thread's perspective; treat it the
+                // same as delete below.
+                if let Some(lease) = current_lease.take() {
+                    if let Some(pool) = pool.as_ref() {
+                        let pool_result = if background {
+                            pool.release(&lease).await
+                        } else {
+                            pool.invalidate(&lease).await
+                        };
+                        if let Err(pool_error) = pool_result {
+                            eprintln!(
+                                "panel-rust: pool.{action} on CloseSession for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent",
+                                action = if background { "release" } else { "invalidate" }
+                            );
+                        }
+                    }
+                }
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::DeleteSession { resp } => {
@@ -1522,6 +2089,14 @@ async fn run_thread_actor(
                 };
                 let params = serde_json::json!({ "sessionId": sid });
                 let result = client.call("session/delete", params, None).await;
+                client.unregister_session_replay(&sid);
+                if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                    if let Err(pool_error) = pool.invalidate(&lease).await {
+                        eprintln!(
+                            "panel-rust: pool.invalidate on DeleteSession for session {sid:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent"
+                        );
+                    }
+                }
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::SetMode { mode_id, resp } => {
@@ -1545,8 +2120,7 @@ async fn run_thread_actor(
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
                 };
-                let params =
-                    serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
+                let params = serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
                 let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
@@ -1580,7 +2154,24 @@ async fn run_thread_actor(
                     }
                 }
             }
-            Command::Shutdown => break,
+            Command::Shutdown => {
+                // acpx-client-session-lease-pool: safe detach, never a
+                // gateway-side close (see `AcpxThreadHandle::shutdown`'s
+                // own doc comment) -- released back to idle so another
+                // thread can pick this session up later. Commands run one
+                // at a time on this loop, so no `SendPrompt` can be
+                // in-flight concurrently with this `Shutdown`; the lease's
+                // turn state is always `NotStarted` here already.
+                if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                    if let Err(pool_error) = pool.release(&lease).await {
+                        eprintln!(
+                            "panel-rust: pool.release on Shutdown for session {:?} unexpectedly failed ({pool_error}) -- lease bookkeeping may be inconsistent",
+                            lease.session_id
+                        );
+                    }
+                }
+                break;
+            }
             Command::ListMcpServers { resp } => {
                 // Deliberately `client.list_mcp_servers()` (a typed method
                 // on the transport-neutral `Gateway` facade this actor
@@ -1648,6 +2239,17 @@ async fn run_thread_actor(
                             })
                             .unwrap_or_default()
                     });
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::ListModels { agent_id, resp } => {
+                let result = client
+                    .call(
+                        "models/list",
+                        serde_json::json!({ "agentId": agent_id }),
+                        None,
+                    )
+                    .await
+                    .map(|value| parse_model_catalog(&value));
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::AgentStatus { agent_id, resp } => {
@@ -1830,14 +2432,96 @@ mod capability_parsing_tests {
         }
     }
 
+    // PROF-11: this used to assert `"plan"` parsed to None -- that was the
+    // real gap this phase closed (see `parse_capability_update_recognizes_
+    // plan` below), so the fixture here now uses a genuinely unrecognized
+    // tag instead of a since-implemented one, to keep proving the
+    // fallthrough `_ => None` arm actually still exists.
     #[test]
     fn parse_capability_update_ignores_unrelated_session_updates() {
         let update = json!({
             "jsonrpc": "2.0",
             "method": "session/update",
-            "params": {"sessionId": "s1", "update": {"sessionUpdate": "plan"}}
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "some_future_unrecognized_update"}}
         });
         assert!(parse_capability_update(&update).is_none());
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_plan() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "plan",
+                "entries": [
+                    {"content": "Read the file", "priority": "high", "status": "completed"},
+                    {"content": "Fix the bug", "priority": "medium", "status": "in_progress"}
+                ]
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::PlanUpdate(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].content, "Read the file");
+                assert_eq!(entries[0].priority, "high");
+                assert_eq!(entries[0].status, "completed");
+                assert_eq!(entries[1].status, "in_progress");
+            }
+            other => panic!("expected PlanUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_plan_with_empty_entries_is_some_empty_not_none() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "plan",
+                "entries": []
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::PlanUpdate(entries) => assert!(entries.is_empty()),
+            other => panic!("expected PlanUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_session_info_update() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "session_info_update",
+                "title": "Fixing the login bug",
+                "updatedAt": "2026-07-25T00:00:00Z"
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::SessionInfoUpdate { title, updated_at } => {
+                assert_eq!(title.as_deref(), Some("Fixing the login bug"));
+                assert_eq!(updated_at.as_deref(), Some("2026-07-25T00:00:00Z"));
+            }
+            other => panic!("expected SessionInfoUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_session_info_update_with_no_fields_is_still_some() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "session_info_update"}}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::SessionInfoUpdate { title, updated_at } => {
+                assert_eq!(title, None);
+                assert_eq!(updated_at, None);
+            }
+            other => panic!("expected SessionInfoUpdate, got {other:?}"),
+        }
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub enum UiMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadMsg {
     New,
+    #[allow(dead_code)]
     NewResolved {
         display_name: String,
         provider: String,
@@ -57,6 +58,7 @@ pub enum ThreadMsg {
 pub enum ComposeMsg {
     SendRequested(String),
     StopRequested,
+    #[allow(dead_code)]
     GenerationStopped,
     /// Drop one send-queue entry (QueuedMessageBar cancel).
     /// `message_index` is the Slint message-list index (`MessageItem.index`).
@@ -76,26 +78,41 @@ pub enum ComposeMsg {
     QueueSendNow {
         message_index: usize,
     },
+    /// SCNA-03: pressing Return on an *empty* compose box immediately
+    /// fast-tracks the front queue entry (send_queue.rs's
+    /// try_fast_track/can_fast_track -- armed for one shot by the enqueue
+    /// that just happened, cleared by consuming it here). No target index:
+    /// unlike QueueSendNow, this always acts on the current front entry
+    /// of the *selected* thread's queue, and is a safe no-op (via
+    /// try_fast_track's own can_fast_track guard) if nothing is eligible
+    /// -- the Slint side does not need to know the queue's state to fire
+    /// this, only that the compose box was empty.
+    QueueFastTrack,
     /// Stop in-flight generation and pause auto-drain of the send queue
     /// (QueuedMessageBar stop while an entry is marked `sending`).
     QueueStop,
+    #[allow(dead_code)]
     MentionTokenPrefix {
         text: String,
         cursor: i32,
     },
+    #[allow(dead_code)]
     MentionTokenQuery {
         text: String,
         cursor: i32,
     },
+    #[allow(dead_code)]
     MentionTokenReplace {
         text: String,
         cursor: i32,
         replacement: String,
     },
+    #[allow(dead_code)]
     WordBoundaryBefore {
         text: String,
         cursor: i32,
     },
+    #[allow(dead_code)]
     ContainsCi {
         haystack: String,
         needle: String,
@@ -148,12 +165,20 @@ pub enum SettingsMsg {
         value: String,
     },
     ModeSelected(String),
-    // setup-followups plan, provider_fastmode_profile_persistence: only
-    // meaningful while the currently selected thread has no attached
-    // session yet (see ThreadItem.has-session's doc comment) -- update()
-    // is a no-op if it already has one, since ACP has no primitive for
-    // moving a live session to a different backend.
-    ProfileSelected(String),
+    // Compose-bar **Provider** picker (ui label "Provider"; still named
+    // ProfileSelected for history). Only meaningful while the selected
+    // thread has no attached session (see ThreadItem.has-session) --
+    // update() is a no-op if it already has one (ACP cannot retarget a
+    // live session). Writes BOTH:
+    //   - profile_name: ACPX profile name (session/_acpx.profile)
+    //   - agent_id → thread.provider: which agent/gateway to attach
+    // (dispatch_compose_send_maybe_attach reads thread.provider for
+    // attach_deferred_thread — writing only profile_name left provider
+    // stuck at create-time default and ignored the picker).
+    ProfileSelected {
+        profile_name: String,
+        agent_id: String,
+    },
     DevModeToggled(bool),
     /// Full typed create, from the settings form's transport-picker/args/
     /// env/headers/timeout/oauth fields (`mcp_servers_view.slint`'s
@@ -273,7 +298,9 @@ pub enum ChromeMsg {
         show_global: bool,
     },
     ToggleExpanded(usize),
-    CopyMessageRequested { text: String },
+    CopyMessageRequested {
+        text: String,
+    },
     ErrorBannerDismissed,
 }
 
@@ -286,6 +313,30 @@ pub enum HostMsg {
     AppearanceChanged(crate::appearance::AppearanceState),
     ThemeChanged(String),
     ProjectPathChanged(Option<String>),
+    ProjectCreatedUntitled,
+    ProjectClosed,
+    /// PISO-7 (project-isolation-mlt-binding plan): an explicit host
+    /// signal for an MLT Save-As, carrying BOTH the old and new project
+    /// file paths -- deliberately a separate variant from
+    /// `ProjectPathChanged` rather than something inferred from two
+    /// consecutive values of it. `old`/`new` alone cannot distinguish
+    /// "Save-As A -> B" from "close A, open B" (both look like the
+    /// active path changing from A to B), and treating them alike would
+    /// rebind B's own pre-existing threads onto A's history -- merging
+    /// two real projects. Only the host genuinely knows which happened,
+    /// so it must say so explicitly. `old` empty means "this project was
+    /// untitled and is being saved for the first time", which is NOT a
+    /// rename (see `update_host`'s handler).
+    ProjectPathRenamed {
+        old: String,
+        new: String,
+    },
+    // language-switch-sync plan: a QSettings "language" locale code (e.g.
+    // "fr", "zh_CN") pushed live from Qt's Settings > Language picker --
+    // see MainWindow::languageChanged's doc comment for why this is a
+    // real live signal (mirroring producerOpened), not construction-time
+    // only (the theme precedent's known gap).
+    LanguageChanged(String),
     /// Cold-start hydration trigger -- see 00-plan.md Phase 0. Carries
     /// whatever `panel_rust_create` already has in hand *before* any
     /// `Effect` runs (window size, requested defaults); the actual
@@ -315,7 +366,17 @@ pub struct FrameInput {
     pub clear_selected_thread: bool,
     pub settings_preferences_snapshot: Option<SettingsPreferencesSnapshot>,
     pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
+    /// Agent ids whose install/enablement RPC is still in flight.
+    pub agent_operations_in_flight: Vec<String>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
+    /// PISO-8 (project-isolation-mlt-binding plan): true at most once
+    /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors
+    /// `skills_rescan_due`'s thread-local-timer pattern), signaling
+    /// `update_frame` to queue `Effect::RefreshDaemonProjectInstances`.
+    /// Computing the throttle here (cheap, no I/O) rather than doing the
+    /// real subprocess-backed poll itself on the frame-collection path
+    /// keeps that path non-blocking, per the plan's data-path discipline.
+    pub daemon_projects_refresh_due: bool,
 }
 
 /// Read-only bridge/store data for the sidebar. The adapter owns collection;
@@ -330,12 +391,25 @@ pub struct ThreadListSnapshot {
     /// hydration for `ThreadModel::archived`, which the sidebar counters
     /// and the archive pool cap read. Empty = no data (tests).
     pub archived_flags: Vec<bool>,
+    /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
+    /// path` this snapshot's `visible_indices`/`rows` were filtered
+    /// against (`ExternalSnapshotSource::collect_thread_list_snapshot`
+    /// tags it with the exact value `retain_items_for_project` used, not
+    /// a fresh re-read). `update_frame`'s stale-snapshot guard compares
+    /// this against `Model::active_project_path` at APPLY time and drops
+    /// the whole list-shape update on a mismatch -- a snapshot collected
+    /// for a project the user has since switched away from must never
+    /// overwrite the (by-then-already-updated) visible list, even though
+    /// today's single-threaded synchronous poll loop makes that window
+    /// vanishingly unlikely to hit in practice; this makes the guarantee
+    /// explicit and independent of that timing accident.
+    pub active_project_path: Option<String>,
 }
 
 /// Read-only settings data collected from the selected gateway for one
 /// reducer turn. The gateway remains the source of truth; `update_frame`
 /// owns the projected values after folding this snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SettingsGatewaySnapshot {
     pub profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
@@ -345,7 +419,7 @@ pub struct SettingsGatewaySnapshot {
 }
 
 /// Read-only JSON/SQLite preferences collected for one reducer turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SettingsPreferencesSnapshot {
     pub scope: String,
     pub default_profile: String,
@@ -360,7 +434,7 @@ pub struct SettingsPreferencesSnapshot {
 /// Read-only bridge data collected for the currently displayed thread during
 /// one frame. The bridge owns the live connections; the reducer owns the
 /// resulting presentation state after this value is folded into `Model`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ThreadFrameSnapshot {
     /// Durable reducer identity. `real_index` is only the bridge lookup
     /// location at collection time and may change before this snapshot is
@@ -389,6 +463,10 @@ pub struct ThreadFrameSnapshot {
     pub available_commands: Vec<crate::protocol_types::AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
+    /// PROF-11: the agent's most recently pushed execution plan/todo list.
+    pub plan: Vec<crate::protocol_types::PlanEntryInfo>,
+    /// PROF-11: the most recently pushed live session title.
+    pub session_title: Option<String>,
 }
 
 #[cfg(test)]

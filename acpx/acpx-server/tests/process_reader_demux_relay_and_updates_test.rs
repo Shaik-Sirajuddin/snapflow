@@ -216,9 +216,12 @@ async fn strict_acp_ws_forwards_permission_requests_under_demux() {
     // the very next frame received would already be the final `id: 2`
     // response, auto-decided by policy without this client ever knowing
     // it was asked.
-    let permission_request = tokio::time::timeout(std::time::Duration::from_secs(10), ws_receive(&mut socket))
-        .await
-        .expect("timed out waiting for the live-relayed permission request -- demux broke the relay");
+    let permission_request = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ws_receive(&mut socket),
+    )
+    .await
+    .expect("timed out waiting for the live-relayed permission request -- demux broke the relay");
     assert_eq!(
         permission_request["method"],
         json!("session/request_permission"),
@@ -236,9 +239,10 @@ async fn strict_acp_ws_forwards_permission_requests_under_demux() {
     )
     .await;
 
-    let final_response = tokio::time::timeout(std::time::Duration::from_secs(10), ws_receive(&mut socket))
-        .await
-        .expect("timed out waiting for the prompt result after answering the relayed request");
+    let final_response =
+        tokio::time::timeout(std::time::Duration::from_secs(10), ws_receive(&mut socket))
+            .await
+            .expect("timed out waiting for the prompt result after answering the relayed request");
     assert_eq!(final_response["id"], json!(2));
     assert_eq!(final_response["result"]["stopReason"], json!("end_turn"));
 }
@@ -254,7 +258,10 @@ async fn strict_acp_ws_forwards_permission_requests_under_demux() {
 #[tokio::test]
 async fn native_ws_agent_request_relay_works_under_demux() {
     let mut router = Router::new("permission-agent-2");
-    router.register_agent("permission-agent-2", chosen_option_echoing_permission_backend_spec());
+    router.register_agent(
+        "permission-agent-2",
+        chosen_option_echoing_permission_backend_spec(),
+    );
     let router = router.with_process_reader_demux(true);
     let router: SharedRouter = Arc::new(Mutex::new(router));
     let addr = spawn_server(router).await;
@@ -363,14 +370,19 @@ async fn http_only_caller_still_sees_updates_under_demux() {
     let client = reqwest::Client::new();
     let new_reply: serde_json::Value = client
         .post(format!("http://{addr}/rpc"))
-        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}))
+        .json(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+        )
         .send()
         .await
         .expect("session/new request")
         .json()
         .await
         .expect("session/new response body");
-    let gateway_id = new_reply["result"]["sessionId"].as_str().expect("sessionId").to_string();
+    let gateway_id = new_reply["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
 
     let prompt_reply: serde_json::Value = client
         .post(format!("http://{addr}/rpc"))
@@ -389,14 +401,20 @@ async fn http_only_caller_still_sees_updates_under_demux() {
     let updates = prompt_reply["_acpx"]["updates"]
         .as_array()
         .expect("expected _acpx.updates to be populated from the pending-updates buffer");
-    assert_eq!(updates.len(), 1, "unexpected _acpx.updates contents: {prompt_reply:?}");
+    assert_eq!(
+        updates.len(),
+        1,
+        "unexpected _acpx.updates contents: {prompt_reply:?}"
+    );
     assert_eq!(
         updates[0]["params"]["sessionId"],
         json!(gateway_id),
         "buffered update must carry the client's gateway session id, not the backend-native one"
     );
     assert_eq!(
-        updates[0]["update"]["sessionUpdate"].as_str().or_else(|| updates[0]["params"]["update"]["sessionUpdate"].as_str()),
+        updates[0]["update"]["sessionUpdate"]
+            .as_str()
+            .or_else(|| updates[0]["params"]["update"]["sessionUpdate"].as_str()),
         Some("agent_message_chunk"),
     );
 }
@@ -478,7 +496,10 @@ async fn native_ws_fs_terminal_approval_relay_works_under_demux() {
     )
     .await;
     let new_reply = ws_receive(&mut socket).await;
-    let gateway_id = new_reply["result"]["sessionId"].as_str().expect("sessionId").to_string();
+    let gateway_id = new_reply["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
 
     ws_send(
         &mut socket,
@@ -493,7 +514,10 @@ async fn native_ws_fs_terminal_approval_relay_works_under_demux() {
         loop {
             let frame = ws_receive(&mut socket).await;
             if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/agent_request") {
-                let relay_id = frame["params"]["relayId"].as_str().expect("relayId").to_string();
+                let relay_id = frame["params"]["relayId"]
+                    .as_str()
+                    .expect("relayId")
+                    .to_string();
                 // Explicitly reject -- the profile's own allow_fs_access
                 // toggle would auto-allow this if the relay never
                 // reached this client at all (the pre-fix regression

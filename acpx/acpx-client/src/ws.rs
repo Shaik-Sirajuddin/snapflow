@@ -8,7 +8,7 @@ use crate::raw::ClientError;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -49,12 +49,46 @@ type WsSink = futures_util::stream::SplitSink<
 /// in a WebSocket framing layer.
 pub type GatewayNotification = serde_json::Value;
 
+struct SessionNotificationChannel {
+    sender: broadcast::Sender<GatewayNotification>,
+    subscribers: usize,
+}
+
+/// A session-scoped notification receiver. Dropping the last receiver for a
+/// session unregisters that session's channel from the WebSocket client so a
+/// long-lived gateway does not retain every historical session id forever.
+pub struct SessionSubscription {
+    receiver: broadcast::Receiver<GatewayNotification>,
+    session_id: String,
+    owner: Weak<GatewayWsClient>,
+}
+
+impl SessionSubscription {
+    pub async fn recv(&mut self) -> Result<GatewayNotification, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<GatewayNotification, broadcast::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for SessionSubscription {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        owner.release_session_subscription(&self.session_id);
+    }
+}
+
 /// A multiplexed WebSocket connection to one gateway.
 pub struct GatewayWsClient {
     sink: Mutex<WsSink>,
     next_id: AtomicI64,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<serde_json::Value, ClientError>>>>,
     notifications: broadcast::Sender<GatewayNotification>,
+    session_notifications: std::sync::Mutex<HashMap<String, SessionNotificationChannel>>,
     // Fired once the reader task's frame loop exits (peer closed the
     // socket, a read errored, ...) -- lets a long-lived subscriber (a
     // live-notification forwarding task with no in-flight `call()` to
@@ -80,6 +114,7 @@ impl GatewayWsClient {
             next_id: AtomicI64::new(1),
             pending: Mutex::new(HashMap::new()),
             notifications,
+            session_notifications: std::sync::Mutex::new(HashMap::new()),
             disconnected: tokio::sync::Notify::new(),
             is_disconnected: std::sync::atomic::AtomicBool::new(false),
         });
@@ -112,6 +147,46 @@ impl GatewayWsClient {
         self.notifications.subscribe()
     }
 
+    /// Returns a receiver for notifications belonging only to `session_id`.
+    /// The raw subscription remains available for low-level gateway/admin
+    /// consumers, but session actors must use this demultiplexed channel.
+    pub fn subscribe_session(self: &Arc<Self>, session_id: &str) -> SessionSubscription {
+        let receiver = self
+            .session_notifications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(session_id.to_owned())
+            .and_modify(|channel| channel.subscribers += 1)
+            .or_insert_with(|| SessionNotificationChannel {
+                sender: broadcast::channel(256).0,
+                subscribers: 1,
+            })
+            .sender
+            .subscribe();
+        SessionSubscription {
+            receiver,
+            session_id: session_id.to_owned(),
+            owner: Arc::downgrade(self),
+        }
+    }
+
+    fn release_session_subscription(&self, session_id: &str) {
+        let mut channels = self
+            .session_notifications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = channels
+            .get_mut(session_id)
+            .map(|channel| {
+                channel.subscribers = channel.subscribers.saturating_sub(1);
+                channel.subscribers == 0
+            })
+            .unwrap_or(false);
+        if remove {
+            channels.remove(session_id);
+        }
+    }
+
     /// Resolves once this connection's reader loop has exited (peer
     /// closed it, a read errored, ...) -- or immediately, if that already
     /// happened before this call. A long-lived subscriber can race this
@@ -128,7 +203,10 @@ impl GatewayWsClient {
         // future first means a `notify_waiters()` from this point
         // onward is guaranteed to be observed by this specific await.
         let notified = self.disconnected.notified();
-        if self.is_disconnected.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .is_disconnected
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
         notified.await;
@@ -244,7 +322,23 @@ impl GatewayWsClient {
             }
             return;
         }
-        let _ = self.notifications.send(value);
+        let _ = self.notifications.send(value.clone());
+        let Some(session_id) = value
+            .get("params")
+            .and_then(|params| params.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let session_sender = self
+            .session_notifications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .map(|channel| channel.sender.clone());
+        if let Some(sender) = session_sender {
+            let _ = sender.send(value);
+        }
     }
 
     async fn fail_pending(&self, message: &str) {
@@ -274,7 +368,10 @@ fn websocket_url(base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::websocket_url;
+    use super::{websocket_url, GatewayWsClient};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn derives_ws_endpoint_from_http_origins() {
@@ -290,5 +387,92 @@ mod tests {
             websocket_url("ws://example.test/ws"),
             "ws://example.test/ws"
         );
+    }
+
+    #[tokio::test]
+    async fn session_subscriptions_demultiplex_interleaved_notifications() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test websocket");
+        let address = listener.local_addr().expect("test websocket address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test websocket");
+            let mut socket = accept_async(stream).await.expect("upgrade test websocket");
+            // Do not emit notifications until the client has completed a
+            // request round trip. The test installs both session receivers
+            // before this barrier, making the demultiplexing assertion
+            // deterministic rather than dependent on scheduler timing.
+            let request = socket
+                .next()
+                .await
+                .expect("client readiness request")
+                .expect("read client readiness request");
+            let request: serde_json::Value = match request {
+                Message::Text(text) => serde_json::from_str(&text).expect("valid readiness JSON"),
+                other => panic!("unexpected readiness frame: {other:?}"),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"sessions": []}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send readiness response");
+            for (session_id, text) in [("session-2", "two"), ("session-3", "three")] {
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {"text": text}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .expect("send test notification");
+            }
+        });
+
+        let client = GatewayWsClient::connect(&format!("http://{address}"))
+            .await
+            .unwrap();
+        let mut session_two = client.subscribe_session("session-2");
+        let mut session_three = client.subscribe_session("session-3");
+        client
+            .call("session/list", serde_json::json!({}))
+            .await
+            .expect("complete subscription barrier");
+
+        let two = tokio::time::timeout(std::time::Duration::from_secs(1), session_two.recv())
+            .await
+            .expect("session-2 notification timeout")
+            .expect("session-2 notification channel closed");
+        let three = tokio::time::timeout(std::time::Duration::from_secs(1), session_three.recv())
+            .await
+            .expect("session-3 notification timeout")
+            .expect("session-3 notification channel closed");
+        assert_eq!(two["params"]["sessionId"], "session-2");
+        assert_eq!(two["params"]["update"]["text"], "two");
+        assert_eq!(three["params"]["sessionId"], "session-3");
+        assert_eq!(three["params"]["update"]["text"], "three");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), session_two.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), session_three.recv())
+                .await
+                .is_err()
+        );
+        server.await.expect("test websocket server");
     }
 }

@@ -43,9 +43,12 @@ async fn main() {
         .to_string();
     eprintln!("chat_init_verify: session opened, sessionId={session_id}");
 
-    for (n, text) in ["hello from chat_init_verify, message one", "this is message two"]
-        .into_iter()
-        .enumerate()
+    for (n, text) in [
+        "hello from chat_init_verify, message one",
+        "this is message two",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let outcome = acpx_client::ext::prompt::send(
             &client,
@@ -64,7 +67,11 @@ async fn main() {
     }
 
     if let Err(err) = client
-        .call("session/close", serde_json::json!({"sessionId": session_id}), None)
+        .call(
+            "session/close",
+            serde_json::json!({"sessionId": session_id}),
+            None,
+        )
         .await
     {
         eprintln!("chat_init_verify: session/close failed (non-fatal): {err}");

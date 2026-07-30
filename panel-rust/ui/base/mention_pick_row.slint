@@ -2,6 +2,8 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 import { Icon } from "./icon.slint";
+import { TextPillButton } from "./text_pill_button.slint";
+import { StatusDot } from "./status_dot.slint";
 
 // Layer 3 (base) -- the "@"/"/"/"#" mention-picker dropdown row hand-rolled
 // 3x in `components/chat_input_layout.slint` (skill, MCP server, file):
@@ -49,46 +51,12 @@ export component MentionPickRow inherits Rectangle {
         clicked => { root.clicked(); }
         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
-    if root.action-label != "" : Rectangle {
-        x: parent.width - self.width - (root.status-dot != "" ? 8px + Metrics.space-3 : 0px) - Metrics.space-3;
-        y: (parent.height - self.height) / 2;
-        width: 52px;
-        height: 18px;
-        border-radius: Theme.radius-sm;
-        border-width: 1px;
-        border-color: Theme.border-default;
-        background: action-touch.has-hover ? Theme.bg-primary-container : transparent;
-        action-touch := TouchArea {
-            mouse-cursor: pointer;
-            clicked => { root.action-clicked(); }
-        }
-        Text {
-            text: root.action-label;
-            color: Theme.text-primary;
-            font-size: 9px * Theme.font-scale;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: 100%;
-            height: 100%;
-        }
-    }
-    if root.status-dot != "" : Rectangle {
-        x: parent.width - self.width - Metrics.space-3;
-        y: (parent.height - self.height) / 2;
-        width: 8px;
-        height: 8px;
-        border-radius: 4px;
-        background: root.status-dot == "connected" ? #22c55e
-            : (root.status-dot == "error" || root.status-dot == "disconnected") ? #ef4444
-            : #eab308;
-    }
-
     HorizontalLayout {
         width: 100%;
         height: 100%;
         padding-left: Metrics.space-4;
         padding-right: Metrics.space-4;
-        spacing: root.show-icon ? Metrics.gap-md : 0px;
+        spacing: Metrics.gap-md;
         alignment: stretch;
         cross-axis-alignment: center;
 
@@ -99,37 +67,44 @@ export component MentionPickRow inherits Rectangle {
             horizontal-stretch: 0;
             vertical-stretch: 0;
         }
-        Text {
-            text: root.title;
-            color: root.highlighted ? Theme.text-on-primary : Theme.text-primary;
-            font-size: 11px * Theme.font-scale;
-            font-family: root.title-font-family;
-            font-weight: root.title-font-weight;
-            vertical-alignment: center;
-            // `overflow: elide` only takes effect once this Text is
-            // actually forced narrower than its content -- `min-width`
-            // defaults to the text's own natural width, which blocks the
-            // layout from ever compressing it, so long titles were
-            // truncating via the row's `clip: true` with NO ellipsis
-            // rendered, leaving the user unable to tell anything was cut.
-            // `preferred-width` is left at its default (the text's own
-            // natural size) -- only `min-width` needs clearing so the
-            // layout is free to compress this Text below that natural
-            // size under space pressure instead of refusing to.
-            horizontal-stretch: root.subtitle == "" ? 1 : 0;
-            min-width: 0px;
-            overflow: elide;
-        }
-        if root.subtitle != "" : Text {
-            text: root.subtitle;
-            color: root.highlighted ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
-            font-size: 10px * Theme.font-scale;
-            font-family: Theme.font-sans;
-            vertical-alignment: center;
+        HorizontalLayout {
             horizontal-stretch: 1;
-            preferred-width: 0px;
+            spacing: Metrics.gap-sm;
+            cross-axis-alignment: center;
             min-width: 0px;
-            overflow: elide;
+
+            Text {
+                text: root.title;
+                color: root.highlighted ? Theme.text-on-primary : Theme.text-primary;
+                font-size: 11px * Theme.font-scale;
+                font-family: root.title-font-family;
+                font-weight: root.title-font-weight;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+                min-width: 0px;
+                overflow: elide;
+            }
+            if root.subtitle != "" : Text {
+                text: root.subtitle;
+                color: root.highlighted ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
+                font-size: 10px * Theme.font-scale;
+                font-family: Theme.font-sans;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                overflow: elide;
+            }
+        }
+        if root.action-label != "" : TextPillButton {
+            horizontal-stretch: 0;
+            label: root.action-label;
+            clicked => { root.action-clicked(); }
+        }
+        if root.status-dot != "" : StatusDot {
+            horizontal-stretch: 0;
+            status: root.status-dot;
+            size: 8px;
         }
     }
 }

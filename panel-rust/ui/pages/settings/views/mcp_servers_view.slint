@@ -8,6 +8,7 @@ import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
 import { McpServerOption, McpToolOption, McpServerFormData } from "../../../types.slint";
 import { TextUtil } from "../../../base/text_util.slint";
+import { StatusDot } from "../../../base/status_dot.slint";
 
 // Multi-line text box for the env-var/header editors below (`KEY=VALUE`/
 // `Header: value` one per line, parsed Rust-side -- see
@@ -186,13 +187,11 @@ export component McpServersView inherits Rectangle {
 
                     // Live connection dot -- green connected, red error/
                     // disconnected, yellow otherwise (auth required...).
-                    if server.status != "" : Rectangle {
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: server.status == "connected" ? #22c55e
-                            : (server.status == "error" || server.status == "disconnected") ? #ef4444
-                            : #eab308;
+                    // Explicit user direction; supersedes the earlier
+                    // no-status-color convention for MCP surfaces.
+                    if server.status != "" : StatusDot {
+                        status: server.status;
+                        size: 8px;
                     }
                     // Transport + auth + connection status, combined into one
                     // muted subtitle (dot above carries the color).

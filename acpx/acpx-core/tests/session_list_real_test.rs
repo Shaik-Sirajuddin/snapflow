@@ -231,14 +231,16 @@ while IFS= read -r line; do
   fi
 done
 "#;
-    let mut router = Router::new("stand-in-agent")
-        .with_lifecycle_config(LifecycleConfig {
-            max_new_sessions_per_list_call: Some(2),
-            ..Default::default()
-        });
+    let mut router = Router::new("stand-in-agent").with_lifecycle_config(LifecycleConfig {
+        max_new_sessions_per_list_call: Some(2),
+        ..Default::default()
+    });
     router.register_agent(
         "stand-in-agent",
-        SpawnSpec::new("sh", vec!["-c".to_string(), five_sessions_script.to_string()]),
+        SpawnSpec::new(
+            "sh",
+            vec!["-c".to_string(), five_sessions_script.to_string()],
+        ),
     );
 
     let list_response = router

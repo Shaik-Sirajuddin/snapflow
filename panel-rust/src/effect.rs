@@ -80,7 +80,7 @@ pub enum Effect {
         title: String,
     },
     SendPrompt {
-        real_index: usize,
+        thread_id: String,
         text: String,
     },
     CancelGeneration {
@@ -204,6 +204,7 @@ pub enum Effect {
         scope: String,
         active_project_path: Option<String>,
     },
+    #[allow(dead_code)]
     SkillDelete {
         path: std::path::PathBuf,
     },
@@ -230,6 +231,28 @@ pub enum Effect {
     SetActiveProjectPath {
         path: Option<String>,
     },
+    /// PISO-7: the ONLY caller of both `AgentBridge::rebind_project_path`
+    /// (live, in-memory, self-heals the running session immediately) and
+    /// `PanelStateStore::rename_project_path` (durable, survives a
+    /// restart) -- issued exclusively from `HostMsg::ProjectPathRenamed`'s
+    /// handler, never from a bare `ProjectPathChanged`. See both of those
+    /// methods' doc comments for why a sqlite-only or bridge-only rewrite
+    /// each leave half the bug unfixed.
+    RenameProjectAssociation {
+        old: String,
+        new: String,
+        old_identity: crate::model::ProjectIdentity,
+    },
+    /// PISO-8 (project-isolation-mlt-binding plan): a throttled background
+    /// poll of snapshotd's `daemon.list`/`daemon.listProjects` CLI
+    /// subcommands, so a thread bound to a project the agent picked via
+    /// its own `daemon.launch` MCP call -- invisibly, in a headless
+    /// instance this panel's own host never opened -- can be flagged as
+    /// actually live rather than merely recorded. Triggered from
+    /// `update_frame` on `FrameInput::daemon_projects_refresh_due`, never
+    /// from the UI thread directly (see `agent_bridge::
+    /// fetch_daemon_project_instances`'s own doc comment).
+    RefreshDaemonProjectInstances,
 }
 
 /// Results feeding back into `Msg::Effect` -- one variant per `Effect`
@@ -260,10 +283,14 @@ pub enum EffectResultMsg {
     /// acpx-skills/README.md's "reactive-sync failures are invisible to
     /// the user" gap. Sent alongside (not instead of) the existing
     /// eprintln! at each call site; best-effort, not retried.
-    SkillReactiveSyncFailed { operation: String, detail: String },
+    SkillReactiveSyncFailed {
+        operation: String,
+        detail: String,
+    },
     /// A streamed token/chunk arriving mid-generation -- not a
     /// completion. See 00-plan.md's stale-target no-op contract: if
     /// `thread_id` no longer exists in `Model`, `update()` must no-op.
+    #[allow(dead_code)]
     PromptStreamDelta {
         thread_id: String,
         message_id: String,
@@ -274,6 +301,7 @@ pub enum EffectResultMsg {
         result: Result<(), EffectError>,
     },
     SettingsSaved(Result<(), EffectError>),
+    #[allow(dead_code)]
     GatewayCallCompleted {
         real_index: usize,
         result: Result<(), EffectError>,
@@ -300,4 +328,13 @@ pub enum EffectResultMsg {
     /// used to only `eprintln!` on failure, with nothing shown in the UI
     /// at all).
     McpServerOperationCompleted(Result<String, EffectError>),
+    /// PISO-8: result of `Effect::RefreshDaemonProjectInstances`. `Err`
+    /// (daemon unreachable, `snapshotd` binary missing, malformed
+    /// output, ...) is a best-effort miss, not a user-facing error --
+    /// `update()` leaves the previously cached instances in place rather
+    /// than surfacing a toast for a background poll the user never
+    /// triggered and cannot act on.
+    DaemonProjectInstancesLoaded(
+        Result<Vec<crate::agent_bridge::DaemonProjectInstance>, EffectError>,
+    ),
 }

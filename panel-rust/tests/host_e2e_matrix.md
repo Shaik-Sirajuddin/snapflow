@@ -36,7 +36,8 @@ literal.
 | Restart / reconnect | Host and gateway restart | Resumed session receives next prompt without an implicit close | Proven (`PANEL_HOST_E2E_RESTART=1`) |
 | HTTP degraded fallback | Gateway WS unavailable then restored | Fallback audit state is present; interactive approval is unavailable | Pending |
 | Send-now / steer (state-controller-notification-audit plan) | Two entries queued behind a blocked ("slow ") turn, send-now clicked on the second (non-front) one | The steered entry's text reaches the backend as its own `session/prompt`, the skipped-over entry never does, and a real `session/cancel` for turn 1 is observed | Proven (`host_e2e_mcp_smoke.sh send-now`, MCP-driven -- see below) |
-| Rename round-trip (offload_state_effects_off_ui_thread) | Real Rename thread → type → confirm | Header title element updates to the new name; `panel-state.sqlite3`'s `thread_settings.display_name` matches after the background-thread write completes | Proven (`host_e2e_mcp_smoke.sh rename`, MCP-driven -- see below). The RenameThread *failure* branch (StateEffectFailed → Dirty::Error) is unit-tested only (`update.rs::state_effect_failed_surfaces_as_dirty_error_not_silently_dropped`) -- forcing an already-open rusqlite connection's write to fail on demand has no reliable trigger for this harness |
+| Rename round-trip (offload_state_effects_off_ui_thread) | Real Rename thread → type → confirm | Header title element updates to the new name; `panel-state.sqlite3`'s `thread_settings.display_name` matches after the background-thread write completes | Proven (`host_e2e_mcp_smoke.sh rename`, MCP-driven -- see below) |
+| Mid-session write failure (SCNA-10) | Rename attempted while the state dir is chmod'd read-only mid-session | Real "attempt to write a readonly database" error surfaces as a live "⚠ failed to persist ..." banner; a later write succeeds again once the directory is writable | Proven (`host_e2e_mcp_smoke.sh mid-session-write-failure`, MCP-driven -- see below) |
 
 ## MCP-driven scenarios (`host_e2e_mcp_smoke.sh` / `host_e2e_mcp_driver.py`)
 
@@ -52,8 +53,62 @@ collides with a concurrent `host_e2e_smoke.sh` or `host_vnc_dev.sh` run.
 
 ```bash
 bash tests/host_e2e_mcp_smoke.sh send-now
+bash tests/host_e2e_mcp_smoke.sh fast-track
 bash tests/host_e2e_mcp_smoke.sh rename
+bash tests/host_e2e_mcp_smoke.sh startup-warning
+bash tests/host_e2e_mcp_smoke.sh mid-session-write-failure
+bash tests/host_e2e_mcp_smoke.sh real-agent-smoke  # opt-in, real billed API call -- see below
 ```
+
+`real-agent-smoke` (SCNA-09): the one gap none of this file's automated
+harnesses had closed -- every scenario above talks to `rui-mock-agent`;
+`host_vnc_dev.sh` talks to a real ambient-auth backend but is manual/VNC
+-only with no automated pass/fail. Unlike every other scenario here, this
+one skips `ACPX_BACKEND_CMD` entirely so `acpx-registry`'s real fallback
+registry resolves `ACPX_DEFAULT_AGENT_ID` (default `claude-acp`) for real
+-- an ambient, npx-spawned adapter process using this machine's real
+`~/.claude/.credentials.json` OAuth, same convention as this repo's own
+`ACPX_LIVE_TEST_AMBIENT=1`-gated `acpx-server` tests. Sends exactly one
+short prompt ("Reply with exactly the single word: OK") through the real,
+live embedded panel UI and waits for a real assistant reply element to
+render -- proving the whole host chain (`ChatRustDock` -> panel-rust's
+dispatch/update/sync -> a real gateway -> a real ambient-auth-spawned
+`claude-acp` process -> a real model response -> back through TEA -> a
+real rendered message bubble) works end to end, not just the
+gateway-level path `acpx-server`'s own real-backend tests already cover.
+Makes one real, billed API call -- not run as part of any default/CI
+suite, opt-in only, same posture as this repo's other real-backend tests.
+Verified 2026-07-24: real `session/new`/`session/prompt` round-trip
+recorded in Panel-Rust's file-backed JSONL transcript (provider `claude-acp`,
+real session ids, real token usage -- `totalTokens: 13984`,
+`stopReason: "end_turn"`), and the reply `"OK"` genuinely rendered in the
+live host UI via the Slint MCP server.
+
+`mid-session-write-failure` (state-controller-followup-issues SCNA-10):
+unlike `startup-warning` (which fails `PanelStateStore::open` itself,
+before this process ever starts), the sqlite connection here is already
+open and has already served at least one successful write -- the driver
+`chmod`s the *containing* `panel/` directory to `0o555` mid-session
+instead. SQLite's default rollback-journal mode needs to create/delete a
+`-journal` sibling file in the same directory on every write even though
+the main `.sqlite3` file itself stays writable, so this reliably fails
+the very next write with a real "attempt to write a readonly database"
+error on an already-open connection -- no test-only production hook
+needed (see the matching Rust-level regression,
+`state_store::tests::a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open`).
+The driver restores permissions in a `finally` and then performs a
+second, real rename to prove the store self-heals once the directory is
+writable again -- no code involved in the recovery, only restored
+permissions.
+
+`fast-track` (state-controller-followup-issues SCNA-03): queues one
+message behind a blocked turn, clears the compose box, presses Return with
+it empty, and confirms via `backend-events.jsonl` that the queued message
+was fast-tracked (sent, turn 1 cancelled) rather than an empty prompt
+being sent -- proves `chat_input_layout.slint`'s Return-key
+compose-text-empty branch reaches `update()`'s `QueueFastTrack` arm
+(`send_queue.rs`'s previously-unwired `try_fast_track`/`can_fast_track`)
+on a real host.
 
 Two lessons from getting the driver working, worth keeping in mind before
 adding a third scenario:

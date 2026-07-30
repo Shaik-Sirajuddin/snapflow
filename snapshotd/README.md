@@ -238,6 +238,20 @@ module, and caches it in your module cache -- no manual action needed,
 provided network access is available. This is standard Go behavior, not a
 workaround.
 
+## Persisted runtime configuration
+
+The installer persists daemon discovery settings in a shared `runtime.env`
+file outside the daemon data directory so the panel and daemon agree after
+restarts:
+
+- Linux: `$XDG_CONFIG_HOME/snapflow/runtime.env`, or `~/.config/snapflow/runtime.env`.
+- macOS: `~/Library/Application Support/Snapflow/runtime.env`.
+- Windows: `%APPDATA%\\Snapflow\\runtime.env`.
+
+The file contains `SNAPSHOTD_HOME` and `SNAPSHOTD_MCP_SSE_ADDR`. Explicit
+environment variables override the file. The control socket remains the
+deterministic `$SNAPSHOTD_HOME/control.sock` path.
+
 ## Build / test / run
 
 ```sh

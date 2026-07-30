@@ -13,10 +13,15 @@
 pub mod ext;
 pub mod gateway;
 pub mod mcp;
+pub mod pool;
 pub mod raw;
 pub mod ws;
 
 pub use gateway::{AgentRequest, Gateway, TransportMode};
+pub use pool::{
+    LeaseId, OpenError, OpenSpec, PoolError, PoolKey, ProjectSessionPool, SessionLease,
+    SessionOpener, ThreadId, TurnState, WARM_TARGET_PER_KEY,
+};
 
 /// Re-export of the single-source-of-truth default acpx bind address (and
 /// its URL/port helpers) from `acpx-proto`, so panel-rust -- which only

@@ -79,6 +79,10 @@ export global Theme {
     // instead of the same literal repeated at every `selection-background-
     // color` site, so the selection tint stays consistent and themable.
     out property <color> selection-bg: #60a5fa80;
+    out property <color> status-success: #22c55e;
+    out property <color> status-error: #ef4444;
+    out property <color> status-warning: #eab308;
+    out property <color> status-info: #38bdf8;
     out property <color> bg-primary: is-dark ? ColorScale.day-white : ColorScale.night-black;
     out property <color> bg-primary-container: is-dark ? ColorScale.dark-primary-container : ColorScale.light-primary-container;
     out property <color> text-on-primary: is-dark ? ColorScale.night-black : ColorScale.day-white;

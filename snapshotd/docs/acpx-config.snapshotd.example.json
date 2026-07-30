@@ -3,7 +3,7 @@
   "mcp_servers": [
     {
       "type": "http",
-      "name": "snapshotd",
+      "name": "snapflow",
       "url": "http://127.0.0.1:7777/mcp",
       "headers": []
     }
@@ -12,7 +12,7 @@
     {
       "name": "default",
       "agent_id": "default",
-      "mcp_servers": ["snapshotd"]
+      "mcp_servers": ["snapflow"]
     }
   ]
 }

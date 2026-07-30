@@ -1,5 +1,5 @@
 //! [`PersistenceStore`]: the async-friendly handle callers use to read and
-//! write `sessions`/`transcripts` rows.
+//! write session/recovery metadata rows.
 //!
 //! Concurrency shape: `rusqlite::Connection` is a synchronous, `Send`-but-
 //! not-`Sync` handle, so the store wraps one in `Arc<Mutex<Connection>>`.
@@ -28,16 +28,15 @@ use std::sync::{Arc, Mutex};
 
 use super::error::PersistenceError;
 use super::sessions::{RecoveryMetadata, RecoveryStatus, RecoveryStatusCounts, SessionRecord};
-use super::transcripts::{Direction, TranscriptRecord};
 use crate::custom_agents::CustomAgent;
 
 #[derive(Clone)]
 pub struct PersistenceStore {
     conn: Arc<Mutex<Connection>>,
-    /// Counts written through this store. Comparing this against SQLite's
-    /// actual count lets a reconnect distinguish normal ACPX persistence
-    /// from an out-of-band transcript mutation.
-    known_transcript_counts: Arc<Mutex<HashMap<String, usize>>>,
+    /// Revisions written through this store. Comparing this against SQLite's
+    /// actual revision lets a reconnect distinguish normal ACPX state writes
+    /// from an out-of-band durable mutation without retaining payloads.
+    known_state_revisions: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl PersistenceStore {
@@ -60,7 +59,7 @@ impl PersistenceStore {
         migrate_sessions_columns(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            known_transcript_counts: Arc::new(Mutex::new(HashMap::new())),
+            known_state_revisions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -198,7 +197,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -223,7 +222,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
@@ -285,7 +284,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
@@ -346,7 +345,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
                  FROM sessions \
                  WHERE bridge_session_id = ?1 AND tenant_id = ?2 \
                  ORDER BY created_at DESC LIMIT 1",
@@ -524,54 +523,43 @@ impl PersistenceStore {
         .await
     }
 
-    /// Append one transcript record for `gateway_session_id`. Returns the
-    /// assigned row id. Cheap to call fire-and-forget via `tokio::spawn` --
-    /// see module docs.
-    pub async fn append_transcript(
+    /// Advance the durable session-state revision without retaining payloads.
+    pub async fn bump_state_revision(
         &self,
         gateway_session_id: impl Into<String>,
-        direction: Direction,
-        payload: serde_json::Value,
-        recorded_at: impl Into<String>,
     ) -> Result<i64, PersistenceError> {
         let gateway_session_id = gateway_session_id.into();
-        let recorded_at = recorded_at.into();
-        let payload_text = serde_json::to_string(&payload)?;
+        let query_id = gateway_session_id.clone();
         let conn = self.conn.clone();
-        let insert_session_id = gateway_session_id.clone();
-        let result = run_blocking(move || {
+        let revision = run_blocking(move || {
             let conn = lock(&conn)?;
-            conn.execute(
-                "INSERT INTO transcripts \
-                 (gateway_session_id, direction, payload, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    insert_session_id,
-                    direction.as_str(),
-                    payload_text,
-                    recorded_at
-                ],
+            let rows = conn.execute(
+                "UPDATE sessions SET state_revision = state_revision + 1 WHERE gateway_session_id = ?1",
+                params![query_id],
             )?;
-            Ok(conn.last_insert_rowid())
-        })
-        .await;
-        if result.is_ok() {
-            if let Some(count) = self
-                .known_transcript_counts
-                .lock()
-                .map_err(|_| PersistenceError::Poisoned)?
-                .get_mut(&gateway_session_id)
-            {
-                *count += 1;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(query_id));
             }
-        }
-        result
+            Ok(conn.query_row(
+                "SELECT state_revision FROM sessions WHERE gateway_session_id = ?1",
+                params![query_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+        let mut known = self
+            .known_state_revisions
+            .lock()
+            .map_err(|_| PersistenceError::Poisoned)?;
+        let baseline = known.entry(gateway_session_id).or_insert(0);
+        *baseline = (*baseline).max(revision);
+        Ok(revision)
     }
 
-    /// Return whether durable transcript state changed outside this store
+    /// Return whether durable session state changed outside this store
     /// since it was last observed. The first observation establishes a
-    /// baseline; successful [`Self::append_transcript`] calls advance it.
-    pub async fn transcript_state_changed(
+    /// baseline; successful [`Self::bump_state_revision`] calls advance it.
+    pub async fn state_revision_changed(
         &self,
         gateway_session_id: impl Into<String>,
     ) -> Result<bool, PersistenceError> {
@@ -580,16 +568,16 @@ impl PersistenceStore {
         let conn = self.conn.clone();
         let actual = run_blocking(move || {
             let conn = lock(&conn)?;
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM transcripts WHERE gateway_session_id = ?1",
+            let revision: i64 = conn.query_row(
+                "SELECT state_revision FROM sessions WHERE gateway_session_id = ?1",
                 params![query_id],
                 |row| row.get(0),
             )?;
-            Ok(usize::try_from(count).expect("SQLite transcript count is non-negative"))
+            Ok(revision)
         })
         .await?;
         let mut known = self
-            .known_transcript_counts
+            .known_state_revisions
             .lock()
             .map_err(|_| PersistenceError::Poisoned)?;
         match known.get_mut(&gateway_session_id) {
@@ -603,46 +591,6 @@ impl PersistenceStore {
                 Ok(false)
             }
         }
-    }
-
-    /// Fetch all transcript records for a session, oldest first -- future
-    /// replay/debugging read path.
-    pub async fn list_transcripts(
-        &self,
-        gateway_session_id: impl Into<String>,
-    ) -> Result<Vec<TranscriptRecord>, PersistenceError> {
-        let gateway_session_id = gateway_session_id.into();
-        let conn = self.conn.clone();
-        run_blocking(move || {
-            let conn = lock(&conn)?;
-            let mut stmt = conn.prepare(
-                "SELECT id, gateway_session_id, direction, payload, recorded_at \
-                 FROM transcripts WHERE gateway_session_id = ?1 ORDER BY id ASC",
-            )?;
-            let raw = stmt
-                .query_map(params![gateway_session_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-            let mut out = Vec::with_capacity(raw.len());
-            for (id, gateway_session_id, direction_text, payload_text, recorded_at) in raw {
-                out.push(TranscriptRecord {
-                    id: Some(id),
-                    gateway_session_id,
-                    direction: Direction::try_from(direction_text.as_str())?,
-                    payload: serde_json::from_str(&payload_text)?,
-                    recorded_at,
-                });
-            }
-            Ok(out)
-        })
-        .await
     }
 
     pub(crate) async fn set_agent_enabled(
@@ -1148,6 +1096,7 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         bridge_model_alias: row.get(16)?,
         bridge_config_options,
         custom_idle_ttl_seconds: row.get(18)?,
+        state_revision: row.get(19)?,
     })
 }
 
@@ -1177,6 +1126,7 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
         ("bridge_model_alias", "TEXT"),
         ("bridge_config_options_json", "TEXT"),
         ("custom_idle_ttl_seconds", "INTEGER"),
+        ("state_revision", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !column_names.iter().any(|column| column == name) {
             conn.execute(
@@ -1231,7 +1181,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[tokio::test]
     async fn oauth_tokens_round_trip_upsert_load_and_delete() {
@@ -1291,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_state_detects_an_out_of_band_database_write() {
+    async fn state_revision_detects_an_out_of_band_database_write() {
         let store = PersistenceStore::open_in_memory().expect("in-memory store");
         store
             .record_session(
@@ -1305,46 +1254,35 @@ mod tests {
             .await
             .expect("parent session");
         assert!(!store
-            .transcript_state_changed("session-1")
+            .state_revision_changed("session-1")
             .await
             .expect("baseline"));
         store
-            .append_transcript(
-                "session-1",
-                Direction::ClientToAgent,
-                json!({"method": "session/prompt"}),
-                "2026-07-16T00:00:00Z",
-            )
+            .bump_state_revision("session-1")
             .await
             .expect("normal ACPX write");
         assert!(!store
-            .transcript_state_changed("session-1")
+            .state_revision_changed("session-1")
             .await
             .expect("normal write stays current"));
 
         // This models an external session-file/import/database mutation:
         // it reaches SQLite but never advances PersistenceStore's known
-        // count, so a later resume must invalidate its old epoch.
+        // baseline, so a later resume must invalidate its old epoch.
         lock(&store.conn)
             .expect("sqlite lock")
             .execute(
-                "INSERT INTO transcripts \
-                 (gateway_session_id, direction, payload, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    "session-1",
-                    "agent_to_client",
-                    r#"{"method":"session/update"}"#,
-                    "2026-07-16T00:00:01Z"
-                ],
+                "UPDATE sessions SET state_revision = state_revision + 1 \
+                 WHERE gateway_session_id = ?1",
+                params!["session-1"],
             )
-            .expect("out-of-band insert");
+            .expect("out-of-band update");
         assert!(store
-            .transcript_state_changed("session-1")
+            .state_revision_changed("session-1")
             .await
             .expect("external write is detected"));
         assert!(!store
-            .transcript_state_changed("session-1")
+            .state_revision_changed("session-1")
             .await
             .expect("new baseline is acknowledged once"));
     }
@@ -1419,7 +1357,11 @@ mod tests {
             .list_recoverable_sessions(None)
             .await
             .expect("unbounded list");
-        assert_eq!(unbounded.len(), 2, "None must preserve the original unbounded behavior");
+        assert_eq!(
+            unbounded.len(),
+            2,
+            "None must preserve the original unbounded behavior"
+        );
 
         // Bounded to 24h: the 2-day-old row must be excluded, the
         // 5-minute-old row must still be included.

@@ -1,0 +1,104 @@
+// audit/extend instead of strings scattered across every component.
+export global Strings {
+    // Composer placeholder and send/stop buttons
+    out property <string> composer-placeholder: @tr("Ask the agent…  / skills  @ mcp  # files");
+    out property <string> send-message: @tr("Send message");
+    out property <string> stop-response: @tr("Stop response");
+
+    // Settings pane preview
+    out property <string> project: @tr("Project");
+    out property <string> global: @tr("Global");
+    out property <string> mcp-servers: @tr("MCP Servers");
+    out property <string> agents: @tr("Agents");
+    out property <string> default-command-timeout: @tr("Default command timeout");
+    out property <string> seconds-before-mcp-stalled: @tr("Seconds before an MCP server call is considered stalled");
+    out property <string> auto-restart-on-failure: @tr("Auto-restart on failure");
+    out property <string> relaunch-crashed-mcp: @tr("Relaunch a crashed MCP server process automatically");
+    out property <string> default-agent: @tr("Default agent");
+    out property <string> used-when-no-agent-specified: @tr("Used when a new thread doesn't specify one");
+    out property <string> install: @tr("Install");
+    out property <string> not-yet-installed: @tr("Not yet installed on this machine");
+
+    // Search and filter
+    out property <string> search-ellipsis: @tr("Search...");
+    out property <string> filter-options: @tr("Filter options");
+
+    // Agents view
+    out property <string> attach: @tr("Attach");
+    out property <string> cancel: @tr("Cancel");
+    out property <string> chat-defaults: @tr("Chat Defaults");
+    out property <string> no-orphaned-sessions: @tr("No orphaned sessions for this provider.");
+    out property <string> permission-profile: @tr("Permission profile");
+    out property <string> profile: @tr("Profile");
+    out property <string> recoverable-sessions: @tr("Recoverable Sessions");
+    out property <string> search-agents: @tr("Search agents");
+    out property <string> search-agents-ellipsis: @tr("Search agents...");
+
+    // Local terminal
+    out property <string> close-local-terminal: @tr("Close local terminal");
+    out property <string> close-local-terminal-overlay: @tr("Close local terminal overlay");
+    out property <string> expand-local-terminal: @tr("Expand local terminal");
+    out property <string> focus-local-terminal: @tr("Focus local terminal");
+    out property <string> kill: @tr("Kill");
+    out property <string> click-to-focus: @tr("click to focus");
+    out property <string> exited: @tr("exited");
+    out property <string> focused: @tr("focused");
+    out property <string> local-terminal: @tr("local terminal");
+
+    // Skills view
+    out property <string> skills: @tr("Skills");
+
+    // Context ring
+    out property <string> session-context: @tr("Session context");
+
+    // Labeled select (top tabs)
+    out property <string> show-global-settings: @tr("Show global settings");
+    out property <string> show-project-settings: @tr("Show project settings");
+
+    // Left tabs
+    out property <string> agents-section: @tr("Agents section");
+    out property <string> harness: @tr("Harness");
+    out property <string> harness-section: @tr("Harness section");
+    out property <string> mcp-servers-section: @tr("MCP Servers section");
+    out property <string> skills-section: @tr("Skills section");
+
+    // Harness view
+    out property <string> enabled: @tr("Enabled");
+
+    // Search bar
+    out property <string> search-settings: @tr("Search settings");
+    out property <string> search-settings-ellipsis: @tr("Search settings...");
+
+    // Agent card
+    out property <string> connected: @tr("Connected");
+    out property <string> installed: @tr("Installed");
+    out property <string> not-found: @tr("Not found");
+
+    // Message card
+    out property <string> agent: @tr("AGENT");
+    out property <string> thinking-label: @tr("THINKING");
+    out property <string> tool-label: @tr("TOOL");
+    out property <string> user: @tr("USER");
+
+    // Generic base controls (select, toggle, search)
+    out property <string> select-label: @tr("Select");
+    out property <string> select-ellipsis: @tr("Select...");
+    out property <string> select-prefix: @tr("Select ");
+    out property <string> toggle-default-label: @tr("Toggle");
+    out property <string> search-label: @tr("Search");
+    out property <string> save-label: @tr("Save");
+
+    // Expandable panel / call detail views
+    out property <string> full-call-details-payload: @tr("FULL CALL DETAILS & PAYLOAD");
+
+    // Agents view / profile picker
+    out property <string> install-agent-prefix: @tr("Install agent ");
+    out property <string> default-badge: @tr("Default");
+
+    // Agent card default/enable toggles
+    out property <string> unset-default-agent-prefix: @tr("Unset ");
+    out property <string> set-default-agent-prefix: @tr("Set ");
+    out property <string> as-default-agent-suffix: @tr(" as default agent");
+    out property <string> disable-prefix: @tr("Disable ");
+    out property <string> enable-prefix: @tr("Enable ");
+}

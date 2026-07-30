@@ -42,12 +42,14 @@ real `cargo test --workspace` run.
 `acpx-server` is configured entirely via environment variables (no config
 file is required for a minimal single-agent deployment):
 
-- `ACPX_BACKEND_CMD` -- space-separated program + args for the default/
-  native-mode backend (default: `npx -y @agentclientprotocol/codex-acp@1.1.2`).
+- `ACPX_DEFAULT_ACP_COMMAND` -- space-separated program + args for the
+  native-mode default ACP agent command (profiles override; default:
+  `npx -y @agentclientprotocol/codex-acp@1.1.2`). Legacy alias:
+  `ACPX_BACKEND_CMD`.
 - `ACPX_DEFAULT_AGENT_ID` -- id that command is registered under (default: `default`).
 - `ACPX_HTTP_BIND` -- HTTP/WS bind address (default: `127.0.0.1:8790`, loopback only).
 - `ACPX_AUTH_TOKEN` -- if set, requires `Authorization: Bearer <token>` on `POST /rpc` and the `GET /ws` upgrade; unset means no auth (still no TLS -- pair with a TLS-terminating reverse proxy for any non-loopback bind).
-- `ACPX_DB_PATH` -- sqlite file for session metadata + transcripts; unset skips persistence entirely.
+- `ACPX_DB_PATH` -- sqlite file for session metadata and state revisions; message transcripts remain Panel-Rust JSONL files. Unset skips ACPX persistence entirely.
 - `ACPX_CONFIG_FILE` -- path to a JSON file declaring providers/central MCP servers/profiles to provision at startup, before either transport starts accepting requests. See `acpx-server/src/provisioning.rs`'s doc comment for the full schema and the `secret`/`secret_env` distinction (`secret_env` -- reading the actual value from an env var rather than the file -- is the recommended shape for anything beyond local testing). A malformed or rejected file fails startup outright rather than booting a partially-configured gateway. Example:
 
   ```json

@@ -387,7 +387,8 @@ async fn handle_acp_socket(
                                     let Ok(frame) = serde_json::to_string(&update) else {
                                         continue;
                                     };
-                                    if !send_frame_bounded(&forwarder_sink, Message::Text(frame)).await
+                                    if !send_frame_bounded(&forwarder_sink, Message::Text(frame))
+                                        .await
                                     {
                                         break;
                                     }
@@ -864,7 +865,8 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 let Ok(payload) = serde_json::to_string(&update) else {
                                     continue;
                                 };
-                                if !send_frame_bounded(&forwarder_sink, Message::Text(payload)).await
+                                if !send_frame_bounded(&forwarder_sink, Message::Text(payload))
+                                    .await
                                 {
                                     break;
                                 }
@@ -1042,7 +1044,8 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 let Ok(payload) = serde_json::to_string(&update) else {
                                     continue;
                                 };
-                                if !send_frame_bounded(&forwarder_sink, Message::Text(payload)).await
+                                if !send_frame_bounded(&forwarder_sink, Message::Text(payload))
+                                    .await
                                 {
                                     break;
                                 }

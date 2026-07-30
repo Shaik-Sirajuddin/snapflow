@@ -67,7 +67,7 @@ class RecoveryProtocolTest(unittest.TestCase):
     def start_daemon(self) -> tuple[subprocess.Popen[bytes], AcpHttpClient]:
         port = free_port()
         env = os.environ | {
-            "ACPX_BACKEND_CMD": f"sh {self.backend_path}",
+            "ACPX_DEFAULT_ACP_COMMAND": f"sh {self.backend_path}",
             "ACPX_DEFAULT_AGENT_ID": "default",
             "ACPX_HTTP_BIND": f"127.0.0.1:{port}",
             "ACPX_DB_PATH": str(self.db_path),

@@ -69,13 +69,11 @@ pub(crate) fn is_live_verified(vendor_id: &str) -> bool {
 /// skills list," not a second, divergent notion of what counts as a skill.
 fn skill_source_dirs_visible_to_the_ui(project_root: Option<&Path>) -> Vec<std::path::PathBuf> {
     let global_dir = crate::skills_state::global_skills_dir(&crate::resolve_cache_dir());
-    let mut dirs: Vec<std::path::PathBuf> = crate::skills_state::scan_skills_dir(
-        &global_dir,
-        crate::skills_state::SkillScope::Global,
-    )
-    .into_iter()
-    .map(|entry| entry.path)
-    .collect();
+    let mut dirs: Vec<std::path::PathBuf> =
+        crate::skills_state::scan_skills_dir(&global_dir, crate::skills_state::SkillScope::Global)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
     if let Some(project_root) = project_root {
         let project_dir = crate::skills_state::project_skills_dir(project_root);
         dirs.extend(
@@ -272,7 +270,8 @@ mod tests {
         for (_vendor_id, outcome) in &results {
             assert!(matches!(
                 outcome,
-                Ok(RegisterOutcome::Registered { .. }) | Ok(RegisterOutcome::AdoptedExisting { .. })
+                Ok(RegisterOutcome::Registered { .. })
+                    | Ok(RegisterOutcome::AdoptedExisting { .. })
             ));
         }
 
@@ -283,7 +282,10 @@ mod tests {
             sync_agent_targets("codex-acp", None).expect("sync_agent_targets(codex-acp)");
         assert_eq!(codex_results.len(), 1);
         let expected_link = home.path().join(".codex").join("skills").join("commit");
-        assert!(fs::symlink_metadata(&expected_link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&expected_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         let unknown_results =
             sync_agent_targets("some-unknown-agent", None).expect("unknown agent is a no-op");
@@ -294,18 +296,14 @@ mod tests {
         let skill_dir_2 = write_skill(source_dir.path(), "review-pr");
         register_and_sync_new_skill(&skill_dir_2, None, &["codex-acp".to_string()])
             .expect("register_and_sync_new_skill");
-        assert!(home
-            .path()
-            .join(".codex/skills/review-pr")
-            .exists());
+        assert!(home.path().join(".codex/skills/review-pr").exists());
 
         // Backfill: a skill placed directly in the real UI-visible global
         // skills directory (not registered through this adapter at all --
         // simulating a skill created while "new-agent" was disabled or not
         // yet installed) must be picked up the first time sync_agent_targets
         // runs for a vendor_id that has never owned anything.
-        let global_ui_dir =
-            crate::skills_state::global_skills_dir(&crate::resolve_cache_dir());
+        let global_ui_dir = crate::skills_state::global_skills_dir(&crate::resolve_cache_dir());
         write_skill(&global_ui_dir, "pre-existing-global-skill");
 
         let manager = open_manager(None).unwrap();

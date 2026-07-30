@@ -1,4 +1,5 @@
 import { Metrics } from "../../../tokens/metrics.slint";
+import { Strings } from "../../../tokens/strings.slint";
 import { NavItem } from "../../../base/nav_item.slint";
 
 // Settings page chrome -- the `[Project | Global]` scope switcher from the
@@ -18,8 +19,8 @@ export component SettingsTopTabs inherits Rectangle {
 
         NavItem {
             width: 72px;
-            label: "Project";
-            button-accessible-label: "Show project settings";
+            label: Strings.project;
+            button-accessible-label: Strings.show-project-settings;
             active: root.scope == "project";
             centered: true;
             label-font-weight-active: 600;
@@ -28,8 +29,8 @@ export component SettingsTopTabs inherits Rectangle {
         }
         NavItem {
             width: 72px;
-            label: "Global";
-            button-accessible-label: "Show global settings";
+            label: Strings.global;
+            button-accessible-label: Strings.show-global-settings;
             active: root.scope == "global";
             centered: true;
             label-font-weight-active: 600;

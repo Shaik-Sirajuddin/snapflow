@@ -36,7 +36,7 @@ done
 "#;
 
 /// Records every backend call. The log path is the script's first argument
-/// because `ACPX_BACKEND_CMD` only supports whitespace-separated arguments.
+/// because `ACPX_DEFAULT_ACP_COMMAND` only supports whitespace-separated arguments.
 const RECOVERY_RECORDING_BACKEND_SCRIPT: &str = r#"
 log_path=$1
 fail_load_path=$2
@@ -168,13 +168,16 @@ async fn real_binary_applies_a_provisioning_file_at_startup() {
     );
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .env("ACPX_CONFIG_FILE", config_path.display().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_CONFIG_FILE", config_path.display().to_string())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let child = cmd.spawn().expect("spawn real acpx-server binary");
     let mut guard = ServerGuard {
         child,
@@ -257,13 +260,16 @@ async fn real_binary_refuses_to_start_with_an_invalid_provisioning_file() {
     );
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .env("ACPX_CONFIG_FILE", config_path.display().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_CONFIG_FILE", config_path.display().to_string())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let mut child = cmd.spawn().expect("spawn real acpx-server binary");
 
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -310,7 +316,7 @@ async fn real_binary_recovers_open_sqlite_sessions_before_client_requests() {
     let mut first_cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     first_cmd
         .env(
-            "ACPX_BACKEND_CMD",
+            "ACPX_DEFAULT_ACP_COMMAND",
             format!("sh {} {}", script_path.display(), log_path.display()),
         )
         .env("ACPX_HTTP_BIND", addr.to_string())
@@ -362,7 +368,7 @@ async fn real_binary_recovers_open_sqlite_sessions_before_client_requests() {
     let mut restart_cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     restart_cmd
         .env(
-            "ACPX_BACKEND_CMD",
+            "ACPX_DEFAULT_ACP_COMMAND",
             format!("sh {} {}", script_path.display(), log_path.display()),
         )
         .env("ACPX_HTTP_BIND", restart_addr.to_string())
@@ -443,7 +449,7 @@ async fn real_binary_skips_startup_recovery_when_disabled() {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
+        "ACPX_DEFAULT_ACP_COMMAND",
         format!("sh {} {}", script_path.display(), log_path.display()),
     )
     .env("ACPX_HTTP_BIND", addr.to_string())
@@ -505,7 +511,7 @@ async fn real_binary_recovered_session_accepts_websocket_prompt() {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
+        "ACPX_DEFAULT_ACP_COMMAND",
         format!("sh {} {}", script_path.display(), log_path.display()),
     )
     .env("ACPX_HTTP_BIND", addr.to_string())
@@ -578,7 +584,7 @@ async fn real_binary_survives_a_recovery_connector_outage() {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
+        "ACPX_DEFAULT_ACP_COMMAND",
         format!(
             "sh {} {} {}",
             script_path.display(),

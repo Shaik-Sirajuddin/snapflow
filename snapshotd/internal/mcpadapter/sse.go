@@ -6,9 +6,23 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/server"
 )
+
+type contextTokenKey struct{}
+
+// ContextTokenFromContext returns the opaque per-ACP-session token supplied
+// by panel-rust as an HTTP MCP header.
+func ContextTokenFromContext(ctx context.Context) string {
+	token, _ := ctx.Value(contextTokenKey{}).(string)
+	return token
+}
+
+func contextWithToken(ctx context.Context, r *http.Request) context.Context {
+	return context.WithValue(ctx, contextTokenKey{}, r.Header.Get("X-Snapshotd-Context-Token"))
+}
 
 // Credentials is the current HTTP Basic Auth check for an SSEServer. A
 // zero-value Credentials (Enabled == false) disables auth entirely -- the
@@ -33,6 +47,7 @@ type SSEServer struct {
 	addr       string
 	sse        *server.SSEServer
 	streamable *server.StreamableHTTPServer
+	sessions   *streamableSessionManager
 	httpServer *http.Server
 
 	credMu sync.RWMutex
@@ -45,10 +60,17 @@ type SSEServer struct {
 // transport (POST/GET/DELETE /mcp).
 func NewSSEServer(h Handler, addr string) *SSEServer {
 	mcpServer := New(h)
+	sessions := newStreamableSessionManager(time.Hour)
 	return &SSEServer{
-		addr:       addr,
-		sse:        server.NewSSEServer(mcpServer),
-		streamable: server.NewStreamableHTTPServer(mcpServer, server.WithEndpointPath("/mcp")),
+		addr: addr,
+		sse:  server.NewSSEServer(mcpServer, server.WithSSEContextFunc(contextWithToken)),
+		streamable: server.NewStreamableHTTPServer(mcpServer,
+			server.WithEndpointPath("/mcp"),
+			server.WithSessionIdManager(sessions),
+			server.WithSessionIdleTTL(time.Hour),
+			server.WithHTTPContextFunc(contextWithToken),
+		),
+		sessions: sessions,
 	}
 }
 
@@ -103,9 +125,26 @@ func (s *SSEServer) requireAuth(next http.Handler) http.Handler {
 // tests that want to exercise the auth check via httptest.
 func (s *SSEServer) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", s.streamable)
+	mux.Handle("/mcp", s.streamableHandler())
 	mux.Handle("/", s.sse)
 	return s.requireAuth(mux)
+}
+
+func (s *SSEServer) streamableHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// mcp-go validates POST session IDs, but intentionally does not
+		// validate GET IDs. Validate an explicitly supplied GET ID here so an
+		// expired session cannot silently create a new notification session.
+		if r.Method == http.MethodGet {
+			if id := r.Header.Get("Mcp-Session-Id"); id != "" {
+				if err := s.sessions.validateGET(id); err != nil {
+					http.Error(w, "session not found", http.StatusNotFound)
+					return
+				}
+			}
+		}
+		s.streamable.ServeHTTP(w, r)
+	})
 }
 
 // Listen binds the configured address without serving yet, so a caller

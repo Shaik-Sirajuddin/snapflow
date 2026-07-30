@@ -138,7 +138,11 @@ pub(crate) fn update_persistent(
         update(&mut model, msg)
     };
     if !result.1.is_empty() {
-        let model = panel.model.borrow().clone();
+        // Borrow the persistent model directly. Cloning `Model` duplicates
+        // RefCell key caches while keeping Slint VecModels shared, so sync
+        // would update a throwaway cache against the real UI model and
+        // trigger perpetual list reconciliation desyncs.
+        let model = panel.model.borrow();
         sync(&model, &panel.component, &result.1);
     }
     result
@@ -505,7 +509,14 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
-    let real_idx = panel.real_index(filtered_idx);
+    let expected_thread_id = panel.real_index(filtered_idx).and_then(|real_idx| {
+        panel
+            .model
+            .borrow()
+            .threads
+            .get(real_idx)
+            .map(|thread| thread.thread_id.clone())
+    });
     let (effects, _dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
@@ -522,8 +533,8 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
         effects.iter().all(|effect| {
             matches!(
                 effect,
-                crate::effect::Effect::SendPrompt { real_index, .. }
-                    if Some(*real_index) == real_idx
+                crate::effect::Effect::SendPrompt { thread_id, .. }
+                    if Some(thread_id) == expected_thread_id.as_ref()
             )
         }),
         "send effect must target the selected filtered index"
@@ -590,13 +601,34 @@ pub(crate) fn dispatch_queue_send_now(panel: &PanelSingleton, message_index: usi
     execute_effects(panel, effects);
 }
 
+/// SCNA-03: Return pressed on an empty compose box -- fast-tracks the
+/// front queue entry if one is eligible (safe no-op otherwise, see
+/// ComposeMsg::QueueFastTrack's own doc comment).
+pub(crate) fn dispatch_queue_fast_track(panel: &PanelSingleton) {
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)));
+    debug_assert!(
+        effects.len() <= 2
+            && effects.iter().all(|effect| matches!(
+                effect,
+                crate::effect::Effect::CancelGeneration { .. }
+                    | crate::effect::Effect::SendPrompt { .. }
+            )),
+        "Compose::QueueFastTrack must only produce CancelGeneration/SendPrompt effects"
+    );
+    execute_effects(panel, effects);
+}
+
 /// QueuedMessageBar stop -- pause queue auto-drain and cancel generation.
 pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
     let (effects, _dirty) =
         update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)));
     debug_assert!(
         effects.is_empty()
-            || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
+            || matches!(
+                effects.as_slice(),
+                [crate::effect::Effect::CancelGeneration { .. }]
+            ),
         "Compose::QueueStop must produce zero or one CancelGeneration effect"
     );
     execute_effects(panel, effects);
@@ -726,8 +758,10 @@ pub(crate) fn dispatch_terminal_kill_requested(
     component: &ChatPanel,
     terminal_id: String,
 ) {
-    let (effects, _dirty) =
-        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::Kill(terminal_id))));
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::Kill(terminal_id))),
+    );
     let _ = component;
     execute_effects(panel, effects);
 }
@@ -750,8 +784,10 @@ pub(crate) fn dispatch_terminal_close_overlay(panel: &PanelSingleton) {
 /// switching the active tab never touches which ids are open, only which
 /// one's content the overlay currently renders.
 pub(crate) fn dispatch_terminal_tab_selected(panel: &PanelSingleton, terminal_id: String) {
-    let (_effects, _dirty) =
-        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab(terminal_id))));
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab(terminal_id))),
+    );
     panel.dispatch_frame_input(crate::msg::FrameInput {
         selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
             .collect_selected_thread_snapshot(),
@@ -765,8 +801,10 @@ pub(crate) fn dispatch_terminal_tab_selected(panel: &PanelSingleton, terminal_id
 /// user action); the terminal itself is untouched, just no longer pinned
 /// open as a tab.
 pub(crate) fn dispatch_terminal_tab_closed(panel: &PanelSingleton, terminal_id: String) {
-    let (_effects, _dirty) =
-        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab(terminal_id))));
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab(terminal_id))),
+    );
     panel.dispatch_frame_input(crate::msg::FrameInput {
         selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
             .collect_selected_thread_snapshot(),
@@ -1120,10 +1158,17 @@ pub(crate) fn dispatch_mode_selected(
     execute_effects(panel, effects);
 }
 
-pub(crate) fn dispatch_profile_selected(panel: &PanelSingleton, profile_name: String) {
+pub(crate) fn dispatch_profile_selected(
+    panel: &PanelSingleton,
+    profile_name: String,
+    agent_id: String,
+) {
     let (effects, _) = update_persistent(
         panel,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(profile_name))),
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
+            profile_name,
+            agent_id,
+        })),
     );
     execute_effects(panel, effects);
 }
@@ -1319,13 +1364,15 @@ pub(crate) fn dispatch_search_submitted(
 }
 
 pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
-    let (_, dirty) = update_persistent(
+    // ToggleExpanded intentionally emits a one-row MessageRowPatch.  The
+    // reducer test covers that contract; requiring MessagesDiff here was an
+    // obsolete assertion that caused debug builds to abort during normal
+    // expand/collapse interaction, especially while project state was being
+    // refreshed concurrently.
+    let _ = update_persistent(
         panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))),
     );
-    debug_assert!(dirty
-        .iter()
-        .any(|item| matches!(item, Dirty::MessagesDiff { .. })));
 }
 
 pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
@@ -1345,8 +1392,45 @@ pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_project_created_untitled(panel: &PanelSingleton) {
+    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectCreatedUntitled));
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_project_closed(panel: &PanelSingleton) {
+    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectClosed));
+    execute_effects(panel, effects);
+}
+
+/// PISO-7: the explicit Save-As rename signal, kept as its own dispatch
+/// function rather than folded into `dispatch_project_path_changed` --
+/// see `HostMsg::ProjectPathRenamed`'s doc comment for why only the host
+/// (never an inferred pair of `ProjectPathChanged` calls) may say "this
+/// was a rename".
+pub(crate) fn dispatch_project_path_renamed(panel: &PanelSingleton, old: String, new: String) {
+    // Shotcut has no knowledge of the Rust-assigned untitled UUID. On the
+    // first save it therefore sends an empty old path; resolve that signal
+    // while the prior lifecycle identity is still available so the physical
+    // staging store can be moved into the saved project store.
+    let old = if old.is_empty() {
+        match panel.model.borrow().active_project.clone() {
+            crate::model::ProjectIdentity::Untitled(id) => id,
+            _ => old,
+        }
+    } else {
+        old
+    };
+    let (effects, _) =
+        update_persistent(panel, Msg::Host(HostMsg::ProjectPathRenamed { old, new }));
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_theme_changed(panel: &PanelSingleton, theme: String) {
     let _ = update_persistent(panel, Msg::Host(HostMsg::ThemeChanged(theme)));
+}
+
+pub(crate) fn dispatch_language_changed(panel: &PanelSingleton, language: String) {
+    let _ = update_persistent(panel, Msg::Host(HostMsg::LanguageChanged(language)));
 }
 
 pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32) -> bool {

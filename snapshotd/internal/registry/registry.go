@@ -5,15 +5,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
 // ErrNotFound is returned by lookups that find no matching row.
 var ErrNotFound = errors.New("registry: not found")
+
+// ErrProjectAlreadyExists is returned by project.create when the path is
+// already registered or already exists on disk. Distinct from project.open,
+// which attaches to whatever is already there.
+var ErrProjectAlreadyExists = errors.New("registry: project already exists")
 
 // Registry wraps a GORM database handle and exposes the daemon's persistence
 // operations. It is safe for concurrent use (GORM/database/sql pool their own
@@ -47,7 +54,7 @@ func Open(path string) (*Registry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: open %s: %w", path, err)
 	}
-	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &ExternalInstance{}, &McpContext{}, &AuditEvent{}); err != nil {
 		return nil, fmt.Errorf("registry: automigrate: %w", err)
 	}
 	return &Registry{db: db}, nil
@@ -119,6 +126,9 @@ func (r *Registry) CreateProject(p *Project) error {
 	if p.Status == "" {
 		p.Status = "active"
 	}
+	if p.ProjectType == "" {
+		p.ProjectType = ProjectTypeFolder
+	}
 	now := time.Now().UTC()
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
@@ -127,6 +137,27 @@ func (r *Registry) CreateProject(p *Project) error {
 		p.LastOpenedAt = now
 	}
 	return r.db.Create(p).Error
+}
+
+// UpdateProjectType persists the authoritative file|folder type after open.
+func (r *Registry) UpdateProjectType(id, projectType string) error {
+	if projectType != ProjectTypeFolder && projectType != ProjectTypeFile {
+		return fmt.Errorf("registry: invalid projectType %q", projectType)
+	}
+	return r.db.Model(&Project{}).Where("id = ?", id).Update("project_type", projectType).Error
+}
+
+// FillProjectPathFields sets Path and ProjectID on a Project for path-first APIs.
+func FillProjectPathFields(p *Project) {
+	if p == nil {
+		return
+	}
+	p.ProjectID = p.ID
+	if p.ProjectType == ProjectTypeFile {
+		p.Path = filepath.Join(p.RootDir, p.MltFileName)
+	} else {
+		p.Path = p.RootDir
+	}
 }
 
 func (r *Registry) GetProject(id string) (*Project, error) {
@@ -140,12 +171,116 @@ func (r *Registry) GetProject(id string) (*Project, error) {
 	return &p, nil
 }
 
+// EnsureProjectForPath makes an externally opened MLT visible in the same
+// project inventory used by daemon-launched instances. It never creates or
+// deletes files; it only derives the registry folder/file identity.
+func (r *Registry) EnsureProjectForPath(projectPath string) (*Project, error) {
+	abs, err := filepath.Abs(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = filepath.Clean(resolved)
+	}
+	root := filepath.Dir(abs)
+	fileName := filepath.Base(abs)
+	if filepath.Ext(abs) == "" {
+		root = abs
+		fileName = DefaultMltFileName
+	}
+	var existing Project
+	if err := r.db.Where("root_dir = ?", root).First(&existing).Error; err == nil {
+		return &existing, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	project := &Project{
+		ID: uuid.NewString(), RootDir: root, MltFileName: fileName, Status: "active",
+	}
+	if err := r.CreateProject(project); err != nil {
+		return nil, err
+	}
+	return project, nil
+}
+
 func (r *Registry) ListProjects() ([]Project, error) {
 	var out []Project
 	if err := r.db.Order("created_at asc").Find(&out).Error; err != nil {
 		return nil, err
 	}
+	instances, err := r.ListExternalInstances()
+	if err != nil {
+		return nil, err
+	}
+	// Newest process instance per project (for active/isOpen marker).
+	allPI, err := r.ListProcessInstances()
+	if err != nil {
+		return nil, err
+	}
+	newestPI := map[string]ProcessInstance{}
+	for i := len(allPI) - 1; i >= 0; i-- { // ListProcessInstances is started_at asc
+		pi := allPI[i]
+		if _, ok := newestPI[pi.ProjectID]; !ok {
+			newestPI[pi.ProjectID] = pi
+		}
+	}
+	for i := range out {
+		projectRoot := filepath.Clean(out[i].RootDir)
+		for _, instance := range instances {
+			if instance.ProjectPath == "" {
+				continue
+			}
+			instanceRoot := filepath.Clean(instance.ProjectPath)
+			if filepath.Ext(instanceRoot) == ".mlt" {
+				instanceRoot = filepath.Dir(instanceRoot)
+			} else if info, statErr := os.Stat(instanceRoot); statErr == nil && !info.IsDir() {
+				instanceRoot = filepath.Dir(instanceRoot)
+			}
+			if instanceRoot != projectRoot {
+				continue
+			}
+			out[i].InstanceCount++
+			if instance.Status == ExternalStatusOpen && instance.LeaseExpiresAt.After(time.Now().UTC()) {
+				out[i].Open = true
+				out[i].DiscoveryState = "registered"
+			}
+			if instance.LastSeenAt.After(out[i].LastSeenAt) {
+				out[i].LastSeenAt = instance.LastSeenAt
+			}
+		}
+		if out[i].DiscoveryState == "" {
+			out[i].DiscoveryState = "known"
+		}
+		// active/isOpen: most recent ProcessInstance Status == ready (DB-only).
+		// Also fold daemon-launched ready instances into open/instanceCount so
+		// list aggregates cover both external leases and owned children.
+		if pi, ok := newestPI[out[i].ID]; ok && pi.Status == StatusReady {
+			out[i].Active = true
+			out[i].IsOpen = true
+			out[i].Open = true
+			out[i].InstanceCount++
+			out[i].DiscoveryState = "registered"
+			if pi.LastHealthCheckAt.After(out[i].LastSeenAt) {
+				out[i].LastSeenAt = pi.LastHealthCheckAt
+			}
+		}
+		FillProjectPathFields(&out[i])
+	}
 	return out, nil
+}
+
+// GetProjectByRootDir returns the project registered at rootDir, or ErrNotFound.
+func (r *Registry) GetProjectByRootDir(rootDir string) (*Project, error) {
+	var p Project
+	if err := r.db.Where("root_dir = ?", rootDir).First(&p).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	FillProjectPathFields(&p)
+	return &p, nil
 }
 
 func (r *Registry) DeleteProject(id string) error {
@@ -224,6 +359,76 @@ func (r *Registry) TouchHealthCheck(id string) error {
 	return r.db.Model(&ProcessInstance{}).Where("id = ?", id).Update("last_health_check_at", time.Now().UTC()).Error
 }
 
+// GetExternalInstanceByNonce returns the one registration owned by a GUI
+// instance nonce, allowing reconnect/retry to be idempotent.
+func (r *Registry) GetExternalInstanceByNonce(nonce string) (*ExternalInstance, error) {
+	var instance ExternalInstance
+	if err := r.db.First(&instance, "instance_nonce = ?", nonce).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &instance, nil
+}
+
+func (r *Registry) GetExternalInstance(id string) (*ExternalInstance, error) {
+	var instance ExternalInstance
+	if err := r.db.First(&instance, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &instance, nil
+}
+
+func (r *Registry) ListExternalInstances() ([]ExternalInstance, error) {
+	var out []ExternalInstance
+	if err := r.db.Order("updated_at desc").Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (r *Registry) SaveExternalInstance(instance *ExternalInstance) error {
+	return r.db.Save(instance).Error
+}
+
+func (r *Registry) GetMcpContext(token string) (*McpContext, error) {
+	var context McpContext
+	if err := r.db.First(&context, "context_token = ?", token).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &context, nil
+}
+
+func (r *Registry) SaveMcpContext(context *McpContext) error {
+	return r.db.Save(context).Error
+}
+
+func (r *Registry) ListMcpContexts() ([]McpContext, error) {
+	var out []McpContext
+	if err := r.db.Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (r *Registry) DeleteMcpContext(token string) error {
+	result := r.db.Delete(&McpContext{}, "context_token = ?", token)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // --- Audit ---
 
 func (r *Registry) Audit(projectID, kind, detail string) error {
@@ -233,6 +438,22 @@ func (r *Registry) Audit(projectID, kind, detail string) error {
 		Detail:    detail,
 		Timestamp: time.Now().UTC(),
 	}).Error
+}
+
+// AuditOnce records an audit event only if no prior row exists for the
+// same projectID+kind pair. Used for AuditInit so multi-client
+// project.select/Bind re-attaches do not spam init rows.
+func (r *Registry) AuditOnce(projectID, kind, detail string) error {
+	var n int64
+	if err := r.db.Model(&AuditEvent{}).
+		Where("project_id = ? AND kind = ?", projectID, kind).
+		Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	return r.Audit(projectID, kind, detail)
 }
 
 func (r *Registry) ListAuditEvents(projectID string) ([]AuditEvent, error) {

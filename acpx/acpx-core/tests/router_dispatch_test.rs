@@ -413,7 +413,10 @@ async fn background_mode_suppresses_session_close_and_the_session_stays_promptab
         }))
         .await
         .expect("session/new");
-    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+    let gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let close_response = router
         .dispatch(json!({
@@ -453,7 +456,10 @@ async fn background_mode_bg_off_override_forces_a_real_close() {
         }))
         .await
         .expect("session/new");
-    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+    let gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let close_response = router
         .dispatch(json!({
@@ -495,7 +501,10 @@ async fn background_mode_off_by_default_keeps_a_real_close() {
         }))
         .await
         .expect("session/new");
-    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+    let gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     router
         .dispatch(json!({
@@ -541,7 +550,10 @@ async fn background_mode_suppresses_session_close_via_dispatch_shared_too() {
     )
     .await
     .expect("session/new");
-    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+    let gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let close_response = dispatch_shared(
         &router,

@@ -18,20 +18,21 @@
 //!   prompt turn would have produced (a stand-in for "replay history").
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CloseSessionRequest,
-    CloseSessionResponse, ContentBlock, ContentChunk, CancelNotification, DeleteSessionRequest,
+    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, DeleteSessionRequest,
     DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
-    NewSessionResponse, PromptResponse, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionId, SessionInfo, SessionNotification, SessionUpdate,
-    StopReason, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionConfigSelectOption,
+    SessionId, SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
+    TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -69,7 +70,10 @@ fn persona_prefix() -> String {
 /// advertises no commands at all, matching `persona_prefix`'s own
 /// "direct, non-gateway dev path stays unchanged" convention.
 fn persona_commands() -> Vec<AvailableCommand> {
-    match std::env::var("RUI_MOCK_AGENT_PERSONA").unwrap_or_default().as_str() {
+    match std::env::var("RUI_MOCK_AGENT_PERSONA")
+        .unwrap_or_default()
+        .as_str()
+    {
         "codex" => vec![
             AvailableCommand::new("codex_plan", "Draft an execution plan (codex persona)"),
             AvailableCommand::new("codex_review", "Review a diff (codex persona)"),
@@ -136,7 +140,9 @@ fn with_sessions<T>(f: impl FnOnce(&mut HashMap<String, SessionState>) -> T) -> 
 static CANCEL_NOTIFY: Mutex<Option<HashMap<String, Arc<Notify>>>> = Mutex::new(None);
 
 fn cancel_notify_for(session_id: &str) -> Arc<Notify> {
-    let mut guard = CANCEL_NOTIFY.lock().expect("mock-agent cancel map poisoned");
+    let mut guard = CANCEL_NOTIFY
+        .lock()
+        .expect("mock-agent cancel map poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
     map.entry(session_id.to_string())
         .or_insert_with(|| Arc::new(Notify::new()))
@@ -194,7 +200,7 @@ async fn main() -> Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_request: agent_client_protocol::schema::v1::NewSessionRequest,
+            async move |request: agent_client_protocol::schema::v1::NewSessionRequest,
                         responder,
                         _connection| {
                 let id = format!("mock-session-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
@@ -209,8 +215,37 @@ async fn main() -> Result<()> {
                         },
                     );
                 });
-                record_gateway_event("session/new", Some(&id), "");
-                responder.respond(NewSessionResponse::new(SessionId::new(id)))
+                // PISO-6: the live isolation matrix needs to assert each
+                // thread's `session/new` actually carried its OWN project's
+                // cwd (not the global override) -- `request.cwd` is the one
+                // place that's visible from outside the panel process, so
+                // it's logged as this event's `detail` instead of the
+                // previously-discarded `""`. Every existing assertion in
+                // this crate keys off `detail` by exact string match on
+                // prompt text, never `session/new`'s, so this is additive.
+                record_gateway_event("session/new", Some(&id), &request.cwd.to_string_lossy());
+                // acpx-client-session-lease-pool regression coverage: a real
+                // backend (claude-acp) advertises configOptions on its
+                // session/new response; this mock previously returned a
+                // bare response with none at all, which meant the
+                // "fresh-create sessions never got capability events" bug
+                // (see thread_actor.rs's AcquireAndAttach) was invisible to
+                // every mock-agent-backed e2e scenario -- there was nothing
+                // to fail to propagate. One fake "model" select option is
+                // enough for a test to assert ChatInput's config dropdown
+                // actually populates for a pool-created thread.
+                let config_options = vec![SessionConfigOption::select(
+                    "model",
+                    "Model",
+                    "mock-model-a",
+                    vec![
+                        SessionConfigSelectOption::new("mock-model-a", "Mock Model A"),
+                        SessionConfigSelectOption::new("mock-model-b", "Mock Model B"),
+                    ],
+                )];
+                responder.respond(
+                    NewSessionResponse::new(SessionId::new(id)).config_options(config_options),
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -253,6 +288,39 @@ async fn main() -> Result<()> {
                             )),
                         ));
                     }
+                }
+                // PROF-11 e2e marker (same lowercase-plain-word convention
+                // as `"slow "` below): a `"plan "`-prefixed prompt gets a
+                // real `plan` session/update (two entries, one completed
+                // one in-progress -- exercising both `PlanEntryStatus`
+                // values a single notification could plausibly carry) and
+                // a real `session_info_update` pushing a live title,
+                // BEFORE the usual thought/tool_call/message-chunk turn --
+                // gated behind this marker (not sent on every turn) so it
+                // doesn't perturb the message-count/ordering assumptions
+                // every other existing e2e test already depends on.
+                if text.starts_with("plan ") {
+                    let _ = connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::Plan(Plan::new(vec![
+                            PlanEntry::new(
+                                "Read the file",
+                                PlanEntryPriority::High,
+                                PlanEntryStatus::Completed,
+                            ),
+                            PlanEntry::new(
+                                "Fix the bug",
+                                PlanEntryPriority::Medium,
+                                PlanEntryStatus::InProgress,
+                            ),
+                        ])),
+                    ));
+                    let _ = connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::SessionInfoUpdate(
+                            SessionInfoUpdate::new().title("Fixing the login bug"),
+                        ),
+                    ));
                 }
                 // Lowercase, punctuation-free marker: the real host XTEST
                 // driver (`host_e2e_driver.py`) taps unshifted keysyms one
@@ -366,12 +434,12 @@ async fn main() -> Result<()> {
                         );
                         let _ = connection_for_wait.send_notification(SessionNotification::new(
                             session_id_for_wait.clone(),
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                                TextContent::new(format!(
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(format!(
                                     "{}permission decision: {chosen}",
                                     persona_prefix()
-                                )),
-                            ))),
+                                ))),
+                            )),
                         ));
                         let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                     });
@@ -444,10 +512,10 @@ async fn main() -> Result<()> {
                         agent_client_protocol::util::internal_error("unknown session id"),
                     );
                 }
-               responder.respond(ResumeSessionResponse::new())
-           },
-           agent_client_protocol::on_receive_request!(),
-       )
+                responder.respond(ResumeSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_request(
             async move |request: CloseSessionRequest, responder, _connection| {
                 // Real, stable v1 ACP `session/close` -- Coverage Matrix

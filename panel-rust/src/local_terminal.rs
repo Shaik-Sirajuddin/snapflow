@@ -77,11 +77,13 @@ impl LocalTerminal {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if let Ok(mut parser) = parser_for_reader.lock() {
-                            parser.process(&buf[..n]);
-                        } else {
-                            break;
-                        }
+                        // SCNA-08: self-heal on poison, matching agent_bridge.rs/
+                        // state_store.rs's convention -- a panic elsewhere while
+                        // holding this lock must not permanently stop this reader
+                        // thread from ever processing PTY output again.
+                        let mut parser =
+                            parser_for_reader.lock().unwrap_or_else(|e| e.into_inner());
+                        parser.process(&buf[..n]);
                     }
                 }
             }
@@ -124,9 +126,10 @@ impl LocalTerminal {
                 pixel_height: 0,
             })
             .map_err(to_io_err)?;
-        if let Ok(mut parser) = self.parser.lock() {
-            parser.set_size(rows, cols);
-        }
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_size(rows, cols);
         self.cols = cols;
         self.rows = rows;
         Ok(())
@@ -138,19 +141,21 @@ impl LocalTerminal {
     /// cursor movement, clear-screen, etc. all actually interpreted),
     /// not a raw-byte passthrough.
     pub fn screen_text(&self) -> String {
-        match self.parser.lock() {
-            Ok(parser) => parser.screen().contents(),
-            Err(_) => String::new(),
-        }
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .contents()
     }
 
     /// 0-indexed `(row, col)` cursor position within the current
     /// screen, for a caret indicator in the UI.
     pub fn cursor_position(&self) -> (u16, u16) {
-        match self.parser.lock() {
-            Ok(parser) => parser.screen().cursor_position(),
-            Err(_) => (0, 0),
-        }
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .cursor_position()
     }
 
     pub fn cols(&self) -> u16 {
@@ -243,6 +248,38 @@ mod tests {
             "expected the real PTY's own stty size to report the resized dimensions, got: {:?}",
             term.screen_text()
         );
+    }
+
+    /// SCNA-08: a panic anywhere while holding `parser`'s lock must not
+    /// permanently wedge screen_text/cursor_position/resize for the rest
+    /// of this terminal's life -- matches state_store.rs's own poison
+    /// regression test (`a_poisoned_connection_mutex_self_heals_...`)
+    /// added when agent_bridge.rs/state_store.rs were converted to the
+    /// same self-healing convention.
+    #[test]
+    fn a_poisoned_parser_mutex_self_heals_instead_of_wedging_screen_reads() {
+        let mut term = LocalTerminal::spawn(80, 24).expect("spawn local terminal");
+        let parser = Arc::clone(&term.parser);
+        let joined = std::thread::spawn(move || {
+            let _guard = parser.lock().unwrap();
+            panic!("intentionally poison the parser mutex while holding the guard");
+        })
+        .join();
+        assert!(joined.is_err(), "the spawned thread should have panicked");
+
+        // Pre-fix (the old `if let Ok(...) { .. } else { break/default }`
+        // style) these still "worked" in the sense of not panicking, but
+        // silently returned empty/zero forever instead of the real
+        // screen state once poisoned. Self-healing means they recover
+        // real data on the next successful lock instead.
+        let _ = term.screen_text();
+        let _ = term.cursor_position();
+        assert!(
+            term.resize(100, 40).is_ok(),
+            "resize must not fail just because the parser mutex was poisoned earlier"
+        );
+        assert_eq!(term.cols(), 100);
+        assert_eq!(term.rows(), 40);
     }
 
     #[test]

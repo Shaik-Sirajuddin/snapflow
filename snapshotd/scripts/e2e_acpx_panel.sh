@@ -64,14 +64,14 @@ doc = {
   "providers": [],
   "mcp_servers": [{
     "type": "http",
-    "name": "snapshotd",
+    "name": "snapflow",
     "url": "http://${MCP_BIND}/mcp",
     "headers": [],
   }],
   "profiles": [{
     "name": "default",
     "agent_id": "default",
-    "mcp_servers": ["snapshotd"],
+    "mcp_servers": ["snapflow"],
   }],
 }
 Path("$CFG").write_text(json.dumps(doc, indent=2) + "\n")
@@ -98,7 +98,7 @@ PY
   if curl -sf -X POST "http://${ACPX_BIND}/rpc" \
       -H 'Content-Type: application/json' \
       -d "$RPC_BODY" | tee -a "$LOG" | grep -q snapshotd; then
-    echo "PASS: mcp_servers/list contains snapshotd" | tee -a "$LOG"
+    echo "PASS: mcp_servers/list contains snapflow" | tee -a "$LOG"
   else
     echo "WARN: could not confirm snapshotd in list (gateway may need auth/backend)" | tee -a "$LOG"
     # still pass health-only if list endpoint shape differs

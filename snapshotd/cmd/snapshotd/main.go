@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"snapshotd/internal/acpnode"
 	"snapshotd/internal/acpxmgr"
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
@@ -48,12 +49,18 @@ func main() {
 		err = cmdLaunch(cfg, os.Args[2:])
 	case "list":
 		err = cmdList(cfg, os.Args[2:])
+	case "listProjects":
+		err = cmdListProjects(cfg, os.Args[2:])
 	case "close":
 		err = cmdClose(cfg, os.Args[2:])
 	case "mcp":
 		err = cmdMCP(cfg, os.Args[2:])
 	case "install":
 		err = cmdInstall(cfg, os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(cfg, os.Args[2:])
+	case "runtime":
+		err = cmdRuntime(cfg, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -77,6 +84,7 @@ Usage:
   snapshotd stop                         ask a running daemon to shut down gracefully
   snapshotd launch <projectId>           convenience wrapper around daemon.launch
   snapshotd list                         list known process instances (bare daemon.list)
+  snapshotd listProjects                 list known projects (bare daemon.listProjects)
   snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
   snapshotd mcp status                   show the MCP listener's bind address and auth state
   snapshotd mcp restart [--bind ADDR]    rebind the MCP listener (default 127.0.0.1:7777; a
@@ -85,7 +93,8 @@ Usage:
   snapshotd mcp auth set --user U --password P
                                           set/replace the MCP listener's Basic Auth credentials
   snapshotd mcp install-config get       print the MCP endpoint + credentials for a client config
-  snapshotd install                      print what installing a system service would do (not implemented for real)`)
+  snapshotd install                      print what installing a system service would do (not implemented for real)  snapshotd doctor                       check ACP Node/npm (global-first, then product bundle)
+	  snapshotd runtime install node [--force]  install official Node into product runtime/ (if global missing)`)
 }
 
 func cmdServe(cfg config.Config, args []string) error {
@@ -130,6 +139,16 @@ func cmdServe(cfg config.Config, args []string) error {
 		logger.Warn("startup reconciliation failed", "err", err)
 	}
 
+	// ACP Node fallback: if global node missing and bundle missing, try
+	// official local install once (same policy as install.sh ensure).
+	if acpnode.Resolve().Source == acpnode.SourceMissing {
+		if err := acpnode.Ensure(false); err != nil {
+			logger.Warn("ACP Node ensure failed (agents needing node/npm will be limited)", "err", err)
+		} else {
+			logger.Info("ACP Node runtime ready", "source", string(acpnode.Resolve().Source))
+		}
+	}
+
 	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
 	sdpErrCh := make(chan error, 1)
 	go func() {
@@ -154,14 +173,14 @@ func cmdServe(cfg config.Config, args []string) error {
 		} else {
 			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			mgr, err := acpxmgr.Start(startCtx, acpxmgr.Config{
-				BinPath:        cfg.AcpxBinPath,
-				HttpBind:       cfg.AcpxHttpBind,
-				ConfigPath:     cfg.AcpxConfigPath,
-				DbPath:         filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
-				McpURL:         acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
-				DefaultAgentID: "default",
-				BackendCmd:     cfg.AcpxBackendCmd,
-				Log:            logger,
+				BinPath:           cfg.AcpxBinPath,
+				HttpBind:          cfg.AcpxHttpBind,
+				ConfigPath:        cfg.AcpxConfigPath,
+				DbPath:            filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
+				McpURL:            acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
+				DefaultAgentID:    "default",
+				DefaultAcpCommand: cfg.AcpxDefaultAcpCommand,
+				Log:               logger,
 			})
 			startCancel()
 			if err != nil {
@@ -311,6 +330,29 @@ func cmdList(cfg config.Config, args []string) error {
 	}
 	for _, in := range instances {
 		enc, _ := json.Marshal(in)
+		fmt.Println(string(enc))
+	}
+	return nil
+}
+
+// cmdListProjects mirrors cmdList exactly, for daemon.listProjects instead
+// of daemon.list -- PISO-8: the panel needs both (an instance's ProjectID
+// alone has no display path/name; that lives on the Project row, per
+// registry.Project's RootDir) to show which real project a live instance
+// is actually for.
+func cmdListProjects(cfg config.Config, args []string) error {
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var projects []map[string]any
+	if err := c.Call("daemon.listProjects", map[string]any{}, &projects); err != nil {
+		return fmt.Errorf("daemon.listProjects: %w", err)
+	}
+	for _, p := range projects {
+		enc, _ := json.Marshal(p)
 		fmt.Println(string(enc))
 	}
 	return nil
@@ -466,5 +508,32 @@ A real implementation would, per 08-lifecycle-and-cli.md:
 None of that is performed here -- this command intentionally only prints
 this description and exits 0, so it is never mistaken for having actually
 modified host service configuration.`)
+	return nil
+}
+
+func cmdDoctor(cfg config.Config, args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: snapshotd doctor")
+	}
+	fmt.Print(acpnode.DoctorReport())
+	return nil
+}
+
+func cmdRuntime(cfg config.Config, args []string) error {
+	if len(args) < 2 || args[0] != "install" || args[1] != "node" {
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
+	}
+	force := false
+	for _, arg := range args[2:] {
+		if arg == "--force" {
+			force = true
+			continue
+		}
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
+	}
+	if err := acpnode.Ensure(force); err != nil {
+		return err
+	}
+	fmt.Print(acpnode.DoctorReport())
 	return nil
 }

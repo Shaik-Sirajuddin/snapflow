@@ -80,7 +80,7 @@ fn deleting_a_key_makes_a_profile_that_references_it_fail_to_resolve() {
     // Keystore and ProfileStore are independent -- deleting a key doesn't
     // cascade into the profile that references it (no foreign-key-style
     // enforcement between these two in-memory stores, unlike sqlite's
-    // sessions/transcripts). A profile referencing a deleted key should
+    // sessions and message transcripts). A profile referencing a deleted key should
     // fail to *resolve* (what `router.rs` does at `session/new`), not
     // silently succeed with an empty/wrong secret.
     let mut keystore = Keystore::new();

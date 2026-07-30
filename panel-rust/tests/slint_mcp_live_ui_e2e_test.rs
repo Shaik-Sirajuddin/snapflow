@@ -30,6 +30,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile};
+
 fn repo_root() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -37,29 +41,8 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
-fn mock_agent_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent")
-}
-
-fn acpx_server_bin() -> PathBuf {
-    repo_root().join("acpx/target/debug/acpx-server")
-}
-
 fn shotcut_bin() -> PathBuf {
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
-}
-
-/// Same "bind an ephemeral port, drop it immediately, hand the number to
-/// the real process" trick `gateway_actor_e2e_test.rs`'s `free_port()`
-/// uses -- has the same inherent TOCTOU gap that helper's own doc comment
-/// documents; acceptable here for the same reason (this is a single,
-/// bounded-once acquisition per test run, not a hot loop).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
 }
 
 fn free_x_display() -> u32 {
@@ -122,7 +105,14 @@ impl LiveUiHarness {
         let display = free_x_display();
         let display_str = format!(":{display}");
         let xvfb = Command::new("Xvfb")
-            .args([&display_str, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+            .args([
+                &display_str,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -152,15 +142,14 @@ impl LiveUiHarness {
 
         let gateway_port = free_port();
         let persona = "codex";
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
         let acpx_server = Command::new(acpx_server_bin())
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{gateway_port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
             .env("ACPX_DEFAULT_AGENT_ID", persona)
             .env("ACPX_DB_PATH", state_dir.join("acpx/gateway.sqlite3"))
-            .env("RUI_MOCK_AGENT_PERSONA", persona)
+            .env("ACPX_ADMIN_TOKEN", &admin_token)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", "error")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -186,9 +175,46 @@ impl LiveUiHarness {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        // PROF-4 (`profile-only-backend-selection` plan): the panel used to
+        // reach `rui-mock-agent` via `ACPX_BACKEND_CMD` + native/unmanaged
+        // mode (removed from production in PROF-3). Replaced with a real
+        // profile: `provision_mock_profile` registers `rui-mock-agent` as a
+        // durable custom agent under `"mock-codex"` (deliberately NOT
+        // `persona` itself -- acpx-server's own `main.rs` unconditionally
+        // pre-registers a supervisor entry under `ACPX_DEFAULT_AGENT_ID` at
+        // startup using its bare npx-codex-acp default, so reusing that
+        // exact id here would 409 with "custom agent id codex conflicts
+        // with an existing registered backend") and creates a profile
+        // literally named `persona` ("codex") pointing at it. The
+        // settings.global.json written below (before shotcut starts) sets
+        // `default_agent_id: "codex"`, which the panel's own cold-start
+        // seed binds as `_acpx.profile` (`lib.rs`'s `cold_start_thread_
+        // specs`) -- so this panel run never touches native mode at all.
+        let base_url = format!("http://127.0.0.1:{gateway_port}");
+        provision_mock_profile(
+            &base_url,
+            admin_port,
+            &admin_token,
+            persona,
+            std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        let settings_dir = state_dir.join("panel-settings");
+        std::fs::create_dir_all(&settings_dir).expect("create panel settings dir");
+        std::fs::write(
+            settings_dir.join("settings.global.json"),
+            format!(r#"{{"schema_version":1,"default_agent_id":"{persona}"}}"#),
+        )
+        .expect("write settings.global.json");
+
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())
-            .args(["--appdata", state_dir.join("shotcut").to_str().unwrap(), "--noupgrade"])
+            .args([
+                "--appdata",
+                state_dir.join("shotcut").to_str().unwrap(),
+                "--noupgrade",
+            ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
             .env("SLINT_MCP_PORT", mcp_port.to_string())
@@ -287,7 +313,10 @@ impl LiveUiHarness {
     /// (200) truncates well before this UI's real size.
     async fn element_tree(&self, window_handle: &Value) -> Vec<Value> {
         let root_handle = self
-            .tool_call("get_window_properties", json!({"windowHandle": window_handle}))
+            .tool_call(
+                "get_window_properties",
+                json!({"windowHandle": window_handle}),
+            )
             .await["rootElementHandle"]
             .clone();
         let tree = self
@@ -296,10 +325,7 @@ impl LiveUiHarness {
                 json!({"elementHandle": root_handle, "maxElements": 4000}),
             )
             .await;
-        tree["elements"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        tree["elements"].as_array().cloned().unwrap_or_default()
     }
 
     async fn find_by_label_prefix(&self, window_handle: &Value, prefix: &str) -> Option<Value> {
@@ -420,7 +446,9 @@ async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
     );
     // Also present: rename + archive arms for the same selected row.
     let rename = wait_for(Duration::from_secs(5), || async {
-        harness.find_by_label_prefix(&window, "Rename thread ").await
+        harness
+            .find_by_label_prefix(&window, "Rename thread ")
+            .await
     })
     .await;
     assert!(
@@ -430,7 +458,9 @@ async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
         "selected seed thread must also expose a Rename thread control"
     );
     let archive = wait_for(Duration::from_secs(5), || async {
-        harness.find_by_label_prefix(&window, "Archive thread ").await
+        harness
+            .find_by_label_prefix(&window, "Archive thread ")
+            .await
     })
     .await;
     assert!(
@@ -452,8 +482,13 @@ async fn debug_watch_thread_row_churn() {
     // isolates whether churn happens purely from background/poll activity.
     for i in 0..10 {
         let tree = harness.element_tree(&window).await;
-        let row = tree.iter().find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
-        log.push_str(&format!("phase1 tick {i}: handle={:?}\n", row.map(|e| e["handle"].clone())));
+        let row = tree
+            .iter()
+            .find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
+        log.push_str(&format!(
+            "phase1 tick {i}: handle={:?}\n",
+            row.map(|e| e["handle"].clone())
+        ));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -465,8 +500,13 @@ async fn debug_watch_thread_row_churn() {
     // Phase 2: 20 polls right after expanding, still no thread-row click.
     for i in 0..20 {
         let tree = harness.element_tree(&window).await;
-        let row = tree.iter().find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
-        log.push_str(&format!("phase2 tick {i}: handle={:?}\n", row.map(|e| e["handle"].clone())));
+        let row = tree
+            .iter()
+            .find(|e| e["accessibleLabel"].as_str() == Some("Fix timeline crash"));
+        log.push_str(&format!(
+            "phase2 tick {i}: handle={:?}\n",
+            row.map(|e| e["handle"].clone())
+        ));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     std::fs::write("/tmp/mcp_thread_row_churn_log.txt", log).unwrap();

@@ -163,9 +163,7 @@ impl ResumeTracker {
             return;
         };
         let (Some(seq), Some(epoch)) = (
-            frame
-                .pointer("/params/_acpx/seq")
-                .and_then(Value::as_u64),
+            frame.pointer("/params/_acpx/seq").and_then(Value::as_u64),
             frame
                 .pointer("/params/_acpx/epoch")
                 .and_then(Value::as_str)
@@ -251,7 +249,8 @@ mod tests {
         let mut tracker = ResumeTracker::new();
         tracker.observe_incoming(&session_update("s1", 3, "epoch-a"));
         tracker.mark_all_for_resync();
-        let mut frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let mut frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         assert!(!tracker.prepare_outgoing(&mut frame));
     }
 

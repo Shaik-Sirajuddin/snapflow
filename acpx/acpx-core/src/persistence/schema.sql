@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_at_unix_nanos INTEGER,
     bridge_session_id TEXT,
     bridge_model_alias TEXT,
-    bridge_config_options_json TEXT
+    bridge_config_options_json TEXT,
+    state_revision INTEGER NOT NULL DEFAULT 0
     ,
     -- `retention_administration` (`acpx-session-lifecycle`). Per-session
     -- idle-TTL override in whole seconds; NULL means "no override, use
@@ -35,17 +36,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- `ALTER TABLE`s this in for a pre-existing database.
     custom_idle_ttl_seconds INTEGER
 );
-
-CREATE TABLE IF NOT EXISTS transcripts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    gateway_session_id TEXT NOT NULL REFERENCES sessions(gateway_session_id),
-    direction TEXT NOT NULL, -- 'client_to_agent' | 'agent_to_client'
-    payload TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_transcripts_session
-    ON transcripts (gateway_session_id);
 
 CREATE TABLE IF NOT EXISTS agent_enablement (
     agent_id TEXT PRIMARY KEY,

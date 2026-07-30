@@ -90,6 +90,7 @@ fn symlink_remove_if_present(target_path: &Path) -> Result<(), SkillError> {
 /// Whether `target_path` is currently a live, correctly-pointed symlink to
 /// `canonical_skill` -- used by `status()` without touching the filesystem
 /// beyond a single lstat/readlink.
+#[allow(dead_code)]
 pub(crate) fn is_linked_symlink(target_path: &Path, canonical_skill: &Path) -> bool {
     #[cfg(unix)]
     {

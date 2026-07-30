@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACPX_SERVER_BIN="${ACPX_SERVER_BIN:-$SCRIPT_DIR/../target/release/acpx-server}"
 
-export ACPX_BACKEND_CMD="${ACPX_BACKEND_CMD:-npx -y @agentclientprotocol/codex-acp@1.1.2}"
+export ACPX_DEFAULT_ACP_COMMAND="${ACPX_DEFAULT_ACP_COMMAND:-npx -y @agentclientprotocol/codex-acp@1.1.2}"
 export ACPX_DEFAULT_AGENT_ID="${ACPX_DEFAULT_AGENT_ID:-codex-acp}"
 # OpenHands 1.29 does not select codex-acp's generic `api-key` auth method
 # itself. Make the backend method explicit for this single native wrapper.

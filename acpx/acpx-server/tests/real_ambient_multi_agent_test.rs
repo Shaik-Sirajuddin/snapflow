@@ -429,7 +429,7 @@ impl Drop for ServerGuard {
 
 /// Spawns the real, already-compiled `acpx-server` binary against an
 /// ephemeral HTTP bind address and waits for its listener to accept
-/// connections. `ACPX_BACKEND_CMD`/default-agent is left unused -- every
+/// connections. `ACPX_DEFAULT_ACP_COMMAND`/default-agent is left unused -- every
 /// session in this test goes through a profile.
 async fn spawn_real_server(http_addr: SocketAddr) -> ServerGuard {
     spawn_real_server_with_db(http_addr, None).await

@@ -224,7 +224,9 @@ mod tests {
         let result = relay_task.await.unwrap();
         assert_eq!(
             result,
-            Some(serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}}))
+            Some(
+                serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}})
+            )
         );
     }
 

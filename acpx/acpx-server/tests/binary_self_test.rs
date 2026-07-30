@@ -21,7 +21,7 @@
 //! Still uses the workspace's standard synthetic `sh -c '...'` stand-in
 //! backend (see `acpx-core/tests/router_dispatch_test.rs`'s doc comment
 //! for the pattern) so this doesn't depend on a real ACP adapter or API
-//! key being available in this environment. `ACPX_BACKEND_CMD` is parsed
+//! key being available in this environment. `ACPX_DEFAULT_ACP_COMMAND` is parsed
 //! by naive whitespace-splitting in `src/config.rs` (`program` is the
 //! first token, everything else is a separate arg), so the multi-line
 //! stand-in script can't be inlined into the env var directly -- it's
@@ -109,12 +109,15 @@ impl Drop for ServerGuard {
 async fn spawn_real_server(http_addr: SocketAddr) -> ServerGuard {
     let script_path = write_stand_in_script();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", http_addr.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", http_addr.to_string())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
 
     let child = cmd.spawn().expect("spawn real acpx-server binary");
 
@@ -249,12 +252,15 @@ async fn real_binary_with_closed_stdin_still_serves_http() {
     let script_path = write_stand_in_script();
     let addr = ephemeral_addr().await;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let child = cmd.spawn().expect("spawn real acpx-server binary");
     let _server = ServerGuard { child, script_path };
 
@@ -395,12 +401,15 @@ async fn real_binary_answers_the_client_facing_initialize_and_authenticate_hands
 async fn real_binary_with_http_bind_off_still_serves_stdio() {
     let script_path = write_stand_in_script();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", "off")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", "off")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let mut child = cmd.spawn().expect("spawn real acpx-server binary");
     let mut stdin = child.stdin.take().expect("child stdin piped");
     let stdout = child.stdout.take().expect("child stdout piped");
@@ -450,17 +459,20 @@ async fn real_binary_survives_a_concurrent_bind_conflict_and_still_serves_stdio(
     // stdio transport still answers normally.
     let script_path = write_stand_in_script();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-        .env("ACPX_HTTP_BIND", addr.to_string())
-        // Default `EnvFilter` (no `RUST_LOG`) only surfaces `ERROR`-level
-        // events -- this test asserts on a `tracing::warn!`, so make sure
-        // it's not filtered out regardless of this environment's ambient
-        // `RUST_LOG`.
-        .env("RUST_LOG", "acpx_server=warn")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.env(
+        "ACPX_DEFAULT_ACP_COMMAND",
+        format!("sh {}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    // Default `EnvFilter` (no `RUST_LOG`) only surfaces `ERROR`-level
+    // events -- this test asserts on a `tracing::warn!`, so make sure
+    // it's not filtered out regardless of this environment's ambient
+    // `RUST_LOG`.
+    .env("RUST_LOG", "acpx_server=warn")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let mut child = cmd.spawn().expect("spawn second real acpx-server binary");
     let mut stdin = child.stdin.take().expect("child stdin piped");
     let stdout = child.stdout.take().expect("child stdout piped");
