@@ -1,0 +1,42 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Subtle, full-width, no-background status row shown in place of real
+// content while a turn is in flight and nothing from the agent has
+// arrived yet (models.rs's synthetic "pending" row -- Phase 18,
+// send_feedback_and_empty_states). Same pulsing-dots animation regardless
+// of what `label` says; `label` defaults to a generic in-progress message
+// but the caller can pass the last known API error instead, so one
+// component covers both the steady-state "still working" case and a
+// transient-error case without a second, near-duplicate component.
+export component PendingStatusRow inherits HorizontalLayout {
+    in property <string> label: "thinking...";
+
+    horizontal-stretch: 1;
+    preferred-width: 0px;
+    spacing: Metrics.space-2;
+    height: 20px;
+    cross-axis-alignment: center;
+
+    property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms));
+
+    Text {
+        text: "\u{2022} \u{2022} \u{2022}";
+        color: Theme.text-muted;
+        opacity: root.pulse;
+        font-size: 11px * Theme.font-scale;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.label;
+        color: Theme.text-muted;
+        opacity: 0.7;
+        font-size: 9px * Theme.font-scale;
+        font-italic: true;
+        vertical-alignment: center;
+        overflow: elide;
+        horizontal-stretch: 1;
+        preferred-width: 0px;
+        min-width: 0px;
+    }
+}

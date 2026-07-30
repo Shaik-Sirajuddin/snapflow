@@ -49,10 +49,13 @@ export component MessageCard inherits Rectangle {
             : Metrics.space-5;
         spacing: Metrics.space-3;
 
-        // No header for agent messages.
+        // No header for agent messages. Tool-call rows are status-only --
+        // no separate "TOOL" label box next to the status: a boxed kicker
+        // label paired with a status badge read as two competing pieces
+        // of chrome for what is really one status.
         if !is-agent : HorizontalLayout {
             spacing: Metrics.space-3;
-            Text {
+            if !is-tool-call : Text {
                 text: header-label;
                 font-family: Theme.font-mono;
                 font-size: 9px * Theme.font-scale;
