@@ -1327,6 +1327,29 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             let Some(idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
             };
+            let Some(thread) = model.threads.get_mut(idx) else {
+                return (vec![], vec![]);
+            };
+            if thread.session_id.is_none() {
+                if let Some(option) = thread.config_options.iter_mut().find(|option| {
+                    option.id == key
+                        && option
+                            .options
+                            .iter()
+                            .any(|candidate| candidate.value == value)
+                }) {
+                    option.current_value = Some(value);
+                }
+                return (
+                    vec![],
+                    vec![
+                        Dirty::Settings,
+                        Dirty::Capabilities {
+                            thread_id: thread.thread_id.clone(),
+                        },
+                    ],
+                );
+            }
             (
                 vec![Effect::SetConfigOption {
                     real_index: idx,
@@ -2247,6 +2270,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // hydration makes the identity available.
             continue;
         };
+        let target_thread_id = model.threads[target_index].thread_id.clone();
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
         };
@@ -2405,7 +2429,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
-            | crate::protocol_types::AgentEvent::ConfigOptions(_)
             // PUI-003: the agent's slash commands flow through the per-frame
             // snapshot fold (thread.available_commands) like other caps.
             | crate::protocol_types::AgentEvent::AvailableCommands(_)
@@ -2415,6 +2438,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::PlanUpdate(_)
             | crate::protocol_types::AgentEvent::SessionInfoUpdate { .. } => {
                 dirty.push(thread_row_dirty(model, target_index));
+            }
+            crate::protocol_types::AgentEvent::ConfigOptions(_) => {
+                dirty.push(Dirty::Capabilities {
+                    thread_id: target_thread_id,
+                });
             }
         }
     }

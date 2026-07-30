@@ -2555,6 +2555,7 @@ fn spawn_background_attachment(
     requested_session_id: Option<String>,
     has_cached_transcript: bool,
     profile_name: Option<String>,
+    desired_config_options: Vec<(String, serde_json::Value)>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
     // acpx-client-session-lease-pool: whether `handle` was constructed
@@ -2727,6 +2728,23 @@ fn spawn_background_attachment(
 
         match result {
             Ok(session_id) => {
+                // A deferred thread has no session while its compose
+                // controls are editable. Apply those in-memory selections
+                // after the real (possibly pooled) session is attached and
+                // before attachment is released to the first prompt.
+                for (config_id, value) in desired_config_options {
+                    if let Err(error) = handle.set_config_option(config_id.clone(), value).await {
+                        events_out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back(BridgeEvent {
+                                thread_index: idx,
+                                event: AgentEvent::Error(format!(
+                                    "session/set_config_option failed before first prompt for {config_id:?}: {error}"
+                                )),
+                            });
+                    }
+                }
                 *slot
                     .acp_session_id
                     .lock()
@@ -3115,6 +3133,7 @@ impl AgentBridge {
                 spec.session_id.clone().or(cached_session_id),
                 has_cached_transcript,
                 spec.profile_name.clone(),
+                Vec::new(),
                 attachment_gate,
                 session_cwd_override.clone(),
                 // acpx-client-session-lease-pool: bulk cold-start restore
@@ -3266,6 +3285,46 @@ impl AgentBridge {
             base_url,
             mcp_servers,
         )
+    }
+
+    /// Notify every pool for the settings gateway that its admin-plane MCP
+    /// configuration changed. The pool generation refresh evicts idle
+    /// sessions immediately; a currently leased session is left alive and is
+    /// discarded when its owner releases it, so an in-flight turn is never
+    /// force-closed by a Settings edit.
+    fn refresh_pools_for_gateway(&self, base_url: &str) {
+        let pools = {
+            let pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.rsplit_once('|').is_some_and(|(_, url)| url == base_url))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Immediate signal from Settings after a successful MCP registry
+    /// mutation. The settings gateway is represented by a bridge slot, so
+    /// resolve its base URL and refresh all project pools sharing that
+    /// gateway. This deliberately does not perform an RPC or wait for the
+    /// refresh on the UI thread.
+    fn notify_mcp_settings_changed(&self, settings_idx: usize) {
+        let Some(provider) = self
+            .slots
+            .get(settings_idx)
+            .map(|slot| slot.provider.clone())
+        else {
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            return;
+        };
+        self.refresh_pools_for_gateway(&base_url);
     }
 
     /// `chat_sessions_project_path` phase: called from the FFI-driven
@@ -3626,6 +3685,21 @@ impl AgentBridge {
         preferred_provider: Option<&str>,
         profile: Option<&str>,
     ) -> Result<(), BridgeError> {
+        self.attach_deferred_thread_with_config_options(
+            idx,
+            preferred_provider,
+            profile,
+            Vec::new(),
+        )
+    }
+
+    pub fn attach_deferred_thread_with_config_options(
+        &mut self,
+        idx: usize,
+        preferred_provider: Option<&str>,
+        profile: Option<&str>,
+        desired_config_options: Vec<(String, serde_json::Value)>,
+    ) -> Result<(), BridgeError> {
         let Some(existing) = self.slots.get(idx) else {
             return Err(BridgeError::Gateway(format!(
                 "no thread slot at index {idx}"
@@ -3650,6 +3724,7 @@ impl AgentBridge {
             cached_session_id,
             has_cached_transcript,
             profile.map(str::to_string),
+            desired_config_options,
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
             uses_pool,
@@ -3699,6 +3774,7 @@ impl AgentBridge {
             cached_session_id,
             has_cached_transcript,
             profile.map(str::to_string),
+            Vec::new(),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
             uses_pool,
@@ -3991,6 +4067,12 @@ impl AgentBridge {
         })
     }
 
+    /// Durable thread identity for routing bridge events before a deferred
+    /// thread has acquired its first ACP session.
+    pub fn thread_id(&self, idx: usize) -> Option<String> {
+        self.slots.get(idx).map(|slot| slot.thread_id.clone())
+    }
+
     /// Provider selected for a thread at creation time. This stays separate
     /// from display ordering so a restored subset cannot be reassigned merely
     /// because a preceding thread was deleted.
@@ -4257,9 +4339,14 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let success = self
+            .runtime
             .block_on(handle.create_mcp_server(entry))
-            .is_ok()
+            .is_ok();
+        if success {
+            self.notify_mcp_settings_changed(idx);
+        }
+        success
     }
 
     /// `mcp_servers/update` -- same payload shape as [`Self::
@@ -4269,9 +4356,14 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let success = self
+            .runtime
             .block_on(handle.update_mcp_server(entry))
-            .is_ok()
+            .is_ok();
+        if success {
+            self.notify_mcp_settings_changed(idx);
+        }
+        success
     }
 
     /// `mcp_servers/delete`.
@@ -4280,9 +4372,14 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let success = self
+            .runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
-            .is_ok()
+            .is_ok();
+        if success {
+            self.notify_mcp_settings_changed(idx);
+        }
+        success
     }
 
     /// `agents/list` against thread `idx`'s bound gateway -- the
@@ -4936,13 +5033,36 @@ impl AgentBridge {
             .get(idx)
             .map(|slot| slot.provider.clone())
             .unwrap_or_default();
-        self.config_options_for_provider(idx, &provider)
+        self.config_options_for_provider(idx, &provider, None)
     }
 
-    pub fn config_options_for_provider(&self, idx: usize, provider: &str) -> Vec<ConfigOptionInfo> {
+    pub fn config_options_for_provider(
+        &self,
+        idx: usize,
+        provider: &str,
+        profile_name: Option<&str>,
+    ) -> Vec<ConfigOptionInfo> {
         let Some(slot) = self.slots.get(idx) else {
             return Vec::new();
         };
+        // `slot.config_options` is written only by `store_capability_event`,
+        // itself fed only by a real attached session's own live event
+        // stream (`AgentEvent::ConfigOptions`) or by cold-start restoring
+        // a prior run's persisted `ThreadRuntimeSnapshot::config_options`
+        // at slot construction -- never by the pool-preview path (see
+        // `ensure_models_for_provider`'s own doc comment: it writes only
+        // `pre_session_model_options`, and pushes its `ConfigOptions`
+        // event onto the aggregate `self.events` queue for the UI layer,
+        // not into this slot's own capability state). And
+        // `ThreadSlot::acp_session_id` is set exactly once, from `None`
+        // to `Some`, and never reset back to `None` afterward -- so there
+        // is no window in this slot's lifetime where `config_options` can
+        // hold a *different, stale* session's live values while looking
+        // unattached; gating this read on "currently attached" only ever
+        // discarded a legitimately cold-start-restored snapshot before
+        // the first live event overwrote it, regressing the very
+        // guarantee `restored_interaction_snapshot_is_available_before_
+        // gateway_events_arrive` exists to lock in. Read it unconditionally.
         let live = slot
             .config_options
             .lock()
@@ -4954,7 +5074,7 @@ impl AgentBridge {
         slot.pre_session_model_options
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(provider)
+            .get(&format!("{provider}\0{}", profile_name.unwrap_or_default()))
             .cloned()
             .unwrap_or_default()
     }
@@ -4963,33 +5083,167 @@ impl AgentBridge {
     /// selected in the compose bar. This is intentionally not limited to
     /// deferred threads: changing provider on any session-less thread must
     /// repopulate the model dropdown immediately.
-    pub fn ensure_models_for_provider(&self, idx: usize, provider: &str) {
+    pub fn ensure_models_for_provider(
+        &self,
+        idx: usize,
+        provider: &str,
+        profile_name: Option<&str>,
+    ) {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
         let provider = provider.to_owned();
+        let profile_name = profile_name.map(str::to_owned);
+        let cache_key = format!(
+            "{provider}\0{}",
+            profile_name.as_deref().unwrap_or_default()
+        );
         if provider.is_empty() {
+            return;
+        }
+        // An attached thread already receives its live capabilities from the
+        // session actor. A preview acquire here would create a competing
+        // lease for an active/resumed thread and could disturb its real
+        // session; previews are only needed before the first message.
+        if slot
+            .acp_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return;
         }
         let mut cached = slot
             .pre_session_model_options
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if cached.contains_key(&provider) {
+        if cached.contains_key(&cache_key) {
             return;
         }
-        cached.insert(provider.clone(), Vec::new());
+        cached.insert(cache_key.clone(), Vec::new());
         drop(cached);
 
         let handle = slot.handle.clone();
-        let agent_id = provider.clone();
         let target = slot.pre_session_model_options.clone();
+        let events = self.events.clone();
+        let project_dir = thread_project_dir(
+            slot.project_path_snapshot().as_deref(),
+            &self.session_cwd_override,
+        );
+        let Some(project_dir) = project_dir else {
+            let agent_id = provider.clone();
+            let events = events.clone();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options.clone());
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::ConfigOptions(options),
+                    });
+            });
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            let agent_id = provider.clone();
+            let events = events.clone();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options.clone());
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::ConfigOptions(options),
+                    });
+            });
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            let agent_id = provider.clone();
+            let events = events.clone();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options.clone());
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::ConfigOptions(options),
+                    });
+            });
+            return;
+        };
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            provider.clone(),
+            crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
+        );
+        let preview_thread_id = format!("preview:{idx}:{provider}");
         self.runtime.spawn(async move {
-            let options = handle.list_models(agent_id).await.unwrap_or_default();
+            let options = match pool
+                .acquire(
+                    key,
+                    preview_thread_id,
+                    acpx_client::pool::OpenSpec {
+                        saved_session_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(lease) => {
+                    let options = lease
+                        .capabilities
+                        .as_ref()
+                        .and_then(|value| value.get("configOptions"))
+                        .and_then(crate::gateway_actor::parse_config_options)
+                        .unwrap_or_default();
+                    if let Err(error) = pool.release(&lease).await {
+                        eprintln!("panel-rust: capability preview release failed: {error}");
+                    }
+                    if options.is_empty() {
+                        handle
+                            .list_models(provider.clone())
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        options
+                    }
+                }
+                Err(error) => {
+                    eprintln!("panel-rust: capability preview pool acquire failed: {error}");
+                    handle
+                        .list_models(provider.clone())
+                        .await
+                        .unwrap_or_default()
+                }
+            };
             target
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(provider.to_owned(), options);
+                .insert(cache_key, options.clone());
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ConfigOptions(options),
+                });
         });
     }
 
