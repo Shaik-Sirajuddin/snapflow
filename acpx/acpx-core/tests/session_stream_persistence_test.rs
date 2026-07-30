@@ -187,6 +187,18 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
     .unwrap();
     let session_id = created["result"]["sessionId"].as_str().unwrap().to_owned();
 
+    dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"session/queue",
+            "params":{"sessionId":session_id,"operation":"pause",
+                      "idempotencyKey":"client-a-pause"}
+        }),
+    )
+    .await
+    .unwrap();
+
     let queue_hub = { router.lock().await.queue_hub() };
     let mut client_a = queue_hub.subscribe(&session_id).await;
     let mut client_b = queue_hub.subscribe(&session_id).await;
@@ -195,7 +207,7 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
         &router,
         &tenant,
         json!({
-            "jsonrpc":"2.0", "id":2, "method":"session/queue",
+            "jsonrpc":"2.0", "id":3, "method":"session/queue",
             "params":{"sessionId":session_id,"operation":"enqueue",
                       "text":"first","idempotencyKey":"client-a-1"}
         }),
@@ -206,7 +218,7 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
         &router,
         &tenant,
         json!({
-            "jsonrpc":"2.0", "id":3, "method":"session/queue",
+            "jsonrpc":"2.0", "id":4, "method":"session/queue",
             "params":{"sessionId":session_id,"operation":"enqueue",
                       "text":"second","idempotencyKey":"client-b-1"}
         }),
@@ -215,6 +227,19 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
     .unwrap();
     assert!(first["accepted"].as_bool().unwrap());
     assert!(second["accepted"].as_bool().unwrap());
+
+    let resumed = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":5, "method":"session/queue",
+            "params":{"sessionId":session_id,"operation":"resume",
+                      "idempotencyKey":"client-a-resume"}
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(resumed["accepted"].as_bool().unwrap());
 
     for receiver in [&mut client_a, &mut client_b] {
         let event = tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())

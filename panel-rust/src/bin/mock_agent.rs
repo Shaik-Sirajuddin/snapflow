@@ -29,6 +29,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
 use std::collections::HashMap;
+use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,6 +109,7 @@ fn record_gateway_event(method: &str, session_id: Option<&str>, detail: &str) {
     let _ = writeln!(file, "{record}");
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SessionState {
     title: String,
     updated_at: String,
@@ -115,7 +117,7 @@ struct SessionState {
     replay_turns: Vec<ReplayTurn>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ReplayTurn {
     prompt_text: String,
 }
@@ -126,6 +128,45 @@ fn with_sessions<T>(f: impl FnOnce(&mut HashMap<String, SessionState>) -> T) -> 
     let mut guard = SESSIONS.lock().expect("mock-agent session map poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
+}
+
+/// Optional durable state for the real-server restart matrix. Normal mock
+/// agent runs stay process-local; setting this path makes session/list,
+/// session/load, and session/resume survive a fresh mock-agent process while
+/// keeping the fixture deterministic and isolated per test.
+fn state_file() -> Option<std::path::PathBuf> {
+    std::env::var_os("RUI_MOCK_AGENT_STATE_FILE").map(std::path::PathBuf::from)
+}
+
+fn load_persisted_sessions() {
+    let Some(path) = state_file() else {
+        return;
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(sessions) = serde_json::from_slice::<HashMap<String, SessionState>>(&bytes) else {
+        return;
+    };
+    let mut guard = SESSIONS.lock().expect("mock-agent session map poisoned");
+    *guard = Some(sessions);
+}
+
+fn persist_sessions() {
+    let Some(path) = state_file() else {
+        return;
+    };
+    let sessions = {
+        let guard = SESSIONS.lock().expect("mock-agent session map poisoned");
+        guard.clone().unwrap_or_default()
+    };
+    let Ok(bytes) = serde_json::to_vec(&sessions) else {
+        return;
+    };
+    let temp = path.with_extension("json.tmp");
+    if fs::write(&temp, bytes).is_ok() {
+        let _ = fs::rename(temp, path);
+    }
 }
 
 /// Coverage-matrix `session/cancel` host-scenario support: a prompt whose
@@ -185,6 +226,7 @@ async fn send_replay(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_persisted_sessions();
     Agent
         .builder()
         .name("rui-mock-agent")
@@ -215,6 +257,7 @@ async fn main() -> Result<()> {
                         },
                     );
                 });
+                persist_sessions();
                 // PISO-6: the live isolation matrix needs to assert each
                 // thread's `session/new` actually carried its OWN project's
                 // cwd (not the global override) -- `request.cwd` is the one
@@ -455,6 +498,7 @@ async fn main() -> Result<()> {
                         });
                     }
                 });
+                persist_sessions();
                 let turn = ReplayTurn { prompt_text: text };
                 send_replay(&connection, &session_id, &turn).await?;
                 responder.respond(PromptResponse::new(StopReason::EndTurn))
@@ -540,6 +584,7 @@ async fn main() -> Result<()> {
                 with_sessions(|sessions| {
                     sessions.remove(request.session_id.0.as_ref());
                 });
+                persist_sessions();
                 responder.respond(DeleteSessionResponse::new())
             },
             agent_client_protocol::on_receive_request!(),

@@ -7376,6 +7376,7 @@ async fn dispatch_queue_mutation_shared(
         operation,
         acpx_proto::session_stream::QueueOperation::Enqueue
             | acpx_proto::session_stream::QueueOperation::SendNow
+            | acpx_proto::session_stream::QueueOperation::Resume
     ) {
         if operation == acpx_proto::session_stream::QueueOperation::SendNow {
             // Steering is server-owned: cancel the active backend turn first,
