@@ -1390,6 +1390,15 @@ impl Router {
         self.queue_active.clone()
     }
 
+    fn session_is_in_flight(&self, tenant_id: &TenantId, gateway_session_id: &str) -> bool {
+        self.sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.to_owned()),
+            )
+            .is_some_and(|entry| entry.in_flight != 0)
+    }
+
     pub fn with_transcript_store(mut self, transcripts: TranscriptStore) -> Self {
         self.transcripts = Some(transcripts);
         self
@@ -7404,6 +7413,9 @@ fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, sessi
         loop {
             let (store, hub) = {
                 let router = router.lock().await;
+                if router.session_is_in_flight(&tenant_id, &session_id) {
+                    break;
+                }
                 let Some(store) = router.queue_store() else {
                     break;
                 };
@@ -7925,6 +7937,17 @@ async fn dispatch_proxied_shared(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             0,
+        );
+    }
+    if method == "session/prompt" {
+        // A queue mutation that arrived while this prompt was active may
+        // have observed the in-flight guard and left the dispatcher idle.
+        // Re-arm it at the turn boundary so FIFO follow-ups are sent
+        // automatically without allowing concurrent normal turns.
+        spawn_queue_dispatcher(
+            router.clone(),
+            tenant_id.clone(),
+            gateway_session_id.clone(),
         );
     }
     if let Some(store) = persistence.clone() {

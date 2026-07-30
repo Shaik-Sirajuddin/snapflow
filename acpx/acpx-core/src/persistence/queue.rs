@@ -87,17 +87,22 @@ impl QueueStore {
             let mut paused = false;
             for record in records {
                 match record.operation {
-                    QueueOperation::Enqueue | QueueOperation::SendNow => {
+                    QueueOperation::Enqueue => {
                         if let Some(item) = record.item {
                             if !queue.iter().any(|current: &QueueItem| {
                                 current.idempotency_key == item.idempotency_key
                             }) {
-                                if matches!(record.operation, QueueOperation::SendNow) {
-                                    queue.insert(0, item);
-                                } else {
-                                    queue.push(item);
-                                }
+                                queue.push(item);
                             }
+                        }
+                    }
+                    QueueOperation::SendNow => {
+                        if let Some(item) = record.item {
+                            queue.retain(|current| {
+                                current.idempotency_key != item.idempotency_key
+                                    && current.queue_entry_id != item.queue_entry_id
+                            });
+                            queue.insert(0, item);
                         }
                     }
                     QueueOperation::Cancel => {
@@ -126,7 +131,18 @@ impl QueueStore {
                 .map(|item| item.queue_entry_id.clone())
                 .or_else(|| task_params.queue_entry_id.clone())
                 .or_else(|| Some(format!("queue-{}", task_params.idempotency_key)));
-            if duplicate.is_none() {
+            if let Some(duplicate) = duplicate {
+                if task_params.operation == QueueOperation::SendNow {
+                    let entry_id = duplicate.queue_entry_id.clone();
+                    if let Some(index) = queue
+                        .iter()
+                        .position(|item| item.queue_entry_id == entry_id)
+                    {
+                        let item = queue.remove(index);
+                        queue.insert(0, item);
+                    }
+                }
+            } else {
                 match task_params.operation {
                     QueueOperation::Enqueue | QueueOperation::SendNow => {
                         let item = QueueItem {
@@ -320,18 +336,23 @@ fn replay_records(records: Vec<QueueRecord>) -> (Vec<QueueItem>, bool) {
     let mut paused = false;
     for record in records {
         match record.operation {
-            QueueOperation::Enqueue | QueueOperation::SendNow => {
+            QueueOperation::Enqueue => {
                 if let Some(item) = record.item {
                     if !queue
                         .iter()
                         .any(|current: &QueueItem| current.idempotency_key == item.idempotency_key)
                     {
-                        if matches!(record.operation, QueueOperation::SendNow) {
-                            queue.insert(0, item);
-                        } else {
-                            queue.push(item);
-                        }
+                        queue.push(item);
                     }
+                }
+            }
+            QueueOperation::SendNow => {
+                if let Some(item) = record.item {
+                    queue.retain(|current| {
+                        current.idempotency_key != item.idempotency_key
+                            && current.queue_entry_id != item.queue_entry_id
+                    });
+                    queue.insert(0, item);
                 }
             }
             QueueOperation::Cancel => {
@@ -469,6 +490,42 @@ mod tests {
         assert_eq!(snapshot.queue[0].text, "urgent");
         assert_eq!(snapshot.queue.len(), 2);
         assert!(!snapshot.queue.iter().any(|item| item.text == "second"));
+    }
+
+    #[tokio::test]
+    async fn send_now_moves_an_existing_entry_to_the_front() {
+        let store = QueueStore::new(tempdir().unwrap().path());
+        for (key, text) in [("a", "first"), ("b", "urgent")] {
+            store
+                .mutate(
+                    "s1",
+                    QueueMutationParams {
+                        session_id: "s1".into(),
+                        idempotency_key: key.into(),
+                        operation: QueueOperation::Enqueue,
+                        queue_entry_id: None,
+                        text: Some(text.into()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let urgent = store
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "send-now-b".into(),
+                    operation: QueueOperation::SendNow,
+                    queue_entry_id: Some("queue-b".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(urgent.queue[0].text, "urgent");
+        assert_eq!(urgent.queue[1].text, "first");
     }
 
     #[tokio::test]
