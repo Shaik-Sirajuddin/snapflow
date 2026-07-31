@@ -121,8 +121,10 @@ remain correctly attributed.
 Runtime evidence: the Slint MCP live suite ran against the compiled `snapflow`
 host, Xvfb, and a real `acpx-server` process; four active retained-view,
 popup/tool-state, thread-isolation, and switch-during-stream scenarios passed.
-The optional ambient billed-adapter smoke remains environment-dependent and is
-not part of the default gate.
+The host MCP matrix additionally passed pool switch/session routing, send-now
+active-turn steering, immediate send after new-thread attach, and rename/persist
+through the real compiled host. The optional ambient billed-adapter smoke
+remains environment-dependent and is not part of the default gate.
 
 ## Open risks
 

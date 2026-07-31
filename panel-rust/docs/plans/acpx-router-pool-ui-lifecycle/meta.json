@@ -80,6 +80,22 @@
         {
           "scenario": "switch during stream keeps prompt sessions thread-scoped",
           "matrix_status": "PASS"
+        },
+        {
+          "scenario": "pool switch returns prompts to the original thread session",
+          "matrix_status": "PASS"
+        },
+        {
+          "scenario": "send-now cancels active turn and skips the front queued message",
+          "matrix_status": "PASS"
+        },
+        {
+          "scenario": "immediate send after new-thread attach",
+          "matrix_status": "PASS"
+        },
+        {
+          "scenario": "rename persists through the real host path",
+          "matrix_status": "PASS"
         }
       ],
       "verified": [
@@ -90,6 +106,10 @@
         {
           "description": "The optional ambient billed-adapter smoke was attempted but the selected host did not expose ChatInputLayout::compose; it is not part of the default runtime gate.",
           "verdict": "OPTIONAL_ENVIRONMENT_RESIDUAL"
+        },
+        {
+          "description": "host_e2e_mcp_smoke.sh matrix: pool-switch-between-threads-preserves-session-routing, send-now, pool-send-immediately-after-new-thread, and rename all passed against compiled snapflow + Xvfb + real acpx-server.",
+          "verdict": "MATRIX-PASS"
         }
       ]
     }
