@@ -493,8 +493,14 @@ export component McpServersView inherits Rectangle {
                 font-size: 9px * Theme.font-scale;
             }
 
+            SettingsSectionHeader {
+                text: "Add new subagent";
+                subsection: true;
+            }
+
             HorizontalLayout {
                 spacing: Metrics.gap-sm;
+                cross-axis-alignment: end;
                 SettingsField {
                     horizontal-stretch: 1;
                     label: "Name";
@@ -633,6 +639,7 @@ export component McpServersView inherits Rectangle {
 
             HorizontalLayout {
                 spacing: Metrics.gap-sm;
+                cross-axis-alignment: end;
                 SettingsField {
                     horizontal-stretch: 1;
                     label: "Timeout (seconds)";
