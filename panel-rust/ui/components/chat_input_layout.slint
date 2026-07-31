@@ -5,6 +5,7 @@ import { Icon } from "../base/icon.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
+import { ThinScrollbar } from "../base/thin_scrollbar.slint";
 import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { MentionPickRow } from "../base/mention_pick_row.slint";
@@ -829,6 +830,19 @@ export component ChatInputLayout inherits Rectangle {
             }
         row2-strip := HorizontalLayout {
             x: row2-host.overflow > 0px ? row2-host.pan : 0px;
+            // Bug fix (context ring right-alignment): outside a layout a
+            // free-positioned HorizontalLayout defaults to its own
+            // preferred (content) width, which is all `row2-host.overflow`
+            // ever needed -- but that left no slack for the trailing
+            // stretch spacer below to push `context-ring` to the true
+            // right edge of the bar whenever the dropdown/toggle cluster
+            // doesn't already fill it (the common, non-overflowing case).
+            // Widening to at least `row2-host`'s own width supplies that
+            // slack without changing `preferred-width` (still just the
+            // natural content sum, still what `overflow` above is
+            // measured against), so the panning/overflow math for narrow
+            // docks is unaffected.
+            width: max(self.preferred-width, row2-host.width);
             height: root.row2-h;
             preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
@@ -1014,6 +1028,26 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
 
+            // Absorbs the slack `row2-strip.width` above creates so
+            // `context-ring` sits flush against the bar's right end
+            // instead of immediately trailing whatever dropdowns/toggles
+            // happen to be visible -- same "trailing zero-height stretch
+            // spacer" idiom `markdown_view.slint` uses to pin content to
+            // one edge of a `start`-packed row. horizontal-stretch: 1 is
+            // the only child in this row with a nonzero stretch factor,
+            // so 100% of any leftover width goes here regardless of
+            // `alignment`. Collapses to 0 width (no visual effect) once
+            // the strip is actually overflowing, since `width` above then
+            // equals `preferred-width` and there's no slack left to
+            // absorb.
+            Rectangle {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                preferred-width: 0px;
+                height: 0px;
+                vertical-stretch: 0;
+            }
+
             // Hidden below row2-compact's width threshold -- see its own
             // doc comment. Least essential of row 2's three controls
             // (decorative usage indicator, not a picker), so it's the one
@@ -1036,6 +1070,23 @@ export component ChatInputLayout inherits Rectangle {
                 context-view-requested => { root.context-view-requested(); }
             }
         }
+
+            // Visible horizontal scrollbar for the pan above -- reuses the
+            // same auto-hiding thin-scrollbar pattern/component the
+            // message list already uses (chat_area.slint's vertical
+            // ThinScrollbar), so a narrow dock gets a consistent, visible
+            // affordance that this row scrolls instead of merely relying
+            // on an undiscoverable wheel/trackpad pan.
+            ThinScrollbar {
+                horizontal: true;
+                x: 0px;
+                y: root.row2-h - self.thumb-width;
+                visible-width: row2-host.width;
+                viewport-width: row2-host.width + row2-host.overflow;
+                viewport-x <=> row2-host.pan;
+                thumb-width: 3px;
+                active: row2-scroll.has-hover;
+            }
         }
 
         // PUI-002a: background-terminals chip, own row below the row2

@@ -886,13 +886,22 @@ fn connection_status_is_exposed_to_accessibility() {
         .is_some_and(|label| label.contains("HTTP fallback - approvals unavailable")));
 }
 
-/// Coverage Matrix `session/close`/`session/delete` row -- sidebar's
-/// per-thread two-step arm/confirm close/delete controls. Real
-/// interaction coverage (accessible labels, click, confirm/cancel),
-/// same discipline as this file's other component tests: proves the
-/// UI wiring, not the gateway call itself (that's
-/// `gateway_actor_e2e_test.rs::close_then_delete_session_round_trip_
+/// Coverage Matrix `session/delete` row -- sidebar's per-thread two-step
+/// arm/confirm delete control. Real interaction coverage (accessible
+/// labels, click, confirm), same discipline as this file's other
+/// component tests: proves the UI wiring, not the gateway call itself
+/// (that's `gateway_actor_e2e_test.rs::close_then_delete_session_round_trip_
 /// through_a_real_gateway`'s job).
+///
+/// The sidebar row's "close thread" power-button affordance (armed/
+/// confirm two-step, previously covered by this same test) was removed
+/// at the user's explicit request -- `close-requested()` and its
+/// backing `pending-close-index` state remain wired in
+/// `sidebar_thread_row.slint` for a possible future UI trigger, but no
+/// control currently fires them, so there is nothing left to exercise
+/// here for close. This test now only covers delete, driving the closed
+/// state directly (as `refresh_threads_model` would push it once the
+/// bridge reports a thread closed) instead of via a close button click.
 ///
 /// Previously documented as a "harness anomaly": the controls were in
 /// the tree once `selected-thread` revealed them, but the sidebar width
@@ -901,7 +910,7 @@ fn connection_status_is_exposed_to_accessibility() {
 /// skipped the clipped IconButtons. Settling the expand animation
 /// (see `settle_sidebar_expand`) makes them addressable.
 #[test]
-fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirmed() {
+fn sidebar_thread_delete_control_is_addressable_and_two_step_confirmed() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
@@ -914,65 +923,25 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
     )])));
     panel.set_selected_thread(0);
 
-    let closed_index = Rc::new(Cell::new(-1i32));
     let deleted_index = Rc::new(Cell::new(-1i32));
-    {
-        let closed_index = closed_index.clone();
-        panel.on_thread_close_requested(move |i| closed_index.set(i));
-    }
     {
         let deleted_index = deleted_index.clone();
         panel.on_thread_delete_requested(move |i| deleted_index.set(i));
     }
 
-    // An open thread shows only the close (arm) control -- no delete
-    // control, and no confirm/cancel pair, until armed.
+    // An open thread shows no delete control and no close control (the
+    // close power-button was removed) until it's actually closed.
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Delete thread Fix timeline crash")
             .next()
             .is_none(),
         "an open thread must not show a delete control"
     );
-    let close_arm =
-        ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-            .next()
-            .expect("close-arm control must be accessible on an open thread");
-
-    close_arm.invoke_accessible_default_action();
-    // Armed: confirm/cancel pair now accessible, the plain arm control
-    // is gone (replaced, not merely covered).
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
             .next()
             .is_none(),
-        "the arm control must disappear once armed"
-    );
-    let cancel_close =
-        ElementHandle::find_by_accessible_label(&panel, "Cancel close thread Fix timeline crash")
-            .next()
-            .expect("cancel-close control must be accessible once armed");
-    cancel_close.invoke_accessible_default_action();
-    assert_eq!(closed_index.get(), -1, "cancel must not fire the callback");
-    // Cancelling re-shows the plain arm control.
-    ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-        .next()
-        .expect("arm control must reappear after cancel");
-
-    // Real arm -> confirm round trip.
-    let close_arm =
-        ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-            .next()
-            .expect("close-arm control must still be accessible");
-    close_arm.invoke_accessible_default_action();
-    let confirm_close =
-        ElementHandle::find_by_accessible_label(&panel, "Confirm close thread Fix timeline crash")
-            .next()
-            .expect("confirm-close control must be accessible once armed");
-    confirm_close.invoke_accessible_default_action();
-    assert_eq!(
-        closed_index.get(),
-        0,
-        "confirming close must fire thread-close-requested(0)"
+        "the close power-button was removed and must not be addressable"
     );
 
     // Once the bridge reports the thread closed (Rust re-reads
@@ -1048,8 +1017,11 @@ fn sidebar_thread_archive_and_rename_controls_are_addressable_and_dispatch() {
     );
 
     // After the host marks the row archived (Dirty::ThreadRow path),
-    // the archive arm disappears and the close arm remains (archive
-    // does not close the session).
+    // the archive arm disappears (archive does not close the session,
+    // but there is no close control at all any more -- the close
+    // power-button was removed from the row, see
+    // `sidebar_thread_delete_control_is_addressable_and_two_step_confirmed`'s
+    // doc comment).
     let mut archived = sample_open_thread("Fix timeline crash");
     archived.status = "archived".into();
     archived.archived = true;
@@ -1060,9 +1032,12 @@ fn sidebar_thread_archive_and_rename_controls_are_addressable_and_dispatch() {
             .is_none(),
         "an archived thread must not show an archive control"
     );
-    ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-        .next()
-        .expect("archive must not remove the close control on an open-but-archived thread");
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
+            .next()
+            .is_none(),
+        "the close power-button was removed and must not be addressable"
+    );
 }
 
 /// setup-followups plan, agent_enable_button_e2e_coverage_missing: phase

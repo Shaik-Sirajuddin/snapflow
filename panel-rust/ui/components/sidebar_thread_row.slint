@@ -319,7 +319,6 @@ export component SidebarThreadRow inherits HoverSurface {
                     // without a pointer hover.
                     property <bool> row-hovered: root.has-hover
                         || rename-btn.has-hover
-                        || close-btn.has-hover
                         || delete-btn.has-hover
                         || resume-btn.has-hover
                         || archive-btn.has-hover;
@@ -366,59 +365,15 @@ export component SidebarThreadRow inherits HoverSurface {
                                 }
                             }
                         }
-                        close-btn := IconButton {
-                            // Only offered for a thread that's still live
-                            // (never closed, never archived) -- once closed,
-                            // `delete-btn` below takes over. This is the
-                            // per-thread counterpart to `AgentBridge::
-                            // close_thread`/`Effect::CloseThread`, which had
-                            // no UI trigger at all until now: `close-
-                            // requested()` was declared and wired up through
-                            // `sidebar.slint` but never actually invoked by
-                            // any button in this file.
-                            visible: expanded && rename-thread-index != index
-                                && !thread.closed && !thread.archived
-                                && pending-close-index != index && (row-hovered || index == selected-thread);
-                            btn-width: 18px;
-                            btn-height: 18px;
-                            button-accessible-label: "Close thread " + thread.name;
-                            clicked => { pending-close-index = index; }
-                            Icon {
-                                source: @image-url("../assets/icons/power.svg");
-                                size: 13px;
-                                color: Theme.text-muted;
-                            }
-                        }
-                        if expanded && rename-thread-index != index
-                            && !thread.closed && !thread.archived
-                            && pending-close-index == index : HorizontalLayout {
-                            spacing: 2px;
-                            IconButton {
-                                btn-width: 18px;
-                                btn-height: 18px;
-                                button-accessible-label: "Confirm close thread " + thread.name;
-                                clicked => {
-                                    pending-close-index = -1;
-                                    close-requested();
-                                }
-                                Icon {
-                                    source: @image-url("../assets/icons/circle-check.svg");
-                                    size: Metrics.icon-sm;
-                                    color: Theme.bg-primary;
-                                }
-                            }
-                            IconButton {
-                                btn-width: 18px;
-                                btn-height: 18px;
-                                button-accessible-label: "Cancel close thread " + thread.name;
-                                clicked => { pending-close-index = -1; }
-                                Icon {
-                                    source: @image-url("../assets/icons/x.svg");
-                                    size: 13px;
-                                    color: Theme.text-secondary;
-                                }
-                            }
-                        }
+                        // The "close thread" power-button affordance (armed/
+                        // confirm two-step, mirroring delete-btn below) that
+                        // used to live here was explicitly removed at the
+                        // user's request. `close-requested()` and
+                        // `pending-close-index` are deliberately left wired
+                        // (see their declarations above) for a future UI
+                        // trigger -- only the button itself is gone; nothing
+                        // in this file references them anymore, so no
+                        // control currently fires `close-requested()`.
                         delete-btn := IconButton {
                             visible: expanded && rename-thread-index != index
                                 && thread.closed && pending-delete-index != index && (row-hovered || index == selected-thread);

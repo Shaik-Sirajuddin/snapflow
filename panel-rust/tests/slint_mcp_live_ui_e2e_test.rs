@@ -554,6 +554,15 @@ where
 /// `debug_watch_thread_row_churn` + live probes -- generation stays 1
 /// while arena index advances every tree walk; invoke reports
 /// "element that was destroyed").
+// The sidebar row's "Close thread" power-button was removed at the
+// user's explicit request (see `sidebar_thread_row.slint`'s close-btn
+// removal note); `close-requested()` and `pending-close-index` stay
+// wired for a possible future trigger, but no control fires them
+// anymore, so the "Close thread " assertion below is now permanently
+// stale on top of the pre-existing ignore reason. Left as-is (ignored,
+// not run) rather than rewritten, since this is a live-harness test
+// out of scope for that UI change; a future pass touching this file
+// should drop the close-arm assertion entirely.
 #[tokio::test]
 #[ignore = "legacy sidebar IconButton accessibility assertion; retained as a diagnostic baseline"]
 async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {
