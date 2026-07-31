@@ -716,6 +716,7 @@ mod tests {
     /// test-only production hook. Restoring directory permissions heals it
     /// again with no code changes needed, same as the poison-mutex tests.
     #[test]
+    #[cfg(unix)]
     fn a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open() {
         use std::os::unix::fs::PermissionsExt;
 
