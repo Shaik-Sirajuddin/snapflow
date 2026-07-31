@@ -82,6 +82,8 @@ export component ChatPanel inherits Window {
     callback load-older-requested();
     in-out property <string> compose-text: "";
     in-out property <bool> settings-open: false;
+    // Keep in sync with SettingsPage.scope's own default -- see its doc
+    // comment for why a `<=>` alias makes a mismatch silently misleading.
     in-out property <string> settings-scope: "global";
     // Retains the active settings section while the page is open. The dev
     // fixture sets this to "agents" so its agent cards are visible on load.

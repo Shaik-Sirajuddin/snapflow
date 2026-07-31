@@ -42,7 +42,16 @@ import { ProfileOption, McpServerOption, McpServerFormData, AgentCatalogEntry, R
 
 export component SettingsPage inherits Rectangle {
     // New shell-only state (settings-pane-redesign plan, phase 1).
-    in-out property <string> scope: "project"; // "project" | "global"
+    // "project" | "global". MUST stay identical to app.slint's own
+    // `settings-scope` default: the two are joined by a `<=>` two-way
+    // alias (`scope <=> root.settings-scope`), and Slint resolves that
+    // alias to the OUTER property's default with no diagnostic at all, so
+    // a mismatch here is silently dead code that only shows up when this
+    // component is rendered standalone (ui-dev-viewer, component tests).
+    // The live app never observes either literal -- lib.rs computes the
+    // real scope from SettingsPaths and pushes it synchronously during
+    // panel construction, before the window is shown.
+    in-out property <string> scope: "global";
     // Default must be a section valid under BOTH scopes -- "mcp_servers"
     // is Global-only (see settings_scope_visibility_gate below), and the
     // `changed scope` redirect that guards against landing on it doesn't
