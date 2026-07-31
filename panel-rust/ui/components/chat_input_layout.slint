@@ -1041,25 +1041,18 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
 
-            // Absorbs the slack `row2-strip.width` above creates so
-            // `context-ring` sits flush against the bar's right end
-            // instead of immediately trailing whatever dropdowns/toggles
-            // happen to be visible -- same "trailing zero-height stretch
-            // spacer" idiom `markdown_view.slint` uses to pin content to
-            // one edge of a `start`-packed row. horizontal-stretch: 1 is
-            // the only child in this row with a nonzero stretch factor,
-            // so 100% of any leftover width goes here regardless of
-            // `alignment`. Collapses to 0 width (no visual effect) once
-            // the strip is actually overflowing, since `width` above then
-            // equals `preferred-width` and there's no slack left to
-            // absorb.
-            Rectangle {
-                horizontal-stretch: 1;
-                min-width: 0px;
-                preferred-width: 0px;
-                height: 0px;
-                vertical-stretch: 0;
-            }
+            // NOTE: no trailing stretch spacer here. row2-strip's own
+            // `width` above is bound to `self.preferred-width`
+            // (row2_strip_shrink_to_fit), which by definition leaves no
+            // slack for any stretch child to absorb in *any* state -- not
+            // just once overflowing. A `horizontal-stretch: 1` spacer was
+            // tried here to pin `context-ring` flush against the bar's
+            // right end, but it could never receive any width under that
+            // sizing rule, so it was dead code; removed rather than kept
+            // around implying behavior that can't happen. `context-ring`
+            // simply trails immediately after the last visible control
+            // (see the row2_strip_shrink_to_fit comment above for the
+            // documented trade-off).
 
             // Hidden below row2-compact's width threshold -- see its own
             // doc comment. Least essential of row 2's three controls

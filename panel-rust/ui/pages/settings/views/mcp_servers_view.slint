@@ -10,6 +10,7 @@ import { McpServerOption, McpToolOption, McpServerFormData } from "../../../type
 import { TextUtil } from "../../../base/text_util.slint";
 import { StatusDot } from "../../../base/status_dot.slint";
 import { Spinner } from "../../../base/spinner.slint";
+import { ThinScrollbar } from "../../../base/thin_scrollbar.slint";
 
 // Multi-line text box for the env-var/header editors below (`KEY=VALUE`/
 // `Header: value` one per line, parsed Rust-side -- see
@@ -384,7 +385,7 @@ export component McpServersView inherits Rectangle {
                     border-color: Theme.border-default;
                     clip: true;
 
-                    Flickable {
+                    tools-panel-scroll := Flickable {
                         width: parent.width;
                         height: parent.height;
                         viewport-height: tools-panel-content.preferred-height + 2 * Metrics.pad-md;
@@ -463,6 +464,20 @@ export component McpServersView inherits Rectangle {
                                 }
                             }
                         }
+                    }
+
+                    // Visible scroll affordance -- without this the panel's
+                    // real overflow (viewport-height above) has no
+                    // discoverable way to tell the user it scrolls, same
+                    // gap fixed elsewhere in this diff (settings_page.slint,
+                    // agents_view.slint, searchable_dropdown.slint).
+                    ThinScrollbar {
+                        x: parent.width - self.width - 2px;
+                        y: 2px;
+                        visible-height: parent.height - 4px;
+                        viewport-height: tools-panel-content.preferred-height + 2 * Metrics.pad-md;
+                        viewport-y <=> tools-panel-scroll.viewport-y;
+                        thumb-width: 4px;
                     }
                 }
 
