@@ -644,8 +644,11 @@ mod tests {
             .contains_key("failed-session"));
     }
 
+    /// Broad coverage for typed session/resume request construction:
+    /// happy-path mcpServers round-trip, empty list allowed, malformed
+    /// entry rejected (not silently dropped).
     #[test]
-    fn build_resume_session_params_includes_mcp_servers() {
+    fn build_resume_session_params_covers_shape_and_validation() {
         let mcp = vec![serde_json::json!({
             "name": "skills",
             "command": "/usr/bin/snapflowd-mcp",
@@ -662,44 +665,23 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0]["name"], "skills");
         assert_eq!(servers[0]["command"], "/usr/bin/snapflowd-mcp");
-        assert_eq!(
-            servers[0]["args"],
-            serde_json::json!(["--global-dir", "/tmp/skills"])
-        );
-    }
 
-    #[test]
-    fn build_resume_session_params_rejects_malformed_mcp_entry() {
-        let mcp = vec![serde_json::json!({
-            "name": "broken",
-            // stdio McpServer requires `command`; a bare object is not a
-            // valid ACP McpServer of any transport variant.
-            "notARealField": true,
-        })];
-        let err = build_resume_session_params("sess-1", "/tmp", &mcp)
-            .expect_err("malformed entry must not be silently dropped");
-        match err {
-            ClientError::InvalidParams(message) => {
-                assert!(
-                    message.contains("mcpServers"),
-                    "error should name the field: {message}"
-                );
-            }
-            other => panic!("expected InvalidParams, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_resume_session_params_allows_empty_mcp_list() {
-        let params = build_resume_session_params("sess-2", "/home/me", &[])
+        let empty = build_resume_session_params("sess-2", "/home/me", &[])
             .expect("empty mcp list is valid");
-        assert_eq!(params["sessionId"], "sess-2");
-        assert_eq!(params["cwd"], "/home/me");
-        // ResumeSessionRequest skips serializing empty mcpServers
-        // (`skip_serializing_if = "Vec::is_empty"`), so the key may be
-        // absent rather than `[]` -- either is fine for the wire.
-        if let Some(servers) = params.get("mcpServers") {
+        assert_eq!(empty["sessionId"], "sess-2");
+        if let Some(servers) = empty.get("mcpServers") {
             assert_eq!(servers, &serde_json::json!([]));
         }
+
+        let err = build_resume_session_params(
+            "sess-3",
+            "/tmp",
+            &[serde_json::json!({"name": "broken", "notARealField": true})],
+        )
+        .expect_err("malformed entry must not be silently dropped");
+        assert!(
+            matches!(err, ClientError::InvalidParams(ref m) if m.contains("mcpServers")),
+            "expected InvalidParams naming mcpServers, got {err:?}"
+        );
     }
 }

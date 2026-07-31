@@ -1995,6 +1995,79 @@ async fn run_thread_actor(
                 let _ = resp.send(result);
             }
             Command::SendPrompt { text, resp } => {
+                if session_id.is_none() {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                }
+                // mcp-registry-live-propagation: if the pool generation
+                // bumped (registry change) while we held a lease but had
+                // not yet started a turn, release+reacquire so the first
+                // prompt lands on a session opened under the current
+                // registry merge. Safe because turn is still NotStarted
+                // (ActiveTurnNotReleasable cannot fire). Prefer
+                // session/new (saved_session_id: None) so backends that
+                // ignore mcpServers on resume still get a real reconnect.
+                let stale = match (pool.as_ref(), current_lease.as_ref()) {
+                    (Some(pool), Some(lease)) => pool.is_lease_stale(lease).await,
+                    _ => false,
+                };
+                if stale {
+                    if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                        let key = lease.key.clone();
+                        let thread_id = lease.thread_id.clone();
+                        match pool.release(&lease).await {
+                            Ok(()) => match pool
+                                .acquire(
+                                    key,
+                                    thread_id,
+                                    OpenSpec {
+                                        saved_session_id: None,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(new_lease) => {
+                                    let new_sid = new_lease.session_id.clone();
+                                    if let Some(value) = new_lease.capabilities.as_ref() {
+                                        emit_capability_events(value, &event_tx);
+                                        baseline_config_options = value
+                                            .get("configOptions")
+                                            .and_then(parse_config_options)
+                                            .unwrap_or_default();
+                                        config_overrides.clear();
+                                    }
+                                    client.register_session_replay(
+                                        &new_sid,
+                                        "session/load",
+                                        serde_json::json!({
+                                            "sessionId": new_sid,
+                                            "cwd": new_lease.key.project_dir,
+                                            "mcpServers": [],
+                                        }),
+                                        None,
+                                    );
+                                    let _ = client.subscribe_session(&new_sid);
+                                    session_id = Some(new_sid.clone());
+                                    let _ = session_tx.send(Some(new_sid));
+                                    current_lease = Some(new_lease);
+                                }
+                                Err(err) => {
+                                    session_id = None;
+                                    let _ = session_tx.send(None);
+                                    let _ = resp.send(Err(AcpxThreadError::Pool(err.to_string())));
+                                    continue;
+                                }
+                            },
+                            Err(err) => {
+                                // Put the lease back; still try the prompt.
+                                current_lease = Some(lease);
+                                eprintln!(
+                                    "panel-rust: pool.release of stale lease before prompt failed ({err}) -- sending on original session"
+                                );
+                            }
+                        }
+                    }
+                }
                 let Some(sid) = session_id.clone() else {
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;

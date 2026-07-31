@@ -381,6 +381,33 @@ struct GatewayCatalogCache {
     last_refresh: Option<std::time::Instant>,
 }
 
+/// Identity of the central MCP registry for poll-diff purposes.
+/// Ignores ephemeral `tool_catalog` (recomputed every list) so a tools
+/// fetch cannot look like a registry mutation that should evict pools.
+/// Sorted by name so list order from the gateway does not matter.
+fn mcp_registry_identity(
+    servers: &[crate::protocol_types::McpServerEntry],
+) -> Vec<(
+    String,
+    bool,
+    crate::protocol_types::McpServerConfig,
+    Option<crate::protocol_types::McpAuthStatus>,
+)> {
+    let mut rows: Vec<_> = servers
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                s.enabled,
+                s.config.clone(),
+                s.auth_status,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
 /// Owns the background runtime, the per-thread agent connections, the
 /// jsonl cache, and the event queue the UI thread drains via `poll`.
 pub struct AgentBridge {
@@ -5063,6 +5090,11 @@ impl AgentBridge {
         let cache = self.gateway_catalog.clone();
         let refreshing = self.gateway_catalog_refreshing.clone();
         let admin_creds = resolve_admin_creds();
+        // mcp-registry-live-propagation: on a real central-registry diff
+        // (not the cold first fill), refresh every project pool bound to
+        // this gateway so idle sessions drop and leased ones stamp stale.
+        let base_url = self.gateway_urls.get(&provider).cloned();
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
             let profiles = handle.list_profiles().await.unwrap_or_default();
             let mcp_servers = handle.list_mcp_servers().await.unwrap_or_default();
@@ -5088,8 +5120,12 @@ impl AgentBridge {
                 .into_iter()
                 .filter(|session| !bound.contains(&session.acp_session_id))
                 .collect();
-            {
+            let registry_changed = {
                 if let Ok(mut c) = cache.try_lock() {
+                    let had_prior_fill = c.gen > 0;
+                    let changed = had_prior_fill
+                        && mcp_registry_identity(&c.mcp_servers)
+                            != mcp_registry_identity(&mcp_servers);
                     c.profiles = profiles;
                     c.mcp_servers = mcp_servers;
                     c.agents = agents;
@@ -5097,7 +5133,13 @@ impl AgentBridge {
                     c.recovery_provider = provider;
                     c.gen = c.gen.saturating_add(1).max(1);
                     c.last_refresh = Some(std::time::Instant::now());
+                    changed
+                } else {
+                    false
                 }
+            };
+            if registry_changed {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
             }
             refreshing.store(false, Ordering::SeqCst);
         });
@@ -10559,6 +10601,52 @@ done
             "a project the user has open headful (PISO-9's headful-wins reuse) must not be \
              misreported as headless"
         );
+    }
+
+    /// Broad coverage for registry poll-diff identity: name/enabled/config
+    /// changes count; tool_catalog (ephemeral fetch state) does not; order
+    /// is irrelevant.
+    #[test]
+    fn mcp_registry_identity_ignores_tool_catalog_and_detects_real_diffs() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog};
+
+        let a = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let mut a_with_tools = a.clone();
+        a_with_tools.tool_catalog = Some(McpToolCatalog::Fetching);
+        assert_eq!(
+            mcp_registry_identity(std::slice::from_ref(&a)),
+            mcp_registry_identity(std::slice::from_ref(&a_with_tools)),
+            "tool catalog must not look like a registry mutation"
+        );
+
+        let mut disabled = a.clone();
+        disabled.enabled = false;
+        assert_ne!(
+            mcp_registry_identity(std::slice::from_ref(&a)),
+            mcp_registry_identity(std::slice::from_ref(&disabled)),
+            "enabled flip is a real registry change"
+        );
+
+        let b = McpServerEntry::new(
+            "git",
+            McpServerConfig::Stdio {
+                command: "mcp-git".into(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let ordered = mcp_registry_identity(&[b.clone(), a.clone()]);
+        let reversed = mcp_registry_identity(&[a, b]);
+        assert_eq!(ordered, reversed, "list order must not matter");
     }
 
     /// lock_audit Layer 1 (F-01/F-02): frame-poll catalog path must never

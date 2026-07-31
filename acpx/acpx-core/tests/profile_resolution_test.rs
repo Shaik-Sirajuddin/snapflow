@@ -295,12 +295,11 @@ async fn session_new_profile_with_no_mcp_servers_leaves_params_untouched() {
     assert_eq!(response["result"]["sawClientGit"], false);
 }
 
-/// mcp-registry-live-propagation phase `session_resume_typed_server_merge`:
-/// `session/resume` must get the same client+central MCP merge that
-/// `session/new` already does, so central-only entries appear even when
-/// the client sent none (or only its own list).
+/// Broad coverage for mcp-registry-live-propagation server merge:
+/// resume merges central+client, load merges central when client omits
+/// the list, malformed client mcpServers is rejected (not silently emptied).
 #[tokio::test]
-async fn session_resume_with_profile_merges_central_mcp_servers() {
+async fn session_resume_and_load_merge_central_mcp_and_reject_malformed() {
     let mut router = Router::new("stand-in-agent");
     router.register_agent("stand-in-agent", observing_backend_spec());
 
@@ -322,9 +321,6 @@ async fn session_resume_with_profile_merges_central_mcp_servers() {
         .await
         .expect("profiles/create");
 
-    // Open under the profile so the session is bound to it -- resume
-    // merges against the *session's* profile_name, not a fresh _acpx
-    // selector on the resume request.
     let opened = router
         .dispatch(json!({
             "jsonrpc": "2.0", "id": 3, "method": "session/new",
@@ -341,9 +337,7 @@ async fn session_resume_with_profile_merges_central_mcp_servers() {
         .expect("gateway session id")
         .to_string();
 
-    // Client sends only client-git on resume; central-fs must still be
-    // merged in from the session's profile registry attachment.
-    let response = router
+    let resume = router
         .dispatch(json!({
             "jsonrpc": "2.0", "id": 4, "method": "session/resume",
             "params": {
@@ -354,98 +348,27 @@ async fn session_resume_with_profile_merges_central_mcp_servers() {
         }))
         .await
         .expect("session/resume");
-    assert_eq!(
-        response["result"]["sawCentralFs"], true,
-        "central-only registry entry must appear on session/resume"
-    );
-    assert_eq!(
-        response["result"]["sawClientGit"], true,
-        "client-sent mcpServers entry must still be present after merge"
-    );
-}
+    assert_eq!(resume["result"]["sawCentralFs"], true);
+    assert_eq!(resume["result"]["sawClientGit"], true);
 
-#[tokio::test]
-async fn session_load_with_profile_merges_central_mcp_servers() {
-    let mut router = Router::new("stand-in-agent");
-    router.register_agent("stand-in-agent", observing_backend_spec());
-
-    router
+    let load = router
         .dispatch(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "mcp_servers/create",
-            "params": {"name": "central-fs", "command": "mcp-central-fs"}
-        }))
-        .await
-        .expect("mcp_servers/create");
-
-    let mut profile = sample_profile("with-mcp-load", "stand-in-agent");
-    profile.mcp_servers = vec!["central-fs".to_string()];
-    router
-        .dispatch(json!({
-            "jsonrpc": "2.0", "id": 2, "method": "profiles/create",
-            "params": profile
-        }))
-        .await
-        .expect("profiles/create");
-
-    let opened = router
-        .dispatch(json!({
-            "jsonrpc": "2.0", "id": 3, "method": "session/new",
-            "params": {
-                "cwd": "/tmp",
-                "mcpServers": [],
-                "_acpx": {"profile": "with-mcp-load"}
-            }
-        }))
-        .await
-        .expect("session/new");
-    let session_id = opened["result"]["sessionId"]
-        .as_str()
-        .expect("gateway session id")
-        .to_string();
-
-    // Client omits mcpServers entirely on load; central-fs still merges in.
-    let response = router
-        .dispatch(json!({
-            "jsonrpc": "2.0", "id": 4, "method": "session/load",
-            "params": {
-                "sessionId": session_id,
-                "cwd": "/tmp"
-            }
+            "jsonrpc": "2.0", "id": 5, "method": "session/load",
+            "params": {"sessionId": session_id, "cwd": "/tmp"}
         }))
         .await
         .expect("session/load");
     assert_eq!(
-        response["result"]["sawCentralFs"], true,
-        "central-only registry entry must appear on session/load even when client sent no mcpServers"
+        load["result"]["sawCentralFs"], true,
+        "load must still merge central when client omits mcpServers"
     );
-}
-
-#[tokio::test]
-async fn session_resume_rejects_malformed_mcp_servers_entry() {
-    let mut router = Router::new("stand-in-agent");
-    router.register_agent("stand-in-agent", observing_backend_spec());
-
-    let opened = router
-        .dispatch(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "session/new",
-            "params": {"cwd": "/tmp", "mcpServers": []}
-        }))
-        .await
-        .expect("session/new");
-    let session_id = opened["result"]["sessionId"]
-        .as_str()
-        .expect("gateway session id")
-        .to_string();
 
     let err = router
         .dispatch(json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "jsonrpc": "2.0", "id": 6, "method": "session/resume",
             "params": {
                 "sessionId": session_id,
                 "cwd": "/tmp",
-                // Not a valid ACP McpServer of any transport variant --
-                // must surface InvalidSessionEstablishParams, not be
-                // silently dropped/merged as empty.
                 "mcpServers": [{"name": "broken", "notARealField": true}]
             }
         }))

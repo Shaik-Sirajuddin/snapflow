@@ -660,6 +660,34 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
         }
     }
 
+    /// Read-only check: does this lease's entry carry a generation older
+    /// than its key's current generation (i.e. would `release` drop it
+    /// rather than return it to idle)?
+    ///
+    /// Mirrors the comparison `release` already performs internally --
+    /// exposed so a caller that still holds a lease (turn still
+    /// `NotStarted`) can decide to release+reacquire under the current
+    /// generation before sending the first prompt. Returns `false` if the
+    /// lease/key is unknown (no longer in the pool at all), matching the
+    /// "not stale for our purposes" posture of a missing entry: the
+    /// caller will reacquire anyway if the lease is gone.
+    ///
+    /// No state mutation, no new [`PoolError`] variant.
+    pub async fn is_lease_stale(&self, lease: &SessionLease) -> bool {
+        let keys = self.keys.lock().await;
+        let Some(key_pool) = keys.get(&lease.key) else {
+            return false;
+        };
+        let current_generation = key_pool.generation;
+        key_pool
+            .entries
+            .iter()
+            .find(
+                |e| matches!(&e.state, EntryState::Leased { lease: l, .. } if *l == lease.lease_id),
+            )
+            .is_some_and(|entry| entry.generation != current_generation)
+    }
+
     async fn with_leased_entry_mut<F>(&self, lease: &SessionLease, f: F) -> Result<(), PoolError>
     where
         F: FnOnce(&mut EntryState) -> Result<(), PoolError>,
@@ -1198,6 +1226,53 @@ mod tests {
             "a stale-generation session must be dropped on release, not idled"
         );
         assert_eq!(pool.total_for_key(&key).await, 0);
+    }
+
+    /// Broad coverage for the stale-lease reacquire contract used by
+    /// panel-rust's SendPrompt path: fresh lease is not stale; refresh
+    /// stamps it stale (and leaves an untouched key alone); release of a
+    /// stale lease drops it; a subsequent acquire opens a new session id.
+    #[tokio::test]
+    async fn stale_lease_detect_release_and_reacquire_opens_fresh_session() {
+        let pool = Arc::new(ProjectSessionPool::new(CountingOpener::new()));
+        let key = test_key();
+        let other_key = PoolKey::new("/other-proj", "agent-1", "codex/default");
+        let lease = pool
+            .clone()
+            .acquire(key.clone(), "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire");
+        let other_lease = pool
+            .clone()
+            .acquire(other_key.clone(), "thread-b".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire other");
+        let original_sid = lease.session_id.clone();
+
+        assert!(!pool.is_lease_stale(&lease).await);
+        assert!(!pool.is_lease_stale(&other_lease).await);
+
+        pool.refresh_key(&key).await;
+        assert!(pool.is_lease_stale(&lease).await);
+        assert!(
+            !pool.is_lease_stale(&other_lease).await,
+            "untouched key must stay non-stale"
+        );
+
+        pool.mark_turn_finished(&lease).await.ok();
+        pool.release(&lease).await.expect("release stale lease");
+        assert_eq!(pool.total_for_key(&key).await, 0);
+
+        let reacquired = pool
+            .clone()
+            .acquire(key.clone(), "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("reacquire after refresh");
+        assert_ne!(
+            reacquired.session_id, original_sid,
+            "post-refresh reacquire must open a fresh session"
+        );
+        assert!(!pool.is_lease_stale(&reacquired).await);
     }
 
     #[tokio::test]
