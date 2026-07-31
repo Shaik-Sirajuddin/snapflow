@@ -377,10 +377,35 @@ export component AgentsView inherits Rectangle {
             preferred-height: 0px;
             min-height: 0px;
 
+            // settings_scrollbar_discoverability: same "recently scrolled"
+            // tracking settings_page.slint's other-sections ThinScrollbar
+            // now uses -- without an `active` binding this scrollbar only
+            // fades in on a pixel-perfect hover over its own thin hit zone,
+            // not while the user is actually wheel/drag-scrolling the
+            // agent grid. Flickable has no `pressed` property to mirror the
+            // `row2-scroll.pressed` pattern (chat_input_layout.slint /
+            // searchable_dropdown.slint use a TouchArea for that), so this
+            // flashes on real `viewport-y` movement instead and fades a
+            // beat after it stops.
+            property <bool> scroll-recently-active: false;
+            scroll-idle-timer := Timer {
+                interval: 900ms;
+                running: false;
+                triggered => {
+                    scroll-recently-active = false;
+                    self.running = false;
+                }
+            }
+
             agents-body-scroll := Flickable {
                 width: 100%;
                 height: 100%;
                 viewport-height: agents-body.preferred-height;
+                changed viewport-y => {
+                    scroll-recently-active = true;
+                    scroll-idle-timer.running = false;
+                    scroll-idle-timer.running = true;
+                }
 
                 agents-body := SettingsSection {
                     width: parent.width;
@@ -552,6 +577,7 @@ export component AgentsView inherits Rectangle {
                 viewport-height: agents-body.preferred-height;
                 viewport-y <=> agents-body-scroll.viewport-y;
                 thumb-width: 4px;
+                active: scroll-recently-active;
             }
         }
     }

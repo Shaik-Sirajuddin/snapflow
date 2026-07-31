@@ -319,6 +319,31 @@ export component SettingsPage inherits Rectangle {
                     preferred-height: 0px;
                     min-height: 0px;
 
+                    // settings_scrollbar_discoverability: the ThinScrollbar
+                    // below has no `active` binding, so -- same as every
+                    // other bare-hover ThinScrollbar in this codebase before
+                    // it got one (see chat_input_layout.slint's row2 strip
+                    // and searchable_dropdown.slint) -- it only fades in
+                    // while the pointer sits exactly over its ~10px hit
+                    // zone at the far edge, not while the user is actually
+                    // scrolling the content by wheel or drag. Flickable has
+                    // no `pressed` property to mirror the `row2-scroll.
+                    // pressed` pattern those two use (only a TouchArea
+                    // exposes that), so this tracks "recently scrolled" via
+                    // `changed viewport-y` + a short idle timer instead --
+                    // the scrollbar lights up the instant a real scroll
+                    // happens (wheel included) and fades a beat after it
+                    // stops, rather than requiring a pixel-perfect hover.
+                    property <bool> scroll-recently-active: false;
+                    scroll-idle-timer := Timer {
+                        interval: 900ms;
+                        running: false;
+                        triggered => {
+                            scroll-recently-active = false;
+                            self.running = false;
+                        }
+                    }
+
                     other-sections-scroll := Flickable {
                         width: parent.width;
                         height: parent.height;
@@ -335,6 +360,11 @@ export component SettingsPage inherits Rectangle {
                         // fix `base/expandable_panel.slint`'s own Flickable
                         // documents for the identical symptom.
                         viewport-height: content.preferred-height;
+                        changed viewport-y => {
+                            scroll-recently-active = true;
+                            scroll-idle-timer.running = false;
+                            scroll-idle-timer.running = true;
+                        }
                         content := VerticalLayout {
                             width: parent.width;
                             if root.active-section == "mcp_servers" && root.scope == "global" : McpServersView {
@@ -398,6 +428,7 @@ export component SettingsPage inherits Rectangle {
                         viewport-height: content.preferred-height;
                         viewport-y <=> other-sections-scroll.viewport-y;
                         thumb-width: 4px;
+                        active: scroll-recently-active;
                     }
                 }
             }
