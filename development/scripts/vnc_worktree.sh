@@ -313,6 +313,9 @@ PY
     # the same control.sock that ensure_daemon started.
     local snapshotd_home="$state_dir/snapshotd-scratch/snapshotd-home"
     mkdir -p "$snapshotd_home/run"
+    local admin_token
+    admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null)" +        || die "daemon-managed acpx admin token was not created"
+    [ -n "$admin_token" ] || die "daemon-managed acpx admin token is empty"
     # The embedded SAP endpoint must be present before panel-rust registers
     # the GUI with snapshotd; otherwise MCP can see the project path but has
     # no routable GUI socket and falls back to launching headless.
@@ -372,6 +375,7 @@ PY
         # provider-specific localhost URLs.
         RUI_ACPX_DEFAULT_URL="http://127.0.0.1:$gateway_port"
         RUI_ACPX_ADMIN_URL="http://127.0.0.1:$admin_port"
+        RUI_ACPX_ADMIN_TOKEN="$admin_token"
         RUI_ACPX_NO_AUTOSPAWN=1
         SNAPSHOTD_HOME="$snapshotd_home"
         SNAPSHOTD_MCP_SSE_ADDR="$mcp_addr"

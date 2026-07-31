@@ -1412,6 +1412,15 @@ fn register_snapshotd_registry_sync_target(
         .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// Forces the process-wide watcher to revisit the current daemon address on
+/// its next tick. A bridge can gain a gateway after construction (lazy agent
+/// provisioning), and each gateway owns an independent MCP registry.
+fn invalidate_snapshotd_registry_sync() {
+    *SNAPSHOTD_MCP_SYNCED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 /// Live gate for the built-in snapflow (snapshotd) MCP client injection.
 /// Settings UI name is `"snapflow"`; wire `mcpServers` name is
 /// `"snapshotd"`. This flag alone still governs the always-correct
@@ -3648,6 +3657,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway.clone());
+                invalidate_snapshotd_registry_sync();
                 for setter in setters {
                     setter.set_gateway(gateway.clone());
                 }
@@ -3662,6 +3672,7 @@ impl AgentBridge {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(url, gateway.clone());
+                    invalidate_snapshotd_registry_sync();
                     for setter in setters {
                         setter.set_gateway(gateway.clone());
                     }
@@ -3740,6 +3751,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway);
+                invalidate_snapshotd_registry_sync();
                 return Ok(());
             }
             let _guard = self.runtime.enter();
@@ -3753,6 +3765,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway);
+                invalidate_snapshotd_registry_sync();
             });
         }
         Ok(())
