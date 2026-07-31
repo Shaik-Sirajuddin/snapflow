@@ -1838,6 +1838,7 @@ pub fn to_skill_option_rows(entries: Vec<SkillEntry>) -> Vec<SkillOption> {
             scope: entry.scope.as_str().into(),
             path: entry.path.to_string_lossy().into_owned().into(),
             started_from: entry.started_from.unwrap_or_default().into(),
+            is_dev_only: entry.is_dev_only,
         })
         .collect()
 }

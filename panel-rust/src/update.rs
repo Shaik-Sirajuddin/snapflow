@@ -5325,6 +5325,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/review"),
             scope: crate::skills_state::SkillScope::Global,
             started_from: None,
+            is_dev_only: false,
         };
         let (_, dirty) = update(
             &mut model,

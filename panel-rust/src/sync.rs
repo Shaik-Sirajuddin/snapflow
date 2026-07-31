@@ -2331,6 +2331,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/some-local-skill"),
                 scope: crate::skills_state::SkillScope::Global,
                 started_from: None,
+                is_dev_only: false,
             },
             crate::skills_state::SkillEntry {
                 name: "another-skill".to_owned(),
@@ -2338,6 +2339,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/another-skill"),
                 scope: crate::skills_state::SkillScope::Project,
                 started_from: None,
+                is_dev_only: false,
             },
         ];
         let thread = crate::model::ThreadModel {
@@ -2368,6 +2370,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/some-local-skill"),
             scope: crate::skills_state::SkillScope::Global,
             started_from: None,
+            is_dev_only: false,
         }];
         let thread = crate::model::ThreadModel {
             available_commands: vec![crate::protocol_types::AvailableCommandInfo {

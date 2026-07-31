@@ -538,6 +538,12 @@ export struct SkillOption {
     // from scratch) -- `skills-management`'s "show project_start skills
     // include global `started_from`".
     started-from: string,
+    // True for the bundled placeholder skill dev-mode installs
+    // (`ensure_bundled_global_skill`) -- `skills_view.slint` hides such
+    // rows while dev-mode is off, so disabling dev-mode re-filters the
+    // list instead of leaving it visible forever just because the file
+    // still exists on disk.
+    is-dev-only: bool,
 }
 
 // Recovery/import sheet addition (Coverage Matrix `session/list` row):

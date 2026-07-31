@@ -74,7 +74,15 @@ export component SkillsView inherits Rectangle {
             width: parent.width;
 
             for skill in root.skills : SettingsRow {
-                property <bool> row-visible: skill.scope != "global" || root.show-global-skills;
+                // `dev-mode` filter (dev-mode-off-resync fix): a
+                // dev-mode-only skill (the bundled placeholder
+                // `ensure_bundled_global_skill` installs) stays on disk
+                // after dev-mode is turned off, but must drop out of the
+                // visible list immediately -- this binding re-evaluates
+                // on every `root.dev-mode` change same as the existing
+                // `show-global-skills` gate below, so toggling dev-mode
+                // reactively re-filters without needing a reload.
+                property <bool> row-visible: (skill.scope != "global" || root.show-global-skills) && (!skill.is-dev-only || root.dev-mode);
                 width: parent.width;
                 // No conditional-instantiation of a `for` template item in
                 // Slint (`if` can't follow `:` after a `for` binding) --
