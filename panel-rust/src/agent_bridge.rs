@@ -1102,20 +1102,74 @@ pub struct DaemonProjectInstance {
 /// daemon's control socket the CLI dials, per `config.Default`'s own doc
 /// comment) flows through exactly as a test or production launch already
 /// has it set -- this function never touches `SNAPSHOTD_HOME` itself.
+const SNAPSHOTD_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn run_snapshotd_subcommand(bin: &Path, subcommand: &str) -> Result<String, String> {
-    let output = std::process::Command::new(bin)
+    // Do not use Command::output here: a wedged daemon control socket would
+    // otherwise leave the background inventory thread blocked forever. Files
+    // keep stdout/stderr drainable even if a broken daemon emits a large
+    // diagnostic before the timeout expires.
+    let unique = format!(
+        "snapflow-snapshotd-{}-{}-{}",
+        std::process::id(),
+        subcommand,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let stdout_path = std::env::temp_dir().join(format!("{unique}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("{unique}.stderr"));
+    let stdout_file = File::create(&stdout_path)
+        .map_err(|error| format!("creating snapshotd {subcommand} stdout capture: {error}"))?;
+    let stderr_file = File::create(&stderr_path)
+        .map_err(|error| format!("creating snapshotd {subcommand} stderr capture: {error}"))?;
+    let mut child = std::process::Command::new(bin)
         .arg(subcommand)
-        .output()
-        .map_err(|error| format!("spawning `snapshotd {subcommand}`: {error}"))?;
-    if !output.status.success() {
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .map_err(|error| format!("spawning snapshotd {subcommand}: {error}"))?;
+    let deadline = std::time::Instant::now() + SNAPSHOTD_CLI_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!(
+                    "snapshotd {subcommand} timed out after {}s",
+                    SNAPSHOTD_CLI_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!("waiting for snapshotd {subcommand}: {error}"));
+            }
+        }
+    };
+    let stdout = std::fs::read(&stdout_path)
+        .map_err(|error| format!("reading snapshotd {subcommand} stdout capture: {error}"))?;
+    let stderr = std::fs::read(&stderr_path)
+        .map_err(|error| format!("reading snapshotd {subcommand} stderr capture: {error}"))?;
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    if !status.success() {
         return Err(format!(
-            "`snapshotd {subcommand}` exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            "snapshotd {subcommand} exited {status}: {}",
+            String::from_utf8_lossy(&stderr)
         ));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("`snapshotd {subcommand}` produced non-UTF8 stdout: {error}"))
+    String::from_utf8(stdout)
+        .map_err(|error| format!("snapshotd {subcommand} produced non-UTF8 stdout: {error}"))
 }
 
 /// Parses `snapshotd list`'s JSONL stdout (one `registry.ProcessInstance`
@@ -1411,46 +1465,61 @@ fn snapshotd_control_socket_path() -> PathBuf {
 /// from session creation or the UI thread.
 #[cfg(unix)]
 fn query_snapshotd_mcp_addr_at(path: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
 
-    // UnixStream has no stable connect_timeout API. This connect runs only on
-    // the dedicated watcher thread; all subsequent socket I/O is bounded.
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream
-        .set_read_timeout(Some(SNAPSHOTD_CONTROL_TIMEOUT))
+    // std::os::unix::net::UnixStream has no connect timeout. Use a tiny
+    // current-thread runtime on the already-background watcher thread so a
+    // dead/stuck control socket cannot stop all future five-second probes.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
         .ok()?;
-    stream
-        .set_write_timeout(Some(SNAPSHOTD_CONTROL_TIMEOUT))
+    runtime.block_on(async {
+        let stream = tokio::time::timeout(SNAPSHOTD_CONTROL_TIMEOUT, UnixStream::connect(path))
+            .await
+            .ok()?
+            .ok()?;
+        let (read_half, mut write_half) = stream.into_split();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "daemon.mcpStatus",
+            "params": {}
+        });
+        let mut line = serde_json::to_vec(&request).ok()?;
+        line.push(b'\n');
+        tokio::time::timeout(SNAPSHOTD_CONTROL_TIMEOUT, write_half.write_all(&line))
+            .await
+            .ok()?
+            .ok()?;
+        let mut response_line = String::new();
+        let mut reader = BufReader::new(read_half);
+        let count = tokio::time::timeout(
+            SNAPSHOTD_CONTROL_TIMEOUT,
+            reader.read_line(&mut response_line),
+        )
+        .await
+        .ok()?
         .ok()?;
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "daemon.mcpStatus",
-        "params": {}
-    });
-    let mut line = serde_json::to_vec(&request).ok()?;
-    line.push(b'\n');
-    stream.write_all(&line).ok()?;
-
-    let mut response_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response_line)
-        .ok()
-        .filter(|count| *count > 0)?;
-    let response: serde_json::Value = serde_json::from_str(&response_line).ok()?;
-    if response.get("error").is_some() {
-        return None;
-    }
-    let result = response.get("result")?;
-    if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
-        return None;
-    }
-    result
-        .get("addr")
-        .and_then(|value| value.as_str())
-        .filter(|addr| !addr.is_empty())
-        .map(str::to_owned)
+        if count == 0 {
+            return None;
+        }
+        let response: serde_json::Value = serde_json::from_str(&response_line).ok()?;
+        if response.get("error").is_some() {
+            return None;
+        }
+        let result = response.get("result")?;
+        if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+        result
+            .get("addr")
+            .and_then(|value| value.as_str())
+            .filter(|addr| !addr.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 #[cfg(unix)]
@@ -1521,14 +1590,39 @@ fn sync_snapshotd_registry_if_changed(addr: Option<String>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     targets.retain(|target| target.gateways.strong_count() > 0);
+    let mut scheduled = false;
     for target in targets.iter() {
         let Some(gateways) = target.gateways.upgrade() else {
             continue;
         };
+        if gateways
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            continue;
+        }
+        scheduled = true;
         let entry = entry.clone();
         target.runtime.spawn(async move {
-            sync_snapflow_registry_entry(&gateways, &entry).await;
+            if !sync_snapflow_registry_entry(&gateways, &entry).await {
+                // A gateway can appear after the watcher observes the
+                // daemon address, or can temporarily reject the upsert while
+                // it is still starting. Leave the address unsynced so the
+                // next five-second watcher tick retries it.
+                *SNAPSHOTD_MCP_SYNCED
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
         });
+    }
+    if !scheduled {
+        // Do not consume the address-change edge before a gateway exists.
+        // Otherwise the first gateway created after this tick would never
+        // receive the snapflow registry row until the daemon address changed.
+        *SNAPSHOTD_MCP_SYNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -1575,13 +1669,17 @@ fn builtin_snapflow_registry_entry(addr: &str) -> Option<crate::protocol_types::
 async fn sync_snapflow_registry_entry(
     gateways: &Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>,
     entry: &crate::protocol_types::McpServerEntry,
-) {
+) -> bool {
     let live_gateways: Vec<Arc<acpx_client::Gateway>> = gateways
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .values()
         .cloned()
         .collect();
+    if live_gateways.is_empty() {
+        return false;
+    }
+    let mut all_succeeded = true;
     for gateway in live_gateways {
         if let Err(err) = gateway.create_mcp_server(entry).await {
             let already_exists = matches!(
@@ -1590,13 +1688,15 @@ async fn sync_snapflow_registry_entry(
                     if message.to_ascii_lowercase().contains("already exists")
             );
             if already_exists {
-                // Best-effort: a failed update here is retried on the next
-                // address change (or new-target registration), same as any
-                // other failure in this background sync.
-                let _ = gateway.update_mcp_server(entry).await;
+                if gateway.update_mcp_server(entry).await.is_err() {
+                    all_succeeded = false;
+                }
+            } else {
+                all_succeeded = false;
             }
         }
     }
+    all_succeeded
 }
 
 /// Non-blocking read of the watcher cache. Starting the watcher is one-time
