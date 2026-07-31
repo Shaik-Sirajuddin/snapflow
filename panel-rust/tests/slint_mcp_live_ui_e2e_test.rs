@@ -41,7 +41,30 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
+/// Prefers SNAPFLOW_BIN_OVERRIDE, then rebranded snapflow (dev.make BUILD_DIR
+/// convention), then the older shotcut path. Matches
+/// `slint_mcp_acp_provider_matrix_e2e_test.rs`.
 fn shotcut_bin() -> PathBuf {
+    if let Ok(path) = std::env::var("SNAPFLOW_BIN_OVERRIDE") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return p;
+        }
+    }
+    let snapflow = repo_root().join("shotcut-rebrand/build-local/src/snapflow");
+    if snapflow.exists() {
+        return snapflow;
+    }
+    // Shared main-repo BUILD_DIR when this is a nested worktree checkout.
+    let shared = repo_root()
+        .join("../../shotcut-rebrand/build-local/src/snapflow")
+        .canonicalize()
+        .ok();
+    if let Some(p) = shared {
+        if p.exists() {
+            return p;
+        }
+    }
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
 }
 
