@@ -2375,6 +2375,16 @@ fn panel_rust_create_with_initial_identity(
                 load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings)
             });
         panel.sync_runtime_defaults(&defaults);
+        // bug4_new_thread_default_provider: `scoped_prefs.default_agent_id`
+        // was computed above but never applied to `model.default_agent_id`
+        // (what `ThreadMsg::New` reads for a new thread's provider) -- that
+        // was previously only set via the Settings "Save" button. Apply it
+        // here too so a fresh thread respects the configured default.
+        if let Some(configured_agent_id) = scoped_prefs.as_ref().and_then(|prefs| {
+            settings_file::non_default_sentinel(prefs.default_agent_id.clone())
+        }) {
+            panel.model.borrow_mut().default_agent_id = configured_agent_id;
+        }
         for message in post_hydration_warnings {
             let _ = dispatch::update_persistent(
                 &panel,
