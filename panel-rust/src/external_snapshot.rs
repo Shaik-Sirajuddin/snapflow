@@ -165,6 +165,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .as_ref()
                     .and_then(|bridge| bridge.thread_binding(event.thread_index))
                     .map(|binding| binding.thread_id)
+                    .or_else(|| {
+                        self.panel
+                            .bridge
+                            .as_ref()
+                            .and_then(|bridge| bridge.thread_id(event.thread_index))
+                    })
                     .unwrap_or_default()
             })
             .collect();
@@ -687,13 +693,37 @@ impl<'a> ExternalSnapshotSource<'a> {
         real_idx: usize,
     ) -> Option<msg::ThreadFrameSnapshot> {
         let bridge = self.panel.bridge.as_ref()?;
-        let selected_provider = self
-            .panel
-            .model
-            .borrow()
-            .threads
-            .get(real_idx)
-            .and_then(|thread| thread.profile_name.as_deref())
+        let (selected_profile, model_thread_provider) = {
+            let model = self.panel.model.borrow();
+            let thread = model.threads.get(real_idx);
+            (
+                thread.and_then(|thread| thread.profile_name.clone()),
+                thread
+                    .map(|thread| thread.provider.clone())
+                    .filter(|provider| !provider.is_empty()),
+            )
+        };
+        // pre-send-config-options-visibility: `thread.provider` (the Model/
+        // TEA layer) is what `SettingsMsg::ProfileSelected` actually keeps
+        // current the instant the compose bar's Provider picker changes
+        // (see update.rs's own "Critical: deferred attach uses thread.
+        // provider... Leaving provider at create-time default made the
+        // Provider picker a pure cosmetic change" comment) -- `AgentBridge::
+        // thread_provider` (the fallback this used to end on) reads
+        // `ThreadSlot::provider`, a plain field set once at thread
+        // construction and never reassigned anywhere afterward. Live-
+        // confirmed real bug this fixes: switching providers on a not-yet-
+        // sent thread fetched the new provider's own capabilities
+        // correctly (a real, successful models/list round trip) but the
+        // dropdown stayed empty, because this resolution kept resolving
+        // back to the thread's original (construction-time) provider via
+        // the AgentBridge fallback -- so the fetch and the read population
+        // it just also feeds were silently keyed on different providers.
+        // The profile_name -> available_profiles lookup stays first: a
+        // real, admin-provisioned profile is a more specific selection
+        // than the plain provider id and should still win when present.
+        let selected_provider = selected_profile
+            .as_deref()
             .and_then(|profile_name| {
                 self.panel
                     .model
@@ -703,9 +733,14 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .find(|profile| profile.name == profile_name)
                     .map(|profile| profile.agent_id.clone())
             })
+            .or(model_thread_provider)
             .or_else(|| bridge.thread_provider(real_idx))
             .unwrap_or_default();
-        bridge.ensure_models_for_provider(real_idx, &selected_provider);
+        bridge.ensure_models_for_provider(
+            real_idx,
+            &selected_provider,
+            selected_profile.as_deref(),
+        );
         let pending_request = match bridge.pending_requests(real_idx).first() {
             Some(event) => {
                 let view = crate::permission::to_pending_request_view(event);
@@ -784,7 +819,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             connection_status: bridge.transport_status(real_idx),
             session_modes: bridge.session_modes(real_idx),
             usage: bridge.thread_usage(real_idx),
-            config_options: bridge.config_options_for_provider(real_idx, &selected_provider),
+            config_options: bridge.config_options_for_provider(
+                real_idx,
+                &selected_provider,
+                selected_profile.as_deref(),
+            ),
             available_commands: bridge.available_commands(real_idx),
             plan: bridge.plan(real_idx),
             session_title: bridge.session_title(real_idx),

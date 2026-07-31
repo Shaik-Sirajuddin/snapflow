@@ -39,6 +39,8 @@ export component ChatInputLayout inherits Rectangle {
     // Reasoning effort — own dropdown (not mixed into model).
     in property <[DropdownEntry]> reasoning-dropdown-entries: [];
     in property <string> reasoning-trigger-label: "";
+    in property <[DropdownEntry]> permission-mode-dropdown-entries: [];
+    in property <string> permission-mode-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence:
     // profile/provider picker. Only ever interactive while the active
     // thread has no attached session yet (ThreadItem.has-session) --
@@ -126,6 +128,9 @@ export component ChatInputLayout inherits Rectangle {
     property <string> local-reasoning-id: "";
     property <string> local-reasoning-value: "";
     property <string> local-reasoning-label: "";
+    property <string> local-permission-mode-id: "";
+    property <string> local-permission-mode-value: "";
+    property <string> local-permission-mode-label: "";
     property <string> local-profile-id: "";
     property <string> local-profile-label: "";
     // Optimistic Fast toggle state until the host rewrites capabilities.
@@ -137,6 +142,40 @@ export component ChatInputLayout inherits Rectangle {
         if (!root.fast-mode-available) {
             local-fast-mode = false;
         }
+    }
+
+    // The four `local-*` mirrors above are optimistic-only: they exist so a
+    // dropdown pick renders immediately, before the host round-trips and
+    // rewrites `*-trigger-label`. Without a reset, this component (one
+    // shared instance reused across whichever thread is active) kept
+    // showing the *previous* thread's picked provider/mode/config/
+    // reasoning label on a freshly created thread that never had any of
+    // them selected -- live-confirmed: a brand-new thread's compose bar
+    // read "claude-acp ›" purely from a prior thread's optimistic click,
+    // while the real attach (which reads `thread.provider` from the model,
+    // never this local mirror) silently used the actual default agent
+    // instead. `*-trigger-label` is the host's own per-thread value, so it
+    // reliably changes on every thread switch (including to/from an empty
+    // "nothing selected yet" thread) -- clearing the local mirror whenever
+    // it changes keeps the optimistic pre-host-confirmation flash without
+    // letting it survive past the thread it was clicked on.
+    changed profile-trigger-label => {
+        local-profile-id = "";
+        local-profile-label = "";
+    }
+    changed mode-trigger-label => {
+        local-mode-id = "";
+        local-mode-label = "";
+    }
+    changed config-trigger-label => {
+        local-config-id = "";
+        local-config-value = "";
+        local-config-label = "";
+    }
+    changed reasoning-trigger-label => {
+        local-reasoning-id = "";
+        local-reasoning-value = "";
+        local-reasoning-label = "";
     }
 
     // First control is **Provider** (was "Profile") — shows agent/provider
@@ -154,6 +193,9 @@ export component ChatInputLayout inherits Rectangle {
     property <string> reasoning-label-shown:
         local-reasoning-label != "" ? local-reasoning-label
         : (root.reasoning-trigger-label != "" ? root.reasoning-trigger-label : "Effort");
+    property <string> permission-mode-label-shown:
+        local-permission-mode-label != "" ? local-permission-mode-label
+        : (root.permission-mode-trigger-label != "" ? root.permission-mode-trigger-label : "Permission");
 
     // --- / @ # mention popup ---------------------------------------------
     // TextUtil.* callbacks are installed by the Rust host (lib.rs) or
@@ -908,6 +950,34 @@ export component ChatInputLayout inherits Rectangle {
                     profile-dropdown.close();
                     mode-dropdown.close();
                     config-dropdown.close();
+                }
+            }
+
+            permission-mode-dropdown := SearchableDropdown {
+                enabled: root.inputs-enabled;
+                visible: root.permission-mode-dropdown-entries.length > 0;
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                height: root.row2-h;
+                preferred-height: root.row2-h;
+                trigger-min-width: root.row2-compact ? 56px : 72px;
+                trigger-label: root.permission-mode-label-shown;
+                options: root.permission-mode-dropdown-entries;
+                selected-id: root.local-permission-mode-id;
+                selected-value: root.local-permission-mode-value;
+                placeholder: "Permission mode...";
+                popup-width: 220px;
+                entry-selected(id, value, label) => {
+                    root.local-permission-mode-id = id;
+                    root.local-permission-mode-value = value;
+                    root.local-permission-mode-label = label;
+                    root.config-option-selected(id, value);
+                }
+                opened => {
+                    profile-dropdown.close();
+                    mode-dropdown.close();
+                    config-dropdown.close();
+                    reasoning-dropdown.close();
                 }
             }
 

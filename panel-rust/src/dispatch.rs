@@ -477,18 +477,33 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
             .as_ref()
             .is_some_and(|bridge| bridge.is_deferred(real_idx));
         if is_deferred {
-            let (provider, profile) = {
+            let (provider, profile, desired_config_options) = {
                 let model = panel.model.borrow();
                 match model.threads.get(real_idx) {
-                    Some(thread) => (thread.provider.clone(), thread.profile_name.clone()),
-                    None => (String::new(), None),
+                    Some(thread) => (
+                        thread.provider.clone(),
+                        thread.profile_name.clone(),
+                        thread
+                            .config_options
+                            .iter()
+                            .filter_map(|option| {
+                                option.current_value.as_ref().map(|value| {
+                                    (option.id.clone(), serde_json::Value::String(value.clone()))
+                                })
+                            })
+                            .collect(),
+                    ),
+                    None => (String::new(), None, Vec::new()),
                 }
             };
             if let Some(bridge) = panel.bridge.as_mut() {
                 let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
-                if let Err(error) =
-                    bridge.attach_deferred_thread(real_idx, provider_arg, profile.as_deref())
-                {
+                if let Err(error) = bridge.attach_deferred_thread_with_config_options(
+                    real_idx,
+                    provider_arg,
+                    profile.as_deref(),
+                    desired_config_options,
+                ) {
                     // Surface attach failure the same shape a failed eager
                     // attach would: mark the thread errored via the reducer.
                     let _ = update_persistent(
@@ -506,6 +521,16 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
         }
     }
     dispatch_compose_send(panel, filtered_idx, text);
+}
+
+/// Persists live unsent composer text into the selected thread immediately.
+/// The retained ChatArea remains the UI source of truth while this reducer
+/// mirror lets thread switching and send/restore flows use durable Rust state.
+pub(crate) fn dispatch_compose_draft_changed(panel: &PanelSingleton, text: String) {
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::DraftChanged(text))),
+    );
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
@@ -1163,7 +1188,7 @@ pub(crate) fn dispatch_profile_selected(
     profile_name: String,
     agent_id: String,
 ) {
-    let (effects, _) = update_persistent(
+    let (effects, dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
             profile_name,
@@ -1171,6 +1196,13 @@ pub(crate) fn dispatch_profile_selected(
         })),
     );
     execute_effects(panel, effects);
+    let selected_thread_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_selected_thread_snapshot();
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot,
+        ..crate::msg::FrameInput::default()
+    });
+    let _ = dirty;
 }
 
 pub(crate) fn dispatch_config_option_selected(
@@ -1280,7 +1312,16 @@ pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
         panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::ErrorBannerDismissed)),
     );
-    debug_assert!(dirty.iter().any(|item| matches!(item, Dirty::Error { .. })));
+    // `ChromeMsg::ErrorBannerDismissed`'s reducer arm legitimately returns
+    // empty dirty when there is no genuinely selected/visible thread right
+    // now (see `selected_real_index`'s doc comment) -- this used to assert
+    // unconditionally, which the same "search filter hides the selection"
+    // state that once crashed Send (dispatch_compose_send's debug_assert)
+    // would have hit here too now that selected_real_index no longer
+    // fabricates an index in that case.
+    debug_assert!(
+        dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. }))
+    );
 }
 
 pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
@@ -1387,6 +1428,7 @@ pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
 // bridge shape as every UI domain above.
 
 pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option<String>) {
+    crate::snapshotd_lifecycle::project_changed(path.clone());
     let (effects, _) =
         update_persistent(panel, Msg::Host(HostMsg::ProjectPathChanged(path.clone())));
     execute_effects(panel, effects);
@@ -1476,8 +1518,14 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
     // terminals, error) alongside the selection scalar -- the invariant
     // worth keeping is that a switch command MARKS the selection dirty,
     // not that it marks nothing else.
+    // `ThreadMsg::NavigateDelta` (behind previous-thread/next-thread) bails
+    // out to empty dirty when there are zero threads to navigate among --
+    // legitimately reachable (a cold-start panel with no threads yet), so
+    // this must tolerate empty too, same as the other reducer-shape
+    // asserts above.
     debug_assert!(
         command == crate::PANEL_COMMAND_OPEN_THREAD_SEARCH
+            || dirty.is_empty()
             || dirty
                 .iter()
                 .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))

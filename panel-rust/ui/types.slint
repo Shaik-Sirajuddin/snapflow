@@ -73,7 +73,6 @@ export struct ThreadItem {
     has-session: bool,
 }
 
-
 // Streaming markdown (from streaming-markdown-slint): visual lines/runs.
 export struct MarkdownRun {
     text: string,
@@ -167,6 +166,28 @@ export struct MessageItem {
     // ladder of `if`s. 0 for every other row, including non-start members
     // of the same run.
     tool-group-len: int,
+}
+
+export struct ToolGroupItem {
+    label: string,
+    item-count: int,
+    messages: [MessageItem],
+}
+
+// One durable thread identity plus its stable observable message model.
+// The model is supplied by Rust and is never replaced during a thread
+// switch; only the selected view/model reference changes.
+export struct ThreadViewItem {
+    thread-id: string,
+    messages: [MessageItem],
+    // One slot per message index. Tool-group starts contain a compact
+    // group-local model; non-start slots are empty placeholders so a
+    // message row resolves its group without scanning groups.
+    tool-groups: [ToolGroupItem],
+    // Unsaved composer text belongs to the retained thread view, not to a
+    // shared ChatViewStack buffer. Rust mirrors this value in
+    // ThreadModel.compose_draft for persistence across selection changes.
+    compose-text: string,
 }
 
 // One choice in a pending approval — ACP `PermissionOption` shape

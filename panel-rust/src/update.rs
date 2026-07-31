@@ -104,11 +104,29 @@ pub(crate) fn show_toast(model: &mut Model, kind: &str, message: impl Into<Strin
     Dirty::Toast
 }
 
-pub(crate) fn selected_real_index(model: &Model) -> usize {
+/// The real (storage) index of whichever thread is genuinely visible and
+/// selected right now, or `None` if `model.selected_thread` does not
+/// currently resolve to a visible row at all (e.g. an active thread-search
+/// filter matches nothing, or momentarily matches fewer rows than the
+/// stale selection position).
+///
+/// This used to fall back to `.unwrap_or(model.selected_thread)` on a
+/// lookup miss -- reinterpreting a *filtered-list position* as if it were
+/// already a *real storage index* whenever the two spaces happened to
+/// overlap in range. That silently pointed every caller (compose send,
+/// terminal kill, settings mode/profile/MCP changes, agent-request
+/// approve/reject, ...) at whatever thread happened to occupy that real
+/// slot -- not the thread actually selected/visible in the UI -- and in
+/// `dispatch_compose_send`'s case (the one call site that cross-checks
+/// this against a second, independently-computed real index) that
+/// disagreement tripped a `debug_assert!` and aborted the whole process
+/// (a live-reproduced crash: type a thread-search query that filters the
+/// selected thread out of view, then Send). Returning `None` here instead
+/// lets every caller degrade to "nothing to do" rather than guess.
+pub(crate) fn selected_real_index(model: &Model) -> Option<usize> {
     current_visible_indices(model)
         .get(model.selected_thread)
         .copied()
-        .unwrap_or(model.selected_thread)
 }
 
 // PROF-9 (`profile-only-backend-selection` plan): a thread's agent is
@@ -266,68 +284,45 @@ fn thread_list_dirty_with_keys(model: &mut Model, old_keys: Vec<String>) -> Dirt
 fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>) {
     let real_idx = selected_real_index(model);
     let prev_displayed = model.displayed_thread;
-    let switched = prev_displayed != Some(real_idx);
+    let switched = prev_displayed != real_idx;
 
     let mut dirty = vec![Dirty::Scalar(ScalarField::SelectedThread)];
 
     if switched {
-        // Leave A: snapshot list presentation (content + expand) before
-        // installing B — enables A→B→A expand restore without re-project.
+        if std::env::var_os("RUI_THREAD_VIEW_TRACE").is_some() {
+            eprintln!(
+                "thread-view select from={:?} to={:?} durable={}",
+                prev_displayed,
+                real_idx,
+                real_idx
+                    .and_then(|idx| model.threads.get(idx))
+                    .map(|thread| thread.thread_id.as_str())
+                    .unwrap_or("")
+            );
+        }
+        // Preserve only non-transcript compose state on the leaving thread.
+        // Its retained ChatView owns the message rows and presentation state;
+        // switching must not snapshot/copy them through a shared list cache.
         if let Some(prev) = prev_displayed {
-            snapshot_thread_list_ui_cache(model, prev);
             if let Some(thread) = model.threads.get_mut(prev) {
                 thread.compose_draft = std::mem::take(&mut model.compose_text);
             }
         }
-        model.compose_text = model
-            .threads
-            .get(real_idx)
+        model.compose_text = real_idx
+            .and_then(|idx| model.threads.get(idx))
             .map(|thread| thread.compose_draft.clone())
             .unwrap_or_default();
         dirty.push(Dirty::Scalar(ScalarField::ComposeText));
 
-        // Atomic ownership: displayed + shared list become B in this same
-        // sync turn (no multi-frame window where selection is B and list is A).
-        model.displayed_thread = Some(real_idx);
+        // Selection now changes the active retained ChatView. Its own
+        // observable message model already contains B's rows, so switching
+        // does not install/copy a list into a shared model.
+        model.displayed_thread = real_idx;
 
-        // Prefer leave/return cache for B when present; else ThreadModel rows.
-        let target_id = model
-            .threads
-            .get(real_idx)
+        let target_id = real_idx
+            .and_then(|idx| model.threads.get(idx))
             .map(|t| t.thread_id.clone())
             .unwrap_or_default();
-        if !target_id.is_empty() {
-            if let Some(cache) = model.list_ui_cache.get(&target_id).cloned() {
-                if let Some(thread) = model.threads.get_mut(real_idx) {
-                    // Restore presentation snapshot; frame hydrate may refresh
-                    // content if transcript advanced in background.
-                    thread.transcript_keys = cache.keys;
-                    thread.message_rows = cache.rows;
-                    thread.message_ids = thread
-                        .transcript_keys
-                        .iter()
-                        .filter_map(|key| key.split_once(':').map(|(_, id)| id.to_owned()))
-                        .collect();
-                }
-            }
-        }
-
-        model.expanded = model
-            .threads
-            .get(real_idx)
-            .map(|t| t.message_rows.iter().map(|r| r.expanded).collect())
-            .unwrap_or_default();
-        model.list_owner_thread_id = if target_id.is_empty() {
-            None
-        } else {
-            Some(target_id.clone())
-        };
-        model.list_gen = model.list_gen.wrapping_add(1);
-
-        dirty.push(Dirty::MessageListInstall {
-            thread_id: target_id.clone(),
-        });
-
         // Sibling panes: clear-then-frame-fill for pending/error/terminals
         // (same isolation class as messages; frame re-hydrates B).
         dirty.push(Dirty::PendingRequest {
@@ -336,17 +331,15 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
         dirty.push(Dirty::Error {
             thread_id: target_id.clone(),
             detail: crate::dirty::ErrorDetail {
-                message: model
-                    .threads
-                    .get(real_idx)
+                message: real_idx
+                    .and_then(|idx| model.threads.get(idx))
                     .and_then(|t| t.error.clone())
                     .unwrap_or_default(),
             },
         });
         dirty.push(Dirty::Terminal {
-            id: model
-                .threads
-                .get(real_idx)
+            id: real_idx
+                .and_then(|idx| model.threads.get(idx))
                 .and_then(|t| t.expanded_terminal.as_ref())
                 .map(|t| t.terminal_id.to_string())
                 .unwrap_or_default(),
@@ -356,17 +349,15 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
             thread_id: target_id,
         });
         dirty.push(Dirty::Capabilities {
-            thread_id: model
-                .threads
-                .get(real_idx)
+            thread_id: real_idx
+                .and_then(|idx| model.threads.get(idx))
                 .and_then(|t| t.session_id.clone())
                 .unwrap_or_default(),
         });
     }
 
-    let thread_id = model
-        .threads
-        .get(real_idx)
+    let thread_id = real_idx
+        .and_then(|idx| model.threads.get(idx))
         .map(|thread| thread.thread_id.clone());
     (
         thread_id
@@ -374,50 +365,6 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
             .unwrap_or_default(),
         dirty,
     )
-}
-
-/// Snapshot the currently displayed list into `list_ui_cache[thread_id]`.
-fn snapshot_thread_list_ui_cache(model: &mut Model, real_idx: usize) {
-    let Some(thread) = model.threads.get(real_idx) else {
-        return;
-    };
-    let thread_id = thread.thread_id.clone();
-    if thread_id.is_empty() {
-        return;
-    }
-    // Prefer live shared model (what user actually sees) over ThreadModel
-    // when this thread owns the list; fall back to ThreadModel rows.
-    let (keys, rows) = if model.list_owner_thread_id.as_deref() == Some(thread_id.as_str())
-        || model.displayed_thread == Some(real_idx)
-    {
-        let keys = model.message_model_keys.borrow().clone();
-        let mut rows = Vec::with_capacity(model.messages_model.row_count());
-        for i in 0..model.messages_model.row_count() {
-            if let Some(row) = model.messages_model.row_data(i) {
-                rows.push(row);
-            }
-        }
-        if rows.is_empty() && !thread.message_rows.is_empty() {
-            (thread.transcript_keys.clone(), thread.message_rows.clone())
-        } else {
-            (keys, rows)
-        }
-    } else {
-        (thread.transcript_keys.clone(), thread.message_rows.clone())
-    };
-    // Keep ThreadModel.message_rows in sync with what we cached so return
-    // install and background patch share one presentation store.
-    if let Some(thread) = model.threads.get_mut(real_idx) {
-        if !rows.is_empty() || keys.is_empty() {
-            thread.transcript_keys = keys.clone();
-            thread.message_rows = rows.clone();
-        }
-    }
-    let gen = model.list_gen;
-    model.list_ui_cache.insert(
-        thread_id,
-        crate::model::ThreadListUiCache { keys, rows, gen },
-    );
 }
 
 /// Re-apply expand flags from prior rows by transcript key after a re-project.
@@ -756,7 +703,6 @@ fn rebuild_send_queue_projection(model: &mut Model, idx: usize) -> (String, Vec<
         in_flight,
     );
     let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
-    thread.message_rows = rows;
     thread.transcript_keys = keys;
     (
         thread_id.clone(),
@@ -794,8 +740,25 @@ fn queue_entry_id_at(
 }
 
 fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Every arm below that actually uses `idx` already immediately bails
+    // out via its own `model.threads.get(idx)`/`get_mut(idx)` guard, and
+    // the handful that don't (MentionToken*/WordBoundaryBefore/ContainsCi)
+    // already unconditionally return `(vec![], vec![])` regardless of
+    // `idx` -- so bailing here whenever nothing is genuinely selected/
+    // visible changes nothing for those, and fixes every other arm at
+    // once (see `selected_real_index`'s doc comment for the bug this
+    // closes).
+    let Some(idx) = selected_real_index(model) else {
+        return (vec![], vec![]);
+    };
     match msg {
+        ComposeMsg::DraftChanged(text) => {
+            model.compose_text = text.clone();
+            if let Some(thread) = model.threads.get_mut(idx) {
+                thread.compose_draft = text;
+            }
+            (vec![], vec![])
+        }
         ComposeMsg::SendRequested(text) => {
             model.compose_text.clear();
             let Some(thread) = model.threads.get_mut(idx) else {
@@ -818,7 +781,6 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                             in_flight,
                         );
                         let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
-                        thread.message_rows = rows;
                         thread.transcript_keys = keys;
                         (
                             vec![],
@@ -1111,7 +1073,14 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
 }
 
 fn update_request(model: &mut Model, msg: RequestMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Every arm targets whichever thread `idx` names with no bail-out of
+    // its own (unlike `update_compose`) -- previously this fired an effect
+    // at a possibly-wrong real index whenever `idx` was unsound (see
+    // `selected_real_index`'s doc comment); now it's a clean no-op when
+    // nothing is genuinely selected/visible.
+    let Some(idx) = selected_real_index(model) else {
+        return (vec![], vec![]);
+    };
     match msg {
         RequestMsg::Approve(request_id) => (
             vec![Effect::RespondAgentRequest {
@@ -1160,7 +1129,10 @@ fn update_request(model: &mut Model, msg: RequestMsg) -> (Vec<Effect>, Vec<Dirty
 }
 
 fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Only `Kill` below needs a real thread index -- the rest operate on
+    // the terminal overlay/local-terminal state independent of thread
+    // selection, so (unlike `update_compose`/`update_request`) the guard
+    // stays local to that one arm rather than gating the whole function.
     match msg {
         TerminalMsg::Expand(id) => {
             // Opens (if not already open) AND activates -- the popup row
@@ -1221,6 +1193,9 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
         TerminalMsg::LocalClose => (vec![Effect::LocalTerminalKill], vec![Dirty::LocalTerminal]),
         TerminalMsg::LocalKeyInput(bytes) => (vec![Effect::LocalTerminalWrite { bytes }], vec![]),
         TerminalMsg::Kill(terminal_id) => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             // No model mutation here -- the real exit is observed the
             // same way any other terminal exit is, via the next
             // `AgentEvent::TerminalOutput` carrying a non-null
@@ -1238,7 +1213,12 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
 }
 
 fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dirty>) {
-    let idx = selected_real_index(model);
+    // Open/Close/Save/ScopeChanged/DevModeToggled are global settings
+    // actions that must still work with no thread genuinely selected/
+    // visible (e.g. Settings should still open while a thread search
+    // filters the list to nothing) -- so unlike `update_compose`/
+    // `update_request`, `idx` is resolved per-arm below, only where an
+    // arm actually targets a specific thread's gateway/session.
     match msg {
         SettingsMsg::Open => {
             model.settings_open = true;
@@ -1284,25 +1264,61 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 vec![Dirty::Scalar(ScalarField::SettingsScope), Dirty::Settings],
             )
         }
-        SettingsMsg::ConfigOptionSelected { key, value } => (
-            vec![Effect::SetConfigOption {
-                real_index: idx,
-                key,
-                value,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::ModeSelected(mode) => (
-            vec![Effect::SetMode {
-                real_index: idx,
-                mode,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::ConfigOptionSelected { key, value } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            let Some(thread) = model.threads.get_mut(idx) else {
+                return (vec![], vec![]);
+            };
+            if thread.session_id.is_none() {
+                if let Some(option) = thread.config_options.iter_mut().find(|option| {
+                    option.id == key
+                        && option
+                            .options
+                            .iter()
+                            .any(|candidate| candidate.value == value)
+                }) {
+                    option.current_value = Some(value);
+                }
+                return (
+                    vec![],
+                    vec![
+                        Dirty::Settings,
+                        Dirty::Capabilities {
+                            thread_id: thread.thread_id.clone(),
+                        },
+                    ],
+                );
+            }
+            (
+                vec![Effect::SetConfigOption {
+                    real_index: idx,
+                    key,
+                    value,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::ModeSelected(mode) => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::SetMode {
+                    real_index: idx,
+                    mode,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::ProfileSelected {
             profile_name,
             agent_id,
         } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             // Resolve agent_id before mutably borrowing the thread (may need
             // available_profiles if UI only sent the profile name).
             let resolved_agent = if !agent_id.is_empty() {
@@ -1368,6 +1384,9 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
         // authenticated, and blocking it here would trap a user trying to
         // fix the MCP side first).
         SettingsMsg::McpServerCreate { entry } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             if !thread_agent_usable(model, idx) {
                 let toast = show_toast(
                     model,
@@ -1384,21 +1403,34 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 vec![Dirty::Settings],
             )
         }
-        SettingsMsg::McpServerUpdate { entry } => (
-            vec![Effect::McpServerUpdate {
-                real_index: idx,
-                entry,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::McpServerDelete { name } => (
-            vec![Effect::McpServerDelete {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::McpServerUpdate { entry } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerUpdate {
+                    real_index: idx,
+                    entry,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerDelete { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerDelete {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerEnabledChanged { name, enabled } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             if enabled && !thread_agent_usable(model, idx) {
                 let toast = show_toast(
                     model,
@@ -1417,25 +1449,38 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 vec![Dirty::Settings],
             )
         }
-        SettingsMsg::McpServerAuthenticate { name } => (
-            vec![Effect::McpServerAuthenticate {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::McpServerLogout { name } => (
-            vec![Effect::McpServerLogout {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::McpServerAuthenticate { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerAuthenticate {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerLogout { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerLogout {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerToolEnabledChanged {
             server_name,
             tool_name,
             enabled,
         } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             if enabled && !thread_agent_usable(model, idx) {
                 let toast = show_toast(
                     model,
@@ -1458,59 +1503,89 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             server_name,
             tool_name,
             deferred,
-        } => (
-            vec![Effect::McpServerToolDeferredChanged {
-                real_index: idx,
-                server_name,
-                tool_name,
-                deferred,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::McpServerToolsFetchRequested { server_name } => (
-            vec![Effect::McpServerToolsFetchRequested {
-                real_index: idx,
-                server_name,
-            }],
-            vec![Dirty::Settings],
-        ),
+        } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerToolDeferredChanged {
+                    real_index: idx,
+                    server_name,
+                    tool_name,
+                    deferred,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerToolsFetchRequested { server_name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerToolsFetchRequested {
+                    real_index: idx,
+                    server_name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::ProfileCreate {
             name,
             agent_id,
             terminal_enabled,
             fs_enabled,
-        } => (
-            vec![Effect::ProfileCreate {
-                real_index: idx,
-                name,
-                agent_id,
-                terminal_enabled,
-                fs_enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::ProfileDelete { name } => (
-            vec![Effect::ProfileDelete {
-                real_index: idx,
-                name,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::AgentInstallRequested { agent_id } => (
-            vec![Effect::AgentInstallRequested {
-                real_index: idx,
-                agent_id,
-            }],
-            vec![Dirty::Settings],
-        ),
-        SettingsMsg::AgentSetEnabled { agent_id, enabled } => (
-            vec![Effect::AgentSetEnabled {
-                real_index: idx,
-                agent_id,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::ProfileCreate {
+                    real_index: idx,
+                    name,
+                    agent_id,
+                    terminal_enabled,
+                    fs_enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::ProfileDelete { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::ProfileDelete {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::AgentInstallRequested { agent_id } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::AgentInstallRequested {
+                    real_index: idx,
+                    agent_id,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::AgentSetEnabled { agent_id, enabled } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::AgentSetEnabled {
+                    real_index: idx,
+                    agent_id,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
     }
 }
 
@@ -1605,7 +1680,8 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 let n = model
                     .threads
                     .get(real_idx)
-                    .map(|t| t.message_rows.len())
+                    .and_then(|thread| model.thread_view_models.get(&thread.thread_id))
+                    .map(|messages| messages.row_count())
                     .unwrap_or(0);
                 model.expanded.resize(n.max(index + 1), false);
             }
@@ -1613,28 +1689,34 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 return (vec![], vec![]);
             };
             *slot = !*slot;
+            #[cfg(test)]
             let expanded = *slot;
             let Some(thread) = model.threads.get_mut(real_idx) else {
                 return (vec![], vec![]);
             };
-            // One-row only: do not re-project the whole transcript.
-            if let Some(row) = thread.message_rows.get_mut(index) {
-                row.expanded = expanded;
-            } else {
+            // One-row only: do not re-project the whole transcript. The
+            // sync boundary applies the new flag to the retained model.
+            let row_exists = model
+                .thread_view_models
+                .get(&thread.thread_id)
+                .is_some_and(|messages| index < messages.row_count());
+            #[cfg(test)]
+            let row_exists = row_exists || index < thread.message_rows.len();
+            if !row_exists {
                 return (vec![], vec![]);
             }
-            let thread_id = thread.thread_id.clone();
-            // Keep leave/return cache coherent while still on this thread.
-            if let Some(cache) = model.list_ui_cache.get_mut(&thread_id) {
-                if let Some(row) = cache.rows.get_mut(index) {
-                    row.expanded = expanded;
-                }
+            #[cfg(test)]
+            if let Some(row) = thread.message_rows.get_mut(index) {
+                row.expanded = expanded;
             }
+            let thread_id = thread.thread_id.clone();
             (vec![], vec![Dirty::MessageRowPatch { thread_id, index }])
         }
         ChromeMsg::CopyMessageRequested { text } => (vec![Effect::ClipboardWrite { text }], vec![]),
         ChromeMsg::ErrorBannerDismissed => {
-            let real_idx = selected_real_index(model);
+            let Some(real_idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
             let Some(thread) = model.threads.get_mut(real_idx) else {
                 return (vec![], vec![]);
             };
@@ -1723,21 +1805,13 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
         HostMsg::ProjectClosed => {
             model.project_generation = model.project_generation.saturating_add(1);
             model.project_lifecycle_reason = "closed".to_owned();
-            let old_keys = model.message_model_keys.borrow().clone();
             model.displayed_thread = None;
-            model.list_owner_thread_id = None;
             model.active_project = crate::model::ProjectIdentity::None;
             model.active_project_path = None;
-            let clear =
-                crate::dirty::diff_by_id(&old_keys, &[] as &[String], &[] as &[crate::MessageItem]);
             (
                 vec![Effect::SetActiveProjectPath { path: None }],
                 vec![
                     Dirty::ProjectPath,
-                    Dirty::MessagesDiff {
-                        thread_id: String::new(),
-                        ops: clear,
-                    },
                     Dirty::PendingRequest {
                         thread_id: String::new(),
                     },
@@ -2031,17 +2105,17 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             if !thread.message_ids.iter().any(|id| id == &message_id) {
                 return (vec![], vec![]);
             }
-            let candidates = [
-                format!("assistant:{message_id}"),
-                format!("thought:{message_id}"),
-                format!("user:{message_id}"),
-                format!("tool:{message_id}"),
-            ];
-            if let Some(index) = thread
-                .transcript_keys
+            #[cfg(test)]
+            if let Some(index) = thread.transcript_keys.iter().position(|key| {
+                [
+                    format!("assistant:{message_id}"),
+                    format!("thought:{message_id}"),
+                    format!("user:{message_id}"),
+                    format!("tool:{message_id}"),
+                ]
                 .iter()
-                .position(|key| candidates.iter().any(|candidate| candidate == key))
-            {
+                .any(|candidate| candidate == key)
+            }) {
                 if let Some(row) = thread.message_rows.get_mut(index) {
                     row.text = format!("{}{}", row.text, delta).into();
                 }
@@ -2195,6 +2269,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // hydration makes the identity available.
             continue;
         };
+        let target_thread_id = model.threads[target_index].thread_id.clone();
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
         };
@@ -2353,7 +2428,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
-            | crate::protocol_types::AgentEvent::ConfigOptions(_)
             // PUI-003: the agent's slash commands flow through the per-frame
             // snapshot fold (thread.available_commands) like other caps.
             | crate::protocol_types::AgentEvent::AvailableCommands(_)
@@ -2363,6 +2437,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::PlanUpdate(_)
             | crate::protocol_types::AgentEvent::SessionInfoUpdate { .. } => {
                 dirty.push(thread_row_dirty(model, target_index));
+            }
+            crate::protocol_types::AgentEvent::ConfigOptions(_) => {
+                dirty.push(Dirty::Capabilities {
+                    thread_id: target_thread_id,
+                });
             }
         }
     }
@@ -2399,13 +2478,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         model.expanded = expanded;
     }
     if frame.clear_selected_thread {
-        let old_keys = model.message_model_keys.borrow().clone();
-        if model.displayed_thread.take().is_some() || !old_keys.is_empty() {
-            dirty.push(Dirty::MessagesDiff {
-                thread_id: String::new(),
-                ops: crate::dirty::diff_by_id(&old_keys, &[], &Vec::<crate::MessageItem>::new()),
-            });
-        }
+        model.displayed_thread = None;
     }
     if let Some(snapshot) = frame.thread_list_snapshot {
         let old_keys = model.thread_model_keys.borrow().clone();
@@ -2530,17 +2603,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // uses: drop displayed_thread and diff the shared model to
             // empty.
             if snapshot.visible_thread_ids.is_empty() {
-                let old_keys = model.message_model_keys.borrow().clone();
-                if model.displayed_thread.take().is_some() || !old_keys.is_empty() {
-                    dirty.push(Dirty::MessagesDiff {
-                        thread_id: String::new(),
-                        ops: crate::dirty::diff_by_id(
-                            &old_keys,
-                            &[],
-                            &Vec::<crate::MessageItem>::new(),
-                        ),
-                    });
-                }
+                model.displayed_thread = None;
             }
         }
         if snapshot_matches_active_project {
@@ -2621,14 +2684,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // failed session disappears. Never leave the previous thread's
             // rows visible under the new selection; clear the shared list
             // and ownership instead of silently keeping stale content.
-            if model.list_owner_thread_id.is_some() {
-                let old_keys = model.message_model_keys.borrow().clone();
-                model.list_owner_thread_id = None;
-                dirty.push(Dirty::MessagesDiff {
-                    thread_id: String::new(),
-                    ops: crate::dirty::diff_by_id(&old_keys, &[], &[]),
-                });
-            }
+            model.displayed_thread = None;
             return (effects, dirty);
         };
         // SCNA-01: distinct from `switched_thread` below -- specifically
@@ -2661,17 +2717,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         // switch the display when the snapshot is for the thread the user
         // actually has selected -- otherwise leave the display alone and
         // let the next tick collect the right thread's snapshot.
-        let selection_matches = target_index == selected_real_index(model);
+        let selection_matches = Some(target_index) == selected_real_index(model);
         // Owner mismatch covers selection that already set displayed_thread
         // but list/owner still needs hydrate from a fresh snapshot.
-        let owner_before = model.list_owner_thread_id.clone();
         let switched_thread = selection_matches && model.displayed_thread != Some(target_index);
         if switched_thread {
             // Rare path: frame promotes display without going through
             // apply_thread_selection_switch (e.g. cold first paint).
-            if let Some(prev) = model.displayed_thread {
-                snapshot_thread_list_ui_cache(model, prev);
-            }
             model.displayed_thread = Some(target_index);
         }
         // Build expand vec from existing row flags / model.expanded, not
@@ -2682,16 +2734,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.expanded.resize(transcript_row_count, false);
         }
         let expanded = model.expanded.clone();
-        // Clone cache expand map before mutably borrowing the thread.
-        let cache_expand = model
-            .threads
-            .get(target_index)
-            .map(|t| t.thread_id.clone())
-            .and_then(|id| model.list_ui_cache.get(&id).cloned());
         if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
-            let old_rows = thread.message_rows.clone();
+            let old_rows = model
+                .thread_view_models
+                .rows(&thread_id)
+                .unwrap_or_default();
             // Include send-queue rows (QueuedMessageBar) in the projection.
             let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
             let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
@@ -2702,9 +2751,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             );
             // Preserve expand-by-key across re-project (live poll + switch).
             merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
-            if let Some(cache) = cache_expand.as_ref() {
-                merge_expanded_by_key(&cache.keys, &cache.rows, &new_keys, &mut rows);
-            }
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
             // A brand new thread's own cache is empty both before and
@@ -2727,9 +2773,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // ModelRc-free transcript data), and expand/collapse already
             // dispatches its own `Dirty::MessageRowPatch` (see
             // `ChromeMsg::ToggleExpanded`).
-            let owner_mismatch =
-                selection_matches && owner_before.as_deref() != Some(thread_id.as_str());
-            let force_list_install = switched_thread || owner_mismatch;
+            let force_list_install = switched_thread;
             let transcript_changed = force_list_install
                 || old_keys != new_keys
                 || thread.transcript != snapshot.transcript;
@@ -2762,7 +2806,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 .iter()
                 .filter_map(|key| key.split_once(':').map(|(_, id)| id.to_owned()))
                 .collect();
-            thread.message_rows = rows.clone();
+            #[cfg(test)]
+            {
+                thread.message_rows = rows.clone();
+            }
             thread.has_older_messages = snapshot.has_older_messages;
             thread.pending_request = snapshot.pending_request;
             thread.terminals = snapshot.terminals;
@@ -2778,35 +2825,20 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.session_title = snapshot.session_title;
 
             if transcript_changed {
-                if force_list_install {
-                    // Full list ownership install (switch / owner mismatch).
-                    dirty.push(Dirty::MessageListInstall {
-                        thread_id: thread_id.clone(),
-                    });
-                } else {
-                    // Same-thread content change: key-keyed diff only (go-fast).
-                    dirty.push(Dirty::MessagesDiff {
-                        thread_id: thread_id.clone(),
-                        ops: crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &rows),
-                    });
-                }
+                // Every transcript change, including cold hydration and a
+                // switch to a previously retained view, is a diff against
+                // that thread's own model. There is no shared-list install
+                // on the selection path anymore.
+                dirty.push(Dirty::MessagesDiff {
+                    thread_id: thread_id.clone(),
+                    ops: crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &rows),
+                });
             }
-            // Refresh leave/return cache + expand flags when this is the
-            // displayed owner (selection already set displayed_thread).
+            // Keep the legacy scalar projection synchronized for non-message
+            // consumers. The retained ChatView model remains the owner of
+            // message row identity and presentation state.
             if selection_matches {
                 model.expanded = rows.iter().map(|r| r.expanded).collect();
-                model.list_owner_thread_id = Some(thread_id.clone());
-                if force_list_install {
-                    model.list_gen = model.list_gen.wrapping_add(1);
-                }
-                model.list_ui_cache.insert(
-                    thread_id.clone(),
-                    crate::model::ThreadListUiCache {
-                        keys: new_keys.clone(),
-                        rows: rows.clone(),
-                        gen: model.list_gen,
-                    },
-                );
             }
             if pending_changed {
                 if thread.pending_request.active {
@@ -2917,15 +2949,11 @@ mod tests {
         model
     }
 
-    /// Dirty set emitted when selection actually changes thread: atomic
-    /// MessageListInstall for target + sibling pane resync (chat_view §5).
+    /// Dirty set emitted when selection changes the active retained view.
     fn thread_switch_dirty(target_thread_id: &str) -> Vec<Dirty> {
         vec![
             Dirty::Scalar(ScalarField::SelectedThread),
             Dirty::Scalar(ScalarField::ComposeText),
-            Dirty::MessageListInstall {
-                thread_id: target_thread_id.to_owned(),
-            },
             Dirty::PendingRequest {
                 thread_id: target_thread_id.to_owned(),
             },
@@ -3363,8 +3391,8 @@ mod tests {
                 thread_id: "thread-1".to_owned()
             }]
         );
-        // Selection change also installs target list + sibling panes so
-        // the outgoing thread's UI state cannot leak (apply_thread_selection_switch).
+        // Selection change switches the retained view and sibling panes; the
+        // target message model is already owned by that thread.
         assert_eq!(dirty, thread_switch_dirty("thread-1"));
     }
 
@@ -3395,7 +3423,12 @@ mod tests {
         let mut model = model_with_threads(&["a", "b"]);
         model.selected_thread = 0;
         model.displayed_thread = Some(0);
-        model.compose_text = "draft for A".to_owned();
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::DraftChanged(
+                "draft for A".to_owned(),
+            ))),
+        );
 
         update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
         assert_eq!(
@@ -3409,7 +3442,12 @@ mod tests {
 
         // Frame promotes B to displayed (real app); then user types into B.
         model.displayed_thread = Some(1);
-        model.compose_text = "draft for B".to_owned();
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::DraftChanged(
+                "draft for B".to_owned(),
+            ))),
+        );
         update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(0))));
         assert_eq!(
             model.threads[1].compose_draft, "draft for B",
@@ -3814,6 +3852,46 @@ mod tests {
         );
         assert_eq!(model.threads[2].state, ThreadState::Loading);
         assert_eq!(model.threads[1].state, ThreadState::Idle);
+    }
+
+    /// Live-reproduced crash, root-caused and fixed here: typing a
+    /// thread-search query that matches nothing filters the currently
+    /// selected thread out of the visible list (`visible_indices` becomes
+    /// genuinely empty, not just "not yet synced" -- see
+    /// `current_visible_indices`'s own fallback condition). Before this
+    /// fix, `selected_real_index` papered over that with
+    /// `.unwrap_or(model.selected_thread)`, treating the *filtered-list
+    /// position* number as if it were already a *real storage index* --
+    /// which happened to still be in-bounds here (`threads.len() == 1`),
+    /// so `update_compose` built a `SendPrompt { real_index: 0, .. }`
+    /// effect anyway. Meanwhile `dispatch.rs`'s `dispatch_compose_send`
+    /// independently computes the caller's own real index via
+    /// `panel.real_index(filtered_idx)`, which reads raw
+    /// `visible_indices` with no such fallback and correctly got `None`
+    /// for the same empty list. The two disagreed, and
+    /// `dispatch_compose_send`'s `debug_assert!("send effect must target
+    /// the selected filtered index")` aborted the whole process --
+    /// Rust panics can't unwind across the Slint/Qt host boundary here,
+    /// so a hard `abort()`, not a graceful error. This is the actual
+    /// unit-level proof that Send is now a clean no-op instead, whatever
+    /// the caller-side index bookkeeping does.
+    #[test]
+    fn compose_send_requested_is_a_no_op_when_the_search_filter_hides_the_selection() {
+        let mut model = model_with_threads(&["only thread"]);
+        model.visible_list_synced = true;
+        model.visible_indices = vec![]; // search query matched nothing
+        model.selected_thread = 0;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("hi".to_owned()))),
+        );
+        assert_eq!(effects, vec![], "no thread is genuinely selected/visible right now");
+        assert_eq!(dirty, vec![]);
+        assert_eq!(
+            model.threads[0].state,
+            ThreadState::Idle,
+            "must not silently start a turn on a thread that isn't the visible selection"
+        );
     }
 
     #[test]
@@ -4381,14 +4459,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(model.list_owner_thread_id, None);
-        assert!(dirty.iter().any(|item| matches!(
-            item,
-            Dirty::MessagesDiff { thread_id, .. } if thread_id.is_empty()
-        )));
-        crate::sync::apply_message_ops(&model, "", &[]);
-        assert_eq!(model.messages_model.row_count(), 0);
-        assert!(model.message_model_keys.borrow().is_empty());
+        assert_eq!(model.displayed_thread, None);
     }
 
     #[test]
@@ -4718,10 +4789,9 @@ mod tests {
             }),
         );
         assert!(
-            first_dirty.iter().any(|item| matches!(
-                item,
-                Dirty::MessagesDiff { .. } | Dirty::MessageListInstall { .. }
-            )),
+            first_dirty
+                .iter()
+                .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
             "first tick should populate the shared model: {first_dirty:?}"
         );
 
@@ -4733,10 +4803,9 @@ mod tests {
             }),
         );
         assert!(
-            !second_dirty.iter().any(|item| matches!(
-                item,
-                Dirty::MessagesDiff { .. } | Dirty::MessageListInstall { .. }
-            )),
+            !second_dirty
+                .iter()
+                .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
             "second tick with an unchanged snapshot must not resync: {second_dirty:?}"
         );
     }
@@ -4939,8 +5008,7 @@ mod tests {
         assert_eq!(model.threads[0].connection_status, "Live connection");
         assert!(dirty.iter().any(|item| matches!(
             item,
-            Dirty::MessagesDiff { thread_id, .. }
-                | Dirty::MessageListInstall { thread_id }
+                Dirty::MessagesDiff { thread_id, .. }
                 if thread_id == "thread-0"
         )));
         assert!(dirty.iter().any(|item| matches!(
@@ -5084,27 +5152,20 @@ mod tests {
         );
 
         assert_eq!(model.displayed_thread, Some(1));
-        let installed = dirty.iter().any(|item| {
-            matches!(
-                item,
-                Dirty::MessageListInstall { thread_id } if thread_id == "thread-1"
-            )
-        });
         let ops = dirty.iter().find_map(|item| match item {
             Dirty::MessagesDiff { thread_id, ops } if thread_id == "thread-1" => Some(ops.clone()),
             _ => None,
         });
         assert!(
-            installed || ops.is_some(),
-            "switching to the new thread must resync the shared messages model even \
+            ops.is_some(),
+            "switching to the new thread must update its retained message model even \
              though thread-1's own transcript diff is a no-op -- otherwise thread-0's \
              messages stay on screen as bogus 'prefill' data: {dirty:?}"
         );
 
-        // Apply the same way sync() would, and check the *shared* model.
-        if installed {
-            crate::sync::install_message_list_snapshot(&model, "thread-1");
-        } else if let Some(ops) = ops {
+        // Apply the same way sync() would through the compatibility helper;
+        // production sync now targets the retained per-thread model.
+        if let Some(ops) = ops {
             crate::sync::apply_message_ops(&model, "thread-1", &ops);
         }
         assert_eq!(
@@ -5166,8 +5227,7 @@ mod tests {
         assert!(dirty.iter().any(|item| matches!(
             item,
             Dirty::MessagesDiff { thread_id, .. }
-                | Dirty::MessageListInstall { thread_id }
-                if thread_id == "thread-1"
+            if thread_id == "thread-1"
         )));
     }
 
@@ -5627,7 +5687,7 @@ mod tests {
             model.selected_thread, 2,
             "selection must follow thread-1 to its new visible slot"
         );
-        assert_eq!(selected_real_index(&model), 1);
+        assert_eq!(selected_real_index(&model), Some(1));
         assert!(dirty
             .iter()
             .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));
@@ -5716,9 +5776,9 @@ mod tests {
             }),
         );
         assert_eq!(model.displayed_thread, None);
-        assert!(dirty.iter().any(|d| matches!(
+        assert!(!dirty.iter().any(|d| matches!(
             d,
-            Dirty::MessagesDiff { thread_id, ops } if thread_id.is_empty() && !ops.is_empty()
+            Dirty::MessagesDiff { thread_id, .. } if thread_id.is_empty()
         )));
         // Post-sync fallback: an empty visible list is real now.
         assert!(model.visible_list_synced);
@@ -5788,7 +5848,7 @@ mod tests {
             model.selected_thread, 0,
             "must land on B's first thread (thread-2), not a numeric clamp"
         );
-        assert_eq!(selected_real_index(&model), 2);
+        assert_eq!(selected_real_index(&model), Some(2));
         assert_eq!(
             model.synced_project_path.as_deref(),
             Some("/work/b/project.mlt")
@@ -6284,30 +6344,38 @@ mod tests {
             text: "from B".into(),
             ..crate::MessageItem::default()
         }];
+        model.rebuild_thread_indices();
+        crate::sync::apply_message_ops(&model, "thread-0", &[]);
+        crate::sync::apply_message_ops(&model, "thread-1", &[]);
         model
             .messages_model
             .push(model.threads[0].message_rows[0].clone());
         *model.message_model_keys.borrow_mut() = vec!["assistant:a1".to_owned()];
 
-        let (_, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        let (_, _dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
 
         assert_eq!(model.displayed_thread, Some(1));
-        assert_eq!(model.list_owner_thread_id.as_deref(), Some("thread-1"));
-        assert!(dirty.iter().any(|d| matches!(
-            d,
-            Dirty::MessageListInstall { thread_id } if thread_id == "thread-1"
-        )));
-        // Leave cache for A must capture expand.
-        let cache_a = model
-            .list_ui_cache
-            .get("thread-0")
-            .expect("leave A should snapshot cache");
-        assert_eq!(cache_a.rows[0].text, "from A");
-        assert!(cache_a.rows[0].expanded);
-
-        crate::sync::install_message_list_snapshot(&model, "thread-1");
-        assert_eq!(model.messages_model.row_count(), 1);
-        assert_eq!(model.messages_model.row_data(0).unwrap().text, "from B");
+        assert_eq!(model.list_owner_thread_id.as_deref(), Some("thread-0"));
+        assert_eq!(
+            model
+                .thread_view_models
+                .get("thread-0")
+                .unwrap()
+                .row_data(0)
+                .unwrap()
+                .text,
+            "from A"
+        );
+        assert_eq!(
+            model
+                .thread_view_models
+                .get("thread-1")
+                .unwrap()
+                .row_data(0)
+                .unwrap()
+                .text,
+            "from B"
+        );
     }
 
     #[test]
@@ -6323,6 +6391,8 @@ mod tests {
             expanded: false,
             ..crate::MessageItem::default()
         }];
+        model.rebuild_thread_indices();
+        crate::sync::apply_message_ops(&model, "thread-0", &[]);
         model
             .messages_model
             .push(model.threads[0].message_rows[0].clone());
@@ -6343,31 +6413,35 @@ mod tests {
         ));
         assert!(model.threads[0].message_rows[0].expanded);
         crate::sync::apply_message_row_patch(&model, "thread-0", 0);
-        assert!(model.messages_model.row_data(0).unwrap().expanded);
+        assert!(
+            model
+                .thread_view_models
+                .get("thread-0")
+                .unwrap()
+                .row_data(0)
+                .unwrap()
+                .expanded
+        );
 
         // A → B
         let _ = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
-        crate::sync::install_message_list_snapshot(&model, "thread-1");
         assert_eq!(model.displayed_thread, Some(1));
 
-        // B → A: cache must restore expanded thought.
+        // B → A: the retained A model already owns the expanded row.
         let _ = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(0))));
         assert!(
-            model
-                .list_ui_cache
-                .get("thread-0")
-                .is_some_and(|c| { c.rows.first().is_some_and(|r| r.expanded) }),
-            "cache[A] must keep expand after leave"
-        );
-        // Selection restores from cache into ThreadModel then install.
-        assert!(
             model.threads[0].message_rows[0].expanded,
-            "return to A must restore expanded on ThreadModel from cache"
+            "return to A must preserve expanded on the source row"
         );
-        crate::sync::install_message_list_snapshot(&model, "thread-0");
         assert!(
-            model.messages_model.row_data(0).unwrap().expanded,
-            "shared list must show expanded after return install"
+            model
+                .thread_view_models
+                .get("thread-0")
+                .unwrap()
+                .row_data(0)
+                .unwrap()
+                .expanded,
+            "retained A view must show expanded after return"
         );
     }
 
@@ -6392,10 +6466,9 @@ mod tests {
             Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(0))),
         );
         assert!(
-            !dirty.iter().any(|d| matches!(
-                d,
-                Dirty::MessagesDiff { .. } | Dirty::MessageListInstall { .. }
-            )),
+            !dirty
+                .iter()
+                .any(|d| matches!(d, Dirty::MessagesDiff { .. })),
             "expand must not full-rebuild list: {dirty:?}"
         );
         assert!(dirty

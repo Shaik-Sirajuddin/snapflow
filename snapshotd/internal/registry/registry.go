@@ -54,7 +54,7 @@ func Open(path string) (*Registry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: open %s: %w", path, err)
 	}
-	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &ExternalInstance{}, &McpContext{}, &AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &ExternalInstance{}, &McpContext{}, &ClientLease{}, &AuditEvent{}); err != nil {
 		return nil, fmt.Errorf("registry: automigrate: %w", err)
 	}
 	return &Registry{db: db}, nil
@@ -427,6 +427,60 @@ func (r *Registry) DeleteMcpContext(token string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (r *Registry) UpsertClientLease(lease *ClientLease) error {
+	var existing ClientLease
+	err := r.db.Where("client_id = ? AND project_id = ?", lease.ClientID, lease.ProjectID).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if lease.ID == "" {
+			lease.ID = fmt.Sprintf("%s:%s", lease.ClientID, lease.ProjectID)
+		}
+		if lease.LastHeartbeat.IsZero() {
+			lease.LastHeartbeat = time.Now().UTC()
+		}
+		return r.db.Create(lease).Error
+	}
+	if err != nil {
+		return err
+	}
+	return r.db.Model(&existing).Updates(map[string]any{
+		"instance_id":    lease.InstanceID,
+		"generation":     lease.Generation,
+		"mode":           lease.Mode,
+		"last_heartbeat": time.Now().UTC(),
+	}).Error
+}
+
+func (r *Registry) GetClientLease(clientID, projectID string) (*ClientLease, error) {
+	var lease ClientLease
+	if err := r.db.Where("client_id = ? AND project_id = ?", clientID, projectID).First(&lease).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &lease, nil
+}
+
+func (r *Registry) DeleteClientLease(clientID, projectID string) error {
+	return r.db.Where("client_id = ? AND project_id = ?", clientID, projectID).Delete(&ClientLease{}).Error
+}
+
+func (r *Registry) DeleteClientLeases(clientID string) error {
+	return r.db.Where("client_id = ?", clientID).Delete(&ClientLease{}).Error
+}
+
+func (r *Registry) TouchClientLeases(clientID string) error {
+	return r.db.Model(&ClientLease{}).Where("client_id = ?", clientID).Update("last_heartbeat", time.Now().UTC()).Error
+}
+
+func (r *Registry) CountInstanceLeases(instanceID string) (int64, error) {
+	var count int64
+	if err := r.db.Model(&ClientLease{}).Where("instance_id = ?", instanceID).Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // --- Audit ---

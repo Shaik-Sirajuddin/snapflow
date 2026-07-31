@@ -60,8 +60,8 @@
 use crate::conversation::ConversationState;
 use crate::gateway_actor::{
     spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_delayed_gateway_and_pool,
-    spawn_acpx_thread_with_gateway, spawn_acpx_thread_with_gateway_and_pool,
-    AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
+    spawn_acpx_thread_with_gateway, AcpxThreadGatewaySetter, AcpxThreadHandle,
+    GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
     JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
@@ -1415,6 +1415,38 @@ fn read_codex_api_key_from_auth_file() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// pool-capability-fix: the other half of `read_codex_api_key_from_auth_
+/// file`'s own gap -- `codex login`'s far more common ChatGPT-plan device
+/// flow writes a `tokens.access_token` OAuth session into the same
+/// `auth.json` and leaves `OPENAI_API_KEY` null, so a real, valid,
+/// already-authenticated login of that shape was previously
+/// indistinguishable here from no login at all. Live-confirmed against
+/// this exact file shape: acpx-server's own mirrored auto-detection
+/// (`acpx-server/src/config.rs`'s `default_codex_native_auth_method`)
+/// resolved `native_auth_method_id=None` for it, and every real
+/// `session/new` failed with "backend requires authentication" until
+/// `chat-gpt` was selected explicitly -- after which a real prompt round-
+/// tripped successfully through the genuine ambient login.
+fn codex_auth_file_has_chatgpt_login() -> bool {
+    let Some(path) = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))
+    else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|token| token.as_str())
+        .is_some_and(|token| !token.is_empty())
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -1954,10 +1986,27 @@ fn spawn_gateway_process(
         // system's already-authenticated Codex CLI login instead of
         // codex-acp's headless-incapable chat-gpt device flow (see
         // read_codex_api_key_from_auth_file's doc comment).
+        //
+        // pool-capability-fix: this used to hardcode "api-key"
+        // unconditionally whenever the env var was unset -- worse than
+        // doing nothing for a real ChatGPT-plan login (no raw API key
+        // ever stored, by design): it forced codex-acp down the
+        // api-key path with no key at all, instead of leaving
+        // auth_method_id unset so codex-acp could at least attempt its
+        // own default flow. Mirrors acpx-server's own auto-detection
+        // (`config.rs`'s `default_codex_native_auth_method`): api-key
+        // when a real key is found, else chat-gpt when a real ChatGPT
+        // OAuth login is found, else leave it unset.
         if std::env::var_os("ACPX_NATIVE_AUTH_METHOD_ID").is_none() {
-            cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
-        }
-        if std::env::var_os("CODEX_API_KEY").is_none() {
+            if let Some(key) = read_codex_api_key_from_auth_file() {
+                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+                if std::env::var_os("CODEX_API_KEY").is_none() {
+                    cmd.env("CODEX_API_KEY", key);
+                }
+            } else if codex_auth_file_has_chatgpt_login() {
+                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+            }
+        } else if std::env::var_os("CODEX_API_KEY").is_none() {
             if let Some(key) = read_codex_api_key_from_auth_file() {
                 cmd.env("CODEX_API_KEY", key);
             }
@@ -2564,6 +2613,7 @@ fn spawn_background_attachment(
     requested_session_id: Option<String>,
     has_cached_transcript: bool,
     profile_name: Option<String>,
+    desired_config_options: Vec<(String, serde_json::Value)>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
     // acpx-client-session-lease-pool: whether `handle` was constructed
@@ -2736,6 +2786,23 @@ fn spawn_background_attachment(
 
         match result {
             Ok(session_id) => {
+                // A deferred thread has no session while its compose
+                // controls are editable. Apply those in-memory selections
+                // after the real (possibly pooled) session is attached and
+                // before attachment is released to the first prompt.
+                for (config_id, value) in desired_config_options {
+                    if let Err(error) = handle.set_config_option(config_id.clone(), value).await {
+                        events_out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back(BridgeEvent {
+                                thread_index: idx,
+                                event: AgentEvent::Error(format!(
+                                    "session/set_config_option failed before first prompt for {config_id:?}: {error}"
+                                )),
+                            });
+                    }
+                }
                 *slot
                     .acp_session_id
                     .lock()
@@ -3124,6 +3191,7 @@ impl AgentBridge {
                 spec.session_id.clone().or(cached_session_id),
                 has_cached_transcript,
                 spec.profile_name.clone(),
+                Vec::new(),
                 attachment_gate,
                 session_cwd_override.clone(),
                 // acpx-client-session-lease-pool: bulk cold-start restore
@@ -3276,6 +3344,71 @@ impl AgentBridge {
             base_url,
             mcp_servers,
         )
+    }
+
+    /// Notify every pool for the settings gateway that its admin-plane MCP
+    /// configuration changed. The pool generation refresh evicts idle
+    /// sessions immediately; a currently leased session is left alive and is
+    /// discarded when its owner releases it, so an in-flight turn is never
+    /// force-closed by a Settings edit.
+    fn refresh_pools_for_gateway(&self, base_url: &str) {
+        let pools = {
+            let pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.rsplit_once('|').is_some_and(|(_, url)| url == base_url))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Async counterpart to [`Self::refresh_pools_for_gateway`] for use
+    /// inside already-spawned MCP-settings futures that only hold a
+    /// pre-captured `project_pools` Arc (no `&self`).
+    async fn refresh_captured_pools(
+        project_pools: &Mutex<
+            std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>,
+        >,
+        base_url: Option<&str>,
+    ) {
+        let Some(url) = base_url else {
+            return;
+        };
+        let pools = {
+            let pools = project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.rsplit_once('|').is_some_and(|(_, u)| u == url))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            pool.refresh_all().await;
+        }
+    }
+
+    /// Immediate signal from Settings after a successful MCP registry
+    /// mutation. The settings gateway is represented by a bridge slot, so
+    /// resolve its base URL and refresh all project pools sharing that
+    /// gateway. This deliberately does not perform an RPC or wait for the
+    /// refresh on the UI thread.
+    fn notify_mcp_settings_changed(&self, settings_idx: usize) {
+        let Some(provider) = self
+            .slots
+            .get(settings_idx)
+            .map(|slot| slot.provider.clone())
+        else {
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            return;
+        };
+        self.refresh_pools_for_gateway(&base_url);
     }
 
     /// `chat_sessions_project_path` phase: called from the FFI-driven
@@ -3636,6 +3769,21 @@ impl AgentBridge {
         preferred_provider: Option<&str>,
         profile: Option<&str>,
     ) -> Result<(), BridgeError> {
+        self.attach_deferred_thread_with_config_options(
+            idx,
+            preferred_provider,
+            profile,
+            Vec::new(),
+        )
+    }
+
+    pub fn attach_deferred_thread_with_config_options(
+        &mut self,
+        idx: usize,
+        preferred_provider: Option<&str>,
+        profile: Option<&str>,
+        desired_config_options: Vec<(String, serde_json::Value)>,
+    ) -> Result<(), BridgeError> {
         let Some(existing) = self.slots.get(idx) else {
             return Err(BridgeError::Gateway(format!(
                 "no thread slot at index {idx}"
@@ -3660,6 +3808,7 @@ impl AgentBridge {
             cached_session_id,
             has_cached_transcript,
             profile.map(str::to_string),
+            desired_config_options,
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
             uses_pool,
@@ -3709,6 +3858,7 @@ impl AgentBridge {
             cached_session_id,
             has_cached_transcript,
             profile.map(str::to_string),
+            Vec::new(),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
             uses_pool,
@@ -4001,6 +4151,12 @@ impl AgentBridge {
         })
     }
 
+    /// Durable thread identity for routing bridge events before a deferred
+    /// thread has acquired its first ACP session.
+    pub fn thread_id(&self, idx: usize) -> Option<String> {
+        self.slots.get(idx).map(|slot| slot.thread_id.clone())
+    }
+
     /// Provider selected for a thread at creation time. This stays separate
     /// from display ordering so a restored subset cannot be reassigned merely
     /// because a preceding thread was deleted.
@@ -4277,9 +4433,17 @@ impl AgentBridge {
             return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let result = self
+            .runtime
             .block_on(handle.create_mcp_server(entry))
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string());
+        // Main's live-pool refresh: registry mutations must bump pool
+        // generations so already-open sessions pick up the change on next
+        // reacquire (see notify_mcp_settings_changed).
+        if result.is_ok() {
+            self.notify_mcp_settings_changed(idx);
+        }
+        result
     }
 
     /// `mcp_servers/update` -- same payload shape and error-surfacing
@@ -4293,9 +4457,14 @@ impl AgentBridge {
             return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let result = self
+            .runtime
             .block_on(handle.update_mcp_server(entry))
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
+            self.notify_mcp_settings_changed(idx);
+        }
+        result
     }
 
     /// `mcp_servers/delete`.
@@ -4304,9 +4473,14 @@ impl AgentBridge {
             return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let result = self
+            .runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
+            self.notify_mcp_settings_changed(idx);
+        }
+        result
     }
 
     /// `mcp_servers/authenticate`. Returns the authorization URL to open
@@ -4364,6 +4538,11 @@ impl AgentBridge {
     /// touching any Slint/`PanelSingleton` state, same as every other
     /// background-thread completion in this codebase (`effect_executor.rs`'s
     /// skill-effect handlers, `report_mcp_server_result`).
+    ///
+    /// On successful create/update/delete/enabled, also fires
+    /// [`Self::notify_mcp_settings_changed`] so pooled sessions refresh
+    /// (same contract as the synchronous methods above -- critical because
+    /// the Settings UI exclusively uses these async paths).
     pub fn create_mcp_server_async(
         &self,
         idx: usize,
@@ -4380,11 +4559,23 @@ impl AgentBridge {
         }
         let handle = slot.handle.clone();
         let operations = self.mcp_operations.clone();
+        // Cannot call &self methods from the spawn future; capture base_url
+        // + project_pools the same way notify_mcp_settings_changed resolves
+        // them so a successful mutation still refreshes pools off the UI
+        // thread (Settings uses only these async paths).
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
             let result = handle
                 .create_mcp_server(entry)
                 .await
                 .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
             operations
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4410,11 +4601,19 @@ impl AgentBridge {
         }
         let handle = slot.handle.clone();
         let operations = self.mcp_operations.clone();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
             let result = handle
                 .update_mcp_server(entry)
                 .await
                 .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
             operations
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4441,11 +4640,19 @@ impl AgentBridge {
         let handle = slot.handle.clone();
         let operations = self.mcp_operations.clone();
         let name = name.to_string();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
             let result = handle
                 .delete_mcp_server(name)
                 .await
                 .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
             operations
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4480,6 +4687,11 @@ impl AgentBridge {
         let handle = slot.handle.clone();
         let operations = self.mcp_operations.clone();
         let name = name.to_string();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
             let result = async {
                 let mut entry = handle
@@ -4498,6 +4710,9 @@ impl AgentBridge {
                     .map_err(|err| err.to_string())
             }
             .await;
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
             operations
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -5280,13 +5495,36 @@ impl AgentBridge {
             .get(idx)
             .map(|slot| slot.provider.clone())
             .unwrap_or_default();
-        self.config_options_for_provider(idx, &provider)
+        self.config_options_for_provider(idx, &provider, None)
     }
 
-    pub fn config_options_for_provider(&self, idx: usize, provider: &str) -> Vec<ConfigOptionInfo> {
+    pub fn config_options_for_provider(
+        &self,
+        idx: usize,
+        provider: &str,
+        profile_name: Option<&str>,
+    ) -> Vec<ConfigOptionInfo> {
         let Some(slot) = self.slots.get(idx) else {
             return Vec::new();
         };
+        // `slot.config_options` is written only by `store_capability_event`,
+        // itself fed only by a real attached session's own live event
+        // stream (`AgentEvent::ConfigOptions`) or by cold-start restoring
+        // a prior run's persisted `ThreadRuntimeSnapshot::config_options`
+        // at slot construction -- never by the pool-preview path (see
+        // `ensure_models_for_provider`'s own doc comment: it writes only
+        // `pre_session_model_options`, and pushes its `ConfigOptions`
+        // event onto the aggregate `self.events` queue for the UI layer,
+        // not into this slot's own capability state). And
+        // `ThreadSlot::acp_session_id` is set exactly once, from `None`
+        // to `Some`, and never reset back to `None` afterward -- so there
+        // is no window in this slot's lifetime where `config_options` can
+        // hold a *different, stale* session's live values while looking
+        // unattached; gating this read on "currently attached" only ever
+        // discarded a legitimately cold-start-restored snapshot before
+        // the first live event overwrote it, regressing the very
+        // guarantee `restored_interaction_snapshot_is_available_before_
+        // gateway_events_arrive` exists to lock in. Read it unconditionally.
         let live = slot
             .config_options
             .lock()
@@ -5298,42 +5536,223 @@ impl AgentBridge {
         slot.pre_session_model_options
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(provider)
+            .get(&format!("{provider}\0{}", profile_name.unwrap_or_default()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// pre-send-config-options-visibility, Finding C: `NO_PROVIDER_
+    /// REQUESTED_FALLBACK` ("codex") is a valid `session/new`/pool
+    /// provider sentinel -- omitting an explicit profile/agent selector
+    /// there lets acpx-server fall back to its own `ACPX_DEFAULT_AGENT_ID`
+    /// -- but `models/list`'s `agentId` param requires a real, resolvable
+    /// registry id and rejects the bare sentinel outright. Confirmed live
+    /// via a direct RPC: `agentId=codex` -> real error "unknown agent id
+    /// codex"; `agentId=codex-acp` -> a real, correct model catalog. Only
+    /// `list_models` calls need this resolved; every other call site in
+    /// this file that already works with the bare sentinel (session/new,
+    /// the pool preview path, snapflowd_mcp_servers_entry's own dual-form
+    /// handling) is untouched.
+    fn resolve_registry_agent_id_for_capability_probe(provider: &str) -> String {
+        if provider == NO_PROVIDER_REQUESTED_FALLBACK {
+            "codex-acp".to_owned()
+        } else {
+            provider.to_owned()
+        }
     }
 
     /// Start one background `models/list` probe for the provider currently
     /// selected in the compose bar. This is intentionally not limited to
     /// deferred threads: changing provider on any session-less thread must
     /// repopulate the model dropdown immediately.
-    pub fn ensure_models_for_provider(&self, idx: usize, provider: &str) {
+    pub fn ensure_models_for_provider(
+        &self,
+        idx: usize,
+        provider: &str,
+        profile_name: Option<&str>,
+    ) {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
         let provider = provider.to_owned();
+        let profile_name = profile_name.map(str::to_owned);
+        let cache_key = format!(
+            "{provider}\0{}",
+            profile_name.as_deref().unwrap_or_default()
+        );
         if provider.is_empty() {
+            return;
+        }
+        // An attached thread already receives its live capabilities from the
+        // session actor. A preview acquire here would create a competing
+        // lease for an active/resumed thread and could disturb its real
+        // session; previews are only needed before the first message.
+        if slot
+            .acp_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return;
         }
         let mut cached = slot
             .pre_session_model_options
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if cached.contains_key(&provider) {
+        if cached.contains_key(&cache_key) {
             return;
         }
-        cached.insert(provider.clone(), Vec::new());
+        cached.insert(cache_key.clone(), Vec::new());
         drop(cached);
 
         let handle = slot.handle.clone();
-        let agent_id = provider.clone();
         let target = slot.pre_session_model_options.clone();
+        let events = self.events.clone();
+        let project_dir = thread_project_dir(
+            slot.project_path_snapshot().as_deref(),
+            &self.session_cwd_override,
+        );
+        let Some(project_dir) = project_dir else {
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
+            let events = events.clone();
+            // pre-send-config-options-visibility: `cwd` here was `None`
+            // (real project dir unknown before any project is opened/
+            // saved) on the theory that "there's nothing absolute to
+            // send" -- wrong, and live-confirmed a real bug: a `None`
+            // cwd omits the field entirely, `probe_adapter_capabilities`
+            // then rejects the server's own `"."` default outright
+            // (same "must be an absolute path" error Finding A already
+            // fixed for the other two branches). It only ever appeared
+            // to work for whichever provider happened to already have
+            // server-side cached capabilities (this gateway's own
+            // default agent, warmed some other way) -- confirmed live:
+            // an identical never-yet-probed second provider on the same
+            // cwd-less branch failed immediately. `probe_adapter_
+            // capabilities` doesn't need a *meaningful* cwd, just a
+            // valid absolute one for a generic capability probe, so the
+            // process's own cwd is a perfectly good fallback here.
+            let cwd = std::env::current_dir().ok();
+            self.runtime.spawn(async move {
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options.clone());
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::ConfigOptions(options),
+                    });
+            });
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
+            let events = events.clone();
+            let cwd = Some(project_dir.clone());
+            self.runtime.spawn(async move {
+                // pre-send-config-options-visibility: this branch has a
+                // real project_dir even though gateway_urls missed --
+                // sending it (absolute, per thread_project_dir) is what
+                // makes probe_adapter_capabilities accept the call
+                // instead of rejecting the "." it defaults to otherwise.
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options.clone());
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::ConfigOptions(options),
+                    });
+            });
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
+            let events = events.clone();
+            let cwd = Some(project_dir.clone());
+            self.runtime.spawn(async move {
+                // Same reasoning as the gateway_urls-miss branch above.
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
+                target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, options.clone());
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::ConfigOptions(options),
+                    });
+            });
+            return;
+        };
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            provider.clone(),
+            crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
+        );
+        let preview_thread_id = format!("preview:{idx}:{provider}");
+        let cwd = Some(project_dir.clone());
+        let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
         self.runtime.spawn(async move {
-            let options = handle.list_models(agent_id).await.unwrap_or_default();
+            let options = match pool
+                .acquire(
+                    key,
+                    preview_thread_id,
+                    acpx_client::pool::OpenSpec {
+                        saved_session_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(lease) => {
+                    let options = lease
+                        .capabilities
+                        .as_ref()
+                        .and_then(|value| value.get("configOptions"))
+                        .and_then(crate::gateway_actor::parse_config_options)
+                        .unwrap_or_default();
+                    if let Err(error) = pool.release(&lease).await {
+                        eprintln!("panel-rust: capability preview release failed: {error}");
+                    }
+                    if options.is_empty() {
+                        handle
+                            .list_models(agent_id.clone(), cwd.clone())
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        options
+                    }
+                }
+                Err(error) => {
+                    eprintln!("panel-rust: capability preview pool acquire failed: {error}");
+                    handle
+                        .list_models(agent_id.clone(), cwd.clone())
+                        .await
+                        .unwrap_or_default()
+                }
+            };
             target
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(provider.to_owned(), options);
+                .insert(cache_key, options.clone());
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ConfigOptions(options),
+                });
         });
     }
 
@@ -6698,17 +7117,26 @@ mod tests {
                 )
             });
 
-        crate::sync::apply_message_ops(&model, &thread_id, &ops);
+        crate::sync::apply_thread_message_ops(&model, &thread_id, &ops);
 
         assert!(
-            model.messages_model.row_count() > 0,
-            "the real {provider} reply must render into the shared messages_model, not just \
+            model
+                .thread_view_models
+                .get(&thread_id)
+                .unwrap()
+                .row_count()
+                > 0,
+            "the real {provider} reply must render into its retained thread model, not just \
              AgentBridge::history()"
         );
         assert_eq!(
-            model.messages_model.row_count(),
-            model.message_model_keys.borrow().len(),
-            "messages_model and its key cache must stay aligned after a real reply renders \
+            model
+                .thread_view_models
+                .get(&thread_id)
+                .unwrap()
+                .row_count(),
+            model.thread_view_models.keys(&thread_id).unwrap().len(),
+            "retained thread model and its key cache must stay aligned after a real reply renders \
              (this exact desync used to abort the whole process)"
         );
         let rendered_text: String = (0..model.messages_model.row_count())
@@ -7922,6 +8350,63 @@ done
                 .iter()
                 .all(|spec| spec.provider == NO_PROVIDER_REQUESTED_FALLBACK),
             "got: {specs:?}"
+        );
+    }
+
+    /// Supersedes the old `normalize_provider_maps_registry_ids_onto_
+    /// gateway_keys` test now that `normalize_provider` is gone entirely
+    /// (see `resolve_provider_for`'s doc comment): every distinct
+    /// registry id -- not just "codex"/"claude" -- must resolve its own
+    /// gateway and be recorded as itself, never collapsed onto a
+    /// two-family bucket. This is the routing half of the "selected
+    /// grok-build, codex underneath" fix; see
+    /// `open_session_maybe_profiled`'s doc comment for the other half
+    /// (the profile-name fallback needed to actually reach the right
+    /// backend).
+    #[test]
+    fn distinct_registry_ids_each_resolve_and_record_their_own_provider_no_family_collapsing() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let requested_for_resolver = requested.clone();
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[] as &[&str],
+            move |provider| {
+                requested_for_resolver
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(provider.to_owned());
+                Ok(format!("http://127.0.0.1:1/{provider}"))
+            },
+            None,
+        )
+        .expect("bridge");
+
+        let codex_idx = bridge
+            .add_thread_with_profile_and_provider("Codex Thread", None, Some("codex-acp"))
+            .expect("codex-acp thread");
+        let claude_idx = bridge
+            .add_thread_with_profile_and_provider("Claude Thread", None, Some("claude-acp"))
+            .expect("claude-acp thread");
+        let grok_idx = bridge
+            .add_thread_with_profile_and_provider("Grok Thread", None, Some("grok-build"))
+            .expect("grok-build thread -- must not be rejected or silently rebucketed");
+
+        assert_eq!(
+            bridge.thread_provider(codex_idx).as_deref(),
+            Some("codex-acp"),
+            "provider is recorded as the raw requested registry id, not normalized"
+        );
+        assert_eq!(bridge.thread_provider(claude_idx).as_deref(), Some("claude-acp"));
+        assert_eq!(
+            bridge.thread_provider(grok_idx).as_deref(),
+            Some("grok-build"),
+            "grok-build must get its own identity, not collapse onto codex-acp/codex"
+        );
+        assert!(
+            requested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&"grok-build".to_owned()),
+            "the resolver must actually be asked to provision grok-build's own gateway"
         );
     }
 
@@ -9923,8 +10408,8 @@ done
     /// proved deliver skills via native filesystem discovery with no MCP
     /// present -- panel-rust/tests/skills_manager_live_discovery_e2e_test.rs
     /// ran 4/4 real passes against a real codex-acp backend. "codex" and
-    /// "codex-acp" (both forms `slot.provider` can currently take, see
-    /// `normalize_provider`) must therefore get NO "skills" MCP entry at
+    /// "codex-acp" (both forms `slot.provider` can currently take) must
+    /// therefore get NO "skills" MCP entry at
     /// all -- snapshotd's entry (if a live daemon answers) is unaffected,
     /// this is skills-specific.
     #[test]

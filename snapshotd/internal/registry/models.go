@@ -135,6 +135,27 @@ type McpContext struct {
 
 func (McpContext) TableName() string { return "mcp_contexts" }
 
+// ClientLease records one live daemon client using a project process. The
+// daemon may close a process only after the last lease is released.
+//
+// The client-lease-pool RPC surface that was meant to read/write these rows
+// (daemon.clientRegister/clientHeartbeat/projectOpen/projectClose/
+// projectSwitch) was never finished -- see daemon.Dispatch's stubbed cases
+// for those methods -- so this table and the Registry lease methods below
+// are currently unused by any caller, kept only so a future pass can finish
+// wiring them without a schema change.
+type ClientLease struct {
+	ID            string `gorm:"primaryKey"`
+	ClientID      string `gorm:"index:idx_lease_client_project,unique"`
+	ProjectID     string `gorm:"index:idx_lease_client_project,unique"`
+	InstanceID    string
+	Generation    int64
+	Mode          string
+	LastHeartbeat time.Time
+}
+
+func (ClientLease) TableName() string { return "client_leases" }
+
 // Process instance statuses, per 07's schema comment and 08's
 // two-liveness-signal discussion.
 const (

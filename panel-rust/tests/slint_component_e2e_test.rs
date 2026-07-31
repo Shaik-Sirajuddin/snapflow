@@ -2,10 +2,10 @@ use i_slint_backend_testing::ElementHandle;
 use panel_rust::{
     AgentCatalogEntry, ChatPanel, DropdownEntry, LocalTerminalItem, McpServerOption, MessageItem,
     PendingRequestItem, ProfileOption, RemoteSessionOption, SkillOption, TerminalItem, TextUtil,
-    ThreadItem,
+    ThreadItem, ThreadViewItem,
 };
 use slint::platform::{Key, WindowEvent};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
@@ -49,6 +49,48 @@ fn sample_open_thread(name: &str) -> ThreadItem {
 }
 
 #[test]
+fn retained_thread_view_items_keep_live_model_references() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    let thread_a = Rc::new(VecModel::<MessageItem>::default());
+    let thread_b = Rc::new(VecModel::<MessageItem>::default());
+    let views = Rc::new(VecModel::from(vec![
+        ThreadViewItem {
+            thread_id: "thread-a".into(),
+            messages: ModelRc::from(thread_a.clone()),
+            tool_groups: ModelRc::default(),
+            compose_text: "draft A".into(),
+        },
+        ThreadViewItem {
+            thread_id: "thread-b".into(),
+            messages: ModelRc::from(thread_b.clone()),
+            tool_groups: ModelRc::default(),
+            compose_text: "draft B".into(),
+        },
+    ]));
+
+    panel.set_thread_views(ModelRc::from(views));
+    panel.set_selected_thread(0);
+    thread_a.push(MessageItem {
+        text: "A only".into(),
+        ..MessageItem::default()
+    });
+    thread_b.push(MessageItem {
+        text: "B only".into(),
+        ..MessageItem::default()
+    });
+
+    let retained = panel.get_thread_views();
+    let view_a = retained.row_data(0).expect("thread A view");
+    let view_b = retained.row_data(1).expect("thread B view");
+    assert_eq!(view_a.messages.row_count(), 1);
+    assert_eq!(view_a.messages.row_data(0).unwrap().text, "A only");
+    assert_eq!(view_b.messages.row_count(), 1);
+    assert_eq!(view_b.messages.row_data(0).unwrap().text, "B only");
+}
+
+#[test]
 fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     i_slint_backend_testing::init_no_event_loop();
 
@@ -84,10 +126,8 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     }
     {
         let sent_text = sent_text.clone();
-        let panel_weak = panel.as_weak();
-        panel.on_send_requested(move || {
-            let panel = panel_weak.upgrade().expect("panel alive during callback");
-            sent_text.set(panel.get_compose_text().to_string());
+        panel.on_send_requested(move |text| {
+            sent_text.set(text.to_string());
         });
     }
     {

@@ -300,7 +300,11 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
         thread_id: ThreadId,
         open_spec: OpenSpec,
     ) -> Result<SessionLease, PoolError> {
-        // Fast path: an idle entry already exists for this key.
+        // Fast path: an idle entry already exists for this key. Leased
+        // in place (mutated, never removed from `entries`) -- see
+        // `lease_entry`'s own doc comment for why a remove-without-
+        // reinsert here would silently orphan the entry from every
+        // later `release`/`invalidate`/`mark_turn_*` call against it.
         let existing = {
             let mut keys = self.keys.lock().await;
             let key_pool = keys.entry(key.clone()).or_insert_with(KeyPool::new);
@@ -309,10 +313,10 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                 .entries
                 .iter()
                 .position(|e| matches!(e.state, EntryState::Idle))
-                .map(|idx| key_pool.entries.remove(idx))
+                .map(|idx| self.lease_entry(&mut key_pool.entries[idx], key.clone(), thread_id.clone(), false))
         };
-        let lease = if let Some(entry) = existing {
-            self.lease_entry(entry, key.clone(), thread_id.clone(), false)
+        let lease = if let Some(lease) = existing {
+            lease
         } else {
             self.open_and_lease(key.clone(), thread_id.clone(), open_spec)
                 .await?
@@ -322,21 +326,39 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
         Ok(lease)
     }
 
+    /// Transitions `entry` (still in place inside its `KeyPool::entries`,
+    /// never removed) from `Idle` to `Leased`, and builds the
+    /// `SessionLease` handle for it. **Must** be called on an entry that
+    /// stays reachable through `key_pool.entries` afterward -- pool-
+    /// capability-fix regression: an earlier version of both call sites
+    /// below `entries.remove()`d the entry first and passed the owned
+    /// value here, which built a valid-looking `SessionLease` whose
+    /// `lease_id` matched nothing in `entries` anymore. That lease could
+    /// be used to send prompts (fine, doesn't touch `entries`) but its
+    /// *first* `release`/`invalidate`/`mark_turn_*` call always failed
+    /// `UnknownLease`, silently orphaning the entry from the pool's
+    /// bookkeeping forever (the backend session stayed alive, un-
+    /// trackable and unreusable) instead of returning it to idle.
     fn lease_entry(
         &self,
-        entry: Entry,
+        entry: &mut Entry,
         key: PoolKey,
         thread_id: ThreadId,
         resumed_from_saved: bool,
     ) -> SessionLease {
         let lease_id = next_lease_id();
+        entry.state = EntryState::Leased {
+            lease: lease_id,
+            thread: thread_id.clone(),
+            turn: TurnState::NotStarted,
+        };
         SessionLease {
             lease_id,
             key,
-            session_id: entry.session_id,
+            session_id: entry.session_id.clone(),
             thread_id,
             resumed_from_saved,
-            capabilities: entry.capabilities,
+            capabilities: entry.capabilities.clone(),
         }
     }
 
@@ -360,16 +382,19 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
 
         // Re-check idle entries: a racer that opened while we waited on
         // the gate may have already produced a spare (e.g. warmup).
-        if let Some(entry) = {
+        // Same in-place-lease requirement as the fast path in `acquire`
+        // -- see `lease_entry`'s doc comment.
+        let racer_spare = {
             let mut keys = self.keys.lock().await;
             let key_pool = keys.entry(key.clone()).or_insert_with(KeyPool::new);
             key_pool
                 .entries
                 .iter()
                 .position(|e| matches!(e.state, EntryState::Idle))
-                .map(|idx| key_pool.entries.remove(idx))
-        } {
-            return Ok(self.lease_entry(entry, key, thread_id, false));
+                .map(|idx| self.lease_entry(&mut key_pool.entries[idx], key.clone(), thread_id.clone(), false))
+        };
+        if let Some(lease) = racer_spare {
+            return Ok(lease);
         }
 
         // Snapshotted just before the actual open call (not after): the

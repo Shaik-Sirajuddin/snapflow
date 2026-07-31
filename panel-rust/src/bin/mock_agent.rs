@@ -85,6 +85,10 @@ fn persona_commands() -> Vec<AvailableCommand> {
                 "Summarize the conversation (claude persona)",
             ),
         ],
+        "grok" => vec![AvailableCommand::new(
+            "grok_search",
+            "Search the web (grok persona)",
+        )],
         _ => Vec::new(),
     }
 }
@@ -113,6 +117,13 @@ struct SessionState {
     updated_at: String,
     turn_count: u64,
     replay_turns: Vec<ReplayTurn>,
+    /// pool-capability-fix regression coverage: this session's current
+    /// `"model"` configOption value, mutated only by a real `session/
+    /// set_config_option` call below -- lets an e2e test prove a pooled
+    /// session's config state really does persist across a lease
+    /// release/reacquire (or really doesn't, once `thread_actor.rs`
+    /// resets it before release).
+    model: String,
 }
 
 #[derive(Clone)]
@@ -212,6 +223,7 @@ async fn main() -> Result<()> {
                             updated_at: now_iso(),
                             turn_count: 0,
                             replay_turns: Vec::new(),
+                            model: "mock-model-a".to_string(),
                         },
                     );
                 });
@@ -573,6 +585,75 @@ async fn main() -> Result<()> {
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            // pool-capability-fix regression coverage: `session/set_
+            // config_option` is a real, published ACP extension method
+            // (see `acpx-core/src/router.rs`'s `MethodClass::Proxied`
+            // comment) that this SDK's schema doesn't type -- acpx
+            // forwards it to the connected agent byte-for-byte, so this
+            // mock must actually answer it (not just advertise
+            // configOptions on `session/new`) for a pool-reuse-leak test
+            // to exercise the real wire path `thread_actor.rs`'s
+            // `Command::SetConfigOption` drives. Registered last (via
+            // the untyped fallback) so every method already claimed by a
+            // typed handler above is unaffected; anything this handler
+            // doesn't recognize is passed on to the `unhandled message`
+            // catch-all below exactly as before this was added.
+            async move |request: agent_client_protocol::UntypedMessage,
+                        responder: agent_client_protocol::Responder<serde_json::Value>,
+                        _connection| {
+                if request.method() != "session/set_config_option" {
+                    return Ok(agent_client_protocol::Handled::No {
+                        message: (request, responder),
+                        retry: false,
+                    });
+                }
+                let params = request.params();
+                let session_id = params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let config_id = params
+                    .get("configId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let value = params
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                record_gateway_event(
+                    "session/set_config_option",
+                    Some(&session_id),
+                    &format!("{config_id}={value}"),
+                );
+                let current = with_sessions(|sessions| {
+                    let Some(state) = sessions.get_mut(&session_id) else {
+                        return value.clone();
+                    };
+                    if config_id == "model" {
+                        state.model = value.clone();
+                    }
+                    state.model.clone()
+                });
+                responder.respond(serde_json::json!({
+                    "configOptions": [{
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "currentValue": current,
+                        "options": [
+                            {"value": "mock-model-a", "name": "Mock Model A"},
+                            {"value": "mock-model-b", "name": "Mock Model B"}
+                        ]
+                    }]
+                }))?;
+                Ok(agent_client_protocol::Handled::Yes)
+            },
+            agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {

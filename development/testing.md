@@ -2,15 +2,15 @@
 
 `panel-rust` embeds Slint's own MCP UI-testing server (`SLINT_MCP_PORT`), which
 lets a test drive the real compiled UI headlessly over HTTP JSON-RPC instead
-of raw screen/VNC coordinates. Full harness (Xvfb + real `acpx-server`,
-mock-backed + the real compiled `snapflow`/`shotcut` binary):
-`panel-rust/tests/slint_mcp_acp_provider_matrix_e2e_test.rs`.
+of raw screen/VNC coordinates. In this checkout the full harness (Xvfb + real
+`acpx-server`, mock-backed + the real compiled `snapflow`/`shotcut` binary) is
+`panel-rust/tests/slint_mcp_live_ui_e2e_test.rs`.
 
 Run it:
 
 ```bash
 cd panel-rust
-cargo test --test slint_mcp_acp_provider_matrix_e2e_test -- --test-threads=1
+cargo test --quiet --test slint_mcp_live_ui_e2e_test -- --test-threads=1
 ```
 
 Minimal example, in that file's own code (`LiveUiHarness::tool_call` +
