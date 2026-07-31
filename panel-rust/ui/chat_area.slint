@@ -488,7 +488,7 @@ export component ChatArea inherits Rectangle {
             property <bool> header-spinning:
                 root.sending || connection-status == "Connecting...";
             property <angle> header-spin: header-spinning
-                ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                 : 0deg;
             // PUI-011: loading shimmer along the header's bottom border while
             // the selected ACP's details are being fetched (same signal as the
@@ -504,7 +504,7 @@ export component ChatArea inherits Rectangle {
                 Rectangle {
                     height: 100%;
                     width: parent.width * 0.35;
-                    x: (parent.width + self.width) * (mod(animation-tick(), 1200ms) / 1200ms) - self.width;
+                    x: (parent.width + self.width) * (mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period) - self.width;
                     background: @linear-gradient(90deg,
                         transparent 0%, Theme.bg-primary 50%, transparent 100%);
                 }
@@ -971,7 +971,7 @@ export component ChatArea inherits Rectangle {
                     height: 160px;
                     alignment: center;
                     property <bool> reloading: connection-status == "Connecting...";
-                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), 1000ms) / 1000ms));
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
                     Text {
                         text: reloading ? "loading conversation..."
                             : "Send a message to start the conversation";
@@ -1024,7 +1024,7 @@ export component ChatArea inherits Rectangle {
                     // must not mount already at 1.0 (animate never runs).
                     // Drive travel with animation-tick while live.
                     property <float> flow-t: is-live-tail
-                        ? mod(animation-tick(), 1200ms) / 1200ms
+                        ? mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                         : 0.0;
                     property <length> flow-blob: 36px;
 
@@ -1075,28 +1075,26 @@ export component ChatArea inherits Rectangle {
                         // gap Rectangle siblings, pushing "waiting for
                         // response" further right than every other row's
                         // content actually starts.
-                        // Tight/zero gap by request: dots use a narrow
-                        // "..." glyph (was a wide "• • •"
-                        // with inter-dot spaces) so "waiting for
-                        // response" sits immediately after it, not spaced
-                        // out with dead room.
+                        // Zero gap by request: label first, then the
+                        // pulsing dots immediately after it, no dead room
+                        // between them.
                         spacing: 0px;
                         height: 20px;
                         cross-axis-alignment: center;
-                        property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms));
+                        property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
                         Text {
-                            text: "...";
-                            color: Theme.text-muted;
-                            opacity: parent.pulse;
-                            font-size: 11px * Theme.font-scale;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: " waiting for response";
+                            text: "waiting for response ";
                             color: Theme.text-muted;
                             opacity: 0.7;
                             font-size: 9px * Theme.font-scale;
                             font-italic: true;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "\u{2022} \u{2022} \u{2022}";
+                            color: Theme.text-muted;
+                            opacity: parent.pulse;
+                            font-size: 11px * Theme.font-scale;
                             vertical-alignment: center;
                         }
                     }

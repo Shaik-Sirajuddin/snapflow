@@ -738,7 +738,7 @@ export component ChatInputLayout inherits Rectangle {
                     // audit-fixes animation_tick_loaders: continuous spin
                     // via animation-tick (no dynamic iteration-count).
                     property <angle> load-spin: root.sending
-                        ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                        ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                         : 0deg;
                     if root.sending : VerticalLayout {
                         // Without this wrapper the ring rendered pinned to

@@ -41,7 +41,7 @@ export component ToolGroupView inherits Rectangle {
         min(root.item-count - 1, max(0, Math.floor((- flickable.viewport-y + 20px) / (body-layout.preferred-height / max(1, root.item-count)))));
 
     // Left-rail vertical pulse animation during active loading execution
-    property <float> pulse-opacity: root.loading ? (0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms))) : 0.0;
+    property <float> pulse-opacity: root.loading ? (0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period))) : 0.0;
 
     background: root.mcp-variant ? Theme.bg-tertiary : Theme.bg-agent-bubble;
     border-color: transparent;

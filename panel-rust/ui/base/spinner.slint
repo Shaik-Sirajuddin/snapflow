@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
 
 // Layer 3 (base) -- real indeterminate circular loading spinner. No
 // equivalent existed anywhere in this codebase before it (grepped for
@@ -66,7 +67,7 @@ export component Spinner inherits Rectangle {
         // -- it re-evaluates on every frame as `animation-tick()`
         // advances, producing a smooth 0.0..1.0 sawtooth with no Timer
         // and no explicit `animate` block.
-        property <float> start: mod(animation-tick(), 1.2s) / 1.2s;
+        property <float> start: mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period;
         // A fixed ~0.75 revolution arc (not a full circle) so the
         // rotation is actually visible as motion rather than reading as
         // a static ring -- same "partial arc chasing itself" silhouette

@@ -124,7 +124,7 @@ export component SidebarThreadRow inherits HoverSurface {
                     property <bool> row-busy:
                         thread.status == "loading" || thread.status == "cancelling";
                     property <angle> load-spin: row-busy
-                        ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                        ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                         : 0deg;
                     // Phase 25 (thread_row_loading_indicator_fix): two
                     // live defects here. (1) The spinner/hand were drawn
