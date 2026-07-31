@@ -72,6 +72,17 @@ SNAPFLOW_BIN="${SNAPFLOW_BIN_OVERRIDE:-$BUILD_DIR/src/snapflow}"
 ACTIVE_MARKER="$BUILD_DIR/.vnc_worktree_active"
 SOURCE_MARKER="$BUILD_DIR/.vnc_worktree_cmake_source"
 
+# Worktrees may carry memory as an unpopulated gitlink. Reuse the main
+# checkout's shared harness helpers in that case; all daemon/acpx state still
+# remains worktree-scoped under /tmp.
+if [ ! -x "$REG" ]; then
+    COMMON_GIT_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$COMMON_GIT_DIR" ]; then
+        COMMON_ROOT="$(cd "$COMMON_GIT_DIR/.." && pwd)"
+        REG="$COMMON_ROOT/memory/team/reserved/port_registry.sh"
+    fi
+fi
+
 die() { echo "error: $*" >&2; exit 1; }
 
 worktree_label() {
@@ -212,6 +223,8 @@ cmd_start() {
         vnc_display="$(echo "$vnc_out" | cut -d' ' -f2)"
     fi
     gateway_port="$("$REG" reserve "$label" "acpx-gateway vnc_worktree.sh")"
+    local admin_port
+    admin_port="$("$REG" reserve "$label" "acpx-admin vnc_worktree.sh")"
 
     # Opt-in Slint MCP server (i_slint_backend_testing::mcp_server) on the
     # real-backend snapflow this script launches -- previously the only way
@@ -233,20 +246,10 @@ cmd_start() {
     fi
 
     mkdir -p "$state_dir"/{acpx,panel,shotcut}
-    local fifo="$state_dir/acpx/stdin.fifo"
-    rm -f "$fifo"
-    mkfifo "$fifo"
-    exec 3<>"$fifo"
-    # Keep one FIFO writer alive after this launcher shell exits. Without
-    # this, acpx-server inherits the FIFO reader but sees EOF as soon as the
-    # short-lived `start` command closes fd 3, so the freshly launched
-    # gateway dies immediately after reporting "ready".
-    setsid nohup bash -c 'while :; do sleep 3600; done' >"$fifo" 2>/dev/null &
-    local fifo_keeper_pid=$!
-
-    # snapshotd serve is NOT started by panel-rust (it only probes). Ensure a
-    # worktree-scoped daemon via snapshotd_test_instance.ensure_daemon so
-    # SNAPSHOTD_MCP_SSE_ADDR is real and injects into session/new MCP list.
+    # snapshotd owns the acpx child and its provisioning file. Ensure a
+    # worktree-scoped daemon via snapshotd_test_instance.ensure_daemon so the
+    # live daemon MCP URL and the acpx central registry are initialized before
+    # the panel connects.
     echo "==> ensuring snapshotd serve for $label..."
     # The selected worktree owns the GUI lifecycle protocol and its matching
     # daemon implementation. Running the root checkout's snapshotd here can
@@ -269,12 +272,13 @@ from snapshotd_test_instance import ensure_daemon, load_instance
 import os
 scratch = Path("$state_dir") / "snapshotd-scratch"
 scratch.mkdir(parents=True, exist_ok=True)
-# vnc_worktree already runs its own acpx-server on a reserved gateway port.
-# snapshotd's *bundled* acpx defaults to 127.0.0.1:8790 and will crash the
-# whole daemon with EADDRINUSE when another instance (e.g. snapshotd-vnc100)
-# already holds that bind — found live in snapshotd_stdout.log. Disable
-# the bundle; panel-rust only needs the MCP SSE/HTTP surface for media tools.
-os.environ["SNAPSHOTD_ACPX_ENABLED"] = "false"
+# The daemon owns the gateway for this worktree. Give it the exact worktree
+# acpx binary, reserved gateway bind, and worktree-scoped config path.
+os.environ["SNAPSHOTD_ACPX_ENABLED"] = "true"
+os.environ["SNAPSHOTD_ACPX_BIN"] = "$worktree_dir/acpx/target/debug/acpx-server"
+os.environ["SNAPSHOTD_ACPX_HTTP_BIND"] = "0.0.0.0:$gateway_port"
+os.environ["SNAPSHOTD_ACPX_ADMIN_BIND"] = "127.0.0.1:$admin_port"
+os.environ["SNAPSHOTD_ACPX_CONFIG"] = "$state_dir/snapshotd-scratch/snapshotd-home/acpx-config.json"
 # Stable session id so ensure_daemon can reuse across VNC restarts.
 os.environ.setdefault(
     "CLAUDE_CODE_SESSION_ID",
@@ -318,23 +322,20 @@ PY
     echo "    SNAPSHOTD_MCP_SSE_ADDR=$mcp_addr"
     echo "    SNAPSHOTD_HOME=$snapshotd_home"
 
-    echo "==> starting acpx-server..."
-    # Match panel-rust's auto-spawn defaults (agent_bridge.rs): the
-    # library defaults are only 16/tenant and 128 total -- far too low for
-    # a real UI session once session/list re-registers backend history
-    # under the same tenant. Without these, "I only opened 4 threads" hits
-    # `session capacity reached for tenant default: 16/16` after a single
-    # session/list import of foreign claude-acp rows.
-    ACPX_HTTP_BIND="0.0.0.0:$gateway_port" \
-    ACPX_DEFAULT_AGENT_ID="$agent_id" \
-    ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
-    ACPX_STORAGE_DIR="$state_dir/acpx/storage" \
-    ACPX_MAX_SESSIONS_PER_TENANT="${ACPX_MAX_SESSIONS_PER_TENANT:-512}" \
-    ACPX_MAX_SESSIONS_TOTAL="${ACPX_MAX_SESSIONS_TOTAL:-2048}" \
-    RUI_MOCK_AGENT_EVENT_LOG="${RUI_MOCK_AGENT_EVENT_LOG:-}" \
-        setsid nohup "$worktree_dir/acpx/target/debug/acpx-server" <"$fifo" \
-        >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
-    local server_pid=$!
+    echo "==> waiting for daemon-managed acpx-server..."
+    local acpx_config="$snapshotd_home/acpx-config.json"
+    local acpx_pid_file="$snapshotd_home/acpx-server.pid"
+    local server_pid=""
+    local fifo_keeper_pid=""
+    for _ in $(seq 1 100); do
+        if [ -s "$acpx_pid_file" ]; then
+            server_pid="$(tr -d '[:space:]' <"$acpx_pid_file")"
+            kill -0 "$server_pid" 2>/dev/null && break
+            server_pid=""
+        fi
+        sleep 0.1
+    done
+    [ -n "$server_pid" ] || die "daemon-managed acpx-server pid file was not created"
     "$REG" update-pid "$gateway_port" "$server_pid" || true
 
     for _ in $(seq 1 100); do
@@ -342,7 +343,7 @@ PY
         sleep 0.1
     done
     curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null \
-        || die "acpx-server never became healthy, see $state_dir/acpx/server.stderr.log"
+        || die "daemon-managed acpx-server never became healthy, see $state_dir/snapshotd-scratch/snapshotd_stdout.log"
 
     echo "==> starting snapflow on display $vnc_display..."
     local project_args=()
@@ -370,6 +371,7 @@ PY
         # competing internal acpx-server. Production config does not export
         # provider-specific localhost URLs.
         RUI_ACPX_DEFAULT_URL="http://127.0.0.1:$gateway_port"
+        RUI_ACPX_ADMIN_URL="http://127.0.0.1:$admin_port"
         RUI_ACPX_NO_AUTOSPAWN=1
         SNAPSHOTD_HOME="$snapshotd_home"
         SNAPSHOTD_MCP_SSE_ADDR="$mcp_addr"
@@ -398,6 +400,7 @@ PY
                 >/dev/null 2>&1 || true
             "$SHARED_VNC" workspace-release "$worktree_dir" \
                 >/dev/null 2>&1 || true
+            "$REG" release "$admin_port" >/dev/null 2>&1 || true
             "$REG" release "$gateway_port" >/dev/null 2>&1 || true
             die "could not place Snapflow pid $shotcut_pid on workspace $workspace_id"
         fi
@@ -409,10 +412,12 @@ worktree_dir=$worktree_dir
 vnc_port=$vnc_port
 display=$vnc_display
 gateway_port=$gateway_port
+admin_port=$admin_port
 state_dir=$state_dir
 vnc_connect=localhost:$vnc_port
 workspace=$workspace_id
 acpx_bin=$worktree_dir/acpx/target/debug/acpx-server
+acpx_config=$acpx_config
 snapflow_bin=$SNAPFLOW_BIN
 snapshotd_mcp_sse_addr=$mcp_addr
 slint_mcp_port=$mcp_port
@@ -449,6 +454,9 @@ cmd_rebuild() {
 }
 
 SNAPSHOTD_TEST_INSTANCE="$REPO_ROOT/memory/team/testing/snapshotd_test_instance.py"
+if [ ! -f "$SNAPSHOTD_TEST_INSTANCE" ] && declare -p COMMON_ROOT >/dev/null 2>&1; then
+    SNAPSHOTD_TEST_INSTANCE="$COMMON_ROOT/memory/team/testing/snapshotd_test_instance.py"
+fi
 CLEAN_LOG_DIR="$STATE_BASE/snapflow/vnc-logs"
 mkdir -p "$CLEAN_LOG_DIR" 2>/dev/null || true
 
@@ -516,6 +524,9 @@ cmd_clean() {
         done
         curl --fail --silent --max-time 1 "http://127.0.0.1:$gateway_port/health" >/dev/null 2>&1 \
             && echo "warning: gateway port $gateway_port still answering after teardown" >&2
+    fi
+    if [ -v admin_port ] && [ -n "$admin_port" ]; then
+        quiet_step "release-admin-$label" "$REG" release "$admin_port"
     fi
     quiet_step "release-worktree-$label" "$REG" release-worktree "$label"
     rm -rf "$state_dir"

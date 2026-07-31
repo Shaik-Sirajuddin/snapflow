@@ -179,6 +179,7 @@ func cmdServe(cfg config.Config, args []string) error {
 				DbPath:            filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
 				McpURL:            acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
 				DefaultAgentID:    "default",
+				AdminBind:         cfg.AcpxAdminBind,
 				DefaultAcpCommand: cfg.AcpxDefaultAcpCommand,
 				Log:               logger,
 			})
