@@ -1406,6 +1406,38 @@ fn read_codex_api_key_from_auth_file() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// pool-capability-fix: the other half of `read_codex_api_key_from_auth_
+/// file`'s own gap -- `codex login`'s far more common ChatGPT-plan device
+/// flow writes a `tokens.access_token` OAuth session into the same
+/// `auth.json` and leaves `OPENAI_API_KEY` null, so a real, valid,
+/// already-authenticated login of that shape was previously
+/// indistinguishable here from no login at all. Live-confirmed against
+/// this exact file shape: acpx-server's own mirrored auto-detection
+/// (`acpx-server/src/config.rs`'s `default_codex_native_auth_method`)
+/// resolved `native_auth_method_id=None` for it, and every real
+/// `session/new` failed with "backend requires authentication" until
+/// `chat-gpt` was selected explicitly -- after which a real prompt round-
+/// tripped successfully through the genuine ambient login.
+fn codex_auth_file_has_chatgpt_login() -> bool {
+    let Some(path) = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))
+    else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|token| token.as_str())
+        .is_some_and(|token| !token.is_empty())
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -1945,10 +1977,27 @@ fn spawn_gateway_process(
         // system's already-authenticated Codex CLI login instead of
         // codex-acp's headless-incapable chat-gpt device flow (see
         // read_codex_api_key_from_auth_file's doc comment).
+        //
+        // pool-capability-fix: this used to hardcode "api-key"
+        // unconditionally whenever the env var was unset -- worse than
+        // doing nothing for a real ChatGPT-plan login (no raw API key
+        // ever stored, by design): it forced codex-acp down the
+        // api-key path with no key at all, instead of leaving
+        // auth_method_id unset so codex-acp could at least attempt its
+        // own default flow. Mirrors acpx-server's own auto-detection
+        // (`config.rs`'s `default_codex_native_auth_method`): api-key
+        // when a real key is found, else chat-gpt when a real ChatGPT
+        // OAuth login is found, else leave it unset.
         if std::env::var_os("ACPX_NATIVE_AUTH_METHOD_ID").is_none() {
-            cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
-        }
-        if std::env::var_os("CODEX_API_KEY").is_none() {
+            if let Some(key) = read_codex_api_key_from_auth_file() {
+                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+                if std::env::var_os("CODEX_API_KEY").is_none() {
+                    cmd.env("CODEX_API_KEY", key);
+                }
+            } else if codex_auth_file_has_chatgpt_login() {
+                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+            }
+        } else if std::env::var_os("CODEX_API_KEY").is_none() {
             if let Some(key) = read_codex_api_key_from_auth_file() {
                 cmd.env("CODEX_API_KEY", key);
             }
@@ -5079,6 +5128,26 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
+    /// pre-send-config-options-visibility, Finding C: `NO_PROVIDER_
+    /// REQUESTED_FALLBACK` ("codex") is a valid `session/new`/pool
+    /// provider sentinel -- omitting an explicit profile/agent selector
+    /// there lets acpx-server fall back to its own `ACPX_DEFAULT_AGENT_ID`
+    /// -- but `models/list`'s `agentId` param requires a real, resolvable
+    /// registry id and rejects the bare sentinel outright. Confirmed live
+    /// via a direct RPC: `agentId=codex` -> real error "unknown agent id
+    /// codex"; `agentId=codex-acp` -> a real, correct model catalog. Only
+    /// `list_models` calls need this resolved; every other call site in
+    /// this file that already works with the bare sentinel (session/new,
+    /// the pool preview path, snapflowd_mcp_servers_entry's own dual-form
+    /// handling) is untouched.
+    fn resolve_registry_agent_id_for_capability_probe(provider: &str) -> String {
+        if provider == NO_PROVIDER_REQUESTED_FALLBACK {
+            "codex-acp".to_owned()
+        } else {
+            provider.to_owned()
+        }
+    }
+
     /// Start one background `models/list` probe for the provider currently
     /// selected in the compose bar. This is intentionally not limited to
     /// deferred threads: changing provider on any session-less thread must
@@ -5131,10 +5200,27 @@ impl AgentBridge {
             &self.session_cwd_override,
         );
         let Some(project_dir) = project_dir else {
-            let agent_id = provider.clone();
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
             let events = events.clone();
+            // pre-send-config-options-visibility: `cwd` here was `None`
+            // (real project dir unknown before any project is opened/
+            // saved) on the theory that "there's nothing absolute to
+            // send" -- wrong, and live-confirmed a real bug: a `None`
+            // cwd omits the field entirely, `probe_adapter_capabilities`
+            // then rejects the server's own `"."` default outright
+            // (same "must be an absolute path" error Finding A already
+            // fixed for the other two branches). It only ever appeared
+            // to work for whichever provider happened to already have
+            // server-side cached capabilities (this gateway's own
+            // default agent, warmed some other way) -- confirmed live:
+            // an identical never-yet-probed second provider on the same
+            // cwd-less branch failed immediately. `probe_adapter_
+            // capabilities` doesn't need a *meaningful* cwd, just a
+            // valid absolute one for a generic capability probe, so the
+            // process's own cwd is a perfectly good fallback here.
+            let cwd = std::env::current_dir().ok();
             self.runtime.spawn(async move {
-                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
                 target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5150,10 +5236,16 @@ impl AgentBridge {
             return;
         };
         let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
-            let agent_id = provider.clone();
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
             let events = events.clone();
+            let cwd = Some(project_dir.clone());
             self.runtime.spawn(async move {
-                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                // pre-send-config-options-visibility: this branch has a
+                // real project_dir even though gateway_urls missed --
+                // sending it (absolute, per thread_project_dir) is what
+                // makes probe_adapter_capabilities accept the call
+                // instead of rejecting the "." it defaults to otherwise.
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
                 target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5171,10 +5263,12 @@ impl AgentBridge {
         let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
         let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
         else {
-            let agent_id = provider.clone();
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
             let events = events.clone();
+            let cwd = Some(project_dir.clone());
             self.runtime.spawn(async move {
-                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                // Same reasoning as the gateway_urls-miss branch above.
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
                 target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5195,6 +5289,8 @@ impl AgentBridge {
             crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
         );
         let preview_thread_id = format!("preview:{idx}:{provider}");
+        let cwd = Some(project_dir.clone());
+        let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
         self.runtime.spawn(async move {
             let options = match pool
                 .acquire(
@@ -5218,7 +5314,7 @@ impl AgentBridge {
                     }
                     if options.is_empty() {
                         handle
-                            .list_models(provider.clone())
+                            .list_models(agent_id.clone(), cwd.clone())
                             .await
                             .unwrap_or_default()
                     } else {
@@ -5228,7 +5324,7 @@ impl AgentBridge {
                 Err(error) => {
                     eprintln!("panel-rust: capability preview pool acquire failed: {error}");
                     handle
-                        .list_models(provider.clone())
+                        .list_models(agent_id.clone(), cwd.clone())
                         .await
                         .unwrap_or_default()
                 }

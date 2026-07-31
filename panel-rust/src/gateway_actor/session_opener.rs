@@ -54,6 +54,59 @@ fn profile_from_key(key: &PoolKey) -> Option<&str> {
     }
 }
 
+/// finding-b-real-attach-agent-id-plumbing: `key.agent_id` already carries
+/// the thread's own explicitly-selected provider (e.g. `"claude-acp"`) --
+/// but until now nothing ever forwarded it to `session/new`/`session/
+/// resume` when no real profile also names that agent, so a real attach
+/// silently fell through to the gateway's single `ACPX_DEFAULT_AGENT_ID`
+/// regardless of what the compose bar's Provider picker showed (live-
+/// confirmed: a `claude-acp`-selected thread's `session/new` kept failing
+/// with the *codex* backend's own auth error). `session/new` supports a
+/// real, direct `_acpx.agentId` selector for exactly this (see acpx-core's
+/// `router.rs`, `dispatch_session_new`'s `_acpx.agentId`/`_acpx.profile`
+/// precedence) -- distinct from `_acpx.profile` and mutually exclusive
+/// with it (acpx-core rejects a request naming both). Returns `None` for
+/// `NO_PROVIDER_REQUESTED_FALLBACK` ("codex"), which must keep meaning
+/// "no explicit selection, use the server's own default" exactly as
+/// before -- only a real, specific agent id should ever override that.
+fn explicit_agent_id_from_key(key: &PoolKey) -> Option<&str> {
+    if key.agent_id.is_empty() || key.agent_id == crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK {
+        None
+    } else {
+        Some(key.agent_id.as_str())
+    }
+}
+
+/// Embeds `_acpx.agentId` into `params` when the caller resolved an
+/// explicit agent selection for this key AND no real profile already
+/// claims that role (acpx-core rejects a request naming both `_acpx.
+/// profile` and `_acpx.agentId`; a real profile is always the more
+/// specific selection when both could apply). Returns the profile to
+/// pass through `Gateway::call`'s own `profile` parameter unchanged --
+/// `None` whenever this embedded an explicit agentId instead, since
+/// `Gateway::call`'s `with_profile` must not also inject `_acpx.profile`
+/// into the same params and either violate that exclusivity or silently
+/// overwrite the `_acpx` object this just built.
+fn apply_explicit_agent_selection<'a>(
+    key: &'a PoolKey,
+    mut params: serde_json::Value,
+) -> (serde_json::Value, Option<&'a str>) {
+    let profile = profile_from_key(key);
+    if profile.is_some() {
+        return (params, profile);
+    }
+    let Some(agent_id) = explicit_agent_id_from_key(key) else {
+        return (params, None);
+    };
+    if let Some(object) = params.as_object_mut() {
+        object.insert(
+            "_acpx".to_string(),
+            serde_json::json!({ "agentId": agent_id }),
+        );
+    }
+    (params, None)
+}
+
 /// Opens sessions for one project against a shared `Gateway`. `key.
 /// project_dir` is used verbatim as the ACP `cwd`; `mcp_servers` is project/
 /// agent policy, not a compatibility axis for session reuse, so it lives on
@@ -116,8 +169,9 @@ impl SessionOpener for GatewaySessionOpener {
                 "sessionId": saved_session_id,
                 "cwd": Self::cwd_for(key).to_string_lossy(),
             });
+            let (params, profile) = apply_explicit_agent_selection(key, params);
             self.gateway
-                .call("session/resume", params, profile_from_key(key))
+                .call("session/resume", params, profile)
                 .await
                 .map_err(classify)?;
             Ok(saved_session_id.to_string())
@@ -149,9 +203,10 @@ impl SessionOpener for GatewaySessionOpener {
                 "cwd": Self::cwd_for(key).to_string_lossy(),
                 "mcpServers": mcp_servers,
             });
+            let (params, profile) = apply_explicit_agent_selection(key, params);
             let value = self
                 .gateway
-                .call("session/new", params, profile_from_key(key))
+                .call("session/new", params, profile)
                 .await
                 .map_err(classify)?;
             let session_id = value

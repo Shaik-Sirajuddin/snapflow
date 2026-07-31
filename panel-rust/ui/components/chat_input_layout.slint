@@ -144,6 +144,40 @@ export component ChatInputLayout inherits Rectangle {
         }
     }
 
+    // The four `local-*` mirrors above are optimistic-only: they exist so a
+    // dropdown pick renders immediately, before the host round-trips and
+    // rewrites `*-trigger-label`. Without a reset, this component (one
+    // shared instance reused across whichever thread is active) kept
+    // showing the *previous* thread's picked provider/mode/config/
+    // reasoning label on a freshly created thread that never had any of
+    // them selected -- live-confirmed: a brand-new thread's compose bar
+    // read "claude-acp ›" purely from a prior thread's optimistic click,
+    // while the real attach (which reads `thread.provider` from the model,
+    // never this local mirror) silently used the actual default agent
+    // instead. `*-trigger-label` is the host's own per-thread value, so it
+    // reliably changes on every thread switch (including to/from an empty
+    // "nothing selected yet" thread) -- clearing the local mirror whenever
+    // it changes keeps the optimistic pre-host-confirmation flash without
+    // letting it survive past the thread it was clicked on.
+    changed profile-trigger-label => {
+        local-profile-id = "";
+        local-profile-label = "";
+    }
+    changed mode-trigger-label => {
+        local-mode-id = "";
+        local-mode-label = "";
+    }
+    changed config-trigger-label => {
+        local-config-id = "";
+        local-config-value = "";
+        local-config-label = "";
+    }
+    changed reasoning-trigger-label => {
+        local-reasoning-id = "";
+        local-reasoning-value = "";
+        local-reasoning-label = "";
+    }
+
     // First control is **Provider** (was "Profile") — shows agent/provider
     // id; " ›" marks it as a chooser for the cascade (provider → models).
     property <string> profile-label-shown:

@@ -265,8 +265,21 @@ enum Command {
             oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
     },
     /// `models/list` for one agent, safe before a session exists.
+    ///
+    /// pre-send-config-options-visibility: `cwd` is forwarded verbatim to
+    /// the `models/list` RPC. It must be `Some(_)` with an *absolute*
+    /// path whenever the caller has one -- `acpx-core::router`'s
+    /// `probe_adapter_capabilities` defaults a missing `cwd` to `"."` and
+    /// then rejects it outright ("cwd must be an absolute path"),
+    /// confirmed live: this is exactly why a not-yet-attached thread's
+    /// config dropdown went silently empty for any provider whose
+    /// capability lookup fell through to this command (the RPC error was
+    /// swallowed by the caller's own `unwrap_or_default()`, so nothing
+    /// ever surfaced). `None` only when the caller genuinely has no known
+    /// project directory yet (e.g. no project open at all).
     ListModels {
         agent_id: String,
+        cwd: Option<std::path::PathBuf>,
         resp: oneshot::Sender<Result<Vec<ConfigOptionInfo>, AcpxThreadError>>,
     },
     /// `agents/status` for one agent id.
@@ -629,11 +642,15 @@ impl AcpxThreadHandle {
     }
 
     /// `models/list` for an agent-scoped pre-session model catalog.
+    /// `cwd` must be an absolute path when `Some` -- see `Command::
+    /// ListModels`'s own doc comment for why a relative/missing one
+    /// makes the backend reject the probe outright.
     pub async fn list_models(
         &self,
         agent_id: String,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<Vec<ConfigOptionInfo>, AcpxThreadError> {
-        self.call(|resp| Command::ListModels { agent_id, resp })
+        self.call(|resp| Command::ListModels { agent_id, cwd, resp })
             .await
     }
 
@@ -2294,13 +2311,13 @@ async fn run_thread_actor(
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
-            Command::ListModels { agent_id, resp } => {
+            Command::ListModels { agent_id, cwd, resp } => {
+                let mut params = serde_json::json!({ "agentId": agent_id });
+                if let Some(cwd) = cwd {
+                    params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+                }
                 let result = client
-                    .call(
-                        "models/list",
-                        serde_json::json!({ "agentId": agent_id }),
-                        None,
-                    )
+                    .call("models/list", params, None)
                     .await
                     .map(|value| parse_model_catalog(&value));
                 let _ = resp.send(result.map_err(Into::into));
