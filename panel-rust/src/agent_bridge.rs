@@ -2759,6 +2759,12 @@ fn spawn_background_attachment(
                 )
                 .await
             {
+                // `attached.resumed_from_saved` deliberately unread here --
+                // see `AttachedSession`'s own doc comment: capability
+                // events are already emitted uniformly for both the
+                // resumed and freshly-created cases by
+                // `Command::AcquireAndAttach`'s handler, so no fallback
+                // decision needs it at this layer.
                 Ok(attached) => Ok(attached.session_id),
                 Err(error) => Err(error),
             }
@@ -5096,9 +5102,18 @@ impl AgentBridge {
         let base_url = self.gateway_urls.get(&provider).cloned();
         let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
-            let profiles = handle.list_profiles().await.unwrap_or_default();
-            let mcp_servers = handle.list_mcp_servers().await.unwrap_or_default();
-            let mut agents = handle.list_agents().await.unwrap_or_default();
+            // These four RPCs are independent of each other (only the admin-enablement
+            // merge below depends on `agents` having resolved), so run them concurrently
+            // via `tokio::join!` instead of paying for N sequential round-trips.
+            let (profiles, mcp_servers, agents_result, sessions_result) = tokio::join!(
+                handle.list_profiles(),
+                handle.list_mcp_servers(),
+                handle.list_agents(),
+                handle.list_sessions_for_agent(provider.clone())
+            );
+            let profiles = profiles.unwrap_or_default();
+            let mcp_servers = mcp_servers.unwrap_or_default();
+            let mut agents = agents_result.unwrap_or_default();
             if let Some((admin_url, admin_token)) = admin_creds {
                 let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
                 if let Ok(entries) = client.list_agents().await {
@@ -5113,9 +5128,7 @@ impl AgentBridge {
                     }
                 }
             }
-            let recoverable_sessions = handle
-                .list_sessions_for_agent(provider.clone())
-                .await
+            let recoverable_sessions = sessions_result
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|session| !bound.contains(&session.acp_session_id))

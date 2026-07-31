@@ -385,6 +385,38 @@ fn merge_expanded_by_key(
     }
 }
 
+/// Frame-poll fold merges a fresh `config_options` snapshot (from
+/// `AgentBridge::config_options_for_provider`, which never carries a
+/// `current_value`) over the thread's existing options. A blind overwrite
+/// would silently discard a user's just-made `SettingsMsg::
+/// ConfigOptionSelected` pick on a deferred thread the very next frame,
+/// before they had a chance to send. Carry the old `current_value` forward
+/// onto the matching new option only when it's still a valid choice in the
+/// new option's `options[].value` list; otherwise leave the fresh
+/// snapshot's `current_value` as-is (never fabricate a value that isn't
+/// actually offered anymore).
+fn merge_config_options_preserving_current_value(
+    old: &[crate::protocol_types::ConfigOptionInfo],
+    new: Vec<crate::protocol_types::ConfigOptionInfo>,
+) -> Vec<crate::protocol_types::ConfigOptionInfo> {
+    new.into_iter()
+        .map(|mut option| {
+            if let Some(old_option) = old.iter().find(|candidate| candidate.id == option.id) {
+                if let Some(value) = old_option.current_value.as_ref() {
+                    if option
+                        .options
+                        .iter()
+                        .any(|candidate| &candidate.value == value)
+                    {
+                        option.current_value = Some(value.clone());
+                    }
+                }
+            }
+            option
+        })
+        .collect()
+}
+
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
         ThreadMsg::New => {
@@ -2818,7 +2850,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.local_terminal = snapshot.local_terminal;
             thread.connection_status = snapshot.connection_status;
             thread.session_modes = snapshot.session_modes;
-            thread.config_options = snapshot.config_options;
+            let old_config_options = std::mem::take(&mut thread.config_options);
+            thread.config_options = merge_config_options_preserving_current_value(
+                &old_config_options,
+                snapshot.config_options,
+            );
             thread.available_commands = snapshot.available_commands;
             thread.usage = snapshot.usage;
             thread.plan = snapshot.plan;
@@ -6474,5 +6510,47 @@ mod tests {
         assert!(dirty
             .iter()
             .any(|d| matches!(d, Dirty::MessageRowPatch { index: 0, .. })));
+    }
+
+    fn config_option(
+        id: &str,
+        current_value: Option<&str>,
+        values: &[&str],
+    ) -> crate::protocol_types::ConfigOptionInfo {
+        crate::protocol_types::ConfigOptionInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            description: None,
+            category: None,
+            kind: "select".into(),
+            current_value: current_value.map(str::to_owned),
+            options: values
+                .iter()
+                .map(|value| crate::protocol_types::ConfigOptionValue {
+                    value: (*value).to_owned(),
+                    name: (*value).to_owned(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn config_option_merge_keeps_current_value_when_still_a_valid_choice() {
+        let old = vec![config_option("model", Some("opus"), &["sonnet", "opus"])];
+        let new = vec![config_option("model", None, &["sonnet", "opus", "haiku"])];
+        let merged = merge_config_options_preserving_current_value(&old, new);
+        assert_eq!(merged[0].current_value.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn config_option_merge_drops_current_value_once_it_is_no_longer_offered() {
+        let old = vec![config_option("model", Some("opus"), &["sonnet", "opus"])];
+        let new = vec![config_option("model", None, &["sonnet", "haiku"])];
+        let merged = merge_config_options_preserving_current_value(&old, new);
+        assert_eq!(
+            merged[0].current_value, None,
+            "must not fabricate a value that isn't a real choice in the fresh snapshot"
+        );
     }
 }

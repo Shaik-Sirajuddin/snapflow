@@ -579,10 +579,6 @@ pub fn message_rows_for_thread_with_state(
     generation_in_flight: bool,
 ) -> (Vec<MessageItem>, Vec<String>) {
     let mut keys = transcript_row_keys(&transcript);
-    let last_is_user = transcript
-        .last()
-        .map(|item| matches!(item, crate::conversation::TranscriptItem::User { .. }))
-        .unwrap_or(false);
     let mut rows = to_message_rows_from_transcript(transcript, expanded);
     // Phase 18 (send_feedback_and_empty_states): the instant the user's
     // message is the transcript tail and a generation is in flight,
@@ -590,6 +586,18 @@ pub fn message_rows_for_thread_with_state(
     // chat shows immediate feedback before any real agent event
     // arrives. Rendered as a subtle thinking-style item with a loading
     // animation, deliberately distinct from real "thinking" rows.
+    //
+    // Checked against `rows` (the actually-displayed, post-filter list),
+    // not the raw transcript: `to_message_rows_from_transcript` can drop
+    // a trailing item (e.g. `filter_map` skipping an empty in-progress
+    // chunk), which let a stale "user is last" read survive even after a
+    // real "thinking" row had already landed -- rendering both "Agent is
+    // working..." and "Thinking" at once instead of the pending
+    // placeholder yielding to the real one, as intended.
+    let last_is_user = rows
+        .last()
+        .map(|row| row.kind == "user")
+        .unwrap_or(false);
     if generation_in_flight && last_is_user {
         rows.push(MessageItem {
             kind: "pending".into(),

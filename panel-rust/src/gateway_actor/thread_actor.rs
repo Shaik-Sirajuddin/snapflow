@@ -64,12 +64,17 @@ fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
 }
 
 /// Result of [`AcpxThreadHandle::acquire_and_attach`]. `resumed_from_saved`
-/// distinguishes a session the pool resumed from a persisted id (which
-/// already carries capability/config info from its `session/resume`
-/// response, emitted as the usual capability events) from one the pool
-/// freshly created (whose capabilities are not yet known to this actor --
-/// callers should fall back to `models/list` per the plan's capability-
-/// loading precedence rather than expect capability events for that case).
+/// distinguishes a session the pool resumed from a persisted id from one
+/// the pool freshly created. Not currently consumed by any caller --
+/// `Command::AcquireAndAttach`'s own handler already emits capability
+/// events uniformly for both cases (resumed: from the `session/resume`
+/// response; freshly created: from `SessionLease::capabilities`, which
+/// `ProjectSessionPool` populates from `session/new`'s response and
+/// carries through even a warm-pool reuse, see `pool.rs`'s
+/// `reusing an idle entry must not drop its captured capabilities` test)
+/// -- so no caller-side models/list fallback decision needs this flag.
+/// Kept for now as a cheap diagnostic signal (e.g. logging) rather than
+/// removed outright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedSession {
     pub session_id: String,
