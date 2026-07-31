@@ -285,14 +285,58 @@ export component SearchableDropdown inherits Rectangle {
         spacing: Metrics.space-2;
         alignment: stretch;
         cross-axis-alignment: center;
-        Text {
-            text: root.trigger-label;
-            color: Theme.text-primary;
-            font-family: Theme.font-mono;
-            font-size: 10px * Theme.font-scale;
-            vertical-alignment: center;
+        // Own-bounds horizontal scroll for the trigger label -- when the
+        // assigned trigger width (e.g. a narrow docked panel, or several
+        // triggers competing for space in chat_input_layout.slint's
+        // row2-strip) is too small for the full label, text must stay
+        // containable within the trigger rather than spilling past its
+        // border (root's `clip` defaults to false). Mirrors row2-host's
+        // own pattern one level up: a TouchArea handling only
+        // `scroll-event` (wheel/trackpad) so plain clicks still fall
+        // through undisturbed to `trigger-touch` below (declared before
+        // this HorizontalLayout, so it only sees events this layout's
+        // children don't consume), plus a ThinScrollbar overlay for a
+        // visible affordance. `active` mirrors row2-strip's ThinScrollbar
+        // (pressed, not has-hover) -- see chat_input_layout.slint.
+        label-scroll-host := Rectangle {
             horizontal-stretch: 1;
-            overflow: elide;
+            min-width: 0px;
+            height: parent.height;
+            clip: true;
+            property <length> pan: 0px;
+            property <length> overflow: max(0px, label-text.preferred-width - self.width);
+            label-scroll := TouchArea {
+                width: 100%;
+                height: 100%;
+                scroll-event(e) => {
+                    if (label-scroll-host.overflow > 0px) {
+                        label-scroll-host.pan = max(-label-scroll-host.overflow,
+                            min(0px, label-scroll-host.pan + e.delta-x + e.delta-y));
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            label-text := Text {
+                x: label-scroll-host.overflow > 0px ? label-scroll-host.pan : 0px;
+                height: parent.height;
+                text: root.trigger-label;
+                color: Theme.text-primary;
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: clip;
+            }
+            ThinScrollbar {
+                horizontal: true;
+                x: 0px;
+                y: parent.height - self.thumb-width;
+                visible-width: label-scroll-host.width;
+                viewport-width: label-scroll-host.width + label-scroll-host.overflow;
+                viewport-x <=> label-scroll-host.pan;
+                thumb-width: 2px;
+                active: label-scroll.pressed;
+            }
         }
         Text {
             text: "\u{25BE}";
