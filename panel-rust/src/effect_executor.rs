@@ -219,20 +219,18 @@ fn execute_skill_effects(effects: Vec<Effect>) {
         match effect {
             Effect::SkillWrite { path, content } => {
                 std::thread::spawn(move || {
-                    // `path` is the skill's DIRECTORY (same convention as
-                    // every other skill effect -- OpenSkillEditor reads
-                    // path.join("SKILL.md"), CopyPathRequested copies the
-                    // directory, etc.), not the SKILL.md file itself.
-                    // Pre-existing bug fixed here: this previously called
-                    // std::fs::write(path, content) directly on that
-                    // directory, which always fails with EISDIR -- the
-                    // skill editor's save action had no working path to
-                    // actually persist an edit, confirmed empirically
-                    // (std::fs::write on a real directory reliably errors
-                    // "Is a directory") while wiring reactive-sync trigger
-                    // (3)'s edit half (memory/acpx/gen/plans/acpx-skills/).
-                    let skill_md_path = path.join("SKILL.md");
-                    let result = std::fs::write(&skill_md_path, &content)
+                    // `path` is the SKILL.md FILE itself, not the skill's
+                    // directory -- `app.slint:848` sends `active-skill-md-
+                    // path` (added by PUI-010/commit 60820a2f to fix the
+                    // sibling EISDIR bug in OpenSkillEditor). This handler
+                    // previously still did `path.join("SKILL.md")` here
+                    // (correct back when `path` really was the directory,
+                    // pre-60820a2f), which after that commit double-joined
+                    // to `.../SKILL.md/SKILL.md` and failed with ENOTDIR
+                    // ("Not a directory") on every real skill-content save,
+                    // since `SKILL.md` already exists as a plain file, not
+                    // a directory. Write `path` directly.
+                    let result = std::fs::write(&path, &content)
                         .map_err(|error| EffectError::new(error.to_string()));
                     let write_succeeded = result.is_ok();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -1127,6 +1125,37 @@ mod skill_editor_path_tests {
         assert_eq!(
             std::fs::read_to_string(&state.content_path).unwrap(),
             "old body plus a typed delta"
+        );
+    }
+
+    // Regression test for the ENOTDIR bug introduced by 60820a2f itself:
+    // Effect::SkillWrite's handler kept doing `path.join("SKILL.md")`
+    // after `path` became the SKILL.md file (not the directory) per the
+    // fix above -- neither prior test here exercises that handler's own
+    // redundant join, since they write straight to a derived path instead
+    // of reproducing the handler's exact logic.
+    #[test]
+    fn skill_write_effect_handler_writes_the_content_path_directly_not_joined_again() {
+        let dir = tempfile_dir();
+        let md_path = dir.join("SKILL.md");
+        std::fs::write(&md_path, "---\nname: demo\n---\noriginal").unwrap();
+
+        // What the buggy handler did: re-join "SKILL.md" onto a path that
+        // is already the SKILL.md file, then try to write there.
+        let buggy_double_joined = md_path.join("SKILL.md");
+        let buggy_result = std::fs::write(&buggy_double_joined, "new content");
+        assert_eq!(
+            buggy_result.unwrap_err().kind(),
+            ErrorKind::NotADirectory,
+            "demonstrates the exact regression: joining SKILL.md onto an \
+             already-file path hits ENOTDIR"
+        );
+
+        // The fix: write `path` (== content_path) directly, no re-join.
+        std::fs::write(&md_path, "new content").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&md_path).unwrap(),
+            "new content"
         );
     }
 
