@@ -234,6 +234,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .as_ref()
                 .map(AgentBridge::agent_operations_in_flight)
                 .unwrap_or_default(),
+            mcp_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::mcp_operations_in_flight)
+                .unwrap_or_default(),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold
             // the result, so the live skills view tracks filesystem/state

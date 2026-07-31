@@ -428,6 +428,19 @@ export struct McpServerOption {
     // default for every acpx-registry row) means the user added it and may
     // remove it.
     removable: bool,
+    // Per-action "RPC currently in flight for this row" flags, sourced
+    // from `AgentBridge::mcp_operations_in_flight` (see `panel-rust::
+    // models::to_mcp_server_option_rows`'s doc comment) -- each drives
+    // its own button showing a `Spinner` in place of its label instead
+    // of a global busy indicator. Deliberately excludes tools-fetch: the
+    // Fetch/Refresh button already has its own, longer-lived busy signal
+    // (`tool-fetch-status == "fetching"`), and excludes Add/Save (that
+    // one busy flag lives on `McpServersView` itself, not per-row, since
+    // only one add/edit form can be open at a time).
+    remove-busy: bool,
+    enabled-busy: bool,
+    authenticate-busy: bool,
+    logout-busy: bool,
     // Stdio-transport fields, "" / empty for an http server.
     args: string,
     env: string,

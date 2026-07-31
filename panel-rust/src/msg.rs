@@ -368,6 +368,10 @@ pub struct FrameInput {
     pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
     /// Agent ids whose install/enablement RPC is still in flight.
     pub agent_operations_in_flight: Vec<String>,
+    /// MCP server actions ("<action>:<server-name>") whose RPC is still
+    /// in flight -- see `AgentBridge::mcp_operations_in_flight`'s doc
+    /// comment.
+    pub mcp_operations_in_flight: Vec<String>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
     /// PISO-8 (project-isolation-mlt-binding plan): true at most once
     /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors

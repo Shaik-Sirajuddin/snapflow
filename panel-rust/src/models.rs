@@ -1406,13 +1406,28 @@ pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile
 pub fn to_mcp_server_options(
     servers: Vec<crate::protocol_types::McpServerEntry>,
 ) -> ModelRc<McpServerOption> {
-    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers)))
+    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers, &[])))
 }
 
+/// `busy_keys` is `AgentBridge::mcp_operations_in_flight`'s raw output
+/// (`"<action>:<server-name>"` per in-flight RPC, see that method's doc
+/// comment) -- folded here into each row's `remove-busy`/`enabled-busy`/
+/// `authenticate-busy`/`logout-busy` booleans so the Spinner in
+/// `mcp_servers_view.slint` shows precisely on the button whose action is
+/// actually in flight for *that* server, not a global spinner. Tools-fetch
+/// deliberately reads `tool_fetch_status` instead (see `AgentBridge::
+/// fetch_mcp_server_tools_async`'s doc comment for why).
 pub fn to_mcp_server_option_rows(
     servers: Vec<crate::protocol_types::McpServerEntry>,
+    busy_keys: &[String],
 ) -> Vec<McpServerOption> {
     use crate::protocol_types::{McpAuthStatus, McpServerConfig};
+
+    let is_busy = |action: &str, name: &str| {
+        busy_keys
+            .iter()
+            .any(|key| key == &format!("{action}:{name}"))
+    };
 
     servers
         .into_iter()
@@ -1504,6 +1519,10 @@ pub fn to_mcp_server_option_rows(
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            let remove_busy = is_busy("delete", &entry.name);
+            let enabled_busy = is_busy("enabled", &entry.name);
+            let authenticate_busy = is_busy("authenticate", &entry.name);
+            let logout_busy = is_busy("logout", &entry.name);
             McpServerOption {
                 name: entry.name.into(),
                 command: command.into(),
@@ -1523,6 +1542,10 @@ pub fn to_mcp_server_option_rows(
                 // snapshotd daemon) is prepended separately, see
                 // [`builtin_snapshotd_option`].
                 removable: true,
+                remove_busy,
+                enabled_busy,
+                authenticate_busy,
+                logout_busy,
                 args: args.into(),
                 env: env.into(),
                 headers: headers.into(),
@@ -1639,6 +1662,12 @@ pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption>
         tool_fetch_error: String::new().into(),
         tools_search_blob: String::new().into(),
         removable: false,
+        // Not a registry entry -- none of these actions have a target to
+        // dispatch against for this row, so never busy.
+        remove_busy: false,
+        enabled_busy: false,
+        authenticate_busy: false,
+        logout_busy: false,
         args: String::new().into(),
         env: String::new().into(),
         headers: String::new().into(),
@@ -2033,7 +2062,7 @@ mod tests {
                 timeout: None,
             },
         );
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].removable, "user-added registry rows are removable");
     }
@@ -2052,7 +2081,7 @@ mod tests {
                 timeout: Some(30),
             },
         );
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].args.as_str(), "--root /tmp");
         // Sorted by key for deterministic output, not HashMap iteration order.
         assert_eq!(rows[0].env.as_str(), "A_KEY=1\nB_KEY=2");
@@ -2077,7 +2106,7 @@ mod tests {
                 }),
             },
         );
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].headers.as_str(), "Authorization: Bearer abc");
         assert_eq!(rows[0].oauth_client_id.as_str(), "client-123");
         assert_eq!(rows[0].args.as_str(), "");
@@ -2105,7 +2134,7 @@ mod tests {
                 description: None,
             }],
         });
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         let tools: Vec<_> = rows[0].tools.iter().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name.as_str(), "read_file");
@@ -2144,7 +2173,7 @@ mod tests {
                 description: None,
             }],
         });
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         let tools: Vec<_> = rows[0].tools.iter().collect();
         assert_eq!(tools.len(), 2);
         let read_file = tools.iter().find(|t| t.name == "read_file").expect("read_file row");
@@ -2175,7 +2204,7 @@ mod tests {
         entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Error {
             message: "process exited before responding".to_string(),
         });
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "error");
         assert_eq!(rows[0].tool_fetch_error.as_str(), "process exited before responding");
     }
@@ -2194,7 +2223,7 @@ mod tests {
                 timeout: None,
             },
         );
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "");
         assert!(rows[0].tools.iter().next().is_none());
     }
@@ -2228,7 +2257,7 @@ mod tests {
                 },
             ],
         });
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(
             rows[0].tools_search_blob.as_str(),
             "read_file\nReads a file from disk\nping"
@@ -2246,7 +2275,7 @@ mod tests {
                 timeout: None,
             },
         );
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].tools_search_blob.as_str(), "");
     }
 

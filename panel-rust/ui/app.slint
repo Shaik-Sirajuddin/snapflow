@@ -276,6 +276,8 @@ export component ChatPanel inherits Window {
     // see `sync.rs`'s own comment for why this can't be a pure Slint
     // expression (no array-sum/reduce).
     in-out property <int> mcp-tools-total-count: 0;
+    // See `McpServersView.submit-busy`'s own doc comment.
+    in-out property <bool> mcp-server-submit-busy: false;
     callback mcp-server-tool-enabled-changed(string, string, bool);
     callback mcp-server-tool-deferred-changed(string, string, bool);
     callback mcp-server-tools-fetch-requested(string);
@@ -780,6 +782,7 @@ export component ChatPanel inherits Window {
             available-profiles: available-profiles;
             available-mcp-servers: available-mcp-servers;
             mcp-tools-total-count: root.mcp-tools-total-count;
+            mcp-server-submit-busy: root.mcp-server-submit-busy;
             agent-catalog: agent-catalog;
             recoverable-sessions: recoverable-sessions;
             available-skills: available-skills;

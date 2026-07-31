@@ -280,6 +280,13 @@ pub struct Model {
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
     pub agent_operations_in_flight: Vec<String>,
+    /// Same shape/lifecycle as `agent_operations_in_flight` above, sourced
+    /// from `AgentBridge::mcp_operations_in_flight` -- keys are `"<action>:
+    /// <server-name>"` (see that method's own doc comment). Folded into
+    /// `McpServerOption`'s per-row busy booleans by `to_mcp_server_option_
+    /// rows`, driving the Spinner shown on whichever button's action is
+    /// actually in flight.
+    pub mcp_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot

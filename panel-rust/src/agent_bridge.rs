@@ -417,6 +417,15 @@ pub struct AgentBridge {
     /// Agent ids with an install or enablement RPC currently in flight.
     /// Access is short-lived and read with `try_lock` from frame polling.
     agent_operations: Arc<Mutex<HashSet<String>>>,
+    /// MCP server settings actions currently in flight, keyed
+    /// `"<action>:<server-name>"` (e.g. `"create:filesystem"`,
+    /// `"authenticate:github"`) -- same shape/lifecycle as `agent_
+    /// operations` above (`begin_mcp_operation`/`mcp_operations_in_flight`
+    /// mirror `begin_agent_operation`/`agent_operations_in_flight`
+    /// exactly), kept as a separate field rather than sharing one set so
+    /// an agent id and an MCP server name can never collide on the same
+    /// key by coincidence.
+    mcp_operations: Arc<Mutex<HashSet<String>>>,
     // PROF-1: the same per-provider URL resolver the constructor used to
     // seed `gateway_urls` up front, kept around so a provider nobody
     // asked for at construction time (any real agent id, not just a
@@ -3169,6 +3178,7 @@ impl AgentBridge {
             gateway_catalog: Arc::new(Mutex::new(GatewayCatalogCache::default())),
             gateway_catalog_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
+            mcp_operations: Arc::new(Mutex::new(HashSet::new())),
             resolve_gateway,
             default_provider,
             store,
@@ -4336,6 +4346,287 @@ impl AgentBridge {
         self.runtime
             .block_on(handle.fetch_mcp_server_tools(name.to_string()))
             .map_err(|err| err.to_string())
+    }
+
+    /// Non-blocking counterparts to the six `*_mcp_server` methods above --
+    /// same rationale as `install_agent_async`/`set_agent_enabled_async`
+    /// (PUI-013): every one of those synchronous methods does `self.
+    /// runtime.block_on(...)` directly on the calling thread, which for
+    /// every MCP settings action is the Slint UI callback thread, freezing
+    /// the whole panel for the RPC's full duration (the reported "jittery
+    /// lag while toggling the switch" -- a real block, not just visual
+    /// jank). These run the same RPC on `self.runtime` via `spawn` instead,
+    /// deduped through `mcp_operations` exactly like `agent_operations`
+    /// dedupes agent installs, and hand the real `Result` to `on_complete`
+    /// -- invoked on the runtime thread, never the UI thread, so callers
+    /// (`lib.rs`'s `dispatch_mcp_server_*_async` methods) must re-enter the
+    /// event loop themselves (`slint::invoke_from_event_loop`) before
+    /// touching any Slint/`PanelSingleton` state, same as every other
+    /// background-thread completion in this codebase (`effect_executor.rs`'s
+    /// skill-effect handlers, `report_mcp_server_result`).
+    pub fn create_mcp_server_async(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("create:{}", entry.name);
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .create_mcp_server(entry)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn update_mcp_server_async(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("update:{}", entry.name);
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .update_mcp_server(entry)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn delete_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("delete:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking enabled-toggle. Mirrors `lib.rs`'s synchronous
+    /// `dispatch_mcp_server_enabled_changed` (fetch the current entry,
+    /// flip `enabled`, `mcp_servers/update` it back) but runs the whole
+    /// fetch-mutate-update sequence on `self.runtime` instead of blocking
+    /// the caller -- there is no dedicated `mcp_servers/set_enabled` RPC,
+    /// so this composes the same two real calls [`Self::list_mcp_servers`]/
+    /// [`Self::update_mcp_server`] use, just via their `handle.*.await`
+    /// counterparts instead of `self.runtime.block_on`.
+    pub fn set_mcp_server_enabled_async(
+        &self,
+        idx: usize,
+        name: &str,
+        enabled: bool,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("enabled:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut entry = handle
+                    .list_mcp_servers()
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| {
+                        format!("MCP server \"{name}\" disappeared before its enabled state could update")
+                    })?;
+                entry.enabled = enabled;
+                handle
+                    .update_mcp_server(entry)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            .await;
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`]. Returns the authorization URL
+    /// on success, same contract as the synchronous [`Self::
+    /// authenticate_mcp_server`].
+    pub fn authenticate_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<String, String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("authenticate:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .authenticate_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn logout_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("logout:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .logout_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`]. Kicks off the same real
+    /// `mcp_servers/tools_fetch` probe as the synchronous [`Self::
+    /// fetch_mcp_server_tools`], just off the calling thread -- the
+    /// fetched catalog itself still only ever arrives via a later
+    /// [`Self::list_mcp_servers`] poll, so this has no new "busy" UI of
+    /// its own to drive: the existing `tool_fetch_status == "fetching"`
+    /// state (already polled from that same catalog) is what the Fetch/
+    /// Refresh button's spinner is sourced from, not `mcp_operations_in_
+    /// flight` -- the kickoff round-trip this dedupes is typically much
+    /// shorter than the probe itself.
+    pub fn fetch_mcp_server_tools_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("tools_fetch:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .fetch_mcp_server_tools(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    fn begin_mcp_operation(&self, key: &str) -> bool {
+        self.mcp_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned())
+    }
+
+    /// Non-blocking read, safe to call every frame poll -- same contract
+    /// as [`Self::agent_operations_in_flight`]. Keys are `"<action>:
+    /// <server-name>"` (see `mcp_operations`'s own doc comment); callers
+    /// that only need "is *this* server busy at all" should check for any
+    /// key ending in `:<name>`.
+    pub fn mcp_operations_in_flight(&self) -> Vec<String> {
+        self.mcp_operations
+            .try_lock()
+            .map(|operations| operations.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// `agents/list` against thread `idx`'s bound gateway -- the

@@ -1038,142 +1038,6 @@ impl PanelSingleton {
         Ok(())
     }
 
-    /// Every `dispatch_mcp_server_*` method below returns `Result<String,
-    /// String>` (a ready-to-show success/failure message) instead of the
-    /// `eprintln!`-only failure handling they used to have -- the caller
-    /// (`effect_executor.rs`) feeds the result back through
-    /// `EffectResultMsg::McpServerOperationCompleted`, arming the same
-    /// shared action-feedback toast Settings already uses for "Settings
-    /// saved"/"Settings save failed" (`show_toast`/`Dirty::Toast`), so an
-    /// MCP settings failure is no longer silent in the UI.
-    pub(crate) fn dispatch_mcp_server_create(
-        &self,
-        _component: &ChatPanel,
-        entry: crate::protocol_types::McpServerEntry,
-    ) -> Result<String, String> {
-        let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
-        };
-        let gw = self.settings_gateway_index();
-        let name = entry.name.clone();
-        bridge
-            .create_mcp_server(gw, entry)
-            .map(|()| format!("MCP server \"{name}\" created"))
-            .map_err(|err| format!("Failed to create MCP server \"{name}\": {err}"))
-    }
-
-    /// Full typed create/update, for a richer settings form (transport
-    /// picker, args/env/headers/timeout/oauth editors) to call directly
-    /// once it exists -- not yet wired to any Slint callback.
-    pub(crate) fn dispatch_mcp_server_update(
-        &self,
-        _component: &ChatPanel,
-        entry: crate::protocol_types::McpServerEntry,
-    ) -> Result<String, String> {
-        let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
-        };
-        let gw = self.settings_gateway_index();
-        let name = entry.name.clone();
-        bridge
-            .update_mcp_server(gw, entry)
-            .map(|()| format!("MCP server \"{name}\" updated"))
-            .map_err(|err| format!("Failed to update MCP server \"{name}\": {err}"))
-    }
-
-    pub(crate) fn dispatch_mcp_server_delete(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-    ) -> Result<String, String> {
-        let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
-        };
-        let gw = self.settings_gateway_index();
-        bridge
-            .delete_mcp_server(gw, name)
-            .map(|()| format!("MCP server \"{name}\" removed"))
-            .map_err(|err| format!("Failed to remove MCP server \"{name}\": {err}"))
-    }
-
-    pub(crate) fn dispatch_mcp_server_enabled_changed(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-        enabled: bool,
-    ) -> Result<String, String> {
-        let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
-        };
-        let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == name)
-        else {
-            return Err(format!(
-                "MCP server \"{name}\" disappeared before its enabled state could update"
-            ));
-        };
-        entry.enabled = enabled;
-        bridge
-            .update_mcp_server(gw, entry)
-            .map(|()| {
-                format!(
-                    "MCP server \"{name}\" {}",
-                    if enabled { "enabled" } else { "disabled" }
-                )
-            })
-            .map_err(|err| format!("Failed to update enabled state for MCP server \"{name}\": {err}"))
-    }
-
-    /// Begins the real MCP OAuth 2.1 flow (`acpx_core::router::Router::
-    /// authenticate_mcp_server`'s doc comment has the full RFC 9728/8414/
-    /// 7591 discovery + PKCE shape) and opens the returned authorization
-    /// URL in the user's default browser via `opener` (already a dep,
-    /// same crate `editor_detect.rs` uses to open a file in an external
-    /// editor). The rest of the flow -- waiting for the browser redirect,
-    /// exchanging the code, persisting tokens -- completes server-side in
-    /// a detached background task; this call only kicks it off. The
-    /// resulting `auth_status` change is picked up on the next `mcp_
-    /// servers/list` refresh, same as any other server-side state change
-    /// (no separate push channel for this yet).
-    pub(crate) fn dispatch_mcp_server_authenticate(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-    ) -> Result<String, String> {
-        let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
-        };
-        let gw = self.settings_gateway_index();
-        let authorization_url = bridge
-            .authenticate_mcp_server(gw, name)
-            .map_err(|err| format!("Failed to start OAuth flow for MCP server \"{name}\": {err}"))?;
-        if let Err(error) = opener::open(&authorization_url) {
-            return Err(format!(
-                "MCP server \"{name}\": failed to open browser for OAuth: {error}"
-            ));
-        }
-        Ok(format!("Opened browser to connect \"{name}\""))
-    }
-
-    /// Forgets a server's OAuth token, reverting it to `AuthRequired`.
-    pub(crate) fn dispatch_mcp_server_logout(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-    ) -> Result<String, String> {
-        let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
-        };
-        let gw = self.settings_gateway_index();
-        bridge
-            .logout_mcp_server(gw, name)
-            .map(|()| format!("Disconnected \"{name}\""))
-            .map_err(|err| format!("Failed to disconnect MCP server \"{name}\": {err}"))
-    }
-
     /// Sets one boolean preference field (`"enabled"` or `"deferred"`) for
     /// `tool_name` inside `entry`'s opaque `tools` JSON array, creating
     /// the array/row if this is the first preference ever recorded for
@@ -1283,26 +1147,197 @@ impl PanelSingleton {
         )
     }
 
-    /// "Fetch tools" / "Refresh tools" -- kicks off a real `mcp_servers/
-    /// tools_fetch` background probe (`acpx_core::router::Router::spawn_
-    /// mcp_tools_fetch`'s doc comment has the full flow). Returns as
-    /// soon as the gateway has scheduled the probe; the real tool list
-    /// arrives on a later `mcp_servers/list` poll (already refreshed
-    /// after every settings action), same "kick off, then poll" pattern
-    /// as `dispatch_mcp_server_authenticate`.
-    pub(crate) fn dispatch_mcp_server_tools_fetch(
+    /// The seven `dispatch_mcp_server_*_async` methods below are the only
+    /// live dispatchers for "Fetch tools"/"Refresh tools" and the other
+    /// six real UI-reachable MCP settings actions (Add/Save, Remove,
+    /// enable toggle, Connect, Disconnect) -- PUI-013-style fix for the
+    /// reported "jittery lag" while toggling/acting on an MCP server: a
+    /// prior synchronous generation of these dispatchers each ended in
+    /// `AgentBridge::block_on`, which ran on the Slint UI callback thread
+    /// and froze the whole panel for the RPC's duration. These call the
+    /// matching `AgentBridge::*_async` method instead (kicks the RPC off
+    /// on the bridge's own tokio runtime) and pass a completion closure
+    /// that formats the same success/failure
+    /// message text the synchronous versions produce, then feeds it
+    /// through `effect_executor::report_mcp_server_result` -- the closure
+    /// runs on the runtime thread, not the UI thread, but `report_mcp_
+    /// server_result` already re-enters the event loop itself (`slint::
+    /// invoke_from_event_loop`), same as every other background-thread
+    /// completion in this codebase, so this is thread-safe without an
+    /// extra hop back through this type.
+    pub(crate) fn dispatch_mcp_server_create_async(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = entry.name.clone();
+        bridge.create_mcp_server_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{name}\" created"))
+                    .map_err(|err| format!("Failed to create MCP server \"{name}\": {err}")),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_update_async(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = entry.name.clone();
+        bridge.update_mcp_server_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{name}\" updated"))
+                    .map_err(|err| format!("Failed to update MCP server \"{name}\": {err}")),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_delete_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.delete_mcp_server_async(gw, &name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{callback_name}\" removed"))
+                    .map_err(|err| {
+                        format!("Failed to remove MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_enabled_changed_async(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+        enabled: bool,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.set_mcp_server_enabled_async(gw, &name, enabled, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| {
+                        format!(
+                            "MCP server \"{callback_name}\" {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        )
+                    })
+                    .map_err(|err| {
+                        format!(
+                            "Failed to update enabled state for MCP server \"{callback_name}\": {err}"
+                        )
+                    }),
+            );
+        });
+    }
+
+    /// Non-blocking Connect. `opener::open` (opening the returned
+    /// authorization URL in the default browser) is a fast, fire-and-forget
+    /// OS call, so it still runs synchronously inside the completion
+    /// closure -- only the network round-trip that discovers/starts the
+    /// OAuth flow moves off the UI thread.
+    pub(crate) fn dispatch_mcp_server_authenticate_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.authenticate_mcp_server_async(gw, &name, move |result| {
+            let outcome = match result {
+                Ok(authorization_url) => match opener::open(&authorization_url) {
+                    Ok(()) => Ok(format!("Opened browser to connect \"{callback_name}\"")),
+                    Err(error) => Err(format!(
+                        "MCP server \"{callback_name}\": failed to open browser for OAuth: {error}"
+                    )),
+                },
+                Err(err) => Err(format!(
+                    "Failed to start OAuth flow for MCP server \"{callback_name}\": {err}"
+                )),
+            };
+            crate::effect_executor::report_mcp_server_result(outcome);
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_logout_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.logout_mcp_server_async(gw, &name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Disconnected \"{callback_name}\""))
+                    .map_err(|err| {
+                        format!("Failed to disconnect MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_tools_fetch_async(
         &self,
         _component: &ChatPanel,
         server_name: &str,
-    ) -> Result<String, String> {
+    ) {
         let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
         };
         let gw = self.settings_gateway_index();
-        bridge
-            .fetch_mcp_server_tools(gw, server_name)
-            .map(|()| format!("Fetching tools for \"{server_name}\"..."))
-            .map_err(|err| format!("Failed to fetch tools for MCP server \"{server_name}\": {err}"))
+        let server_name = server_name.to_string();
+        let callback_name = server_name.clone();
+        bridge.fetch_mcp_server_tools_async(gw, &server_name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Fetching tools for \"{callback_name}\"..."))
+                    .map_err(|err| {
+                        format!("Failed to fetch tools for MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
     }
 
     pub(crate) fn dispatch_profile_create(

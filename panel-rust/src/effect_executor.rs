@@ -197,7 +197,7 @@ fn dispatch_reactive_sync_failed(operation: &'static str, detail: String) {
 /// arming the shared action-feedback toast -- same `slint::invoke_from_
 /// event_loop` re-entry shape `Effect::SaveSettings`'s own handler above
 /// already uses.
-fn report_mcp_server_result(result: Result<String, String>) {
+pub(crate) fn report_mcp_server_result(result: Result<String, String>) {
     let _ = slint::invoke_from_event_loop(move || {
         crate::PANEL.with(|cell| {
             let slot = cell.borrow();
@@ -569,47 +569,51 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             Effect::SaveDevMode { enabled } => {
                 panel.dispatch_dev_mode_toggled(enabled);
             }
+            // PUI-013: these six dispatch to AgentBridge's `*_async`
+            // methods (real background-thread RPC, deduped via `mcp_
+            // operations`) instead of the synchronous `dispatch_mcp_
+            // server_*` methods above -- the synchronous versions block
+            // this very call site (`execute_effects` runs on the Slint UI
+            // thread) for the full RPC round-trip, which was the reported
+            // "jittery lag while toggling the switch" freeze. The result
+            // is reported from the completion closure itself (inside
+            // `dispatch_mcp_server_*_async`), not here -- no `report_mcp_
+            // server_result` call at this call site any more.
             Effect::McpServerCreate { entry, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_create(&component, entry);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_create_async(&component, entry);
             }
             Effect::McpServerUpdate { entry, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_update(&component, entry);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_update_async(&component, entry);
             }
             Effect::McpServerDelete { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_delete(&component, &name);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_delete_async(&component, &name);
             }
             Effect::McpServerEnabledChanged { name, enabled, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_enabled_changed_async(&component, &name, enabled);
             }
             Effect::McpServerAuthenticate { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_authenticate(&component, &name);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_authenticate_async(&component, &name);
             }
             Effect::McpServerLogout { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_logout(&component, &name);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_logout_async(&component, &name);
             }
             Effect::McpServerToolEnabledChanged {
                 server_name,
@@ -649,8 +653,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_tools_fetch(&component, &server_name);
-                report_mcp_server_result(result);
+                panel.dispatch_mcp_server_tools_fetch_async(&component, &server_name);
             }
             Effect::ProfileCreate {
                 name,

@@ -71,6 +71,7 @@ export component SettingsPage inherits Rectangle {
     in property <[ProfileOption]> available-profiles: [];
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <int> mcp-tools-total-count: 0;
+    in property <bool> mcp-server-submit-busy: false;
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     in property <[SkillOption]> available-skills: [];
@@ -253,6 +254,7 @@ export component SettingsPage inherits Rectangle {
                             width: parent.width;
                             servers: root.available-mcp-servers;
                             total-tools-count: root.mcp-tools-total-count;
+                            submit-busy: root.mcp-server-submit-busy;
                             page-search-query: root.search-query;
                             mcp-server-submit(data) => { root.mcp-server-submit(data); }
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }

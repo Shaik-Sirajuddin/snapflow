@@ -5,10 +5,11 @@ import { Button } from "../../../base/button.slint";
 import { Toggle } from "../../../base/toggle.slint";
 import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
-import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsRowGroup, SettingsField } from "../../../base/settings_section.slint";
 import { McpServerOption, McpToolOption, McpServerFormData } from "../../../types.slint";
 import { TextUtil } from "../../../base/text_util.slint";
 import { StatusDot } from "../../../base/status_dot.slint";
+import { Spinner } from "../../../base/spinner.slint";
 
 // Multi-line text box for the env-var/header editors below (`KEY=VALUE`/
 // `Header: value` one per line, parsed Rust-side -- see
@@ -97,6 +98,12 @@ export component McpServersView inherits Rectangle {
     in property <int> total-tools-count: 0;
     // settings_page_search_filter: page-level query filters this list.
     in property <string> page-search-query: "";
+    // True while an Add/Save (`mcp_servers/create`/`update`) round-trip is
+    // in flight -- Rust-computed (any `"create:"`/`"update:"` key in
+    // `AgentBridge::mcp_operations_in_flight`, see `sync.rs`'s own
+    // comment) since only one add/edit form can be open at a time, so
+    // this doesn't need to be tracked per-row like the other four actions.
+    in property <bool> submit-busy: false;
     callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
@@ -140,6 +147,12 @@ export component McpServersView inherits Rectangle {
     // server" (the Add button becomes Save, and submission sets
     // `McpServerFormData.is-edit`).
     property <string> editing-name: "";
+    // Real client-side validation error for the Name field -- the submit
+    // button used to silently no-op on an empty name with zero feedback
+    // (not even the shared toast). Cleared as soon as the user actually
+    // types a name, not just on next submit attempt, so the error
+    // doesn't linger after it's already been addressed.
+    property <string> name-error: "";
 
     function reset-form() {
         root.form-name = "";
@@ -152,6 +165,7 @@ export component McpServersView inherits Rectangle {
         root.form-timeout = "";
         root.form-oauth-client-id = "";
         root.editing-name = "";
+        root.name-error = "";
     }
 
     background: transparent;
@@ -256,6 +270,7 @@ export component McpServersView inherits Rectangle {
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
+                        busy: server.authenticate-busy;
                         clicked => { root.mcp-server-authenticate(server.name); }
                     }
 
@@ -269,6 +284,7 @@ export component McpServersView inherits Rectangle {
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
+                        busy: server.logout-busy;
                         clicked => { root.mcp-server-logout(server.name); }
                     }
 
@@ -288,32 +304,39 @@ export component McpServersView inherits Rectangle {
                     // Kicks off a real MCP `tools/list` probe
                     // (`mcp_servers/tools_fetch`) -- "Fetch tools" before
                     // the first attempt, "Refresh tools" once a catalog
-                    // (or a failed attempt) exists, "Fetching..." while
-                    // the background probe is in flight.
+                    // (or a failed attempt) exists. `busy` (real Spinner,
+                    // replacing the old text-only "Fetching..." label)
+                    // reads `tool-fetch-status` directly rather than a
+                    // dedicated `mcp_operations_in_flight` key -- the
+                    // catalog fetch itself outlives the kickoff RPC by a
+                    // wide margin, so this is the accurate "still
+                    // fetching" signal, already polled from the same
+                    // catalog (see `AgentBridge::fetch_mcp_server_tools_
+                    // async`'s doc comment).
                     Button {
-                        label: server.tool-fetch-status == "fetching"
-                            ? "Fetching..."
-                            : (server.tool-fetch-status == "" ? "Fetch tools" : "Refresh tools");
+                        label: server.tool-fetch-status == "" ? "Fetch tools" : "Refresh tools";
                         button-accessible-label: "Fetch real tools list for MCP server " + server.name;
                         btn-width: 88px;
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
-                        // No `enabled`/disabled state on `Button` -- a
-                        // click while already fetching is a safe no-op
-                        // server-side (`Router::spawn_mcp_tools_fetch`
-                        // skips spawning a duplicate probe when one is
-                        // already in flight for this server).
+                        busy: server.tool-fetch-status == "fetching";
                         clicked => { root.mcp-server-tools-fetch-requested(server.name); }
                     }
 
                     // Enable/disable without removing the entry -- registry-
                     // backed and immediately re-listed by the Rust host after
-                    // update.
+                    // update. Disabled (and paired with a Spinner) while its
+                    // own `mcp_servers/update` round-trip is in flight so a
+                    // second flip can't fire a duplicate/contradictory update.
                     Toggle {
                         checked: server.enabled;
+                        enabled: !server.enabled-busy;
                         toggle-accessible-label: "Toggle MCP server " + server.name;
                         toggled(enabled) => { root.mcp-server-enabled-changed(server.name, enabled); }
+                    }
+                    if server.enabled-busy : Spinner {
+                        size: 12px;
                     }
 
                     if server.removable : Button {
@@ -323,6 +346,7 @@ export component McpServersView inherits Rectangle {
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
+                        busy: server.remove-busy;
                         clicked => {
                             if (root.editing-name == server.name) {
                                 root.reset-form();
@@ -431,11 +455,16 @@ export component McpServersView inherits Rectangle {
 
             HorizontalLayout {
                 spacing: Metrics.gap-sm;
-                name-field := TextField {
+                SettingsField {
                     horizontal-stretch: 1;
-                    text <=> root.form-name;
-                    field-accessible-label: "MCP server name";
-                    placeholder: "e.g. filesystem";
+                    label: "Name";
+                    error: root.name-error;
+                    name-field := TextField {
+                        text <=> root.form-name;
+                        field-accessible-label: "MCP server name";
+                        placeholder: "e.g. filesystem";
+                        changed text => { root.name-error = ""; }
+                    }
                 }
                 Button {
                     label: "Stdio";
@@ -459,85 +488,119 @@ export component McpServersView inherits Rectangle {
                 }
             }
 
+            // `alignment: start` -- without it, this layout's default
+            // `stretch` redistributes whatever leftover vertical space
+            // the outer form has into gaps between each `SettingsField`
+            // sibling's own label and its field (each `SettingsField`
+            // itself sets `vertical-stretch: 0`, but that only affects
+            // how much of the parent's extra space *it* receives -- once
+            // received, its own children still had nothing pinning them
+            // to the top). Confirmed live: identical structure rendered
+            // correctly in a tight 320x160 preview window (not enough
+            // spare space for the effect to be visible) and visibly
+            // broken at 500x400 (plenty of spare space) -- the real
+            // Settings page has far more room than either, so this was a
+            // real, live bug, not a preview-only artifact.
             if root.form-transport == "stdio" : VerticalLayout {
+                alignment: start;
                 spacing: Metrics.gap-sm;
-                command-field := TextField {
-                    text <=> root.form-command;
-                    field-accessible-label: "Command";
-                    placeholder: "e.g. npx @modelcontextprotocol/server-filesystem";
-                    changed has-focus => {
-                        root.stdio-fields-focused = self.has-focus
-                            || args-field.has-focus || env-field.has-focus;
+                SettingsField {
+                    width: parent.width;
+                    label: "Command";
+                    command-field := TextField {
+                        text <=> root.form-command;
+                        field-accessible-label: "Command";
+                        placeholder: "e.g. npx @modelcontextprotocol/server-filesystem";
+                        changed has-focus => {
+                            root.stdio-fields-focused = self.has-focus
+                                || args-field.has-focus || env-field.has-focus;
+                        }
                     }
                 }
-                args-field := TextField {
-                    text <=> root.form-args;
-                    field-accessible-label: "Arguments, space-separated";
-                    placeholder: "e.g. --root /home/user/projects";
-                    changed has-focus => {
-                        root.stdio-fields-focused = self.has-focus
-                            || command-field.has-focus || env-field.has-focus;
+                SettingsField {
+                    width: parent.width;
+                    label: "Arguments";
+                    args-field := TextField {
+                        text <=> root.form-args;
+                        field-accessible-label: "Arguments, space-separated";
+                        placeholder: "e.g. --root /home/user/projects";
+                        changed has-focus => {
+                            root.stdio-fields-focused = self.has-focus
+                                || command-field.has-focus || env-field.has-focus;
+                        }
                     }
                 }
-                Text {
-                    text: "Environment variables (KEY=VALUE per line)";
-                    color: Theme.text-muted;
-                    font-size: 9px * Theme.font-scale;
-                }
-                env-field := MultilineField {
-                    text <=> root.form-env;
-                    field-accessible-label: "Environment variables, one KEY=VALUE per line";
-                    placeholder: "API_KEY=sk-...\nDEBUG=1";
-                    changed has-focus => {
-                        root.stdio-fields-focused = self.has-focus
-                            || command-field.has-focus || args-field.has-focus;
+                SettingsField {
+                    width: parent.width;
+                    label: "Environment Variables (KEY=VALUE per line)";
+                    env-field := MultilineField {
+                        text <=> root.form-env;
+                        field-accessible-label: "Environment variables, one KEY=VALUE per line";
+                        placeholder: "API_KEY=sk-...\nDEBUG=1";
+                        changed has-focus => {
+                            root.stdio-fields-focused = self.has-focus
+                                || command-field.has-focus || args-field.has-focus;
+                        }
                     }
                 }
             }
 
+            // See the stdio block's identical `alignment: start` comment
+            // just above for why this is required here too.
             if root.form-transport == "http" : VerticalLayout {
+                alignment: start;
                 spacing: Metrics.gap-sm;
-                url-field := TextField {
-                    text <=> root.form-url;
-                    field-accessible-label: "URL";
-                    placeholder: "e.g. https://example.com/mcp";
-                    changed has-focus => {
-                        root.http-fields-focused = self.has-focus
-                            || headers-field.has-focus || oauth-field.has-focus;
+                SettingsField {
+                    width: parent.width;
+                    label: "URL";
+                    url-field := TextField {
+                        text <=> root.form-url;
+                        field-accessible-label: "URL";
+                        placeholder: "e.g. https://example.com/mcp";
+                        changed has-focus => {
+                            root.http-fields-focused = self.has-focus
+                                || headers-field.has-focus || oauth-field.has-focus;
+                        }
                     }
                 }
-                Text {
-                    text: "Headers (Header-Name: value per line)";
-                    color: Theme.text-muted;
-                    font-size: 9px * Theme.font-scale;
-                }
-                headers-field := MultilineField {
-                    text <=> root.form-headers;
-                    field-accessible-label: "Headers, one Header-Name: value per line";
-                    placeholder: "Authorization: Bearer ...";
-                    changed has-focus => {
-                        root.http-fields-focused = self.has-focus
-                            || url-field.has-focus || oauth-field.has-focus;
+                SettingsField {
+                    width: parent.width;
+                    label: "Headers (Header-Name: value per line)";
+                    headers-field := MultilineField {
+                        text <=> root.form-headers;
+                        field-accessible-label: "Headers, one Header-Name: value per line";
+                        placeholder: "Authorization: Bearer ...";
+                        changed has-focus => {
+                            root.http-fields-focused = self.has-focus
+                                || url-field.has-focus || oauth-field.has-focus;
+                        }
                     }
                 }
-                oauth-field := TextField {
-                    text <=> root.form-oauth-client-id;
-                    field-accessible-label: "OAuth client id (optional -- leave blank to use dynamic client registration)";
-                    placeholder: "optional -- blank uses dynamic client registration";
-                    changed has-focus => {
-                        root.http-fields-focused = self.has-focus
-                            || url-field.has-focus || headers-field.has-focus;
+                SettingsField {
+                    width: parent.width;
+                    label: "OAuth Client ID";
+                    oauth-field := TextField {
+                        text <=> root.form-oauth-client-id;
+                        field-accessible-label: "OAuth client id (optional -- leave blank to use dynamic client registration)";
+                        placeholder: "optional -- blank uses dynamic client registration";
+                        changed has-focus => {
+                            root.http-fields-focused = self.has-focus
+                                || url-field.has-focus || headers-field.has-focus;
+                        }
                     }
                 }
             }
 
             HorizontalLayout {
                 spacing: Metrics.gap-sm;
-                timeout-field := TextField {
+                SettingsField {
                     horizontal-stretch: 1;
-                    text <=> root.form-timeout;
-                    field-accessible-label: "Timeout in seconds (optional)";
-                    placeholder: "timeout in seconds (optional)";
+                    label: "Timeout (seconds)";
+                    timeout-field := TextField {
+                        text <=> root.form-timeout;
+                        field-accessible-label: "Timeout in seconds (optional)";
+                        placeholder: "timeout in seconds (optional)";
+                    }
                 }
                 Button {
                     label: root.editing-name == "" ? "Add" : "Save";
@@ -547,22 +610,28 @@ export component McpServersView inherits Rectangle {
                     btn-height: 26px;
                     font-size: 11px;
                     font-weight: 400;
+                    busy: root.submit-busy;
                     clicked => {
-                        if (root.form-name != "") {
-                            root.mcp-server-submit({
-                                name: root.form-name,
-                                transport: root.form-transport,
-                                command: root.form-command,
-                                args: root.form-args,
-                                env: root.form-env,
-                                url: root.form-url,
-                                headers: root.form-headers,
-                                timeout: root.form-timeout,
-                                oauth-client-id: root.form-oauth-client-id,
-                                is-edit: root.editing-name != "",
-                            });
-                            root.reset-form();
+                        // Real validation feedback -- this used to silently
+                        // no-op on an empty name with zero indication why
+                        // nothing happened.
+                        if (root.form-name == "") {
+                            root.name-error = "Name is required";
+                            return;
                         }
+                        root.mcp-server-submit({
+                            name: root.form-name,
+                            transport: root.form-transport,
+                            command: root.form-command,
+                            args: root.form-args,
+                            env: root.form-env,
+                            url: root.form-url,
+                            headers: root.form-headers,
+                            timeout: root.form-timeout,
+                            oauth-client-id: root.form-oauth-client-id,
+                            is-edit: root.editing-name != "",
+                        });
+                        root.reset-form();
                     }
                 }
                 if root.editing-name != "" : Button {
