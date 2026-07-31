@@ -1094,7 +1094,11 @@ export component ChatInputLayout inherits Rectangle {
                 viewport-width: row2-host.width + row2-host.overflow;
                 viewport-x <=> row2-host.pan;
                 thumb-width: 3px;
-                active: row2-scroll.has-hover;
+                // Press-and-hold only, not plain hover -- hovering the row
+                // (to reach a dropdown trigger) shouldn't light up the
+                // scrollbar; it should only appear while actually being
+                // dragged.
+                active: row2-scroll.pressed;
             }
         }
 
