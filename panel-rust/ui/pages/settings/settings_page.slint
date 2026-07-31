@@ -33,6 +33,7 @@ import { IconButton } from "../../base/icon_button.slint";
 import { SettingsTopTabs } from "components/top_tabs.slint";
 import { SettingsLeftTabs } from "components/left_tabs.slint";
 import { SettingsSearchBar } from "components/search_bar.slint";
+import { ThinScrollbar } from "../../base/thin_scrollbar.slint";
 import { McpServersView } from "views/mcp_servers_view.slint";
 import { AgentsView } from "views/agents_view.slint";
 import { HarnessView } from "views/harness_view.slint";
@@ -258,112 +259,145 @@ export component SettingsPage inherits Rectangle {
                 vertical-stretch: 1;
                 spacing: Metrics.space-4;
 
-                // The one elastic region in this column -- same
-                // `vertical-stretch: 1` + `preferred-height: 0px` +
-                // `min-height: 0px` convention `chat_area.slint`'s own
-                // message-scroll Flickable uses, rather than binding
-                // `height: parent.height` (that only resolves once the
-                // layout has already assigned this Flickable a height,
-                // which a plain binding can't rely on inside a
-                // `VerticalLayout`).
-                Flickable {
+                // settings_agents_search_sticky: the Agents section owns
+                // its own bounded scroll region (see agents_view.slint's
+                // own internal Flickable/ThinScrollbar) so its
+                // "search agents" bar can stay pinned above the scrolling
+                // agent grid/recoverable-sessions body -- pinning it would
+                // not be possible if AgentsView shared the single generic
+                // Flickable below with the other sections, since that
+                // Flickable scrolls its whole mounted child (search bar
+                // included) as one unit. Same `vertical-stretch: 1` +
+                // `preferred-height: 0px` + `min-height: 0px` convention
+                // used everywhere else in this file to hand a Flickable
+                // (or, here, a self-scrolling component) real bounded
+                // height inside a VerticalLayout.
+                if root.active-section == "agents" : AgentsView {
                     width: parent.width;
                     vertical-stretch: 1;
                     preferred-height: 0px;
                     min-height: 0px;
-                    // Was missing entirely (the actual reported "scroll
-                    // issues" bug) -- a bare Flickable doesn't reliably
-                    // report its own preferred-height from arbitrary child
-                    // content (it's a scroll viewport, not a layout), so
-                    // without this the Flickable had no real idea how tall
-                    // its content actually was and couldn't scroll far
-                    // enough (or at all) to reach content past the visible
-                    // area. Every other Flickable in this codebase already
-                    // binds this explicitly (confirmed by grepping every
-                    // Flickable site); this was the one exception. Same
-                    // fix `base/expandable_panel.slint`'s own Flickable
-                    // documents for the identical symptom.
-                    viewport-height: content.preferred-height;
-                    content := VerticalLayout {
+                    scope: root.scope;
+                    default-profile <=> root.default-profile;
+                    permission-profile <=> root.permission-profile;
+                    profile-wiring-enabled: root.profile-wiring-enabled;
+                    default-agent-id <=> root.default-agent-id;
+                    available-profiles: root.available-profiles;
+                    agent-catalog: root.agent-catalog;
+                    page-search-query: root.search-query;
+                    recoverable-sessions: root.recoverable-sessions;
+                    profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
+                        root.profile-create(name, agent-id, terminal-enabled, fs-enabled);
+                    }
+                    profile-delete(name) => { root.profile-delete(name); }
+                    agent-install-requested(id) => { root.agent-install-requested(id); }
+                    agent-set-enabled(id, enabled) => { root.agent-set-enabled(id, enabled); }
+                    recover-session-attach(session-id, provider, title) => {
+                        root.recover-session-attach(session-id, provider, title);
+                    }
+                    changed search-has-focus => {
+                        root.agents-search-focus-mirror = self.search-has-focus;
+                    }
+                }
+
+                // The other three sections have no pinned-header need, so
+                // they keep sharing one generic scrolling viewport.
+                if root.active-section != "agents" : Rectangle {
+                    // The one elastic region in this column -- same
+                    // `vertical-stretch: 1` + `preferred-height: 0px` +
+                    // `min-height: 0px` convention `chat_area.slint`'s own
+                    // message-scroll Flickable uses, rather than binding
+                    // `height: parent.height` (that only resolves once the
+                    // layout has already assigned this Flickable a height,
+                    // which a plain binding can't rely on inside a
+                    // `VerticalLayout`). Wrapped in a plain (non-layout)
+                    // Rectangle, same as chat_area.slint's `message-area`,
+                    // so the ThinScrollbar sibling below can be positioned
+                    // as a free-floating overlay instead of being packed
+                    // into the vertical flow by a layout parent.
+                    vertical-stretch: 1;
+                    preferred-height: 0px;
+                    min-height: 0px;
+
+                    other-sections-scroll := Flickable {
                         width: parent.width;
-                        if root.active-section == "mcp_servers" && root.scope == "global" : McpServersView {
+                        height: parent.height;
+                        // Was missing entirely (the actual reported "scroll
+                        // issues" bug) -- a bare Flickable doesn't reliably
+                        // report its own preferred-height from arbitrary child
+                        // content (it's a scroll viewport, not a layout), so
+                        // without this the Flickable had no real idea how tall
+                        // its content actually was and couldn't scroll far
+                        // enough (or at all) to reach content past the visible
+                        // area. Every other Flickable in this codebase already
+                        // binds this explicitly (confirmed by grepping every
+                        // Flickable site); this was the one exception. Same
+                        // fix `base/expandable_panel.slint`'s own Flickable
+                        // documents for the identical symptom.
+                        viewport-height: content.preferred-height;
+                        content := VerticalLayout {
                             width: parent.width;
-                            servers: root.available-mcp-servers;
-                            total-tools-count: root.mcp-tools-total-count;
-                            submit-busy: root.mcp-server-submit-busy;
-                            page-search-query: root.search-query;
-                            mcp-server-submit(data) => { root.mcp-server-submit(data); }
-                            mcp-server-delete(name) => { root.mcp-server-delete(name); }
-                            mcp-server-enabled-changed(name, enabled) => {
-                                root.mcp-server-enabled-changed(name, enabled);
+                            if root.active-section == "mcp_servers" && root.scope == "global" : McpServersView {
+                                width: parent.width;
+                                servers: root.available-mcp-servers;
+                                total-tools-count: root.mcp-tools-total-count;
+                                submit-busy: root.mcp-server-submit-busy;
+                                page-search-query: root.search-query;
+                                mcp-server-submit(data) => { root.mcp-server-submit(data); }
+                                mcp-server-delete(name) => { root.mcp-server-delete(name); }
+                                mcp-server-enabled-changed(name, enabled) => {
+                                    root.mcp-server-enabled-changed(name, enabled);
+                                }
+                                mcp-server-authenticate(name) => {
+                                    root.mcp-server-authenticate(name);
+                                }
+                                mcp-server-logout(name) => {
+                                    root.mcp-server-logout(name);
+                                }
+                                mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
+                                    root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
+                                }
+                                mcp-server-tool-deferred-changed(server-name, tool-name, deferred) => {
+                                    root.mcp-server-tool-deferred-changed(server-name, tool-name, deferred);
+                                }
+                                mcp-server-tools-fetch-requested(server-name) => {
+                                    root.mcp-server-tools-fetch-requested(server-name);
+                                }
+                                changed search-has-focus => {
+                                    root.mcp-servers-focus-mirror = self.search-has-focus;
+                                }
                             }
-                            mcp-server-authenticate(name) => {
-                                root.mcp-server-authenticate(name);
+                            if root.active-section == "harness" : HarnessView {
+                                width: parent.width;
+                                background-default <=> root.background-default;
+                                background-override-set <=> root.background-override-set;
+                                background-override <=> root.background-override;
                             }
-                            mcp-server-logout(name) => {
-                                root.mcp-server-logout(name);
-                            }
-                            mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
-                                root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
-                            }
-                            mcp-server-tool-deferred-changed(server-name, tool-name, deferred) => {
-                                root.mcp-server-tool-deferred-changed(server-name, tool-name, deferred);
-                            }
-                            mcp-server-tools-fetch-requested(server-name) => {
-                                root.mcp-server-tools-fetch-requested(server-name);
-                            }
-                            changed search-has-focus => {
-                                root.mcp-servers-focus-mirror = self.search-has-focus;
+                            if root.active-section == "skills" : SkillsView {
+                                width: parent.width;
+                                scope: root.scope;
+                                skills: root.available-skills;
+                                dev-mode: root.dev-mode;
+                                show-global-skills <=> root.show-global-skills;
+                                skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
+                                dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
                             }
                         }
-                        // Stays `if` (unlike the other visible:-conversion
-                        // fixes elsewhere for this same issue) -- this sits
-                        // alongside 3 other mutually-exclusive sections in
-                        // a VerticalLayout, so an unconditionally-mounted
-                        // AgentsView would reserve its height even while
-                        // hidden, pushing the other sections down whenever
-                        // this tab isn't active. Mirrors its own
-                        // search-has-focus into a plain root property
-                        // instead (see agents-search-focus-mirror below).
-                        if root.active-section == "agents" : AgentsView {
-                            width: parent.width;
-                            scope: root.scope;
-                            default-profile <=> root.default-profile;
-                            permission-profile <=> root.permission-profile;
-                            profile-wiring-enabled: root.profile-wiring-enabled;
-                            default-agent-id <=> root.default-agent-id;
-                            available-profiles: root.available-profiles;
-                            agent-catalog: root.agent-catalog;
-                            page-search-query: root.search-query;
-                            recoverable-sessions: root.recoverable-sessions;
-                            profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
-                                root.profile-create(name, agent-id, terminal-enabled, fs-enabled);
-                            }
-                            profile-delete(name) => { root.profile-delete(name); }
-                            agent-install-requested(id) => { root.agent-install-requested(id); }
-                            agent-set-enabled(id, enabled) => { root.agent-set-enabled(id, enabled); }
-                            recover-session-attach(session-id, provider, title) => {
-                                root.recover-session-attach(session-id, provider, title);
-                            }
-                            changed search-has-focus => {
-                                root.agents-search-focus-mirror = self.search-has-focus;
-                            }
-                        }
-                        if root.active-section == "harness" : HarnessView {
-                            width: parent.width;
-                            background-default <=> root.background-default;
-                            background-override-set <=> root.background-override-set;
-                            background-override <=> root.background-override;
-                        }
-                        if root.active-section == "skills" : SkillsView {
-                            width: parent.width;
-                            scope: root.scope;
-                            skills: root.available-skills;
-                            dev-mode: root.dev-mode;
-                            show-global-skills <=> root.show-global-skills;
-                            skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
-                            dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
-                        }
+                    }
+
+                    // settings_page_scrollbar: was previously a bare
+                    // Flickable with scroll mechanics but no visible
+                    // scrollbar -- same class of gap the compose-bar
+                    // horizontal-scroll row had (chat_input_layout.slint)
+                    // before it got its own ThinScrollbar. Reuses that same
+                    // component/pattern chat_area.slint's message list uses.
+                    ThinScrollbar {
+                        x: parent.width - self.width - 2px;
+                        y: 4px;
+                        visible-height: parent.height - 8px;
+                        viewport-height: content.preferred-height;
+                        viewport-y <=> other-sections-scroll.viewport-y;
+                        thumb-width: 4px;
                     }
                 }
             }

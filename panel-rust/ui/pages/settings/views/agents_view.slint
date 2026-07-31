@@ -5,6 +5,7 @@ import { Button } from "../../../base/button.slint";
 import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider } from "../../../base/settings_section.slint";
+import { ThinScrollbar } from "../../../base/thin_scrollbar.slint";
 import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
@@ -140,7 +141,25 @@ export component AgentsView inherits Rectangle {
 
     background: transparent;
 
-    SettingsSection {
+    // settings_agents_search_sticky: split into a fixed, non-scrolling
+    // header (chat-defaults/profile fields + the "Agents" sub-header +
+    // agent-search-bar) and a separately-scrolled body (the agent grid +
+    // recoverable sessions). Previously this whole view was one long
+    // `SettingsSection` mounted inside SettingsPage's single page-level
+    // Flickable, so scrolling through the agent grid also scrolled the
+    // search bar itself out of view. AgentsView now owns its own bounded
+    // Flickable/ThinScrollbar for just the body (settings_page.slint gives
+    // this component real bounded height via vertical-stretch: 1 +
+    // preferred-height: 0px + min-height: 0px at its call site, same
+    // convention as every other elastic Flickable region in this
+    // codebase), so the header -- and the search bar inside it -- stays
+    // pinned above that scroll region instead of scrolling away with it.
+    VerticalLayout {
+        width: parent.width;
+        height: parent.height;
+        spacing: Metrics.space-6;
+
+        SettingsSection {
         width: parent.width;
 
         SettingsSectionHeader { text: Strings.chat-defaults; }
@@ -346,6 +365,25 @@ export component AgentsView inherits Rectangle {
             bar-accessible-label: Strings.search-agents;
             query <=> root.agent-search-query;
         }
+        }
+
+        // Scrollable body: the agent grid + recoverable sessions. Owns its
+        // own bounded Flickable + visible ThinScrollbar (mirrors
+        // settings_page.slint's page-level scroll region) so it can scroll
+        // independently underneath the fixed header above, keeping
+        // agent-search-bar pinned in view.
+        agents-body-area := Rectangle {
+            vertical-stretch: 1;
+            preferred-height: 0px;
+            min-height: 0px;
+
+            agents-body-scroll := Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-height: agents-body.preferred-height;
+
+                agents-body := SettingsSection {
+                    width: parent.width;
 
         // Wrapping grid of `AgentCard` tiles, per the settings-pane-redesign
         // plan's "Agents view is a grid, not a row list" section. Slint's
@@ -502,6 +540,18 @@ export component AgentsView inherits Rectangle {
                 bg: Theme.bg-card;
                 fg: Theme.text-secondary;
                 clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
+            }
+        }
+                }
+            }
+
+            ThinScrollbar {
+                x: parent.width - self.width - 2px;
+                y: 4px;
+                visible-height: parent.height - 8px;
+                viewport-height: agents-body.preferred-height;
+                viewport-y <=> agents-body-scroll.viewport-y;
+                thumb-width: 4px;
             }
         }
     }
