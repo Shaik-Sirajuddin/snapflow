@@ -5,6 +5,7 @@ import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
+import { ThinScrollbar } from "thin_scrollbar.slint";
 
 // Layer 3 (base) -- trigger + upward popup list of `DropdownEntry` rows.
 // Search UX mirrors the compose `/` skills popup:
@@ -362,9 +363,18 @@ export component SearchableDropdown inherits Rectangle {
                     self.focus-input();
                 }
             }
-            Flickable {
+            // Wrapper Rectangle so `options-scrollbar` below can overlay
+            // the Flickable as a free-floating sibling positioned against
+            // a fixed-size parent -- same pattern used for the compose
+            // bar's row2-host horizontal scrollbar and the Settings page's
+            // vertical one, both added earlier this session.
+            options-scroll-host := Rectangle {
                 vertical-stretch: 1;
-                viewport-height: options-col.preferred-height;
+                clip: true;
+                options-flickable := Flickable {
+                    width: parent.width;
+                    height: parent.height;
+                    viewport-height: options-col.preferred-height;
                 options-col := VerticalLayout {
                     alignment: start;
                     for entry[i] in root.options : Rectangle {
@@ -415,6 +425,15 @@ export component SearchableDropdown inherits Rectangle {
                             }
                         }
                     }
+                }
+                }
+                ThinScrollbar {
+                    x: parent.width - self.width - 2px;
+                    y: 2px;
+                    visible-height: options-flickable.height - 4px;
+                    viewport-height: options-col.preferred-height;
+                    viewport-y <=> options-flickable.viewport-y;
+                    thumb-width: 4px;
                 }
             }
         }
