@@ -26,6 +26,16 @@ import { SelectableChip } from "../../../base/selectable_chip.slint";
 // section doesn't call for. No new fields, no new data wiring -- same
 // models/callbacks `settings_sheet.slint` already used.
 export component AgentsView inherits Rectangle {
+    // settings_scope_visibility_gate: "project" | "global", mirrored from
+    // SettingsPage.scope. This view mixes genuinely dual-tier fields
+    // (default-profile/permission-profile TextFields below, and
+    // default-agent-id via AgentCard's make-default toggle) with
+    // global-only registry browsing (the profile chip picker/delete row --
+    // profile.rs's ProfileStore has no per-project dimension -- and each
+    // AgentCard's install/enable controls, gated inside AgentCard itself
+    // via its own `scope` prop). The dual-tier fields stay unconditional;
+    // only the global-only pieces are gated here.
+    in property <string> scope: "project";
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
     in property <[ProfileOption]> available-profiles: [];
@@ -119,7 +129,11 @@ export component AgentsView inherits Rectangle {
             }
         }
 
-        Flickable {
+        // Global-only (see root.scope's doc comment above) -- this browses/
+        // manages the shared ProfileStore registry itself, not the
+        // dual-tier default-profile *selection*, which the always-visible
+        // TextField above already covers under both scopes.
+        if root.scope == "global" : Flickable {
             width: parent.width;
             height: root.available-profiles.length > 0 ? 30px : 0px;
             viewport-width: profile-chip-row.preferred-width;
@@ -382,6 +396,7 @@ export component AgentsView inherits Rectangle {
                     alignment: start;
 
                     if first-visible : AgentCard {
+                        scope: root.scope;
                         agent-id: root.agent-catalog[first-agent-index].id;
                         agent-name: root.agent-catalog[first-agent-index].name != ""
                             ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
@@ -400,6 +415,7 @@ export component AgentsView inherits Rectangle {
                     }
 
                     if second-visible : AgentCard {
+                        scope: root.scope;
                         agent-id: root.agent-catalog[first-agent-index + 1].id;
                         agent-name: root.agent-catalog[first-agent-index + 1].name != ""
                             ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;

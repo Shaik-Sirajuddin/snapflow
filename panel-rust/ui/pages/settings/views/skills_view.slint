@@ -14,6 +14,15 @@ import { SkillOption } from "../../../types.slint";
 // (`skills-management`'s "make global button", "show project_start
 // skills include global started_from").
 export component SkillsView inherits Rectangle {
+    // settings_scope_visibility_gate: "project" | "global", mirrored from
+    // SettingsPage.scope. Only `dev-mode` below is gated by it -- it's
+    // deliberately Global-tier only (see
+    // `settings_file::SettingsDocument::dev_mode`'s doc comment,
+    // bypassing the generic Project-overrides-Global merge entirely), so
+    // editing it under Project today silently wrote/read the same single
+    // global value with no project-scoped effect. `show-global-skills`
+    // and the skill list itself are unrelated to this gate and stay as-is.
+    in property <string> scope: "project";
     in property <[SkillOption]> skills: [];
     // Page-level toggle: hide the global-scope rows so a long list of
     // shared global skills doesn't drown out a project's own few local
@@ -47,7 +56,7 @@ export component SkillsView inherits Rectangle {
             }
         }
 
-        SettingsRow {
+        if root.scope == "global" : SettingsRow {
             label: "Dev mode";
             Toggle {
                 checked: root.dev-mode;

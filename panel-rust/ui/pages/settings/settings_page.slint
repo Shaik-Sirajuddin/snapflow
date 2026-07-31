@@ -9,11 +9,22 @@
 // `agent-catalog`, `recoverable-sessions`) `settings_sheet.slint` did, via
 // the same round-trip callbacks (`lib.rs` still owns re-populating those
 // lists after any create/update/delete/install call -- nothing here
-// optimistically mutates them). `scope` has no behavioral effect yet
-// (both Project and Global render the same live data) -- a real
-// per-scope `SettingsDocument` is a later phase (see the plan's
-// `settings_store.rs` phases), once the file-backed store exists to
-// actually differ between the two.
+// optimistically mutates them).
+//
+// settings_scope_visibility_gate: `scope` now DOES have a real behavioral
+// effect -- it gates visibility of every settings category that is
+// unconditionally global (no per-project dimension exists on the backend
+// at all, regardless of which tab is showing it): the MCP Servers section
+// (whole `McpServerStore` registry, gated by hiding its left-tab nav item
+// entirely -- see left_tabs.slint), agent enable/disable and the
+// install action (`AgentCard`'s own `scope` prop, gated inside
+// agent_card.slint), the profile registry browse/create/delete row
+// (agents_view.slint), and the Dev mode toggle (skills_view.slint).
+// Everything genuinely dual-tier -- default profile, permission profile,
+// default agent id, background-session-default -- has a real Project-file
+// value that overrides/falls back to Global (`settings_file.rs`'s
+// `SettingsDocument` merge) and stays visible/editable under both tabs
+// unchanged.
 import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Button } from "../../base/button.slint";
@@ -55,6 +66,15 @@ export component SettingsPage inherits Rectangle {
         }
         if (self.active-section != "mcp_servers") {
             self.mcp-servers-focus-mirror = false;
+        }
+    }
+    // settings_scope_visibility_gate: MCP Servers' left-tab nav item only
+    // exists under Global scope (see left_tabs.slint) -- if the user was
+    // sitting on that section and flips to Project, redirect off it so
+    // the content pane isn't left mounted on a now-nonexistent tab.
+    changed scope => {
+        if (self.scope == "project" && self.active-section == "mcp_servers") {
+            self.active-section = "agents";
         }
     }
     out property <bool> search-has-focus:
@@ -210,6 +230,7 @@ export component SettingsPage inherits Rectangle {
             left-tabs := SettingsLeftTabs {
                 active-section: root.active-section;
                 expanded: root.sections-expanded;
+                scope: root.scope;
                 section-selected(new-section) => { root.active-section = new-section; }
                 collapse-requested => { root.sections-expanded = false; }
             }
@@ -250,7 +271,7 @@ export component SettingsPage inherits Rectangle {
                     viewport-height: content.preferred-height;
                     content := VerticalLayout {
                         width: parent.width;
-                        if root.active-section == "mcp_servers" : McpServersView {
+                        if root.active-section == "mcp_servers" && root.scope == "global" : McpServersView {
                             width: parent.width;
                             servers: root.available-mcp-servers;
                             total-tools-count: root.mcp-tools-total-count;
@@ -291,6 +312,7 @@ export component SettingsPage inherits Rectangle {
                         // instead (see agents-search-focus-mirror below).
                         if root.active-section == "agents" : AgentsView {
                             width: parent.width;
+                            scope: root.scope;
                             default-profile <=> root.default-profile;
                             permission-profile <=> root.permission-profile;
                             default-agent-id <=> root.default-agent-id;
@@ -319,6 +341,7 @@ export component SettingsPage inherits Rectangle {
                         }
                         if root.active-section == "skills" : SkillsView {
                             width: parent.width;
+                            scope: root.scope;
                             skills: root.available-skills;
                             dev-mode: root.dev-mode;
                             skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
