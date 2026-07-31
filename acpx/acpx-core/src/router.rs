@@ -300,6 +300,19 @@ pub struct Router {
     /// every call. No TTL/invalidation yet; a later phase can add one if
     /// the registry needs to be re-polled for changes mid-run.
     registry_cache: Option<acpx_registry::Registry>,
+    /// Set when `registry_cache` holds the bundled offline snapshot rather
+    /// than a live fetch. The snapshot carries three agents; the live
+    /// registry carries ~38, so caching a fallback permanently (which is
+    /// what a plain `is_none()` guard did) made one unlucky cold start
+    /// hide every other agent -- `grok-build` included -- from
+    /// `agents/list` for the rest of the process. While this is set,
+    /// `ensure_registry_loaded` retries the live fetch, rate-limited by
+    /// `registry_retry_not_before`.
+    registry_cache_is_fallback: bool,
+    /// Earliest instant `ensure_registry_loaded` may re-attempt a live
+    /// fetch while serving the fallback, so a persistently offline host
+    /// doesn't pay the network timeout on every `agents/list`.
+    registry_retry_not_before: Option<std::time::Instant>,
     /// Cached results from disposable backend capability probes. Unlike the
     /// registry cache this stores adapter-runtime data (`configOptions`,
     /// permission modes, and auth methods), not launch metadata.
@@ -1047,6 +1060,8 @@ impl Router {
                 .build()
                 .expect("valid HTTP client configuration"),
             registry_cache: None,
+            registry_cache_is_fallback: false,
+            registry_retry_not_before: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
             agent_enablement: None,
@@ -3182,13 +3197,46 @@ impl Router {
         }
     }
 
+    /// How long to serve the bundled fallback before re-attempting a live
+    /// registry fetch.
+    const REGISTRY_FALLBACK_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
     /// Ensure the registry cache is populated, fetching (live, falling
     /// back to the bundled snapshot on any error) if it hasn't been yet.
-    /// See `acpx_registry::fetch_registry_or_fallback` -- this never
-    /// itself fails, matching that function's contract.
+    /// Never fails.
+    ///
+    /// A live result is cached for the process lifetime. A *fallback*
+    /// result is only cached provisionally: the bundled snapshot holds
+    /// three agents against the live registry's ~38, so treating it as
+    /// final meant a single slow or failed cold-start fetch permanently
+    /// truncated `agents/list` (the reported "grok-build is not detected
+    /// as installed" -- its adapter was installed and ready on disk, but
+    /// the id was absent from the catalog entirely). Retry the live fetch
+    /// on later calls, throttled to `REGISTRY_FALLBACK_RETRY_INTERVAL`.
     async fn ensure_registry_loaded(&mut self) -> &acpx_registry::Registry {
-        if self.registry_cache.is_none() {
-            self.registry_cache = Some(acpx_registry::fetch_registry_or_fallback(&self.http).await);
+        let retry_due = self
+            .registry_retry_not_before
+            .is_none_or(|not_before| std::time::Instant::now() >= not_before);
+        if self.registry_cache.is_none() || (self.registry_cache_is_fallback && retry_due) {
+            match acpx_registry::fetch_registry(&self.http).await {
+                Ok(registry) => {
+                    self.registry_cache = Some(registry);
+                    self.registry_cache_is_fallback = false;
+                    self.registry_retry_not_before = None;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        url = acpx_registry::REGISTRY_URL,
+                        "failed to fetch live ACP registry, serving the bundled \
+                         registry.fallback.json until the next retry"
+                    );
+                    self.registry_cache = Some(acpx_registry::fallback_registry());
+                    self.registry_cache_is_fallback = true;
+                    self.registry_retry_not_before =
+                        Some(std::time::Instant::now() + Self::REGISTRY_FALLBACK_RETRY_INTERVAL);
+                }
+            }
         }
         self.registry_cache.as_ref().expect("just populated")
     }
