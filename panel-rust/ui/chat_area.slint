@@ -1075,19 +1075,24 @@ export component ChatArea inherits Rectangle {
                         // gap Rectangle siblings, pushing "waiting for
                         // response" further right than every other row's
                         // content actually starts.
-                        spacing: Metrics.space-2;
+                        // Tight/zero gap by request: dots use a narrow
+                        // "..." glyph (was a wide "• • •"
+                        // with inter-dot spaces) so "waiting for
+                        // response" sits immediately after it, not spaced
+                        // out with dead room.
+                        spacing: 0px;
                         height: 20px;
                         cross-axis-alignment: center;
                         property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms));
                         Text {
-                            text: "\u{2022} \u{2022} \u{2022}";
+                            text: "...";
                             color: Theme.text-muted;
                             opacity: parent.pulse;
                             font-size: 11px * Theme.font-scale;
                             vertical-alignment: center;
                         }
                         Text {
-                            text: "waiting for response";
+                            text: " waiting for response";
                             color: Theme.text-muted;
                             opacity: 0.7;
                             font-size: 9px * Theme.font-scale;
