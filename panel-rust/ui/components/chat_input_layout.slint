@@ -816,14 +816,18 @@ export component ChatInputLayout inherits Rectangle {
             width: 100%;
             height: root.row2-h;
             // Clip only while nothing paints outside the 24px band. Open
-            // dropdowns *and* the context-ring hover card both paint upward;
-            // without context-ring.has-hover here the session-context hover
-            // card was fully clipped (never visible in the compose bar).
+            // dropdowns paint upward as children of their own trigger, still
+            // inside this panned strip, so they need clip off here to escape
+            // the band. The context-ring hover card does NOT: it is a
+            // top-level sibling of this whole row (see below), positioned
+            // via absolute-position rather than nested in this pan/clip
+            // host, specifically so hovering it never needs to touch this
+            // clip gate (context_ring_hover_left_overflow -- see that
+            // overlay's own doc comment for why).
             clip: !(profile-dropdown.is-open
                 || mode-dropdown.is-open
                 || config-dropdown.is-open
-                || reasoning-dropdown.is-open
-                || root.context-ring-hovered);
+                || reasoning-dropdown.is-open);
             property <length> pan: 0px;
             property <length> overflow: max(0px, row2-strip.preferred-width - self.width);
             // Declared BEFORE the strip so every trigger keeps click
@@ -1128,6 +1132,75 @@ export component ChatInputLayout inherits Rectangle {
                     label: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
                     clicked => { root.terminals-clicked(); }
                 }
+            }
+        }
+    }
+
+    // context-ring hover card — sibling of the main VerticalLayout, same
+    // idiom as the / @ # mention popup just below: positioned via explicit
+    // x/y outside any layout so it can paint above this bar without being
+    // clipped. This used to be rendered *inside* ContextRing itself (a
+    // descendant of row2-host, the pan host for row 2's selector strip),
+    // which required row2-host to disable its own `clip` whenever the ring
+    // was hovered. row2-host also horizontally pans row2-strip so an
+    // overflowing set of dropdowns stays reachable -- context-ring sits at
+    // the trailing end of that strip, so reaching it on a narrow/crowded
+    // dock means panning strip content far to the left, off row2-host's
+    // visible bounds (still clipped, so invisible -- by design). Disabling
+    // row2-host.clip for the hover card ALSO un-hid that panned-off content
+    // (Provider/Mode/etc triggers), which then rendered past this
+    // component's own left edge (root.clip is deliberately false) and
+    // overlapped whatever sat underneath -- live-reported as the Provider/
+    // agent dropdowns painting on top of the sidebar's Settings footer,
+    // "left overflow" (context_ring_hover_left_overflow). Anchoring this
+    // card via absolute-position instead of nesting it inside row2-host
+    // sidesteps the pan/clip host entirely, so row2-host's clip no longer
+    // needs to react to hover at all (see its own clip binding above).
+    Rectangle {
+        visible: root.context-ring-hovered;
+        property <length> card-w: 168px;
+        property <length> card-h: 64px;
+        // Right-align the card's right edge to the ring's right edge, same
+        // as the old inline card did relative to its own parent -- just
+        // computed here via absolute-position (both root and context-ring
+        // report window-relative coordinates; the difference is
+        // context-ring's position in this component's own local space,
+        // matching how root.mention-open's popup below is positioned).
+        x: (context-ring.absolute-position.x - root.absolute-position.x)
+            + context-ring.width - self.card-w;
+        y: (context-ring.absolute-position.y - root.absolute-position.y)
+            - self.card-h - 8px;
+        width: self.card-w;
+        height: self.card-h;
+        z: 9000;
+        background: Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 10px;
+        drop-shadow-color: #000000.with-alpha(0.35);
+        drop-shadow-offset-y: 2px;
+        VerticalLayout {
+            padding: 8px;
+            spacing: 3px;
+            Text {
+                text: Strings.session-context;
+                color: Theme.text-secondary;
+                font-size: 9px * Theme.font-scale;
+                font-weight: 700;
+                font-family: Theme.font-mono;
+            }
+            Text {
+                text: root.context-used-tokens + " / " + root.context-limit-tokens + " tokens";
+                color: Theme.text-primary;
+                font-size: 11px * Theme.font-scale;
+                font-family: Theme.font-sans;
+            }
+            Text {
+                text: context-ring.pct + "% used";
+                color: context-ring.ring-color;
+                font-size: 10px * Theme.font-scale;
+                font-family: Theme.font-mono;
             }
         }
     }
