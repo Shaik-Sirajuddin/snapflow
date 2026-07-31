@@ -314,7 +314,7 @@ PY
     local snapshotd_home="$state_dir/snapshotd-scratch/snapshotd-home"
     mkdir -p "$snapshotd_home/run"
     local admin_token
-    admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null)" +        || die "daemon-managed acpx admin token was not created"
+    admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null)" || die "daemon-managed acpx admin token was not created"
     [ -n "$admin_token" ] || die "daemon-managed acpx admin token is empty"
     # The embedded SAP endpoint must be present before panel-rust registers
     # the GUI with snapshotd; otherwise MCP can see the project path but has
@@ -382,6 +382,30 @@ PY
         SNAPSHOT_SAP_SOCKET="$sap_socket"
         SNAPSHOT_SAP_TOKEN="$sap_token"
         RUI_SNAPSHOTD_BIN="$snapshotd_bin"
+        # Real bug found 2026-07-31: shotcut-rebrand/src/main.cpp only runs
+        # the real Qt app directly in the process this harness launches when
+        # either QT_DEBUG is compiled in (this build-local build is neither
+        # Debug nor Release -- CMAKE_BUILD_TYPE is unset) or SNAPFLOW_WATCHDOG
+        # is already set. Otherwise main() takes its "watchdog parent"
+        # branch: it re-execs itself as a QProcess CHILD (own PID, same
+        # process group) to detect/retry startup crashes, and the parent
+        # this harness's `$!` captured just waits on that child -- it never
+        # owns the real estate/X11 window itself. wmctrl (called below via
+        # workspace-place, matching pid == $shotcut_pid) can then NEVER find
+        # a window, because the real window's _NET_WM_PID is the child's PID,
+        # not this one. That "could not locate window" failure made
+        # workspace-place return non-zero, which made this function kill the
+        # whole process group (parent AND the perfectly healthy child) --
+        # read from the outside as "snapflow crashed/exited silently right
+        # after launch, no panic, no stderr, no segfault" (confirmed via a
+        # standalone repro: with SNAPFLOW_WATCHDOG unset the launched process
+        # forks a same-pgid child with 77 threads and a real window under a
+        # different pid; the parent this harness tracks has only 2 threads
+        # and never gets a window). Setting SNAPFLOW_WATCHDOG=1 here makes
+        # the harness-launched process itself run the real app inline, one
+        # process, matching debug-build behavior -- $shotcut_pid is then the
+        # actual window's pid and wmctrl placement succeeds.
+        SNAPFLOW_WATCHDOG=1
     )
     if [ -n "$mcp_port" ]; then
         snapflow_env+=(SLINT_MCP_PORT="$mcp_port")
