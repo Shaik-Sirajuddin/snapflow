@@ -64,17 +64,13 @@ export component AgentBubble inherits Rectangle {
         padding: (is-thinking || is-pending) ? Metrics.space-2 : Metrics.space-4;
         spacing: (is-thinking || is-pending) ? Metrics.space-2 : 0px;
 
-                if is-pending : HorizontalLayout {
+                // "Agent is working..." text hidden by request -- the
+        // pending row itself (and its transparent/borderless styling
+        // above) stays, so layout/spacing during the pending state is
+        // unchanged; it now just renders no visible label.
+        if is-pending : HorizontalLayout {
             padding: Metrics.space-2;
             spacing: Metrics.space-2;
-            Text {
-                text: "Agent is working...";
-                color: Theme.text-muted;
-                font-size: 11px * Theme.font-scale;
-                font-family: Theme.font-sans;
-                font-italic: true;
-                vertical-alignment: center;
-            }
         }
 
         // Thinking header — always visible; click toggles the body.
