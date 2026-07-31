@@ -130,6 +130,17 @@ export component Sidebar inherits Rectangle {
         }
     }
 
+    // settings_search_reparse_on_clear: the Rust-side filtered thread
+    // list (`visible_indices`) only rebuilds when `search-changed` fires,
+    // which previously only happened from the TextInput's `edited` event
+    // (a real keystroke) -- a programmatic clear of `search-query` (e.g.
+    // closing the search UI) bypassed that, leaving the filtered list
+    // stuck on the last typed query. React to the property itself so any
+    // change, not just typed edits, re-syncs it.
+    changed search-query => {
+        root.search-changed(root.search-query);
+    }
+
     // Per-thread identity accent -- deliberately the one departure from
     // this project's usual monochrome status language (see theme.slint's
     // note), scoped narrowly to "which thread is this" rather than "what
