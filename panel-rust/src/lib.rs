@@ -3977,7 +3977,40 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
                     || thread.connection_status == "Connecting..."
             })
         };
-        let needs_paint = frame_changed || animating || busy_thread_animating;
+        // mcp_servers_spinner_repaint_gap: the Settings > MCP Servers row
+        // Spinners (Fetch tools / enable-toggle / Remove / Authenticate /
+        // Logout, mcp_servers_view.slint) use this same animation-tick()
+        // pattern but live entirely outside `model.threads` -- their busy
+        // state is `available_mcp_servers`/`mcp_operations_in_flight`,
+        // folded into per-row booleans by `models::to_mcp_server_option_
+        // rows`. Without this check they got one correct frame at
+        // click-time and then froze, same root cause as the
+        // `busy_thread_animating` case above just never extended to this
+        // model. Mirrors `to_mcp_server_option_rows`'s own `is_busy`
+        // check rather than re-deriving the Slint-side McpServerOption
+        // rows here.
+        let busy_mcp_server_animating = {
+            let model = panel.model.borrow();
+            let is_busy = |action: &str, name: &str| {
+                model
+                    .mcp_operations_in_flight
+                    .iter()
+                    .any(|key| key == &format!("{action}:{name}"))
+            };
+            model.available_mcp_servers.iter().any(|entry| {
+                is_busy("delete", &entry.name)
+                    || is_busy("enabled", &entry.name)
+                    || is_busy("authenticate", &entry.name)
+                    || is_busy("logout", &entry.name)
+                    || matches!(
+                        entry.tool_catalog,
+                        Some(crate::protocol_types::McpToolCatalog::Fetching)
+                    )
+                    || (entry.tool_catalog.is_none() && is_busy("tools_fetch", &entry.name))
+            })
+        };
+        let needs_paint =
+            frame_changed || animating || busy_thread_animating || busy_mcp_server_animating;
         // Critical: Qt's `requestRepaint` only re-blits the software
         // buffer. `MinimalSoftwareWindow::draw_if_needed` no-ops unless
         // Slint itself was told to redraw. `animation-tick()` bindings
@@ -3985,7 +4018,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // a busy loader froze: poll returned true, paint ran, but the
         // buffer was never re-rendered. Force the flag whenever we
         // need continuous tick-driven paint.
-        if needs_paint && (animating || busy_thread_animating) {
+        if needs_paint && (animating || busy_thread_animating || busy_mcp_server_animating) {
             panel.window.window().request_redraw();
         }
         needs_paint
