@@ -2155,6 +2155,47 @@ impl Router {
         state.release_live(tenant_id);
     }
 
+    /// Promote a discovery-only (not capacity-counted) session to a live
+    /// capacity slot the first time real work starts against it.
+    ///
+    /// **Live sessions** for admission are ones the gateway is actually
+    /// driving (session/new, recovery, or first in-flight turn) -- not
+    /// passive `session/list` catalog rows. Idempotent when
+    /// `capacity_counted` is already true.
+    fn ensure_capacity_for_active_turn(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Result<(), RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        let needs_admit = self
+            .sessions
+            .resolve(tenant_id, &gateway_id)
+            .is_some_and(|entry| !entry.capacity_counted);
+        if !needs_admit {
+            return Ok(());
+        }
+        let permit = self.admit_session(tenant_id)?;
+        if let Some(entry) = self.sessions.resolve_mut(tenant_id, &gateway_id) {
+            entry.capacity_counted = true;
+        }
+        permit.commit();
+        Ok(())
+    }
+
+    /// Release admission only if this session actually consumed a slot.
+    /// Discovery-only list-import rows never called `admit_session`, so
+    /// they must not call `release_live` (would underflow the counters).
+    fn release_live_session_if_counted(
+        &self,
+        tenant_id: &TenantId,
+        capacity_counted: bool,
+    ) {
+        if capacity_counted {
+            self.release_live_session(tenant_id);
+        }
+    }
+
     /// Register how to spawn a given agent id. Mirrors
     /// `Supervisor::register` -- `Router` doesn't reinterpret the spec, it
     /// just owns the `Supervisor` instance.
@@ -3016,7 +3057,7 @@ impl Router {
                 }
             }
             if let Some(removed) = self.sessions.remove(&tenant_id, &gateway_id) {
-                self.release_live_session(&tenant_id);
+                self.release_live_session_if_counted(&tenant_id, removed.capacity_counted);
                 self.stop_if_session_scoped(&removed.agent_id).await;
                 self.mark_unreferenced_if_idle(&removed.agent_id);
                 report.closed += 1;
@@ -3119,6 +3160,9 @@ impl Router {
                 custom_idle_ttl: record
                     .custom_idle_ttl_seconds
                     .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
+                // Recovery re-admits below -- these are real prior live
+                // sessions, not passive list-import catalog rows.
+                capacity_counted: true,
             },
             admission,
             backend,
@@ -3716,7 +3760,13 @@ impl Router {
                 return None;
             }
         }
-        let admission = self.admit_session(tenant_id).ok()?;
+        // Discovery-only registration: do **not** consume live admission
+        // capacity. A shared backend's session/list can report dozens of
+        // historical sessions (empty burst) that are only catalog rows
+        // until the client actually attaches/turns. Counting them as live
+        // was saturating max_sessions_per_tenant (16 default) after a few
+        // real thread opens. Capacity is promoted on first real turn via
+        // `ensure_capacity_for_active_turn`.
         let gateway_id = self.sessions.register(
             tenant_id,
             agent_id.to_string(),
@@ -3724,7 +3774,9 @@ impl Router {
             profile_name,
             cwd,
         );
-        admission.commit();
+        if let Some(entry) = self.sessions.resolve_mut(tenant_id, &gateway_id) {
+            entry.capacity_counted = false;
+        }
         *new_registrations_used += 1;
         Some(gateway_id.0)
     }
@@ -3986,6 +4038,9 @@ impl Router {
             custom_idle_ttl: record
                 .custom_idle_ttl_seconds
                 .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
+            // On-demand rehydrate of a real gateway id is a live attach;
+            // admit_session below commits capacity for it.
+            capacity_counted: true,
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -4176,6 +4231,12 @@ impl Router {
             profile_name.as_deref(),
         )?;
 
+        // Promote discovery-only list-import rows to capacity-counted
+        // live sessions on first real use (not on close/cancel).
+        if method != "session/close" {
+            self.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
+        }
+
         // Rewrite gateway id -> backend id in place; everything else in
         // `params` is forwarded untouched (except the mcpServers merge
         // above for resume/load), per the proxied-method contract
@@ -4242,7 +4303,7 @@ impl Router {
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             ) {
-                self.release_live_session(tenant_id);
+                self.release_live_session_if_counted(tenant_id, removed.capacity_counted);
                 self.stop_if_session_scoped(&removed.agent_id).await;
                 self.mark_unreferenced_if_idle(&removed.agent_id);
             }
@@ -7977,6 +8038,13 @@ async fn dispatch_proxied_shared(
         if !r.process_reader_demux {
             r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
         }
+        // First real turn / proxied work: promote list-import discovery
+        // rows into capacity-counted live sessions (close is handled
+        // without promoting so an unused catalog row can still be
+        // discarded free).
+        if method != "session/close" {
+            r.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
+        }
         r.sessions.set_in_flight(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
@@ -8118,7 +8186,7 @@ async fn dispatch_proxied_shared(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
         ) {
-            r.release_live_session(tenant_id);
+            r.release_live_session_if_counted(tenant_id, removed.capacity_counted);
             r.stop_if_session_scoped(&removed.agent_id).await;
             r.mark_unreferenced_if_idle(&removed.agent_id);
         }
