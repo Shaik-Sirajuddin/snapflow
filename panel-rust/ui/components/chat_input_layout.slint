@@ -842,19 +842,16 @@ export component ChatInputLayout inherits Rectangle {
             }
         row2-strip := HorizontalLayout {
             x: row2-host.overflow > 0px ? row2-host.pan : 0px;
-            // Bug fix (context ring right-alignment): outside a layout a
-            // free-positioned HorizontalLayout defaults to its own
-            // preferred (content) width, which is all `row2-host.overflow`
-            // ever needed -- but that left no slack for the trailing
-            // stretch spacer below to push `context-ring` to the true
-            // right edge of the bar whenever the dropdown/toggle cluster
-            // doesn't already fill it (the common, non-overflowing case).
-            // Widening to at least `row2-host`'s own width supplies that
-            // slack without changing `preferred-width` (still just the
-            // natural content sum, still what `overflow` above is
-            // measured against), so the panning/overflow math for narrow
-            // docks is unaffected.
-            width: max(self.preferred-width, row2-host.width);
+            // row2_strip_shrink_to_fit: previously always widened to at
+            // least `row2-host.width`, so a near-empty row (few select
+            // items) still reserved the whole bar's width as dead
+            // trailing space. Shrink-to-fit here; overflow math above
+            // already keys off `preferred-width` too, so scroll still
+            // engages once content genuinely overflows. Trade-off:
+            // `context-ring`'s trailing spacer has no slack to absorb
+            // now, so it sits right after the last control instead of
+            // flush against the bar's edge.
+            width: self.preferred-width;
             height: root.row2-h;
             preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
