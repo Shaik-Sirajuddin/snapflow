@@ -4083,6 +4083,71 @@ impl AgentBridge {
         self.set_active_project_identity(&identity);
     }
 
+    /// project-close-session-teardown: soft-releases every open thread's
+    /// live session that is still bound to the CURRENTLY active project
+    /// (i.e. the one about to stop being active), scoped by each
+    /// [`ThreadSlot`]'s own recorded `project_path` (the same value
+    /// `thread_project_path`/`retain_items_for_project` use to scope the
+    /// sidebar). Must be called BEFORE [`Self::set_active_project_
+    /// identity`] overwrites `session_project_path_override`, since that
+    /// is exactly the "currently active project" this method reads.
+    ///
+    /// Root cause this closes: before this method existed, a project
+    /// switch or close only ever updated `session_cwd_override`/
+    /// `session_project_path_override` (so *future* `session/new` calls
+    /// picked up the new project) and, via `refresh_pools_for_project_dir`,
+    /// bumped the previous project's pool generation -- which only evicts
+    /// currently-IDLE pool entries and marks a currently-LEASED one stale
+    /// for later. A thread's [`gateway_actor::thread_actor`] actor holds
+    /// its lease for the thread's entire life (see that module's
+    /// `current_lease`), released only on an explicit close/delete or the
+    /// next `SendPrompt` -- neither of which a thread belonging to a
+    /// project the user just switched away from (or closed) will ever see
+    /// again while that project stays inactive. The live ACPX session and
+    /// its pooled connection therefore stayed open/leased indefinitely,
+    /// exactly the "threads keep running in the background instead of
+    /// being torn down" bug this fixes.
+    ///
+    /// Uses `close_session(true)` (background=true) rather than a hard
+    /// close/delete: per `Command::CloseSession`'s `background` branch in
+    /// `gateway_actor/thread_actor.rs`, a background close still releases
+    /// this panel's client-side pool lease back to Idle -- freeing the
+    /// pooled connection slot, this bug's actual complaint -- while asking
+    /// acpx-core for a resumable soft close on the backend side, so
+    /// switching back to this project later resumes the conversation
+    /// instead of losing it. Deliberately does NOT set `slot.closed` --
+    /// that flag is the user-facing, permanent "Close" button state
+    /// ([`Self::close_thread`]); this is an automatic lifecycle teardown,
+    /// not an explicit user action, and must not make an untouched thread
+    /// look explicitly closed in the sidebar.
+    ///
+    /// Errors are logged and otherwise ignored, same posture as this
+    /// file's other best-effort teardown paths (e.g. `Drop for
+    /// AgentBridge`) -- a failed release here should not block the
+    /// project switch itself.
+    pub fn release_sessions_for_current_project(&self) {
+        let Some(project_path) = self
+            .session_project_path_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        for slot in &self.slots {
+            if slot.project_path_snapshot().as_deref() != Some(project_path.as_path()) {
+                continue;
+            }
+            let handle = slot.handle.clone();
+            if let Err(error) = self.runtime.block_on(handle.close_session(true)) {
+                eprintln!(
+                    "panel-rust: release_sessions_for_current_project close_session failed for thread {}: {error}",
+                    slot.thread_id
+                );
+            }
+        }
+    }
+
     /// Apply the complete lifecycle identity, including an untitled UUID.
     /// An untitled project has no raw MLT path to publish to snapshotd, but it
     /// still owns a staging store and therefore must provide a real ACP cwd.
@@ -7264,6 +7329,70 @@ mod tests {
             None,
             "an unscoped thread must never be retro-bound via an empty `old`"
         );
+    }
+
+    /// project-close-session-teardown: releasing sessions for the
+    /// currently active project must not touch threads recorded against a
+    /// DIFFERENT project (or an unscoped thread) -- mirrors `rebind_
+    /// project_path_moves_only_the_renamed_projects_threads`'s "only the
+    /// matching project's threads move" shape, but for teardown instead of
+    /// rename. None of these threads ever opened a real session (an
+    /// unreachable gateway URL, same as every other bridge-construction
+    /// test in this module), so `close_session` resolves to an immediate
+    /// no-op success on each -- this test's real assertion is that the
+    /// call is safe (no panic) for every slot regardless of project, and
+    /// that it never sets the permanent user-facing `closed` state, which
+    /// only the explicit close/delete UI actions may do.
+    #[test]
+    fn release_sessions_for_current_project_never_marks_threads_permanently_closed() {
+        let specs = vec![
+            ThreadSpec {
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "on-b".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/b/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        // No active project recorded yet -- must be a safe no-op.
+        bridge.release_sessions_for_current_project();
+        for idx in 0..3 {
+            assert!(!bridge.thread_closed(idx));
+        }
+
+        // Now project A becomes active; releasing must leave every thread
+        // (A's own, B's, and the unscoped one) not permanently closed.
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/a/timeline.mlt".to_owned(),
+        ));
+        bridge.release_sessions_for_current_project();
+        for idx in 0..3 {
+            assert!(
+                !bridge.thread_closed(idx),
+                "release must never flip the permanent closed flag"
+            );
+        }
     }
 
     #[test]

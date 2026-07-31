@@ -1734,6 +1734,20 @@ impl PanelSingleton {
             )
         };
         if let Some(bridge) = self.bridge.as_ref() {
+            // project-close-session-teardown: release every thread session
+            // still bound to the project that is about to stop being
+            // active -- BEFORE `set_active_project_identity` below
+            // overwrites the bridge's own record of which project that is.
+            // "switched"/"closed"/"opened"/"created_untitled" all mean the
+            // previously active project (if any) is being left for real;
+            // "saved_as" is deliberately excluded (see `release_sessions_
+            // for_current_project`'s doc comment) since a Save-As/first-
+            // save relabels the SAME live project rather than leaving it,
+            // and releasing there would sever conversations mid-turn for
+            // no reason.
+            if reason != "saved_as" {
+                bridge.release_sessions_for_current_project();
+            }
             bridge.set_active_project_identity(&identity);
             let default_agent_id = self.model.borrow().default_agent_id.clone();
             if !default_agent_id.trim().is_empty() {
