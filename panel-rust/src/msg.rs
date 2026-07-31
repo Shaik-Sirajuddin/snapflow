@@ -56,6 +56,8 @@ pub enum ThreadMsg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComposeMsg {
+    /// Live unsent text from the retained per-thread ChatArea composer.
+    DraftChanged(String),
     SendRequested(String),
     StopRequested,
     #[allow(dead_code)]

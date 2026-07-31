@@ -2,6 +2,7 @@ import { Theme } from "../../../tokens/theme.slint";
 import { SelectionFocus } from "../../../tokens/selection_focus.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
+import { IconButton } from "../../../base/icon_button.slint";
 import { ExpandablePanel } from "../../../base/expandable_panel.slint";
 import { CollapseExpand } from "../../../base/collapse_expand.slint";
 import { ApiCallView } from "../execution/api_call_view.slint";
@@ -38,6 +39,7 @@ export component ToolEventRow inherits Rectangle {
     in property <bool> expanded;
     in property <int> index;
     in property <bool> in-group: false;
+    in property <bool> mcp-variant: false;
     callback toggle-expanded(int);
     callback open-full-view(string, string, string, bool, bool);
 
@@ -47,7 +49,8 @@ export component ToolEventRow inherits Rectangle {
     property <bool> is-mcp: kind == "mcp_server_call";
 
     // Container surface for tool calls, MCP calls, and execution rows
-    background: in-group ? transparent : ((is-mcp || is-tool-use || is-terminal) ? Theme.bg-agent-bubble : transparent);
+    background: mcp-variant ? Theme.bg-tertiary
+        : (in-group ? transparent : ((is-mcp || is-tool-use || is-terminal) ? Theme.bg-agent-bubble : transparent));
     border-color: transparent;
     border-width: 0px;
     border-radius: Theme.radius-md;
@@ -158,14 +161,34 @@ export component ToolEventRow inherits Rectangle {
                 }
             }
 
-            // Maximize / Open full view button right on the call title line
-            if has-execution-content : TouchArea {
-                accessible-role: button;
-                accessible-label: root.expanded ? "Collapse tool call details" : "Expand tool call details";
-                accessible-action-default => { self.clicked(); }
-                width: 22px;
+            // Keep the compact details toggle on the tool-name line, aligned
+            // at the right edge before the full-view action.
+            if has-execution-content : HoverSurface {
+                preferred-width: 48px;
+                min-width: 48px;
+                max-width: 48px;
                 height: 22px;
-                mouse-cursor: pointer;
+                button-accessible-label: root.details-open ? "Hide" : "Show";
+                clicked => {
+                    root.details-open = !root.details-open;
+                    root.toggle-expanded(root.index);
+                }
+                Text {
+                    text: root.details-open ? "Hide" : "Show";
+                    font-family: Theme.font-mono;
+                    font-size: 10px * Theme.font-scale;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Maximize / Open full view button right on the call title line
+            if has-execution-content : IconButton {
+                btn-width: 22px;
+                btn-height: 22px;
+                button-accessible-label: root.expanded ? "Collapse tool call details" : "Expand tool call details";
                 clicked => {
                     root.open-full-view(
                         root.is-mcp ? "MCP CALL PAYLOAD & DETAILS" : (root.is-terminal ? "TERMINAL EXECUTION FULL VIEW" : "TOOL CALL PAYLOAD & DETAILS"),
@@ -176,16 +199,10 @@ export component ToolEventRow inherits Rectangle {
                     );
                 }
 
-                Rectangle {
-                    background: parent.has-hover ? Theme.bg-sidebar : transparent;
-                    border-radius: Theme.radius-sm;
-                    animate background { duration: 120ms; }
-
-                    Icon {
-                        source: @image-url("../../../assets/icons/maximize-2.svg");
-                        size: 14px;
-                        color: Theme.text-primary;
-                    }
+                Icon {
+                    source: @image-url("../../../assets/icons/maximize-2.svg");
+                    size: 14px;
+                    color: Theme.text-primary;
                 }
             }
         }
@@ -209,26 +226,6 @@ export component ToolEventRow inherits Rectangle {
         if root.visible && has-execution-content : VerticalLayout {
             vertical-stretch: 0;
             spacing: Metrics.gap-sm;
-            HoverSurface {
-                height: 22px;
-                border-radius: Theme.radius-sm;
-                button-accessible-label: root.details-open ? "Hide call details" : "Show call details";
-                clicked => {
-                    root.details-open = !root.details-open;
-                    root.toggle-expanded(root.index);
-                }
-                HorizontalLayout {
-                    padding-left: root.lead-indent;
-                    Text {
-                        text: root.details-open ? "[-] hide call details" : "[+] show call details";
-                        font-family: Theme.font-mono;
-                        font-size: 10px * Theme.font-scale;
-                        font-weight: 600;
-                        color: Theme.text-primary;
-                        vertical-alignment: center;
-                    }
-                }
-            }
             CollapseExpand {
                 open: root.details-open;
                 // Vertical height + opacity; full width (no width shrink —

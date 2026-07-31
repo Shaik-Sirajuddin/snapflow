@@ -11,6 +11,24 @@ export component ThinScrollbar inherits Rectangle {
     in-out property <length> viewport-y: 0px;
     in property <length> thumb-width: 4px;
     in property <bool> active: false;
+    // Exposed so a caller's own `viewport-y` alias (e.g. the Flickable
+    // this scrollbar is paired with, via `<=>`) can condition its OWN
+    // `animate` on the same drag state -- not relying on an `animate`
+    // declared on this side propagating across the two-way binding by
+    // itself, which isn't a guarantee worth depending on silently.
+    out property <bool> dragging: touch.pressed;
+
+    // A flat 90ms ease on every `viewport-y` change smoothed click-to-jump
+    // and wheel-scroll nicely, but broke active dragging: the value is
+    // re-targeted on every pointer-move while the thumb is held, so the
+    // eased position perpetually chased a moving target and never caught
+    // up to the cursor until the drag stopped -- reading as "hold and
+    // drag doesn't work" even though it was still (laggily) tracking.
+    // Direct-manipulation drag needs 1:1 tracking, not easing; only the
+    // indirect cases (a wheel tick, a click-to-jump) should ease. `touch`
+    // is declared below but forward-referencing it here is fine (Slint
+    // bindings form one graph, not sequential statements).
+    animate viewport-y { duration: touch.pressed ? 0ms : 90ms; easing: ease-out; }
 
     property <bool> is-overflowing: root.viewport-height > root.visible-height;
     property <length> thumb-h: max(24px, root.visible-height * (root.visible-height / max(1px, root.viewport-height)));
@@ -21,8 +39,14 @@ export component ThinScrollbar inherits Rectangle {
     width: root.thumb-width;
     visible: root.is-overflowing;
 
-    // Fades out completely during non-scroll idle
-    opacity: (root.active || touch.has-hover) ? 1.0 : 0.0;
+    // Shown only while actively scrolled away from the resting position
+    // (`active`) or while the thumb itself is being click-and-held/
+    // dragged (`touch.pressed`) -- deliberately NOT on mere hover.
+    // Hover-triggered opacity used to pop the thumb in as soon as the
+    // pointer entered the track's hit area, which visually read as a
+    // layout shift right at the content edge every time the cursor
+    // passed near it.
+    opacity: (root.active || touch.pressed) ? 1.0 : 0.0;
     animate opacity { duration: 300ms; easing: ease-out; }
 
     Rectangle {
@@ -40,7 +64,13 @@ export component ThinScrollbar inherits Rectangle {
         x: - 3px;
         mouse-cursor: pointer;
         pointer-event(event) => {
-            if (event.kind == PointerEventKind.down || event.kind == PointerEventKind.move) {
+            // `PointerEventKind.move` fires on every hover move, not just
+            // while dragging -- without gating it on `self.pressed`, just
+            // resting the pointer over the track (no click at all) snapped
+            // the scroll position to wherever the cursor happened to be.
+            // `down` still jumps immediately on click; `move` now only
+            // continues tracking while the button is actually held.
+            if (event.kind == PointerEventKind.down || (event.kind == PointerEventKind.move && self.pressed)) {
                 let target-y = self.mouse-y - (root.thumb-h / 2);
                 let ratio = max(0.0, min(1.0, target-y / root.max-travel));
                 root.viewport-y = - (ratio * root.scroll-range);

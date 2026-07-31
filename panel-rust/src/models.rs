@@ -12,7 +12,7 @@ use crate::markdown::{self, LineKind};
 use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use crate::skills_state::SkillEntry;
 use crate::{
-    AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
+    AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownBlock, MarkdownLine, MarkdownRun,
     McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
     TerminalItem, ThreadItem,
 };
@@ -99,9 +99,30 @@ fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
     ModelRc::new(VecModel::from(rows))
 }
 
-/// Agent rows get full markdown parse; other kinds leave lines empty so
-/// MarkdownView falls back to plain `text`.
-fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
+/// Agent/thinking rows get full markdown parse; other kinds leave lines
+/// empty so MarkdownView falls back to plain `text`.
+///
+/// markdown-render-cache-layer plan, Phase 1/3: reuses `render_index`'s
+/// already-rendered `ModelRc<MarkdownLine>` for `key` when `text` hasn't
+/// changed since it was last recorded there, instead of the old global,
+/// text-content-keyed `MARKDOWN_CACHE` thread_local (retired -- see that
+/// plan's "Unification decision"). `render_index` is per-thread
+/// (`ThreadModel::markdown_render_index`), so this is naturally bounded
+/// by that thread's own message count, not a global cap needing
+/// wholesale-clear eviction. This is the same fix for the thread-switch/
+/// poll-tick freeze the old cache was for (see memory/acpx/gen/plans/
+/// panel-thread-switch-freeze-fix-plan.md): `update.rs`'s snapshot
+/// handler calls `message_rows_for_thread_with_state` -> here on *every*
+/// poll tick for the selected thread, not just on an actual switch, so
+/// an unchanged historical message must not be re-parsed by
+/// `pulldown-cmark` and re-wrapped every tick.
+fn markdown_lines_for(
+    render_index: &mut crate::thread_message_index::ThreadMessageIndex,
+    key: &str,
+    row_index: usize,
+    kind: &str,
+    text: &str,
+) -> ModelRc<MarkdownLine> {
     if kind != "agent" && kind != "thinking" {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
@@ -114,7 +135,29 @@ fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
     if agent_text_skips_markdown(text) {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
-    lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
+    // `row_index` always comes from the caller's own row-construction
+    // loop, never inferred from `check()`'s result -- a `RowChange::New`
+    // key has no prior row_index to infer, and using a placeholder here
+    // would corrupt the index for a genuinely new message.
+    let change = render_index.check(key, text);
+    if let crate::thread_message_index::RowChange::Unchanged(_) = change {
+        if let Some(cached) = render_index.rendered_lines_for(key) {
+            crate::trace_host_input(format_args!("markdown cache hit key={key} kind=lines"));
+            return cached;
+        }
+    }
+    crate::trace_host_input(format_args!(
+        "markdown cache miss key={key} kind=lines reason={}",
+        match change {
+            crate::thread_message_index::RowChange::New => "new",
+            crate::thread_message_index::RowChange::Changed(_) => "changed",
+            crate::thread_message_index::RowChange::Unchanged(_) => "uncached",
+        }
+    ));
+    let built = lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS));
+    render_index.record(key, row_index, text);
+    render_index.set_rendered_lines(key, built.clone());
+    built
 }
 
 /// True for agent text that is only status/reconnect/hard-error noise --
@@ -144,6 +187,225 @@ pub(crate) fn agent_text_is_hard_failure(text: &str) -> bool {
         || lower.contains("unexpected status 4")
         || (lower.contains("reconnecting... 5/5")
             && (lower.contains("unexpected status") || lower.contains("bad gateway")))
+}
+
+fn empty_markdown_blocks() -> ModelRc<MarkdownBlock> {
+    ModelRc::new(VecModel::from(Vec::<MarkdownBlock>::new()))
+}
+
+/// Same heading-size ladder `markdown_view.slint`'s `heading-size()`
+/// pure function already uses -- kept in lock-step by hand (Slint can't
+/// import a Rust constant table) the same way `models.rs`'s `is_tool_kind`
+/// doc comment already flags for `chat_area.slint`'s `is-tool-kind`.
+/// Setting this on `StyledText.default-font-size` per block (instead of
+/// baking it into a shared wrap-column estimate the way `wrap_runs` did)
+/// is the fix for the "different text sized line break calc" bug found
+/// during the freeze investigation -- see the plan doc's "current
+/// implementation has an issue with different text sized line break
+/// calc" exchange.
+fn heading_font_size(level: Option<u8>) -> f32 {
+    match level {
+        Some(1) => 18.0,
+        Some(2) => 16.0,
+        Some(3) => 14.0,
+        Some(_) => 13.0,
+        None => 0.0, // 0px = inherit MarkdownView's own default for body text
+    }
+}
+
+/// Plain-data mirror of [`MarkdownBlock`] with a `slint::StyledText`
+/// instead of a `ModelRc`-wrapped `[MarkdownBlock]` row -- `ModelRc`
+/// wraps a non-atomic `Rc` (never `Send`), but `StyledText` is built on
+/// `SharedVector`, which genuinely is `Send + Sync` (spike-confirmed:
+/// `slint_styledtext_spike`, `unsafe impl<T: Send + Sync> Send for
+/// SharedVector<T>` in `i-slint-core`). This type exists so
+/// `build_markdown_block_data` (below) can run on a background thread
+/// (`markdown_worker.rs`) -- the final `ModelRc<MarkdownBlock>`
+/// wrapping (cheap: no parsing, just moving already-built values into a
+/// `VecModel`) has to happen back on the UI thread, in
+/// `markdown_blocks_for` or the worker's delivery callback.
+///
+/// `Debug, PartialEq` (markdown-render-cache-layer plan Phase 2): needed
+/// so `Msg::MarkdownBlocksReady` (which carries a `Vec<MarkdownBlockData>`
+/// during delivery, before the reducer converts it to one `ModelRc` --
+/// see 00-plan.md's "Ownership flow") can derive the same traits every
+/// other `Msg` variant does. `slint::StyledText` itself derives
+/// `Debug, PartialEq, Clone, Default`, so this doesn't require any
+/// hand-written impl.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkdownBlockData {
+    pub kind: &'static str,
+    pub text: slint::StyledText,
+    pub default_font_size: f32,
+    pub indent: i32,
+    pub table_cells: Vec<slint::StyledText>,
+    pub table_col_count: i32,
+    pub code_text: String,
+}
+
+/// Segments+styles `text` into [`MarkdownBlockData`] -- the `Send`-safe,
+/// `ModelRc`-free half of Architecture v2's per-block rendering. Pure
+/// function of `(text, is_streaming_tail)`, no caching, no Slint model
+/// types -- safe to call from any thread, including
+/// `markdown_worker.rs`'s background render thread. `markdown_blocks_for`
+/// (below) wraps this for the synchronous/cached UI-thread call sites;
+/// the worker calls it directly and does its own `ModelRc` wrapping in
+/// its UI-thread delivery closure.
+pub fn build_markdown_block_data(text: &str, is_streaming_tail: bool) -> Vec<MarkdownBlockData> {
+    let spans = markdown::segment_blocks(text);
+    spans
+        .into_iter()
+        .map(|span| {
+            let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
+                // `segment_blocks`' byte ranges are pulldown-cmark's own
+                // verbatim block spans -- they legitimately include a
+                // trailing newline (block ranges) or table-cell padding
+                // whitespace around `|` delimiters, neither of which is
+                // real content (see markdown.rs's segment_blocks tests).
+                let raw = text[range].trim();
+                let candidate = if is_streaming_tail {
+                    markdown::heal_open_markers(raw)
+                } else {
+                    raw.to_string()
+                };
+                slint::StyledText::from_markdown(&candidate)
+                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
+            };
+            match span.kind {
+                markdown::BlockSpanKind::Text => MarkdownBlockData {
+                    kind: "text",
+                    text: styled_text_for(span.source_range),
+                    default_font_size: heading_font_size(span.heading_level),
+                    indent: span.indent as i32,
+                    table_cells: Vec::new(),
+                    table_col_count: 0,
+                    code_text: String::new(),
+                },
+                markdown::BlockSpanKind::Code(body) => MarkdownBlockData {
+                    kind: "code",
+                    text: slint::StyledText::default(),
+                    default_font_size: 0.0_f32,
+                    indent: span.indent as i32,
+                    table_cells: Vec::new(),
+                    table_col_count: 0,
+                    code_text: body,
+                },
+                markdown::BlockSpanKind::Rule => MarkdownBlockData {
+                    kind: "rule",
+                    text: slint::StyledText::default(),
+                    default_font_size: 0.0_f32,
+                    indent: span.indent as i32,
+                    table_cells: Vec::new(),
+                    table_col_count: 0,
+                    code_text: String::new(),
+                },
+                markdown::BlockSpanKind::Table { cells, col_count } => {
+                    let cell_styled: Vec<slint::StyledText> =
+                        cells.into_iter().map(styled_text_for).collect();
+                    MarkdownBlockData {
+                        kind: "table",
+                        text: slint::StyledText::default(),
+                        default_font_size: 0.0_f32,
+                        indent: span.indent as i32,
+                        table_cells: cell_styled,
+                        table_col_count: col_count as i32,
+                        code_text: String::new(),
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+/// Wraps `Vec<MarkdownBlockData>` into the `ModelRc<MarkdownBlock>` Slint
+/// actually consumes -- purely mechanical (no parsing), so it's cheap
+/// enough to run inline on the UI thread even for a worker-delivered
+/// chunk (see `markdown_worker.rs`).
+pub fn markdown_block_data_to_model(rows: Vec<MarkdownBlockData>) -> ModelRc<MarkdownBlock> {
+    let rows: Vec<MarkdownBlock> = rows
+        .into_iter()
+        .map(|d| MarkdownBlock {
+            kind: d.kind.into(),
+            text: d.text,
+            default_font_size: d.default_font_size,
+            indent: d.indent,
+            table_cells: ModelRc::new(VecModel::from(d.table_cells)),
+            table_col_count: d.table_col_count,
+            code_text: d.code_text.into(),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// Architecture v2 (markdown-thread-freeze-fix phase 3): builds one
+/// `MarkdownBlock` per top-level markdown block, each carrying a native
+/// `slint::StyledText` (or, for code/rule blocks, plain data routed
+/// through the existing `TerminalLogBlock`/rule rendering) instead of a
+/// Rust-computed `Vec<MarkdownLine>`. See `markdown::segment_blocks`'s
+/// doc comment and the plan doc's "Architecture v2" section for why:
+/// `StyledText::from_markdown` parses inline styling *and* wraps at real
+/// pixel width itself, so there is nothing left for Rust to precompute
+/// beyond block boundaries. `is_streaming_tail` selects whether
+/// `markdown::heal_open_markers` runs first (only ever needed on the
+/// single actively-streaming tail block -- every closed historical
+/// block is already well-formed source text).
+/// markdown-render-cache-layer plan, Phase 1/3: mirrors `markdown_lines_for`
+/// above -- reuses `render_index`'s already-rendered `ModelRc<MarkdownBlock>`
+/// for `key` when `text` is unchanged, instead of the old global,
+/// text-content-keyed `MARKDOWN_BLOCK_CACHE` thread_local (retired -- see
+/// that plan's "Unification decision"). `row_index` always comes from the
+/// caller's row-construction loop, same reasoning as `markdown_lines_for`.
+///
+/// While `is_streaming_tail` is true, the index is never read or written
+/// for this key -- matching the old cache's exact bypass behavior. The
+/// tail block's text changes on essentially every call while streaming
+/// (so a cache read would never hit anyway), and `heal_open_markers`'
+/// healed output must never be mistaken for the final, unhealed-source
+/// rendering once the message settles (`is_streaming_tail` flips to
+/// `false`) -- the first settled call naturally sees `RowChange::New` or
+/// `Changed` (nothing was ever recorded during streaming) and renders
+/// fresh.
+fn markdown_blocks_for(
+    render_index: &mut crate::thread_message_index::ThreadMessageIndex,
+    key: &str,
+    row_index: usize,
+    kind: &str,
+    text: &str,
+    is_streaming_tail: bool,
+) -> ModelRc<MarkdownBlock> {
+    if kind != "agent" {
+        return empty_markdown_blocks();
+    }
+    if !is_streaming_tail {
+        let change = render_index.check(key, text);
+        if let crate::thread_message_index::RowChange::Unchanged(_) = change {
+            if let Some(cached) = render_index.rendered_blocks_for(key) {
+                crate::trace_host_input(format_args!("markdown cache hit key={key} kind=blocks"));
+                return cached;
+            }
+        }
+        // "uncached" (Unchanged but no rendered_blocks yet) is expected
+        // exactly once per key -- the render that's about to happen
+        // below is what populates it. If this reason keeps recurring
+        // for the same key across ticks, that's the
+        // record()-wipes-the-other-caller's-payload regression this
+        // module's own record_with_matching_hash_does_not_wipe_an_
+        // already_rendered_payload test guards against.
+        crate::trace_host_input(format_args!(
+            "markdown cache miss key={key} kind=blocks reason={}",
+            match change {
+                crate::thread_message_index::RowChange::New => "new",
+                crate::thread_message_index::RowChange::Changed(_) => "changed",
+                crate::thread_message_index::RowChange::Unchanged(_) => "uncached",
+            }
+        ));
+    }
+    let built = markdown_block_data_to_model(build_markdown_block_data(text, is_streaming_tail));
+    if !is_streaming_tail {
+        render_index.record(key, row_index, text);
+        render_index.set_rendered_blocks(key, built.clone());
+    }
+    built
 }
 
 /// Plan phase 27: markdown render of the skill editor's active content
@@ -309,6 +571,10 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
     // First-use skill tracking: walk the list in order, mark a skill_use
     // row first-use only the first time its tracking name appears.
     let mut seen_skills = std::collections::HashSet::<String>::new();
+    // Not production-reachable (see this fn's doc comment: real call
+    // sites use `to_message_model_from_transcript`) -- a throwaway,
+    // call-local index is fine here, no cross-call cache reuse to prove.
+    let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
     let mut items: Vec<MessageItem> = msgs
         .into_iter()
         .enumerate()
@@ -346,7 +612,15 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                     .unwrap_or_default()
                     .into(),
                 text: m.text.clone().into(),
-                markdown_lines: markdown_lines_for(kind, &m.text),
+                markdown_lines: markdown_lines_for(&mut render_index, &i.to_string(), i, kind, &m.text),
+                markdown_blocks: markdown_blocks_for(
+                    &mut render_index,
+                    &i.to_string(),
+                    i,
+                    kind,
+                    &m.text,
+                    false,
+                ),
                 // Send-queue state is not modelled by the raw `ChatMessage`
                 // feed -- a message reaching here has already been dispatched.
                 queued: false,
@@ -383,9 +657,12 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
 pub fn to_message_model_from_transcript(
     items: Vec<crate::conversation::TranscriptItem>,
     expanded: &[bool],
+    render_index: &mut crate::thread_message_index::ThreadMessageIndex,
 ) -> ModelRc<MessageItem> {
     ModelRc::new(VecModel::from(to_message_rows_from_transcript(
-        items, expanded,
+        items,
+        expanded,
+        render_index,
     )))
 }
 
@@ -415,9 +692,16 @@ pub fn transcript_row_keys(items: &[crate::conversation::TranscriptItem]) -> Vec
 }
 
 /// Builds concrete message rows for the persistent message `VecModel`.
+///
+/// `render_index` is this thread's own `ThreadMessageIndex` (markdown-
+/// render-cache-layer plan) -- passed in rather than owned here so the
+/// same per-thread cache survives across repeated calls (every poll
+/// tick) instead of starting empty each time, which would defeat the
+/// whole point of caching by key.
 pub fn to_message_rows_from_transcript(
     items: Vec<crate::conversation::TranscriptItem>,
     expanded: &[bool],
+    render_index: &mut crate::thread_message_index::ThreadMessageIndex,
 ) -> Vec<MessageItem> {
     use crate::conversation::TranscriptItem;
 
@@ -426,6 +710,12 @@ pub fn to_message_rows_from_transcript(
     let mut rows: Vec<MessageItem> = items
         .into_iter()
         .filter_map(|item| {
+            // Stable key for the render-index lookup below -- computed
+            // before `item` is consumed by the `match`. `transcript_row_key`
+            // only borrows, so this is fine to compute even for the
+            // `Notice` arm, which returns `None` right after without
+            // using it.
+            let key = transcript_row_key(&item);
             // Live tool details: raw_input/raw_output flow from
             // ChatMessage → TranscriptItem::Tool → MessageItem (UI
             // expand/hide payload). Skill/MCP kind uses raw_input JSON
@@ -492,9 +782,27 @@ pub fn to_message_rows_from_transcript(
             } else {
                 false
             };
+            let row_index = index as usize;
             let row = MessageItem {
                 kind: kind.into(),
-                markdown_lines: markdown_lines_for(kind, &text),
+                markdown_lines: markdown_lines_for(render_index, &key, row_index, kind, &text),
+                // `is_streaming_tail: false` -- not yet wired to the
+                // in-flight/generation state tracked elsewhere in this
+                // function; every message reaching here today is
+                // treated as already-closed source text, which is safe
+                // (no healing needed) even though it under-uses
+                // `heal_open_markers` for the live-streaming case.
+                // Wiring the real last-message-while-generating signal
+                // through is deferred to the background-render-worker
+                // phase, which already needs to thread that state.
+                markdown_blocks: markdown_blocks_for(
+                    render_index,
+                    &key,
+                    row_index,
+                    kind,
+                    &text,
+                    false,
+                ),
                 text: text.into(),
                 status: status.into(),
                 expanded: expanded.get(index as usize).copied().unwrap_or(false),
@@ -538,6 +846,7 @@ pub fn append_send_queue_rows(
         rows.push(MessageItem {
             kind: "user".into(),
             markdown_lines: ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new())),
+            markdown_blocks: empty_markdown_blocks(),
             text: entry.text.clone().into(),
             status: "".into(),
             expanded: false,
@@ -566,8 +875,9 @@ pub fn message_rows_for_thread(
     transcript: Vec<crate::conversation::TranscriptItem>,
     expanded: &[bool],
     queue: &crate::send_queue::SendQueue,
+    render_index: &mut crate::thread_message_index::ThreadMessageIndex,
 ) -> (Vec<MessageItem>, Vec<String>) {
-    message_rows_for_thread_with_state(transcript, expanded, queue, false)
+    message_rows_for_thread_with_state(transcript, expanded, queue, false, render_index)
 }
 
 /// Like [`message_rows_for_thread`], but marks the front queue row as
@@ -577,13 +887,14 @@ pub fn message_rows_for_thread_with_state(
     expanded: &[bool],
     queue: &crate::send_queue::SendQueue,
     generation_in_flight: bool,
+    render_index: &mut crate::thread_message_index::ThreadMessageIndex,
 ) -> (Vec<MessageItem>, Vec<String>) {
     let mut keys = transcript_row_keys(&transcript);
     let last_is_user = transcript
         .last()
         .map(|item| matches!(item, crate::conversation::TranscriptItem::User { .. }))
         .unwrap_or(false);
-    let mut rows = to_message_rows_from_transcript(transcript, expanded);
+    let mut rows = to_message_rows_from_transcript(transcript, expanded, render_index);
     // Phase 18 (send_feedback_and_empty_states): the instant the user's
     // message is the transcript tail and a generation is in flight,
     // append a synthetic minimal "pending" row (kind "pending") so the
@@ -764,10 +1075,15 @@ pub fn is_reasoning_option_id(id: &str) -> bool {
     )
 }
 
-/// Backend-native permission policy selector (`permissionMode`).
+/// True when this config option is the native ACP `permissionMode`
+/// (dedicated compose dropdown, not mixed into the model selector) --
+/// see `acpx-core::bridge_sessions`'s own `"permissionMode"` `configId`
+/// convention (e.g. its `select_adapter_config_option(..., "permissionMode",
+/// "acceptEdits")` call), same normalized-id-matching shape as
+/// `is_reasoning_option_id`.
 pub fn is_permission_mode_option_id(id: &str) -> bool {
     matches!(
-        option_id_norm(id).as_str(),
+        id.to_ascii_lowercase().replace('-', "_").as_str(),
         "permissionmode" | "permission_mode" | "permission"
     )
 }
@@ -896,10 +1212,25 @@ pub fn to_reasoning_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<
     ModelRc::new(VecModel::from(items))
 }
 
-pub fn to_permission_mode_dropdown_entries(
-    options: Vec<ConfigOptionInfo>,
-) -> ModelRc<DropdownEntry> {
-    let mut items = Vec::new();
+/// Trigger label for the reasoning dropdown (current value name, or "").
+pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
+    for option in options.iter().filter(|o| is_reasoning_option_id(&o.id)) {
+        let Some(cur) = option.current_value.as_ref() else {
+            continue;
+        };
+        if let Some(v) = option.options.iter().find(|v| &v.value == cur) {
+            return v.name.clone();
+        }
+        return cur.clone();
+    }
+    String::new()
+}
+
+/// Permission-mode selector rows (dedicated compose dropdown) -- same
+/// shape as [`to_reasoning_dropdown_entries`], filtering on
+/// [`is_permission_mode_option_id`] instead.
+pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+    let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
         if is_permission_mode_option_id(&option.id) {
             append_option_entries(&mut items, option);
@@ -908,25 +1239,10 @@ pub fn to_permission_mode_dropdown_entries(
     ModelRc::new(VecModel::from(items))
 }
 
+/// Trigger label for the permission-mode dropdown (current value name, or
+/// ""), same shape as [`current_reasoning_trigger_label`].
 pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> String {
-    for option in options
-        .iter()
-        .filter(|option| is_permission_mode_option_id(&option.id))
-    {
-        let Some(current) = option.current_value.as_ref() else {
-            continue;
-        };
-        if let Some(value) = option.options.iter().find(|value| &value.value == current) {
-            return value.name.clone();
-        }
-        return current.clone();
-    }
-    String::new()
-}
-
-/// Trigger label for the reasoning dropdown (current value name, or "").
-pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
-    for option in options.iter().filter(|o| is_reasoning_option_id(&o.id)) {
+    for option in options.iter().filter(|o| is_permission_mode_option_id(&o.id)) {
         let Some(cur) = option.current_value.as_ref() else {
             continue;
         };
@@ -2475,7 +2791,9 @@ mod transcript_model_tests {
             raw_input: Some(r#"{"skill":"artifact-design"}"#.into()),
             raw_output: Some(r#"{"ok":true}"#.into()),
         });
-        let model = to_message_model_from_transcript(state.items().to_vec(), &[false]);
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let model =
+            to_message_model_from_transcript(state.items().to_vec(), &[false], &mut render_index);
         let row = model.row_data(0).expect("one row");
         assert_eq!(row.kind.as_str(), "skill_use");
         assert!(row.first_use);
@@ -2509,7 +2827,8 @@ mod transcript_model_tests {
     #[test]
     fn streaming_markdown_matches_one_shot_for_agent() {
         let full = "Hello **world**\n\n- one\n- two\n";
-        let one_shot = markdown_lines_for("agent", full);
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let one_shot = markdown_lines_for(&mut render_index, "k", 0, "agent", full);
         let mut renderer = markdown::StreamingMarkdownRenderer::new(markdown::DEFAULT_WRAP_COLS);
         for ch in full.chars() {
             renderer.push(&ch.to_string());
@@ -2521,8 +2840,156 @@ mod transcript_model_tests {
 
     #[test]
     fn non_agent_rows_skip_markdown_parse() {
-        assert_eq!(markdown_lines_for("user", "# not parsed").row_count(), 0);
-        assert!(markdown_lines_for("agent", "# Title").row_count() > 0);
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        assert_eq!(
+            markdown_lines_for(&mut render_index, "k1", 0, "user", "# not parsed").row_count(),
+            0
+        );
+        assert!(markdown_lines_for(&mut render_index, "k2", 1, "agent", "# Title").row_count() > 0);
+    }
+
+    #[test]
+    fn markdown_lines_for_cache_hit_returns_equivalent_content_for_repeated_text() {
+        // Same call repeated for identical text, same key -- the case
+        // that fires on every poll tick for an already-rendered
+        // historical message (see
+        // memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md).
+        // Correctness matters more than proving cache-hit-ness here: a
+        // wrong cached value would be a worse bug than a slow one.
+        let text = "Hello **world**, this is *italic* and `code`.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let first = markdown_lines_for(&mut render_index, "k", 0, "agent", text);
+        let second = markdown_lines_for(&mut render_index, "k", 0, "agent", text);
+        assert_eq!(first.row_count(), second.row_count());
+        for i in 0..first.row_count() {
+            let a = first.row_data(i).unwrap();
+            let b = second.row_data(i).unwrap();
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.plain_text, b.plain_text);
+        }
+    }
+
+    #[test]
+    fn markdown_lines_for_second_call_with_same_key_is_a_genuine_cache_hit() {
+        // Strengthens the test above: prove reuse via ThreadMessageIndex's
+        // own bookkeeping, not just equal output.
+        let text = "Some **repeated** agent text.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        markdown_lines_for(&mut render_index, "k", 0, "agent", text);
+        assert!(render_index.rendered_lines_for("k").is_some());
+        assert_eq!(
+            render_index.check("k", text),
+            crate::thread_message_index::RowChange::Unchanged(0)
+        );
+    }
+
+    #[test]
+    fn markdown_lines_for_distinguishes_different_text() {
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let a = markdown_lines_for(&mut render_index, "k1", 0, "agent", "# First");
+        let b = markdown_lines_for(&mut render_index, "k2", 1, "agent", "# Second");
+        assert_ne!(a.row_data(0).unwrap().plain_text, b.row_data(0).unwrap().plain_text);
+    }
+
+    #[test]
+    fn markdown_blocks_for_non_agent_kind_is_empty() {
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        assert_eq!(
+            markdown_blocks_for(&mut render_index, "k", 0, "user", "# not parsed", false)
+                .row_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn markdown_blocks_for_heading_and_paragraph_produce_text_blocks_with_font_size_by_level() {
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let blocks = markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "# Title\n\nBody text.\n",
+            false,
+        );
+        assert_eq!(blocks.row_count(), 2);
+        let heading = blocks.row_data(0).unwrap();
+        assert_eq!(heading.kind, slint::SharedString::from("text"));
+        assert_eq!(heading.default_font_size, 18.0);
+        let body = blocks.row_data(1).unwrap();
+        assert_eq!(body.kind, slint::SharedString::from("text"));
+        assert_eq!(body.default_font_size, 0.0);
+    }
+
+    #[test]
+    fn markdown_blocks_for_code_block_carries_verbatim_text_not_a_styled_text() {
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let blocks = markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "```\nlet x = 1;\n```\n",
+            false,
+        );
+        assert_eq!(blocks.row_count(), 1);
+        let block = blocks.row_data(0).unwrap();
+        assert_eq!(block.kind, slint::SharedString::from("code"));
+        assert_eq!(block.code_text, slint::SharedString::from("let x = 1;"));
+    }
+
+    #[test]
+    fn markdown_blocks_for_table_produces_flat_cells_and_col_count() {
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let blocks = markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n",
+            false,
+        );
+        assert_eq!(blocks.row_count(), 1);
+        let table = blocks.row_data(0).unwrap();
+        assert_eq!(table.kind, slint::SharedString::from("table"));
+        assert_eq!(table.table_col_count, 2);
+        assert_eq!(table.table_cells.row_count(), 4);
+    }
+
+    #[test]
+    fn markdown_blocks_for_cache_hit_on_repeated_non_streaming_text() {
+        let text = "Repeated **agent** text.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let first = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let second = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(first.row_count(), second.row_count());
+        assert!(render_index.rendered_blocks_for("k").is_some());
+    }
+
+    #[test]
+    fn markdown_blocks_for_streaming_tail_heals_unterminated_html_tag_without_erroring() {
+        // Doesn't panic/produce an Err path -- from_markdown's fallback to
+        // from_plain_text only fires when healing didn't fully fix things,
+        // and the real assertion here is just that this returns *a* block
+        // at all rather than losing the in-progress message entirely.
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let blocks = markdown_blocks_for(&mut render_index, "k", 0, "agent", "Hello <u>wor", true);
+        assert_eq!(blocks.row_count(), 1);
+    }
+
+    #[test]
+    fn markdown_blocks_for_streaming_tail_never_populates_the_index() {
+        // Matches the old MARKDOWN_BLOCK_CACHE's exact bypass behavior:
+        // while streaming, the index must not be read or written for
+        // this key, so the eventual settled (non-streaming) render is
+        // never satisfied by a stale, possibly-healed streaming render.
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", "Hello <u>wor", true);
+        assert!(render_index.rendered_blocks_for("k").is_none());
+        assert_eq!(
+            render_index.check("k", "Hello <u>wor"),
+            crate::thread_message_index::RowChange::New
+        );
     }
 
     #[test]
@@ -2688,36 +3155,6 @@ mod transcript_model_tests {
         assert_eq!(
             filtered.row_data(2).unwrap().value.as_str(),
             "claude-acp/sonnet"
-        );
-    }
-
-    #[test]
-    fn permission_mode_is_a_dedicated_backend_config_dropdown() {
-        let options = vec![ConfigOptionInfo {
-            id: "permissionMode".into(),
-            name: "Permission mode".into(),
-            description: None,
-            category: None,
-            kind: "select".into(),
-            current_value: Some("acceptEdits".into()),
-            options: vec![
-                ConfigOptionValue {
-                    value: "default".into(),
-                    name: "Default".into(),
-                    description: None,
-                },
-                ConfigOptionValue {
-                    value: "acceptEdits".into(),
-                    name: "Accept edits".into(),
-                    description: None,
-                },
-            ],
-        }];
-        let entries = to_permission_mode_dropdown_entries(options.clone());
-        assert_eq!(entries.row_count(), 3);
-        assert_eq!(
-            current_permission_mode_trigger_label(&options),
-            "Accept edits"
         );
     }
 

@@ -11,6 +11,10 @@
 //!   then one `agent_message_chunk` echoing the prompt text back
 //!   uppercased (so tests can assert on a known transformation instead of
 //!   just "some string arrived"), then responds `StopReason::EndTurn`.
+//!   A `"stream "`-prefixed prompt instead sends its body as several
+//!   partial `agent_message_chunk`s (fixed-size, mid-token splits
+//!   included) with a real delay between each -- see the prompt handler's
+//!   `"stream "` marker branch.
 //! - `session/list`: returns every session created so far, with a
 //!   `title`/`updated_at` that changes each time a prompt completes on it
 //!   (so cache-staleness tests have something real to diff against).
@@ -86,6 +90,10 @@ fn persona_commands() -> Vec<AvailableCommand> {
                 "Summarize the conversation (claude persona)",
             ),
         ],
+        "grok" => vec![AvailableCommand::new(
+            "grok_search",
+            "Search the web (grok persona)",
+        )],
         _ => Vec::new(),
     }
 }
@@ -115,6 +123,13 @@ struct SessionState {
     updated_at: String,
     turn_count: u64,
     replay_turns: Vec<ReplayTurn>,
+    /// pool-capability-fix regression coverage: this session's current
+    /// `"model"` configOption value, mutated only by a real `session/
+    /// set_config_option` call below -- lets an e2e test prove a pooled
+    /// session's config state really does persist across a lease
+    /// release/reacquire (or really doesn't, once `thread_actor.rs`
+    /// resets it before release).
+    model: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -254,6 +269,7 @@ async fn main() -> Result<()> {
                             updated_at: now_iso(),
                             turn_count: 0,
                             replay_turns: Vec::new(),
+                            model: "mock-model-a".to_string(),
                         },
                     );
                 });
@@ -409,6 +425,53 @@ async fn main() -> Result<()> {
                                     .respond(PromptResponse::new(StopReason::EndTurn));
                             }
                         }
+                    });
+                    return Ok(());
+                }
+                // markdown-render-cache-layer MCP-04 coverage: a
+                // `"stream "`-prefixed prompt sends its markdown body as
+                // several partial `agent_message_chunk`s (mid-token splits
+                // included) with a real delay between each, instead of the
+                // usual single complete chunk `send_replay` sends below --
+                // the only way a live e2e test can observe a genuinely
+                // unterminated trailing block (e.g. `"**bol"` before
+                // `"d**"` arrives) and confirm `heal_open_markers` +
+                // `markdown_worker`'s epoch/dedupe machinery behave the
+                // same live as they do against the synthetic partial
+                // strings the unit tests use. Chunk boundaries are fixed
+                // (every 6 bytes) rather than word-aligned so runs land
+                // mid-marker often, not just between words.
+                if let Some(marker_text) = text.strip_prefix("stream ") {
+                    let body = format!("{}{}", persona_prefix(), marker_text);
+                    let connection_for_stream = connection.clone();
+                    let session_id_for_stream = session_id.clone();
+                    tokio::spawn(async move {
+                        let bytes = body.as_bytes();
+                        const CHUNK_LEN: usize = 6;
+                        let mut sent = 0usize;
+                        while sent < bytes.len() {
+                            let end = (sent + CHUNK_LEN).min(bytes.len());
+                            // `body` is UTF-8; fall back to the next char
+                            // boundary if a fixed byte cut lands mid-codepoint.
+                            let mut end = end;
+                            while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                                end += 1;
+                            }
+                            let piece = String::from_utf8_lossy(&bytes[sent..end]).into_owned();
+                            let _ = connection_for_stream.send_notification(
+                                SessionNotification::new(
+                                    session_id_for_stream.clone(),
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(piece)),
+                                    )),
+                                ),
+                            );
+                            sent = end;
+                            if sent < bytes.len() {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                        }
+                        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                     });
                     return Ok(());
                 }
@@ -618,6 +681,75 @@ async fn main() -> Result<()> {
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            // pool-capability-fix regression coverage: `session/set_
+            // config_option` is a real, published ACP extension method
+            // (see `acpx-core/src/router.rs`'s `MethodClass::Proxied`
+            // comment) that this SDK's schema doesn't type -- acpx
+            // forwards it to the connected agent byte-for-byte, so this
+            // mock must actually answer it (not just advertise
+            // configOptions on `session/new`) for a pool-reuse-leak test
+            // to exercise the real wire path `thread_actor.rs`'s
+            // `Command::SetConfigOption` drives. Registered last (via
+            // the untyped fallback) so every method already claimed by a
+            // typed handler above is unaffected; anything this handler
+            // doesn't recognize is passed on to the `unhandled message`
+            // catch-all below exactly as before this was added.
+            async move |request: agent_client_protocol::UntypedMessage,
+                        responder: agent_client_protocol::Responder<serde_json::Value>,
+                        _connection| {
+                if request.method() != "session/set_config_option" {
+                    return Ok(agent_client_protocol::Handled::No {
+                        message: (request, responder),
+                        retry: false,
+                    });
+                }
+                let params = request.params();
+                let session_id = params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let config_id = params
+                    .get("configId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let value = params
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                record_gateway_event(
+                    "session/set_config_option",
+                    Some(&session_id),
+                    &format!("{config_id}={value}"),
+                );
+                let current = with_sessions(|sessions| {
+                    let Some(state) = sessions.get_mut(&session_id) else {
+                        return value.clone();
+                    };
+                    if config_id == "model" {
+                        state.model = value.clone();
+                    }
+                    state.model.clone()
+                });
+                responder.respond(serde_json::json!({
+                    "configOptions": [{
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "currentValue": current,
+                        "options": [
+                            {"value": "mock-model-a", "name": "Mock Model A"},
+                            {"value": "mock-model-b", "name": "Mock Model B"}
+                        ]
+                    }]
+                }))?;
+                Ok(agent_client_protocol::Handled::Yes)
+            },
+            agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {

@@ -53,7 +53,7 @@ pub use crate::protocol_types::{
 };
 pub use session_opener::{provider_profile_key, GatewaySessionOpener, NO_PROFILE_SENTINEL};
 pub use thread_actor::{
-    spawn_acpx_thread, spawn_acpx_thread_with_delayed_gateway,
+    parse_config_options, spawn_acpx_thread, spawn_acpx_thread_with_delayed_gateway,
     spawn_acpx_thread_with_delayed_gateway_and_pool, spawn_acpx_thread_with_gateway,
     spawn_acpx_thread_with_gateway_and_pool, AcpxThreadError, AcpxThreadGatewaySetter,
     AcpxThreadHandle, AttachedSession, ProfileSummary, RemoteThreadInfo, SharedSessionPool,

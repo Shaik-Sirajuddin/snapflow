@@ -46,6 +46,7 @@ done
 
 mkdir -p "$state_dir"/{acpx,panel,shotcut}
 fifo="$state_dir/acpx/stdin.fifo"
+rm -f "$fifo"
 mkfifo "$fifo"
 # Keep both ends open in this shell -- acpx-server's stdio transport must
 # not see EOF while its HTTP/WS transport is serving the embedded panel.
@@ -91,12 +92,25 @@ else
     unset PANEL_HOST_E2E_DOCK_WIDTH || true
 fi
 
+if command -v fluxbox >/dev/null 2>&1; then
+    mkdir -p "$state_dir/home"
+    HOME="$state_dir/home" fluxbox >"$state_dir/fluxbox.log" 2>&1 &
+    sleep 1
+fi
+
+mkdir -p "$state_dir/shotcut"
+if [ -f "$HOME/.config/Meltytech/Shotcut.conf" ]; then
+    cp "$HOME/.config/Meltytech/Shotcut.conf" "$state_dir/shotcut/Shotcut.conf"
+fi
+
+LIBGL_ALWAYS_SOFTWARE=1 \
+QT_QUICK_BACKEND=software \
 QSG_RENDER_LOOP=basic \
 RUI_PANEL_INPUT_TRACE=1 \
 RUI_ACP_CACHE_DIR="$state_dir/panel" \
 RUI_ACPX_CODEX_URL="http://127.0.0.1:$gateway_port" \
 RUI_ACPX_CLAUDE_URL="http://127.0.0.1:$gateway_port" \
-"$shotcut_bin" --appdata "$state_dir/shotcut" --noupgrade \
+"$shotcut_bin" --appdata "$state_dir/shotcut" --noupgrade --fullscreen ${PANEL_VNC_DEV_EXTRA_ARGS:-} \
     >"$state_dir/shotcut.stdout.log" \
     2>"$state_dir/shotcut.stderr.log" &
 shotcut_pid="$!"

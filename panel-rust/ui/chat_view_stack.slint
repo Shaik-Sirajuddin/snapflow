@@ -1,0 +1,355 @@
+import { ChatArea } from "chat_area.slint";
+import { ThreadViewItem, MessageItem, PendingRequestItem, TerminalItem, PlanEntryItem, LocalTerminalItem, DropdownEntry, SkillOption, McpServerOption } from "types.slint";
+
+// Retained ChatArea instances, one per durable thread. The stack deliberately
+// owns no transcript data: each delegate receives the Rc-backed model carried
+// by its ThreadViewItem and remains mounted while another delegate is visible.
+export component ChatViewStack inherits Rectangle {
+    clip: false;
+    in property <[ThreadViewItem]> views: [];
+    in property <[MessageItem]> fallback-messages: [];
+    in property <int> selected-index: 0;
+
+    in property <string> active-thread-name: "";
+    in property <string> active-thread-description: "";
+    in property <bool> active-thread-background: false;
+    in property <bool> has-older-messages: false;
+    in-out property <bool> loading-older-messages: false;
+    in property <string> agent-badge: "agent . ask";
+    in property <string> project-name: "";
+    in property <string> project-path: "";
+    in property <bool> project-mcp-live: false;
+    in property <bool> no-project: false;
+    in property <string> connection-status: "Connecting...";
+    in property <string> last-error: "";
+    in property <bool> agent-unauthenticated: false;
+    in property <[PlanEntryItem]> plan-entries: [];
+    in property <string> live-session-title: "";
+    in property <bool> sending: false;
+    in property <PendingRequestItem> pending-request;
+    in property <[TerminalItem]> terminals: [];
+    in property <LocalTerminalItem> local-terminal;
+    in-out property <string> compose-text: "";
+    in property <bool> inputs-enabled: true;
+    in property <[DropdownEntry]> mode-dropdown-entries: [];
+    in property <[DropdownEntry]> config-dropdown-entries: [];
+    in property <string> mode-trigger-label: "";
+    in property <string> config-trigger-label: "";
+    in property <[DropdownEntry]> reasoning-dropdown-entries: [];
+    in property <string> reasoning-trigger-label: "";
+    in property <[DropdownEntry]> profile-dropdown-entries: [];
+    in property <string> profile-trigger-label: "";
+    in property <bool> active-thread-has-session: false;
+    in property <bool> fast-mode-available: false;
+    in property <bool> fast-mode-enabled: false;
+    in property <string> fast-mode-option-id: "fastMode";
+    in property <string> fast-mode-on-value: "on";
+    in property <string> fast-mode-off-value: "off";
+    in property <float> context-ratio: 0.0;
+    in property <int> context-used-tokens: 0;
+    in property <int> context-limit-tokens: 0;
+    in property <[SkillOption]> skill-options: [];
+    in property <[SkillOption]> command-options: [];
+    in property <[McpServerOption]> mcp-options: [];
+    in property <[string]> file-options: [];
+    in property <bool> compact: true;
+    in property <bool> narrow: false;
+    in property <bool> sidebar-expanded: true;
+    in property <bool> rename-editing: false;
+    in property <string> rename-focus-target: "";
+    in-out property <string> rename-draft: "";
+
+    // Commands are broadcast as generations; only the selected delegate
+    // consumes them, so a hidden ChatArea cannot steal focus or approval.
+    property <int> focus-command: 0;
+    property <int> approve-command: 0;
+    property <int> reject-command: 0;
+
+    out property <bool> compose-has-focus: false;
+    out property <bool> local-terminal-has-focus: false;
+    out property <bool> secondary-text-input-has-focus: false;
+    out property <bool> has-pending-approval: false;
+
+    callback toggle-background();
+    callback load-older-requested();
+    callback mcp-connect-requested(string);
+    callback mcp-enabled-changed(string, bool);
+    callback md-link-activated(string);
+    callback error-banner-dismissed();
+    callback send-requested(string);
+    callback compose-draft-changed(string);
+    callback queue-fast-track-requested();
+    callback stop-requested();
+    callback terminals-clicked();
+    callback terminal-kill-requested(string);
+    callback queue-cancel-requested(int);
+    callback queue-edit-requested(int);
+    callback queue-send-now-requested(int);
+    callback queue-stop-requested();
+    callback settings-requested();
+    callback new-thread-requested();
+    callback thread-rename-started();
+    callback thread-rename-cancelled();
+    callback thread-rename-confirmed(string);
+    callback toggle-expanded(int);
+    callback copy-message(string);
+    callback approve-request();
+    callback reject-request();
+    callback permission-option-selected(string);
+    callback expand-terminal(string);
+    callback local-terminal-toggle-requested();
+    callback local-terminal-key-input(string);
+    callback local-terminal-expand-requested();
+    callback local-terminal-close-requested();
+    callback mode-selected(string);
+    callback config-option-selected(string, string);
+    callback profile-selected(string, string);
+    callback configure-provider-requested();
+    callback context-view-requested();
+    callback panel-shortcut(KeyEvent) -> EventResult;
+
+    public function restore-compose-focus() {
+        root.focus-command += 1;
+    }
+    public function approve-pending() {
+        root.approve-command += 1;
+    }
+    public function reject-pending() {
+        root.reject-command += 1;
+    }
+
+    // Keep a direct delegate for the legacy/headless fixture that supplies
+    // only `fallback-messages`. Slint's accessibility test backend does not
+    // expose every nested popup/action from a one-item repeater reliably;
+    // real retained threads use the repeater below.
+    if root.views.length == 0 : ChatArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        visible: root.visible;
+        compact: root.compact;
+        narrow: root.narrow;
+        sidebar-expanded: root.sidebar-expanded;
+        rename-editing: root.rename-editing;
+        rename-draft <=> root.rename-draft;
+        rename-focus-target: root.rename-focus-target;
+        active-thread-name: root.active-thread-name;
+        active-thread-description: root.active-thread-description;
+        active-thread-background: root.active-thread-background;
+        messages: root.fallback-messages;
+        tool-groups: [];
+        has-older-messages: root.has-older-messages;
+        loading-older-messages <=> root.loading-older-messages;
+        agent-badge: root.agent-badge;
+        project-name: root.project-name;
+        project-path: root.project-path;
+        project-mcp-live: root.project-mcp-live;
+        no-project: root.no-project;
+        connection-status: root.connection-status;
+        last-error: root.last-error;
+        agent-unauthenticated: root.agent-unauthenticated;
+        plan-entries: root.plan-entries;
+        live-session-title: root.live-session-title;
+        sending: root.sending;
+        pending-request: root.pending-request;
+        terminals: root.terminals;
+        local-terminal: root.local-terminal;
+        compose-text <=> root.compose-text;
+        compose-text-changed(text) => { root.compose-draft-changed(text); }
+        inputs-enabled: root.inputs-enabled;
+        mode-dropdown-entries: root.mode-dropdown-entries;
+        config-dropdown-entries: root.config-dropdown-entries;
+        mode-trigger-label: root.mode-trigger-label;
+        config-trigger-label: root.config-trigger-label;
+        reasoning-dropdown-entries: root.reasoning-dropdown-entries;
+        reasoning-trigger-label: root.reasoning-trigger-label;
+        profile-dropdown-entries: root.profile-dropdown-entries;
+        profile-trigger-label: root.profile-trigger-label;
+        active-thread-has-session: root.active-thread-has-session;
+        fast-mode-available: root.fast-mode-available;
+        fast-mode-enabled: root.fast-mode-enabled;
+        fast-mode-option-id: root.fast-mode-option-id;
+        fast-mode-on-value: root.fast-mode-on-value;
+        fast-mode-off-value: root.fast-mode-off-value;
+        context-ratio: root.context-ratio;
+        context-used-tokens: root.context-used-tokens;
+        context-limit-tokens: root.context-limit-tokens;
+        skill-options: root.skill-options;
+        command-options: root.command-options;
+        mcp-options: root.mcp-options;
+        file-options: root.file-options;
+        focus-command: root.focus-command;
+        approve-command: root.approve-command;
+        reject-command: root.reject-command;
+        changed compose-has-focus => { root.compose-has-focus = self.compose-has-focus; }
+        changed local-terminal-has-focus => { root.local-terminal-has-focus = self.local-terminal-has-focus; }
+        changed secondary-text-input-has-focus => { root.secondary-text-input-has-focus = self.secondary-text-input-has-focus; }
+        changed has-pending-approval => { root.has-pending-approval = self.has-pending-approval; }
+        changed focus-command => { self.restore-compose-focus(); }
+        changed approve-command => { self.approve-pending(); }
+        changed reject-command => { self.reject-pending(); }
+        toggle-background => { root.toggle-background(); }
+        load-older-requested => { root.load-older-requested(); }
+        mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
+        mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
+        md-link-activated(target) => { root.md-link-activated(target); }
+        error-banner-dismissed => { root.error-banner-dismissed(); }
+        send-requested(text) => { root.send-requested(text); }
+        queue-fast-track-requested => { root.queue-fast-track-requested(); }
+        stop-requested => { root.stop-requested(); }
+        terminals-clicked => { root.terminals-clicked(); }
+        terminal-kill-requested(id) => { root.terminal-kill-requested(id); }
+        queue-cancel-requested(i) => { root.queue-cancel-requested(i); }
+        queue-edit-requested(i) => { root.queue-edit-requested(i); }
+        queue-send-now-requested(i) => { root.queue-send-now-requested(i); }
+        queue-stop-requested => { root.queue-stop-requested(); }
+        settings-requested => { root.settings-requested(); }
+        new-thread-requested => { root.new-thread-requested(); }
+        thread-rename-started => { root.thread-rename-started(); }
+        thread-rename-cancelled => { root.thread-rename-cancelled(); }
+        thread-rename-confirmed(name) => { root.thread-rename-confirmed(name); }
+        toggle-expanded(i) => { root.toggle-expanded(i); }
+        copy-message(text) => { root.copy-message(text); }
+        approve-request => { root.approve-request(); }
+        reject-request => { root.reject-request(); }
+        permission-option-selected(id) => { root.permission-option-selected(id); }
+        expand-terminal(id) => { root.expand-terminal(id); }
+        local-terminal-toggle-requested => { root.local-terminal-toggle-requested(); }
+        local-terminal-key-input(text) => { root.local-terminal-key-input(text); }
+        local-terminal-expand-requested => { root.local-terminal-expand-requested(); }
+        local-terminal-close-requested => { root.local-terminal-close-requested(); }
+        mode-selected(id) => { root.mode-selected(id); }
+        config-option-selected(id, value) => { root.config-option-selected(id, value); }
+        profile-selected(id, agent) => { root.profile-selected(id, agent); }
+        configure-provider-requested => { root.configure-provider-requested(); }
+        context-view-requested => { root.context-view-requested(); }
+        panel-shortcut(event) => { return root.panel-shortcut(event); }
+    }
+
+    for view[index] in root.views : ChatArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        visible: root.visible && (root.views.length == 0 || index == root.selected-index);
+        compact: root.compact;
+        narrow: root.narrow;
+        sidebar-expanded: root.sidebar-expanded;
+        rename-editing: root.rename-editing;
+        rename-draft <=> root.rename-draft;
+        rename-focus-target: root.rename-focus-target;
+        active-thread-name: root.active-thread-name;
+        active-thread-description: root.active-thread-description;
+        active-thread-background: root.active-thread-background;
+        messages: view.messages;
+        tool-groups: view.tool-groups;
+        has-older-messages: root.has-older-messages;
+        loading-older-messages <=> root.loading-older-messages;
+        agent-badge: root.agent-badge;
+        project-name: root.project-name;
+        project-path: root.project-path;
+        project-mcp-live: root.project-mcp-live;
+        no-project: root.no-project;
+        connection-status: root.connection-status;
+        last-error: root.last-error;
+        agent-unauthenticated: root.agent-unauthenticated;
+        plan-entries: root.plan-entries;
+        live-session-title: root.live-session-title;
+        sending: root.sending;
+        pending-request: root.pending-request;
+        terminals: root.terminals;
+        local-terminal: root.local-terminal;
+        // Each retained ChatArea owns its composer buffer. Do not bind this
+        // to the stack-level fallback property: doing so makes hidden views
+        // observe and overwrite the selected thread's draft.
+        compose-text: view.compose-text;
+        compose-text-changed(text) => {
+            if (index == root.selected-index) { root.compose-draft-changed(text); }
+        }
+        inputs-enabled: root.inputs-enabled;
+        mode-dropdown-entries: root.mode-dropdown-entries;
+        config-dropdown-entries: root.config-dropdown-entries;
+        mode-trigger-label: root.mode-trigger-label;
+        config-trigger-label: root.config-trigger-label;
+        reasoning-dropdown-entries: root.reasoning-dropdown-entries;
+        reasoning-trigger-label: root.reasoning-trigger-label;
+        profile-dropdown-entries: root.profile-dropdown-entries;
+        profile-trigger-label: root.profile-trigger-label;
+        active-thread-has-session: root.active-thread-has-session;
+        fast-mode-available: root.fast-mode-available;
+        fast-mode-enabled: root.fast-mode-enabled;
+        fast-mode-option-id: root.fast-mode-option-id;
+        fast-mode-on-value: root.fast-mode-on-value;
+        fast-mode-off-value: root.fast-mode-off-value;
+        context-ratio: root.context-ratio;
+        context-used-tokens: root.context-used-tokens;
+        context-limit-tokens: root.context-limit-tokens;
+        skill-options: root.skill-options;
+        command-options: root.command-options;
+        mcp-options: root.mcp-options;
+        file-options: root.file-options;
+        focus-command: root.focus-command;
+        approve-command: root.approve-command;
+        reject-command: root.reject-command;
+
+        changed compose-has-focus => {
+            if (root.views.length == 0 || index == root.selected-index) { root.compose-has-focus = self.compose-has-focus; }
+        }
+        changed local-terminal-has-focus => {
+            if (root.views.length == 0 || index == root.selected-index) { root.local-terminal-has-focus = self.local-terminal-has-focus; }
+        }
+        changed secondary-text-input-has-focus => {
+            if (root.views.length == 0 || index == root.selected-index) { root.secondary-text-input-has-focus = self.secondary-text-input-has-focus; }
+        }
+        changed has-pending-approval => {
+            if (root.views.length == 0 || index == root.selected-index) { root.has-pending-approval = self.has-pending-approval; }
+        }
+        changed focus-command => {
+            if (root.views.length == 0 || index == root.selected-index) { self.restore-compose-focus(); }
+        }
+        changed approve-command => {
+            if (root.views.length == 0 || index == root.selected-index) { self.approve-pending(); }
+        }
+        changed reject-command => {
+            if (root.views.length == 0 || index == root.selected-index) { self.reject-pending(); }
+        }
+
+        toggle-background => { if (index == root.selected-index) { root.toggle-background(); } }
+        load-older-requested => { if (index == root.selected-index) { root.load-older-requested(); } }
+        mcp-connect-requested(name) => { if (index == root.selected-index) { root.mcp-connect-requested(name); } }
+        mcp-enabled-changed(name, enabled) => { if (index == root.selected-index) { root.mcp-enabled-changed(name, enabled); } }
+        md-link-activated(target) => { if (index == root.selected-index) { root.md-link-activated(target); } }
+        error-banner-dismissed => { if (index == root.selected-index) { root.error-banner-dismissed(); } }
+        send-requested(text) => { if (index == root.selected-index) { root.send-requested(text); } }
+        queue-fast-track-requested => { if (index == root.selected-index) { root.queue-fast-track-requested(); } }
+        stop-requested => { if (index == root.selected-index) { root.stop-requested(); } }
+        terminals-clicked => { if (index == root.selected-index) { root.terminals-clicked(); } }
+        terminal-kill-requested(id) => { if (index == root.selected-index) { root.terminal-kill-requested(id); } }
+        queue-cancel-requested(i) => { if (index == root.selected-index) { root.queue-cancel-requested(i); } }
+        queue-edit-requested(i) => { if (index == root.selected-index) { root.queue-edit-requested(i); } }
+        queue-send-now-requested(i) => { if (index == root.selected-index) { root.queue-send-now-requested(i); } }
+        queue-stop-requested => { if (index == root.selected-index) { root.queue-stop-requested(); } }
+        settings-requested => { if (index == root.selected-index) { root.settings-requested(); } }
+        new-thread-requested => { if (index == root.selected-index) { root.new-thread-requested(); } }
+        thread-rename-started => { if (index == root.selected-index) { root.thread-rename-started(); } }
+        thread-rename-cancelled => { if (index == root.selected-index) { root.thread-rename-cancelled(); } }
+        thread-rename-confirmed(name) => { if (index == root.selected-index) { root.thread-rename-confirmed(name); } }
+        toggle-expanded(i) => { if (index == root.selected-index) { root.toggle-expanded(i); } }
+        copy-message(text) => { if (index == root.selected-index) { root.copy-message(text); } }
+        approve-request => { if (index == root.selected-index) { root.approve-request(); } }
+        reject-request => { if (index == root.selected-index) { root.reject-request(); } }
+        permission-option-selected(id) => { if (index == root.selected-index) { root.permission-option-selected(id); } }
+        expand-terminal(id) => { if (index == root.selected-index) { root.expand-terminal(id); } }
+        local-terminal-toggle-requested => { if (index == root.selected-index) { root.local-terminal-toggle-requested(); } }
+        local-terminal-key-input(text) => { if (index == root.selected-index) { root.local-terminal-key-input(text); } }
+        local-terminal-expand-requested => { if (index == root.selected-index) { root.local-terminal-expand-requested(); } }
+        local-terminal-close-requested => { if (index == root.selected-index) { root.local-terminal-close-requested(); } }
+        mode-selected(id) => { if (index == root.selected-index) { root.mode-selected(id); } }
+        config-option-selected(id, value) => { if (index == root.selected-index) { root.config-option-selected(id, value); } }
+        profile-selected(id, agent) => { if (index == root.selected-index) { root.profile-selected(id, agent); } }
+        configure-provider-requested => { if (index == root.selected-index) { root.configure-provider-requested(); } }
+        context-view-requested => { if (index == root.selected-index) { root.context-view-requested(); } }
+        panel-shortcut(event) => { return root.panel-shortcut(event); }
+    }
+}

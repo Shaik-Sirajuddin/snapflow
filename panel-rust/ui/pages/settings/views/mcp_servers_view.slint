@@ -63,6 +63,7 @@ export component McpServersView inherits Rectangle {
 
         SettingsRowGroup {
             width: parent.width;
+            cross-axis-alignment: start;
 
             for server in root.servers : server-block := VerticalLayout {
                 width: parent.width;
@@ -189,6 +190,8 @@ export component McpServersView inherits Rectangle {
                         padding: Metrics.pad-md;
                         padding-left: Metrics.pad-lg;
                         spacing: Metrics.gap-sm;
+                        alignment: start;
+                        cross-axis-alignment: start;
 
                         for tool in server.tools : HorizontalLayout {
                             spacing: Metrics.gap-md;
@@ -239,6 +242,7 @@ export component McpServersView inherits Rectangle {
             // `gap-sm` (6px) -- gap between the two add-server fields and
             // the Add button.
             spacing: Metrics.gap-sm;
+            alignment: start;
             cross-axis-alignment: center;
             new-mcp-name-field := TextField {
                 horizontal-stretch: 1;

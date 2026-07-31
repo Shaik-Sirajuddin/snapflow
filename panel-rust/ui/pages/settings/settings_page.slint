@@ -49,6 +49,7 @@ export component SettingsPage inherits Rectangle {
     // conditional element (`if root.active-section == "mcp_servers"`)
     // that can't be referenced directly outside its own scope.
     property <bool> mcp-servers-focus-mirror: false;
+    property <bool> skills-search-focus-mirror: false;
     changed active-section => {
         if (self.active-section != "agents") {
             self.agents-search-focus-mirror = false;
@@ -56,9 +57,13 @@ export component SettingsPage inherits Rectangle {
         if (self.active-section != "mcp_servers") {
             self.mcp-servers-focus-mirror = false;
         }
+        if (self.active-section != "skills") {
+            self.skills-search-focus-mirror = false;
+        }
     }
     out property <bool> search-has-focus:
-        top-search-bar.input-has-focus || agents-search-focus-mirror || mcp-servers-focus-mirror;
+        top-search-bar.input-has-focus || agents-search-focus-mirror
+        || mcp-servers-focus-mirror || skills-search-focus-mirror;
 
     // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
     // call site only needs its component name + import swapped.
@@ -304,9 +309,13 @@ export component SettingsPage inherits Rectangle {
                         if root.active-section == "skills" : SkillsView {
                             width: parent.width;
                             skills: root.available-skills;
+                            page-search-query <=> root.search-query;
                             dev-mode: root.dev-mode;
                             skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
                             dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
+                            changed search-has-focus => {
+                                root.skills-search-focus-mirror = self.search-has-focus;
+                            }
                         }
                     }
                 }

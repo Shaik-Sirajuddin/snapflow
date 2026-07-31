@@ -1,7 +1,8 @@
 import { Theme } from "tokens/theme.slint";
-import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, PlanEntryItem, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { MarkdownLine, ThreadItem, ThreadViewItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, PlanEntryItem, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
+import { ChatViewStack } from "chat_view_stack.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
 import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
 import { SettingsPage } from "pages/settings/settings_page.slint";
@@ -9,7 +10,7 @@ import { SkillEditorView } from "pages/skills/skill_view.slint";
 import { TextUtil } from "base/text_util.slint";
 import { CursorHost } from "tokens/cursor_host.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme, CursorHost }
+export { ThreadItem, ThreadViewItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme, CursorHost }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -34,7 +35,7 @@ export component ChatPanel inherits Window {
     // Forward window focus into the keybinding FocusScope so panel
     // shortcuts work even when no TextInput currently owns focus.
     forward-focus: panel-keys;
-    out property <bool> compose-has-focus: chat-area.compose-has-focus;
+    out property <bool> compose-has-focus: chat-views.compose-has-focus || legacy-chat-area.compose-has-focus;
     // Aggregates every editable Slint surface's own focus state besides
     // compose/local-terminal (thread search, skill search -- both share
     // Sidebar's one thread-search FilterSearchBar instance) -- see
@@ -62,14 +63,17 @@ export component ChatPanel inherits Window {
     }
     out property <bool> secondary-text-input-has-focus:
         sidebar.search-has-focus
-        || chat-area.secondary-text-input-has-focus
+        || chat-views.secondary-text-input-has-focus
+        || legacy-chat-area.secondary-text-input-has-focus
         || settings-page-instance.search-has-focus
         || skill-editor-focus-mirror;
     out property <bool> local-terminal-has-focus:
-        chat-area.local-terminal-has-focus
+        chat-views.local-terminal-has-focus
+        || legacy-chat-area.local-terminal-has-focus
         || (local-terminal-overlay-open && local-terminal-overlay.has-focus);
     in-out property <int> selected-thread: 0;
     in-out property <[ThreadItem]> threads: [];
+    in-out property <[ThreadViewItem]> thread-views: [];
     in-out property <[MessageItem]> messages: [];
     // Phase 3 paging state -- forwarded to the message Flickable so a
     // top-edge gesture cannot queue duplicate predecessor-page loads.
@@ -253,7 +257,8 @@ export component ChatPanel inherits Window {
     callback thread-archive-requested(int);
     callback thread-rename-requested(int, string);
     callback search-submitted(string, bool, bool);
-    callback send-requested();
+    callback send-requested(string);
+    callback compose-draft-changed(string);
     callback queue-fast-track-requested();
     callback stop-requested();
     callback queue-cancel-requested(int);
@@ -355,7 +360,7 @@ export component ChatPanel inherits Window {
         running: root.pending-compose-focus;
         triggered => {
             root.pending-compose-focus = false;
-            chat-area.restore-compose-focus();
+            root.restore-active-compose-focus();
         }
     }
 
@@ -372,6 +377,28 @@ export component ChatPanel inherits Window {
     // Shared target for Ctrl+K and the C++-side global "focus thread
     // search" command (`panel_rust_invoke_command`'s open-search case),
     // so both paths stay in sync with whatever "open search" means here.
+    public function restore-active-compose-focus() {
+        if (root.thread-views.length > 0) {
+            chat-views.restore-compose-focus();
+        } else {
+            legacy-chat-area.restore-compose-focus();
+        }
+    }
+    public function approve-active-pending() {
+        if (root.thread-views.length > 0) {
+            chat-views.approve-pending();
+        } else {
+            legacy-chat-area.approve-pending();
+        }
+    }
+    public function reject-active-pending() {
+        if (root.thread-views.length > 0) {
+            chat-views.reject-pending();
+        } else {
+            legacy-chat-area.reject-pending();
+        }
+    }
+
     public function open-thread-search() {
         sidebar.open-search();
     }
@@ -384,25 +411,25 @@ export component ChatPanel inherits Window {
         // settings sheet. Always wins over type-to-compose.
         if (event.text == Key.Escape) {
             // Host pending OR local `/demo-permission` card.
-            if (pending-request.active || chat-area.has-pending-approval) {
-                chat-area.reject-pending();
+            if (pending-request.active || chat-views.has-pending-approval) {
+                root.reject-active-pending();
                 return EventResult.accept;
             }
             if (expanded-terminal.terminal-id != "") {
                 expanded-terminal = { terminal-id: "" };
                 close-terminal-overlay();
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
                 return EventResult.accept;
             }
             if (local-terminal-overlay-open) {
                 local-terminal-overlay-open = false;
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
                 return EventResult.accept;
             }
             if (settings-open) {
                 settings-open = false;
                 settings-close();
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
                 return EventResult.accept;
             }
             return EventResult.reject;
@@ -444,8 +471,8 @@ export component ChatPanel inherits Window {
             }
             // Ctrl+Enter -- first allow option (host or local demo card).
             if ((event.text == Key.Return || event.text == "\n")
-                && (pending-request.active || chat-area.has-pending-approval)) {
-                chat-area.approve-pending();
+                && (pending-request.active || chat-views.has-pending-approval)) {
+                root.approve-active-pending();
                 return EventResult.accept;
             }
         }
@@ -521,9 +548,136 @@ export component ChatPanel inherits Window {
                     sidebar-expanded = true;
                 }
             }
-            chat-area := ChatArea {
+            chat-views := ChatViewStack {
+                views: thread-views;
+                fallback-messages: messages;
+                selected-index: thread-views.length > 0 ? selected-thread : 0;
                 no-project: !root.gateway-ready;
-                visible: root.active-pane == "chat";
+                visible: root.active-pane == "chat" && root.thread-views.length > 0;
+                x: sidebar.width;
+                y: 0px;
+                width: root.width - self.x;
+                height: parent.height;
+                compact: compact;
+                narrow: root.narrow;
+                sidebar-expanded: sidebar-expanded;
+                rename-editing: root.rename-thread-index == selected-thread;
+                rename-draft <=> root.rename-thread-draft;
+                rename-focus-target: root.rename-focus-target;
+                active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
+                active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
+                active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
+                toggle-background => { thread-toggle-background(selected-thread); }
+                has-older-messages: has-older-messages;
+                loading-older-messages <=> loading-older-messages;
+                load-older-requested => { load-older-requested(); }
+                // `default_variables_display` phase: `agent-badge` used to
+                // be a static "agent . ask" default that nothing ever set
+                // from Rust, so it never reflected the active thread's real
+                // provider/model or updated on model selection. Derived
+                // here instead, the same way `active-thread-name`/
+                // `active-thread-description` already are, from the same
+                // live per-thread `provider`/`model` fields the sidebar row
+                // already shows -- always current, no separate Rust-side
+                // property push needed.
+                agent-badge: threads.length > 0 && threads[selected-thread].provider != ""
+                    ? threads[selected-thread].provider
+                        + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
+                    : "agent . ask";
+                inputs-enabled: root.gateway-ready
+                    && !(threads.length > 0 && threads[selected-thread].archived);
+                mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
+                mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
+                // Phase 16: project indicator from the selected thread's
+                // live fields (project_* post-populated from the bridge;
+                // connection-status is the live MCP/agent link state).
+                project-name: threads.length > 0 ? threads[selected-thread].project-name : "";
+                project-path: threads.length > 0 ? threads[selected-thread].project-path : "";
+                // Live values from the bridge: "Live connection" (WS interactive)
+                // counts as live; "HTTP fallback"/"Connecting..." do not.
+                project-mcp-live: connection-status == "Live connection";
+                md-link-activated(target) => { root.md-link-activated(target); }
+                connection-status: connection-status;
+                last-error: last-error;
+                error-banner-dismissed => { error-banner-dismissed(); }
+                agent-unauthenticated: agent-unauthenticated;
+                plan-entries: plan-entries;
+                live-session-title: live-session-title;
+                sending: threads.length > 0
+                    ? threads[selected-thread].status == "loading"
+                        || threads[selected-thread].status == "cancelling"
+                    : false;
+                compose-text <=> compose-text;
+                send-requested(text) => { send-requested(text); }
+                compose-draft-changed(text) => { compose-draft-changed(text); }
+                queue-fast-track-requested => { queue-fast-track-requested(); }
+                stop-requested => { stop-requested(); }
+                queue-cancel-requested(i) => { queue-cancel-requested(i); }
+                queue-edit-requested(i) => { queue-edit-requested(i); }
+                queue-send-now-requested(i) => { queue-send-now-requested(i); }
+                queue-stop-requested => { queue-stop-requested(); }
+                settings-requested => { root.open-settings(); }
+                new-thread-requested => { root.start-new-thread(); }
+                thread-rename-started => {
+                    root.begin-thread-rename(selected-thread, "chat");
+                }
+                thread-rename-cancelled => { root.cancel-thread-rename(); }
+                thread-rename-confirmed(name) => {
+                    root.confirm-thread-rename(selected-thread, name);
+                }
+                toggle-expanded(i) => { toggle-expanded(i); }
+                copy-message(text) => { copy-message(text); }
+                pending-request: pending-request;
+                approve-request => { approve-request(); }
+                reject-request => { reject-request(); }
+                permission-option-selected(option-id) => { permission-option-selected(option-id); }
+                terminals: terminals;
+                expand-terminal(id) => { expand-terminal(id); }
+                terminal-kill-requested(id) => { terminal-kill-requested(id); }
+                local-terminal: local-terminal;
+                local-terminal-toggle-requested => { local-terminal-toggle-requested(); }
+                local-terminal-key-input(text) => { local-terminal-key-input(text); }
+                local-terminal-expand-requested => { local-terminal-overlay-open = true; }
+                local-terminal-close-requested => { local-terminal-close-requested(); }
+                mode-dropdown-entries: mode-dropdown-entries;
+                config-dropdown-entries: config-dropdown-entries;
+                mode-trigger-label: mode-trigger-label;
+                config-trigger-label: config-trigger-label;
+                reasoning-dropdown-entries: reasoning-dropdown-entries;
+                reasoning-trigger-label: reasoning-trigger-label;
+                profile-dropdown-entries: profile-dropdown-entries;
+                profile-trigger-label: profile-trigger-label;
+                active-thread-has-session: active-thread-has-session;
+                fast-mode-available: fast-mode-available;
+                fast-mode-enabled: fast-mode-enabled;
+                fast-mode-option-id: fast-mode-option-id;
+                fast-mode-on-value: fast-mode-on-value;
+                fast-mode-off-value: fast-mode-off-value;
+                context-ratio: context-ratio;
+                context-used-tokens: context-used-tokens;
+                context-limit-tokens: context-limit-tokens;
+                skill-options: available-skills;
+                command-options: available-commands;
+                mcp-options: available-mcp-servers;
+                file-options: file-options;
+                mode-selected(id) => { mode-selected(id); }
+                config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+                profile-selected(id, agent) => { profile-selected(id, agent); }
+                configure-provider-requested => {
+                    root.settings-active-section = "agents";
+                    root.open-settings();
+                    root.configure-provider-requested();
+                }
+                context-view-requested => { context-view-requested(); }
+                // Compose owns focus for typing -- re-dispatch panel chords
+                // so Ctrl+B/N/K/, and Escape still work while composing.
+                panel-shortcut(event) => {
+                    return root.handle-panel-shortcut(event);
+                }
+            }
+            legacy-chat-area := ChatArea {
+                no-project: !root.gateway-ready;
+                visible: root.active-pane == "chat" && root.thread-views.length == 0;
                 x: sidebar.width;
                 y: 0px;
                 width: root.width - self.x;
@@ -579,7 +733,7 @@ export component ChatPanel inherits Window {
                         || threads[selected-thread].status == "cancelling"
                     : false;
                 compose-text <=> compose-text;
-                send-requested => { send-requested(); }
+                send-requested(text) => { send-requested(text); }
                 queue-fast-track-requested => { queue-fast-track-requested(); }
                 stop-requested => { stop-requested(); }
                 queue-cancel-requested(i) => { queue-cancel-requested(i); }
@@ -715,7 +869,7 @@ export component ChatPanel inherits Window {
             close => {
                 expanded-terminal = { terminal-id: "" };
                 close-terminal-overlay();
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
             }
             tab-selected(id) => { root.terminal-tab-selected(id); }
             tab-closed(id) => { root.terminal-tab-closed(id); }
@@ -727,12 +881,12 @@ export component ChatPanel inherits Window {
             container-height: root.height;
             close => {
                 local-terminal-overlay-open = false;
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
             }
             close-requested => {
                 local-terminal-overlay-open = false;
                 local-terminal-close-requested();
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
             }
             key-input(text) => { local-terminal-key-input(text); }
         }
@@ -785,7 +939,7 @@ export component ChatPanel inherits Window {
             close => {
                 settings-open = false;
                 settings-close();
-                chat-area.restore-compose-focus();
+                root.restore-active-compose-focus();
             }
             mcp-server-create(name, command) => { mcp-server-create(name, command); }
             mcp-server-delete(name) => { mcp-server-delete(name); }

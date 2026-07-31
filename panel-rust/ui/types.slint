@@ -73,7 +73,6 @@ export struct ThreadItem {
     has-session: bool,
 }
 
-
 // Streaming markdown (from streaming-markdown-slint): visual lines/runs.
 export struct MarkdownRun {
     text: string,
@@ -99,6 +98,21 @@ export struct MarkdownLine {
     plain-text: string,
 }
 
+// Architecture v2 (markdown-thread-freeze-fix phase 3): one native
+// StyledText per markdown block instead of Rust-computed wrap. See
+// memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+// "Architecture v2" section. `kind` selects which of `text`/`table-cells`/
+// `code-text` is populated; the others stay at their default (empty).
+export struct MarkdownBlock {
+    kind: string, // "text" | "table" | "code" | "rule"
+    text: styled-text, // used when kind == "text" -- headings/paragraphs/quotes/list items
+    default-font-size: length, // set per heading level; 0px = inherit MarkdownView's default
+    indent: int,
+    table-cells: [styled-text], // used when kind == "table", row-major flat list
+    table-col-count: int,
+    code-text: string, // used when kind == "code" -- verbatim, routed through TerminalLogBlock
+}
+
 export struct MessageItem {
     // chat-items-redesign.md #5/#11: "tool-call" is being retired in
     // favor of the finer taxonomy `models::classify_tool_call_kind`
@@ -111,6 +125,12 @@ export struct MessageItem {
     // Default agent bodies: pre-parsed streaming markdown visual lines.
     // Empty => MarkdownView falls back to plain `text`.
     markdown-lines: [MarkdownLine],
+    // Architecture v2 (markdown-thread-freeze-fix phase 3): when
+    // non-empty, MarkdownView should prefer this over `markdown-lines`
+    // -- one native StyledText per block, no Rust-computed wrap. Both
+    // fields coexist during the migration so existing call sites/tests
+    // depending on `markdown-lines` are undisturbed.
+    markdown-blocks: [MarkdownBlock],
     // Phase 3: tool-call execution status, already-uppercased display
     // text (e.g. "COMPLETED") or "" for non-tool-call kinds / messages
     // cached before this field existed -- monochrome text badge only,
@@ -167,6 +187,28 @@ export struct MessageItem {
     // ladder of `if`s. 0 for every other row, including non-start members
     // of the same run.
     tool-group-len: int,
+}
+
+export struct ToolGroupItem {
+    label: string,
+    item-count: int,
+    messages: [MessageItem],
+}
+
+// One durable thread identity plus its stable observable message model.
+// The model is supplied by Rust and is never replaced during a thread
+// switch; only the selected view/model reference changes.
+export struct ThreadViewItem {
+    thread-id: string,
+    messages: [MessageItem],
+    // One slot per message index. Tool-group starts contain a compact
+    // group-local model; non-start slots are empty placeholders so a
+    // message row resolves its group without scanning groups.
+    tool-groups: [ToolGroupItem],
+    // Unsaved composer text belongs to the retained thread view, not to a
+    // shared ChatViewStack buffer. Rust mirrors this value in
+    // ThreadModel.compose_draft for persistence across selection changes.
+    compose-text: string,
 }
 
 // One choice in a pending approval — ACP `PermissionOption` shape

@@ -171,6 +171,147 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
     // May also clear messages/terminals/pending/compose on real switch
     // (leak_audit_report thread_switch_sync_clear_models).
     let _ = dirty;
+
+    // markdown-render-cache-layer plan, Phase 7 trigger-wiring: warm
+    // every OTHER thread's markdown cache in the background now that
+    // selection has settled. Deliberately not the just-selected thread
+    // itself -- the synchronous path above (via dispatch_frame_input's
+    // snapshot fold) already rendered it this same frame, so there would
+    // be nothing left to prewarm there; every sibling thread's own
+    // per-tick synchronous render only ever runs while THAT thread is
+    // selected, so this is the only place their markdown otherwise gets
+    // rendered ahead of an actual switch to them.
+    let selected_id = {
+        let model = panel.model.borrow();
+        model.threads.get(model.selected_thread).map(|t| t.thread_id.clone())
+    };
+    if let Some(selected_id) = selected_id {
+        spawn_markdown_prewarm_for_other_threads(panel, &selected_id);
+    }
+}
+
+/// See `dispatch_thread_selected`'s call site comment. Spawns one
+/// background render per other thread that has at least one agent
+/// message not yet cached in its own `ThreadMessageIndex`.
+fn spawn_markdown_prewarm_for_other_threads(panel: &PanelSingleton, just_selected_thread_id: &str) {
+    let other_thread_ids: Vec<String> = panel
+        .model
+        .borrow()
+        .threads
+        .iter()
+        .map(|t| t.thread_id.clone())
+        .filter(|id| id != just_selected_thread_id)
+        .collect();
+    for thread_id in other_thread_ids {
+        spawn_markdown_prewarm_for_thread(panel, &thread_id);
+    }
+}
+
+/// Pure filter, factored out of `spawn_markdown_prewarm_for_thread` so it's
+/// unit-testable without a real `PanelSingleton`/Slint window: which of
+/// `thread`'s own agent messages don't yet have a cached render. Empty
+/// result means "nothing to prewarm," the caller's cue to skip spawning
+/// entirely rather than pay for an OS-thread-pool submission that would
+/// immediately call `on_done` with zero chunks.
+///
+/// `rows` is taken explicitly rather than read off `thread.message_rows`:
+/// that field is test-only now (main's retained-per-thread-ChatView
+/// architecture -- production rows live in `Model::thread_view_models`'s
+/// Slint-side `VecModel`, not a Rust-side row cache). The caller resolves
+/// the real rows from there; tests pass `&thread.message_rows` directly.
+fn messages_needing_prewarm(
+    thread: &crate::model::ThreadModel,
+    rows: &[crate::MessageItem],
+) -> Vec<(String, String)> {
+    thread
+        .transcript_keys
+        .iter()
+        .zip(rows.iter())
+        .filter(|(_, row)| row.kind.as_str() == "agent")
+        .filter(|(key, _)| thread.markdown_render_index.borrow().rendered_blocks_for(key).is_none())
+        .map(|(key, row)| (key.clone(), row.text.to_string()))
+        .collect()
+}
+
+/// markdown-render-cache-layer plan, Phase 7 trigger-wiring: spawns a
+/// background render for `thread_id`'s not-yet-rendered agent messages.
+/// Purely additive -- the synchronous path (`models.rs`'s
+/// `markdown_lines_for`/`markdown_blocks_for`, already wired into every
+/// poll tick for the *selected* thread) remains the sole source of what
+/// is actually shown on screen; this only warms/re-confirms the
+/// per-thread cache via the real `Msg::MarkdownBlocksReady` delivery
+/// pipeline (Phase 2), so a later switch to `thread_id` can hit that
+/// cache instead of parsing cold. Skips entirely (spawns nothing) once
+/// every agent message already has a cached render -- the steady-state
+/// case for a thread that's already been visited or prewarmed once.
+fn spawn_markdown_prewarm_for_thread(panel: &PanelSingleton, thread_id: &str) {
+    let (epoch, epoch_counter, in_flight, messages) = {
+        let model = panel.model.borrow();
+        let Some(thread) = model.threads.iter().find(|t| t.thread_id == thread_id) else {
+            return;
+        };
+        let Some(view_model) = model.thread_view_models.get(thread_id) else {
+            return;
+        };
+        let rows: Vec<crate::MessageItem> = {
+            use slint::Model;
+            (0..view_model.row_count())
+                .filter_map(|i| view_model.row_data(i))
+                .collect()
+        };
+        let messages = messages_needing_prewarm(thread, &rows);
+        if messages.is_empty() {
+            return;
+        }
+        let epoch_counter = thread.markdown_epoch.clone();
+        let in_flight = thread.markdown_in_flight.clone();
+        let epoch = epoch_counter.bump();
+        (epoch, epoch_counter, in_flight, messages)
+    };
+
+    crate::trace_host_input(format_args!(
+        "markdown prewarm spawn thread={thread_id} epoch={epoch} messages={}",
+        messages.len()
+    ));
+
+    let thread_id_owned = thread_id.to_string();
+    let deliver = |job: Box<dyn FnOnce() + Send>| {
+        let _ = slint::invoke_from_event_loop(move || job());
+    };
+    let on_chunk = move |chunk: crate::markdown_worker::MessageBlocksChunk, ack: Box<dyn FnOnce() + Send>| {
+        crate::PANEL.with(|cell| {
+            let slot = cell.borrow();
+            if let Some(panel) = slot.as_ref() {
+                for (message_key, source_hash, blocks) in chunk.messages {
+                    update_persistent(
+                        panel,
+                        Msg::Effect(crate::effect::EffectResultMsg::MarkdownBlocksReady {
+                            thread_id: chunk.thread_id.clone(),
+                            message_key,
+                            source_hash,
+                            blocks,
+                        }),
+                    );
+                }
+            }
+        });
+        ack();
+    };
+    let on_done = |thread_id: String, epoch: u64| {
+        crate::trace_host_input(format_args!("markdown prewarm done thread={thread_id} epoch={epoch}"));
+    };
+
+    crate::markdown_worker::spawn_background_render_pooled(
+        &panel.markdown_render_pool,
+        thread_id_owned,
+        epoch,
+        epoch_counter,
+        in_flight,
+        messages,
+        deliver,
+        on_chunk,
+        on_done,
+    );
 }
 
 /// Wired from `component.on_thread_navigation_requested`. `delta` is
@@ -477,18 +618,33 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
             .as_ref()
             .is_some_and(|bridge| bridge.is_deferred(real_idx));
         if is_deferred {
-            let (provider, profile) = {
+            let (provider, profile, desired_config_options) = {
                 let model = panel.model.borrow();
                 match model.threads.get(real_idx) {
-                    Some(thread) => (thread.provider.clone(), thread.profile_name.clone()),
-                    None => (String::new(), None),
+                    Some(thread) => (
+                        thread.provider.clone(),
+                        thread.profile_name.clone(),
+                        thread
+                            .config_options
+                            .iter()
+                            .filter_map(|option| {
+                                option.current_value.as_ref().map(|value| {
+                                    (option.id.clone(), serde_json::Value::String(value.clone()))
+                                })
+                            })
+                            .collect(),
+                    ),
+                    None => (String::new(), None, Vec::new()),
                 }
             };
             if let Some(bridge) = panel.bridge.as_mut() {
                 let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
-                if let Err(error) =
-                    bridge.attach_deferred_thread(real_idx, provider_arg, profile.as_deref())
-                {
+                if let Err(error) = bridge.attach_deferred_thread_with_config_options(
+                    real_idx,
+                    provider_arg,
+                    profile.as_deref(),
+                    desired_config_options,
+                ) {
                     // Surface attach failure the same shape a failed eager
                     // attach would: mark the thread errored via the reducer.
                     let _ = update_persistent(
@@ -506,6 +662,16 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
         }
     }
     dispatch_compose_send(panel, filtered_idx, text);
+}
+
+/// Persists live unsent composer text into the selected thread immediately.
+/// The retained ChatArea remains the UI source of truth while this reducer
+/// mirror lets thread switching and send/restore flows use durable Rust state.
+pub(crate) fn dispatch_compose_draft_changed(panel: &PanelSingleton, text: String) {
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::DraftChanged(text))),
+    );
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
@@ -1129,7 +1295,7 @@ pub(crate) fn dispatch_profile_selected(
     profile_name: String,
     agent_id: String,
 ) {
-    let (effects, _) = update_persistent(
+    let (effects, dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
             profile_name,
@@ -1137,6 +1303,13 @@ pub(crate) fn dispatch_profile_selected(
         })),
     );
     execute_effects(panel, effects);
+    let selected_thread_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_selected_thread_snapshot();
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot,
+        ..crate::msg::FrameInput::default()
+    });
+    let _ = dirty;
 }
 
 pub(crate) fn dispatch_config_option_selected(
@@ -1246,7 +1419,16 @@ pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
         panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::ErrorBannerDismissed)),
     );
-    debug_assert!(dirty.iter().any(|item| matches!(item, Dirty::Error { .. })));
+    // `ChromeMsg::ErrorBannerDismissed`'s reducer arm legitimately returns
+    // empty dirty when there is no genuinely selected/visible thread right
+    // now (see `selected_real_index`'s doc comment) -- this used to assert
+    // unconditionally, which the same "search filter hides the selection"
+    // state that once crashed Send (dispatch_compose_send's debug_assert)
+    // would have hit here too now that selected_real_index no longer
+    // fabricates an index in that case.
+    debug_assert!(
+        dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. }))
+    );
 }
 
 pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
@@ -1353,6 +1535,7 @@ pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
 // bridge shape as every UI domain above.
 
 pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option<String>) {
+    crate::snapshotd_lifecycle::project_changed(path.clone());
     let (effects, _) =
         update_persistent(panel, Msg::Host(HostMsg::ProjectPathChanged(path.clone())));
     execute_effects(panel, effects);
@@ -1442,8 +1625,14 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
     // terminals, error) alongside the selection scalar -- the invariant
     // worth keeping is that a switch command MARKS the selection dirty,
     // not that it marks nothing else.
+    // `ThreadMsg::NavigateDelta` (behind previous-thread/next-thread) bails
+    // out to empty dirty when there are zero threads to navigate among --
+    // legitimately reachable (a cold-start panel with no threads yet), so
+    // this must tolerate empty too, same as the other reducer-shape
+    // asserts above.
     debug_assert!(
         command == crate::PANEL_COMMAND_OPEN_THREAD_SEARCH
+            || dirty.is_empty()
             || dirty
                 .iter()
                 .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))
@@ -1525,5 +1714,81 @@ mod tests {
             dirty.contains(&Dirty::Scalar(ScalarField::SelectedThread)),
             "wrap must mark SelectedThread dirty, got {dirty:?}"
         );
+    }
+
+    // -- markdown-render-cache-layer plan, Phase 7 trigger-wiring:
+    // messages_needing_prewarm --
+
+    fn thread_with_rows(keys_kinds_texts: &[(&str, &str, &str)]) -> ThreadModel {
+        let mut thread = ThreadModel::default();
+        thread.transcript_keys = keys_kinds_texts.iter().map(|(k, _, _)| k.to_string()).collect();
+        thread.message_rows = keys_kinds_texts
+            .iter()
+            .enumerate()
+            .map(|(i, (_, kind, text))| crate::MessageItem {
+                kind: (*kind).into(),
+                text: (*text).into(),
+                index: i as i32,
+                ..crate::MessageItem::default()
+            })
+            .collect();
+        thread
+    }
+
+    #[test]
+    fn messages_needing_prewarm_includes_uncached_agent_messages_only() {
+        let thread = thread_with_rows(&[
+            ("user:1", "user", "hi"),
+            ("assistant:1", "agent", "hello"),
+            ("tool:1", "tool_use", "ran a command"),
+        ]);
+        let result = messages_needing_prewarm(&thread, &thread.message_rows);
+        assert_eq!(result, vec![("assistant:1".to_string(), "hello".to_string())]);
+    }
+
+    #[test]
+    fn messages_needing_prewarm_skips_already_cached_agent_messages() {
+        let thread = {
+            let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello")]);
+            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello");
+            thread.markdown_render_index.borrow_mut().set_rendered_blocks(
+                "assistant:1",
+                slint::ModelRc::new(slint::VecModel::from(vec![crate::MarkdownBlock::default()])),
+            );
+            thread
+        };
+        assert!(
+            messages_needing_prewarm(&thread, &thread.message_rows).is_empty(),
+            "an already-rendered message must not be re-queued for prewarm"
+        );
+    }
+
+    #[test]
+    fn messages_needing_prewarm_re_includes_a_message_whose_text_changed_since_caching() {
+        // record() without a matching set_rendered_blocks mirrors what
+        // the synchronous path leaves behind for a row whose content
+        // changed (see models.rs's markdown_blocks_for): content_hash
+        // updated, but no cached ModelRc yet for the new text.
+        let thread = {
+            let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello again")]);
+            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello again");
+            thread
+        };
+        assert_eq!(
+            messages_needing_prewarm(&thread, &thread.message_rows),
+            vec![("assistant:1".to_string(), "hello again".to_string())]
+        );
+    }
+
+    #[test]
+    fn messages_needing_prewarm_is_empty_for_a_thread_with_no_agent_messages() {
+        let thread = thread_with_rows(&[("user:1", "user", "hi"), ("tool:1", "tool_use", "ran")]);
+        assert!(messages_needing_prewarm(&thread, &thread.message_rows).is_empty());
+    }
+
+    #[test]
+    fn messages_needing_prewarm_is_empty_for_an_empty_thread() {
+        let thread = ThreadModel::default();
+        assert!(messages_needing_prewarm(&thread, &thread.message_rows).is_empty());
     }
 }

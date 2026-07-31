@@ -28,6 +28,7 @@ pub mod jsonl_store;
 mod list_model;
 mod local_terminal;
 mod markdown;
+mod markdown_worker;
 mod model;
 pub mod models;
 mod msg;
@@ -44,6 +45,8 @@ mod skills_manager_adapter;
 pub mod skills_state;
 mod state_store;
 mod sync;
+mod snapshotd_lifecycle;
+mod thread_view;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
 // crates from this one, unable to see anything less than `pub` -- can
 // reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
@@ -67,6 +70,7 @@ pub mod test_support {
     pub use crate::agent_bridge::{fetch_daemon_project_instances, DaemonProjectInstance};
 }
 mod theme;
+mod thread_message_index;
 mod update;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec, NO_PROVIDER_REQUESTED_FALLBACK};
@@ -706,6 +710,17 @@ struct PanelSingleton {
     settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
     _settings_watcher: Option<settings_file::SettingsWatcher>,
     snapshotd_registration: Option<snapshotd_client::SnapshotdRegistration>,
+    /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: shared
+    /// across every thread's background markdown render (unlike
+    /// `ThreadModel::markdown_epoch`/`markdown_in_flight`, which are
+    /// deliberately per-thread) -- a fixed-size worker pool has no
+    /// notion of which thread a job belongs to, so nothing about sharing
+    /// it risks cross-thread interference the way a shared epoch counter
+    /// would. Lives on `PanelSingleton`, not `Model`: it spawns real OS
+    /// threads, which is infrastructure this crate's own TEA doc comment
+    /// (see `model.rs`'s module doc) reserves for outside the pure
+    /// reducer, alongside `bridge`/`panel_state`.
+    markdown_render_pool: markdown_worker::RenderWorkerPool,
 }
 
 impl PanelSingleton {
@@ -1825,10 +1840,8 @@ fn panel_rust_create_with_initial_identity(
         };
         let mut model = model::Model::default();
         let thread_model = Rc::new(VecModel::default());
-        let messages_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();
-        model.messages_model = messages_model.clone();
         model.skills_model = skills_model.clone();
         let panel = PanelSingleton {
             window,
@@ -1860,6 +1873,13 @@ fn panel_rust_create_with_initial_identity(
                     .as_ref()
                     .and_then(|identity| identity.saved_path().map(str::to_owned)),
             ),
+            // Small fixed pool -- markdown rendering is not the only thing
+            // competing for CPU, and this is background pre-render work,
+            // not latency-critical (the synchronous path already shows
+            // correct content the same frame; this pool exists to warm
+            // the per-thread cache for a later switch, not to gate any
+            // visible render).
+            markdown_render_pool: markdown_worker::RenderWorkerPool::new(2),
         };
         // Gateway availability is panel-scoped, independent of project-open.
         // This enables the first `+` thread on the empty-project screen.
@@ -2426,16 +2446,15 @@ fn panel_rust_create_with_initial_identity(
         // into the reducer and effect executor -- see dispatch.rs's
         // doc comment.
         let component_weak = panel.component.as_weak();
-        panel.component.on_send_requested(move || {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            let text = component.get_compose_text().to_string();
-            let text = text.trim().to_owned();
+        panel.component.on_send_requested(move |text| {
+            let text = text.to_string().trim().to_owned();
             if text.is_empty() {
                 trace_host_input("send requested with empty composer");
                 return;
             }
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
             let filtered_idx = component.get_selected_thread() as usize;
             trace_host_input(format_args!(
                 "send requested selected_thread={filtered_idx} text={text:?}"
@@ -2446,6 +2465,14 @@ fn panel_rust_create_with_initial_identity(
                 // the send is dispatched.
                 if let Some(panel) = cell.borrow_mut().as_mut() {
                     dispatch::dispatch_compose_send_maybe_attach(panel, filtered_idx, text);
+                }
+            });
+        });
+
+        panel.component.on_compose_draft_changed(move |text| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_compose_draft_changed(panel, text.to_string());
                 }
             });
         });
@@ -3415,6 +3442,7 @@ pub extern "C" fn panel_rust_apply_host_appearance(
 /// `panel_rust_render` + trigger a Qt repaint).
 #[no_mangle]
 pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
+    snapshotd_lifecycle::heartbeat_if_due();
     // Slint `animate` blocks (hover fades, entrance/exit transitions, the
     // loading spinner, the sidebar rail's `animate width`, ...) -- and a
     // `Flickable`'s own interactive flick/momentum motion -- only progress
