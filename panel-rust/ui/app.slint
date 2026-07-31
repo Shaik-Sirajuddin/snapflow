@@ -593,9 +593,10 @@ export component ChatPanel inherits Window {
                 // connection-status is the live MCP/agent link state).
                 project-name: threads.length > 0 ? threads[selected-thread].project-name : "";
                 project-path: threads.length > 0 ? threads[selected-thread].project-path : "";
-                // Live values from the bridge: "Live connection" (WS interactive)
-                // counts as live; "HTTP fallback"/"Connecting..." do not.
-                project-mcp-live: connection-status == "Live connection";
+                // The marker represents project-open state, not merely MCP
+                // transport reachability. Cached/expired snapshots keep the
+                // path visible but cannot make the marker green.
+                project-open: threads.length > 0 ? threads[selected-thread].project-instance-live : false;
                 md-link-activated(target) => { root.md-link-activated(target); }
                 connection-status: connection-status;
                 last-error: last-error;
@@ -718,9 +719,10 @@ export component ChatPanel inherits Window {
                 // connection-status is the live MCP/agent link state).
                 project-name: threads.length > 0 ? threads[selected-thread].project-name : "";
                 project-path: threads.length > 0 ? threads[selected-thread].project-path : "";
-                // Live values from the bridge: "Live connection" (WS interactive)
-                // counts as live; "HTTP fallback"/"Connecting..." do not.
-                project-mcp-live: connection-status == "Live connection";
+                // The marker represents project-open state, not merely MCP
+                // transport reachability. Cached/expired snapshots keep the
+                // path visible but cannot make the marker green.
+                project-open: threads.length > 0 ? threads[selected-thread].project-instance-live : false;
                 md-link-activated(target) => { root.md-link-activated(target); }
                 connection-status: connection-status;
                 last-error: last-error;

@@ -160,7 +160,7 @@ func TestProjectList_ActiveMarker(t *testing.T) {
 
 	// Open so a ready ProcessInstance is registered.
 	sink := &fanoutSink{}
-	if _, err := d.ForwardSAP(ctx, "s-active", sink, "project.open", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "s-active", sink, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 
@@ -216,7 +216,7 @@ func TestProjectOpen_PathViaForwardSAP(t *testing.T) {
 
 	sink := &fanoutSink{}
 	// Primary name project.open with path.
-	raw, err := d.ForwardSAP(ctx, "s-path", sink, "project.open", mustJSON(t, map[string]any{"path": root}))
+	raw, err := d.ForwardSAP(ctx, "s-path", sink, "project.enter", mustJSON(t, map[string]any{"path": root}))
 	if err != nil {
 		t.Fatalf("project.open path: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestProjectOpen_PathViaForwardSAP(t *testing.T) {
 		t.Fatalf("expected opened=true: %+v", st)
 	}
 	// Close via primary name.
-	if _, err := d.ForwardSAP(ctx, "s-path", sink, "project.close", mustJSON(t, map[string]any{})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "s-path", sink, "project.exit", mustJSON(t, map[string]any{})); err != nil {
 		t.Fatalf("project.close: %v", err)
 	}
 }
@@ -244,7 +244,7 @@ func TestProjectOpen_MissingPathDoesNotCreateProject(t *testing.T) {
 		t.Fatalf("list before: %v", err)
 	}
 
-	_, err = d.ForwardSAP(ctx, "s-missing", &fanoutSink{}, "project.open", mustJSON(t, map[string]any{
+	_, err = d.ForwardSAP(ctx, "s-missing", &fanoutSink{}, "project.enter", mustJSON(t, map[string]any{
 		"path": filepath.Join(root, "missing.mlt"),
 	}))
 	if err == nil || !strings.Contains(err.Error(), "use project.create first") {

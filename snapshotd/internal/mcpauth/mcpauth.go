@@ -33,6 +33,11 @@ type Config struct {
 
 	AuthUser     string `json:"authUser,omitempty"`
 	AuthPassword string `json:"authPassword,omitempty"`
+
+	// SessionServiceToken authenticates the daemon-side session metadata API.
+	// It is separate from MCP Basic Auth because panel-rust may subscribe to
+	// status without using the MCP tool credential.
+	SessionServiceToken string `json:"sessionServiceToken,omitempty"`
 }
 
 func path(homeDir string) string {

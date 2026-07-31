@@ -36,6 +36,19 @@ pub struct ThreadSettings {
     pub background_session: Option<bool>,
 }
 
+/// Panel-local cache of server-derived snapflowd session state. This is a
+/// restart-safe presentation cache; the daemon remains authoritative and the
+/// WebSocket client refreshes it whenever a live connection is available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionDerivedState {
+    pub session_id: String,
+    pub acp_session_id: Option<String>,
+    pub project_id: Option<String>,
+    pub project_path: Option<String>,
+    pub connection_status: String,
+    pub revision: u64,
+}
+
 /// The durable identity needed to restore a panel thread before its transcript
 /// cache and ACPX session are reconciled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +165,14 @@ impl PanelStateStore {
                 display_name TEXT,
                 provider TEXT
             );
+            CREATE TABLE IF NOT EXISTS session_derived_state (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                acp_session_id TEXT,
+                project_id TEXT,
+                project_path TEXT,
+                connection_status TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0
+            );
             ",
         )?;
         Self::add_column_if_missing(&connection, "display_name", "TEXT")?;
@@ -260,6 +281,72 @@ impl PanelStateStore {
             .optional()
             .map(|stored| stored.unwrap_or_default())
             .map_err(Into::into)
+    }
+
+    pub fn save_session_derived_state(
+        &self,
+        state: &SessionDerivedState,
+    ) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "INSERT INTO session_derived_state
+                (session_id, acp_session_id, project_id, project_path, connection_status, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                acp_session_id = excluded.acp_session_id,
+                project_id = excluded.project_id,
+                project_path = excluded.project_path,
+                connection_status = excluded.connection_status,
+                revision = excluded.revision
+             WHERE excluded.revision >= session_derived_state.revision",
+            params![
+                state.session_id,
+                state.acp_session_id,
+                state.project_id,
+                state.project_path,
+                state.connection_status,
+                state.revision as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_derived_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionDerivedState>, StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection
+            .query_row(
+                "SELECT session_id, acp_session_id, project_id, project_path, connection_status, revision
+                 FROM session_derived_state WHERE session_id = ?1",
+                [session_id],
+                |row| Ok(SessionDerivedState {
+                    session_id: row.get(0)?, acp_session_id: row.get(1)?, project_id: row.get(2)?,
+                    project_path: row.get(3)?, connection_status: row.get(4)?, revision: row.get::<_, i64>(5)? as u64,
+                }),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn all_session_derived_states(&self) -> Result<Vec<SessionDerivedState>, StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT session_id, acp_session_id, project_id, project_path, connection_status, revision
+             FROM session_derived_state ORDER BY session_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SessionDerivedState {
+                session_id: row.get(0)?,
+                acp_session_id: row.get(1)?,
+                project_id: row.get(2)?,
+                project_path: row.get(3)?,
+                connection_status: row.get(4)?,
+                revision: row.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn save_defaults(&self, defaults: &PanelDefaults) -> Result<(), StateStoreError> {
@@ -766,6 +853,28 @@ mod tests {
             store.defaults().unwrap().selected_thread_id.as_deref(),
             Some("thread-b")
         );
+    }
+
+    #[test]
+    fn session_derived_state_is_revision_ordered_and_restart_safe() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let state = SessionDerivedState {
+            session_id: "snap-1".to_owned(),
+            acp_session_id: Some("acp-1".to_owned()),
+            project_id: Some("project-1".to_owned()),
+            project_path: Some("/projects/demo.mlt".to_owned()),
+            connection_status: "connected".to_owned(),
+            revision: 3,
+        };
+        store.save_session_derived_state(&state).unwrap();
+        store
+            .save_session_derived_state(&SessionDerivedState {
+                project_path: Some("/projects/stale.mlt".to_owned()),
+                revision: 2,
+                ..state.clone()
+            })
+            .unwrap();
+        assert_eq!(store.session_derived_state("snap-1").unwrap(), Some(state));
     }
 
     #[test]

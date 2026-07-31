@@ -313,7 +313,14 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                 .entries
                 .iter()
                 .position(|e| matches!(e.state, EntryState::Idle))
-                .map(|idx| self.lease_entry(&mut key_pool.entries[idx], key.clone(), thread_id.clone(), false))
+                .map(|idx| {
+                    self.lease_entry(
+                        &mut key_pool.entries[idx],
+                        key.clone(),
+                        thread_id.clone(),
+                        false,
+                    )
+                })
         };
         let lease = if let Some(lease) = existing {
             lease
@@ -391,7 +398,14 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                 .entries
                 .iter()
                 .position(|e| matches!(e.state, EntryState::Idle))
-                .map(|idx| self.lease_entry(&mut key_pool.entries[idx], key.clone(), thread_id.clone(), false))
+                .map(|idx| {
+                    self.lease_entry(
+                        &mut key_pool.entries[idx],
+                        key.clone(),
+                        thread_id.clone(),
+                        false,
+                    )
+                })
         };
         if let Some(lease) = racer_spare {
             return Ok(lease);

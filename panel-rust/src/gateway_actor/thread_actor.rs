@@ -650,8 +650,12 @@ impl AcpxThreadHandle {
         agent_id: String,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<Vec<ConfigOptionInfo>, AcpxThreadError> {
-        self.call(|resp| Command::ListModels { agent_id, cwd, resp })
-            .await
+        self.call(|resp| Command::ListModels {
+            agent_id,
+            cwd,
+            resp,
+        })
+        .await
     }
 
     /// `agents/status` for one agent id. Typed `AgentCatalogEntry`, same
@@ -2311,7 +2315,11 @@ async fn run_thread_actor(
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
-            Command::ListModels { agent_id, cwd, resp } => {
+            Command::ListModels {
+                agent_id,
+                cwd,
+                resp,
+            } => {
                 let mut params = serde_json::json!({ "agentId": agent_id });
                 if let Some(cwd) = cwd {
                     params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());

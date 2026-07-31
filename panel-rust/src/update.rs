@@ -2024,7 +2024,8 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 ));
                 return (vec![], vec![]);
             };
-            let Some(current_hash) = thread.markdown_render_index.borrow().content_hash_for(&key) else {
+            let Some(current_hash) = thread.markdown_render_index.borrow().content_hash_for(&key)
+            else {
                 crate::trace_host_input(format_args!(
                     "markdown worker dropped thread={thread_id} key={key} reason=stale_key"
                 ));
@@ -2059,7 +2060,13 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             crate::trace_host_input(format_args!(
                 "markdown worker delivered thread={thread_id} key={key}"
             ));
-            (vec![], vec![Dirty::MessageRowPatch { thread_id, index: row_index }])
+            (
+                vec![],
+                vec![Dirty::MessageRowPatch {
+                    thread_id,
+                    index: row_index,
+                }],
+            )
         }
         // memory/acpx/gen/plans/acpx-skills/ phase 17: one of the 6
         // reactive-sync trigger call sites (create/promote/edit/agent-
@@ -2277,9 +2284,91 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
     }
 }
 
+fn daemon_connection_status(status: &str) -> String {
+    match status {
+        "connected" => "Live connection".to_owned(),
+        "connecting" => "Connecting...".to_owned(),
+        "disconnected" => "Disconnected".to_owned(),
+        "error" => "Unavailable".to_owned(),
+        _ => "Unknown".to_owned(),
+    }
+}
+
 fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect>, Vec<Dirty>) {
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
+    for update in frame.session_updates {
+        let snapshot = update.snapshot;
+        let session_id = snapshot.session_id.clone();
+        if model
+            .session_derived
+            .get(&session_id)
+            .is_some_and(|previous| previous.revision > snapshot.revision)
+        {
+            continue;
+        }
+        model
+            .session_derived
+            .insert(session_id.clone(), snapshot.clone());
+        let target_index = model.thread_index_for_id(&session_id).or_else(|| {
+            snapshot
+                .acp_session_id
+                .as_deref()
+                .and_then(|id| model.thread_index_for_id(id))
+        });
+        if let Some(target_index) = target_index {
+            let project_path = snapshot.project_path.clone().unwrap_or_default();
+            let project_name = std::path::Path::new(&project_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let project_instance_live =
+                update.client_instance_id.is_some() && snapshot.connection_status == "connected";
+            let mut project_indicator_changed = false;
+            if let Some(row) = model
+                .thread_rows
+                .iter_mut()
+                .find(|row| row.real_index == target_index)
+            {
+                let next_path: slint::SharedString = project_path.into();
+                let next_name: slint::SharedString = project_name.into();
+                if row.item.project_path != next_path
+                    || row.item.project_name != next_name
+                    || row.item.project_instance_live != project_instance_live
+                {
+                    row.item.project_path = next_path;
+                    row.item.project_name = next_name;
+                    row.item.project_instance_live = project_instance_live;
+                    project_indicator_changed = true;
+                }
+            }
+            if let Some(thread) = model.threads.get_mut(target_index) {
+                // A SQLite-restored snapshot is useful immediately, but it
+                // is not authoritative until the daemon sends a live update
+                // on the authenticated subscription.
+                let status = if update.client_instance_id.is_none()
+                    && snapshot.connection_status == "connected"
+                {
+                    "Connecting...".to_owned()
+                } else {
+                    daemon_connection_status(&snapshot.connection_status)
+                };
+                if thread.connection_status != status {
+                    thread.connection_status = status;
+                    dirty.push(Dirty::Connection {
+                        thread_id: thread.thread_id.clone(),
+                    });
+                }
+                if project_indicator_changed {
+                    dirty.push(Dirty::ThreadRow {
+                        thread_id: thread.thread_id.clone(),
+                    });
+                }
+            }
+        }
+        // The local SQLite cache is written by the subscription owner after
+        // the reducer accepts this revision; no tool interception is needed.
+    }
     for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
         let Some(target_index) = frame
             .bridge_event_thread_ids
@@ -2691,7 +2780,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             )));
         }
     }
-    if let Some(snapshot) = frame.selected_thread_snapshot {
+    if let Some(mut snapshot) = frame.selected_thread_snapshot {
         // The bridge index is only a collection-time location. Resolve the
         // snapshot by durable identity first so a concurrent list diff cannot
         // hydrate the wrong thread after indices shift.
@@ -2708,6 +2797,21 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.displayed_thread = None;
             return (effects, dirty);
         };
+        if let Some(session_id) = model
+            .threads
+            .get(target_index)
+            .and_then(|thread| thread.session_id.as_deref())
+        {
+            let derived = model.session_derived.get(session_id).or_else(|| {
+                model
+                    .session_derived
+                    .values()
+                    .find(|snapshot| snapshot.acp_session_id.as_deref() == Some(session_id))
+            });
+            if let Some(derived) = derived {
+                snapshot.connection_status = daemon_connection_status(&derived.connection_status);
+            }
+        }
         // SCNA-01: distinct from `switched_thread` below -- specifically
         // whether there was a *real* previously-displayed thread to leave.
         // `model.displayed_thread` starts `None` before cold-start
@@ -2974,7 +3078,87 @@ mod tests {
         model
     }
 
-    /// Dirty set emitted when selection changes the active retained view.
+    #[test]
+    fn daemon_session_snapshot_updates_thread_connection_and_revision() {
+        let mut model = model_with_threads(&["chat"]);
+        model.threads[0].session_id = Some("snapflow-session".to_owned());
+        model.rebuild_thread_indices();
+        model.thread_rows = vec![crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            item: crate::ThreadItem::default(),
+            ..Default::default()
+        }];
+        let snapshot = crate::snapflow_session_client::SessionSnapshot {
+            session_id: "snapflow-session".to_owned(),
+            acp_session_id: Some("acp-session".to_owned()),
+            project_id: Some("project-1".to_owned()),
+            project_path: Some("/projects/demo.mlt".to_owned()),
+            connection_status: "connected".to_owned(),
+            revision: 4,
+            created_at: String::new(),
+            expires_at: String::new(),
+        };
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                session_updates: vec![crate::snapflow_session_client::SessionUpdate {
+                    client_instance_id: Some("panel-1".to_owned()),
+                    snapshot: snapshot.clone(),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].connection_status, "Live connection");
+        assert_eq!(model.session_derived["snapflow-session"], snapshot);
+        assert!(dirty.iter().any(
+            |item| matches!(item, Dirty::Connection { thread_id } if thread_id == "thread-0")
+        ));
+        assert!(dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::ThreadRow { thread_id } if thread_id == "thread-0")));
+        assert_eq!(model.thread_rows[0].item.project_path, "/projects/demo.mlt");
+        assert_eq!(model.thread_rows[0].item.project_name, "demo.mlt");
+        assert!(model.thread_rows[0].item.project_instance_live);
+    }
+
+    #[test]
+    fn cached_session_snapshot_is_rendered_as_non_authoritative() {
+        let mut model = model_with_threads(&["chat"]);
+        model.threads[0].session_id = Some("snapflow-session".to_owned());
+        model.rebuild_thread_indices();
+        model.thread_rows = vec![crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            item: crate::ThreadItem::default(),
+            ..Default::default()
+        }];
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                session_updates: vec![crate::snapflow_session_client::SessionUpdate {
+                    client_instance_id: None,
+                    snapshot: crate::snapflow_session_client::SessionSnapshot {
+                        session_id: "snapflow-session".to_owned(),
+                        acp_session_id: Some("acp-session".to_owned()),
+                        project_id: Some("project-1".to_owned()),
+                        project_path: Some("/projects/demo.mlt".to_owned()),
+                        connection_status: "connected".to_owned(),
+                        revision: 4,
+                        created_at: String::new(),
+                        expires_at: String::new(),
+                    },
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].connection_status, "Connecting...");
+        assert!(!model.thread_rows[0].item.project_instance_live);
+        assert_eq!(model.thread_rows[0].item.project_path, "/projects/demo.mlt");
+    }
+
+    /// Dirty set emitted when selection actually changes thread: atomic
+    /// MessageListInstall for target + sibling pane resync (chat_view §5).
     fn thread_switch_dirty(target_thread_id: &str) -> Vec<Dirty> {
         vec![
             Dirty::Scalar(ScalarField::SelectedThread),
@@ -3801,10 +3985,11 @@ mod tests {
         // overwrite the cache with the stale render.
         let mut model = model_with_threads(&["a"]);
         let key = "assistant:m1".to_owned();
-        model.threads[0]
-            .markdown_render_index
-            .borrow_mut()
-            .record(&key, 0, "the text has since grown longer");
+        model.threads[0].markdown_render_index.borrow_mut().record(
+            &key,
+            0,
+            "the text has since grown longer",
+        );
         model.threads[0].message_rows = vec![crate::MessageItem {
             kind: "agent".into(),
             text: "the text has since grown longer".into(),
@@ -3825,7 +4010,10 @@ mod tests {
         );
 
         assert!(effects.is_empty());
-        assert!(dirty.is_empty(), "a stale-hash delivery must never patch anything");
+        assert!(
+            dirty.is_empty(),
+            "a stale-hash delivery must never patch anything"
+        );
         assert!(
             model.threads[0]
                 .markdown_render_index
@@ -4105,7 +4293,11 @@ mod tests {
             &mut model,
             Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("hi".to_owned()))),
         );
-        assert_eq!(effects, vec![], "no thread is genuinely selected/visible right now");
+        assert_eq!(
+            effects,
+            vec![],
+            "no thread is genuinely selected/visible right now"
+        );
         assert_eq!(dirty, vec![]);
         assert_eq!(
             model.threads[0].state,
@@ -5163,6 +5355,7 @@ mod tests {
         let (effects, dirty) = update(
             &mut model,
             Msg::Frame(FrameInput {
+                session_updates: Vec::new(),
                 bridge_events: Vec::new(),
                 bridge_event_thread_ids: Vec::new(),
                 bridge_events_pending: true,

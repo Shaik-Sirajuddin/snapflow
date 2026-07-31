@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"snapshotd/internal/mcpadapter"
 	"snapshotd/internal/mcpauth"
 )
@@ -32,11 +33,12 @@ type Status struct {
 // InstallConfig is what daemon.mcpInstallConfig returns: enough for a
 // client to configure itself against this daemon's MCP endpoint.
 type InstallConfig struct {
-	SSEURL        string `json:"sseUrl"`
-	StreamableURL string `json:"streamableUrl"`
-	AuthEnabled   bool   `json:"authEnabled"`
-	AuthUser      string `json:"authUser,omitempty"`
-	AuthPassword  string `json:"authPassword,omitempty"`
+	SSEURL              string `json:"sseUrl"`
+	StreamableURL       string `json:"streamableUrl"`
+	AuthEnabled         bool   `json:"authEnabled"`
+	AuthUser            string `json:"authUser,omitempty"`
+	AuthPassword        string `json:"authPassword,omitempty"`
+	SessionServiceToken string `json:"sessionServiceToken,omitempty"`
 }
 
 // Supervisor owns exactly one live *mcpadapter.SSEServer at a time.
@@ -86,6 +88,13 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}
 	s.cfg = cfg
+	if cfg.SessionServiceToken == "" {
+		cfg.SessionServiceToken = uuid.NewString()
+		if err := mcpauth.Save(s.homeDir, cfg); err != nil {
+			return fmt.Errorf("mcpsupervisor: persist session service token: %w", err)
+		}
+		s.cfg = cfg
+	}
 	return s.bindLocked(cfg)
 }
 
@@ -100,6 +109,7 @@ func (s *Supervisor) bindNew(cfg mcpauth.Config) (*mcpadapter.SSEServer, net.Lis
 		User:     cfg.AuthUser,
 		Password: cfg.AuthPassword,
 	})
+	srv.SetSessionServiceToken(cfg.SessionServiceToken)
 	ln, err := srv.Listen()
 	if err != nil {
 		return nil, nil, fmt.Errorf("mcpsupervisor: bind %s: %w", cfg.BindAddr, err)
@@ -153,6 +163,9 @@ func (s *Supervisor) Restart(ctx context.Context, bindAddr string) error {
 	}
 	if newCfg.BindAddr == "" {
 		newCfg.BindAddr = s.defaultAddr
+	}
+	if newCfg.SessionServiceToken == "" {
+		newCfg.SessionServiceToken = uuid.NewString()
 	}
 	if !newCfg.AuthEnabled && !isLoopbackAddr(newCfg.BindAddr) {
 		return fmt.Errorf(
@@ -236,11 +249,12 @@ func (s *Supervisor) InstallConfig() InstallConfig {
 		addr = net.JoinHostPort(host, port)
 	}
 	return InstallConfig{
-		SSEURL:        fmt.Sprintf("http://%s/sse", addr),
-		StreamableURL: fmt.Sprintf("http://%s/mcp", addr),
-		AuthEnabled:   s.cfg.AuthEnabled,
-		AuthUser:      s.cfg.AuthUser,
-		AuthPassword:  s.cfg.AuthPassword,
+		SSEURL:              fmt.Sprintf("http://%s/sse", addr),
+		StreamableURL:       fmt.Sprintf("http://%s/mcp", addr),
+		AuthEnabled:         s.cfg.AuthEnabled,
+		AuthUser:            s.cfg.AuthUser,
+		AuthPassword:        s.cfg.AuthPassword,
+		SessionServiceToken: s.cfg.SessionServiceToken,
 	}
 }
 

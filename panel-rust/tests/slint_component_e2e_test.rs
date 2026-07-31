@@ -308,6 +308,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         kind: "agent".into(),
         text: "streamed response".into(),
         markdown_lines: Default::default(),
+        markdown_blocks: Default::default(),
         status: "streaming".into(),
         expanded: false,
         index: 0,
@@ -872,6 +873,57 @@ fn connection_status_is_exposed_to_accessibility() {
         .accessible_label()
         .as_deref()
         .is_some_and(|label| label.contains("HTTP fallback - approvals unavailable")));
+}
+
+#[test]
+fn project_top_bar_reflects_selected_thread_path_and_mcp_status() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 700.0));
+
+    let mut first = sample_open_thread("First thread");
+    first.project_name = "First project".into();
+    first.project_path = "/tmp/first-project".into();
+    let mut second = sample_open_thread("Second thread");
+    second.project_name = "Second project".into();
+    second.project_path = "/tmp/second-project".into();
+    panel.set_threads(ModelRc::new(VecModel::from(vec![first, second])));
+    panel.set_selected_thread(0);
+    panel.set_connection_status("Live connection".into());
+
+    let first_project = ElementHandle::find_by_accessible_label(
+        &panel,
+        "Project /tmp/first-project (MCP connected)",
+    )
+    .next()
+    .expect("selected thread project path must be shown as MCP connected");
+    assert!(first_project
+        .accessible_label()
+        .as_deref()
+        .is_some_and(|label| label.contains("/tmp/first-project")));
+
+    panel.set_selected_thread(1);
+    let second_project = ElementHandle::find_by_accessible_label(
+        &panel,
+        "Project /tmp/second-project (MCP connected)",
+    )
+    .next()
+    .expect("switching selected thread must update the project path");
+    assert!(second_project
+        .accessible_label()
+        .as_deref()
+        .is_some_and(|label| label.contains("/tmp/second-project")));
+
+    panel.set_connection_status("HTTP fallback".into());
+    ElementHandle::find_by_accessible_label(
+        &panel,
+        "Project /tmp/second-project (MCP disconnected)",
+    )
+    .next()
+    .expect("non-live MCP status must mark the selected project disconnected");
 }
 
 /// Coverage Matrix `session/close`/`session/delete` row -- sidebar's

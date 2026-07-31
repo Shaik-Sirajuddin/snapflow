@@ -38,6 +38,10 @@ type Conn struct {
 	// onNotification is set by Router right after dialing, before the
 	// connection is published to any caller -- see router.go.
 	onNotification func(method string, params json.RawMessage)
+	// onClose is set by Router before the connection is published. It lets
+	// the project pool surface an asynchronous SAP disconnect to its bound
+	// sessions instead of waiting for their next request.
+	onClose func(error)
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -103,6 +107,9 @@ func (c *Conn) fail(err error) {
 		c.closeErr = err
 		close(c.closed)
 		_ = c.nc.Close()
+		if onClose := c.onClose; onClose != nil {
+			onClose(err)
+		}
 	})
 }
 

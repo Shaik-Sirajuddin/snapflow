@@ -37,15 +37,16 @@ pub mod project_store;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
+pub mod snapflow_session_client;
 pub mod snapshotd_client;
 // `pub` (not just `mod`) so the `snapflowd-mcp` bin target can
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
 mod skills_manager_adapter;
 pub mod skills_state;
+mod snapshotd_lifecycle;
 mod state_store;
 mod sync;
-mod snapshotd_lifecycle;
 mod thread_view;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
 // crates from this one, unable to see anything less than `pub` -- can
@@ -84,9 +85,9 @@ use slint::platform::{
     EventLoopProxy, Key, Platform, PointerEventButton, WindowAdapter, WindowEvent,
 };
 use slint::{SharedString, VecModel};
-use state_store::{PanelDefaults, PanelStateStore};
+use state_store::{PanelDefaults, PanelStateStore, SessionDerivedState};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -721,6 +722,13 @@ struct PanelSingleton {
     /// (see `model.rs`'s module doc) reserves for outside the pure
     /// reducer, alongside `bridge`/`panel_state`.
     markdown_render_pool: markdown_worker::RenderWorkerPool,
+    /// Reconnecting daemon-side session metadata subscription. Kept behind a
+    /// RefCell because endpoint discovery may become available after panel
+    /// construction when snapflowd starts asynchronously.
+    session_subscription: RefCell<Option<snapflow_session_client::SessionSubscription>>,
+    session_cache_updates: Arc<std::sync::Mutex<VecDeque<snapflow_session_client::SessionUpdate>>>,
+    session_cache_scope: RefCell<Option<model::ProjectIdentity>>,
+    session_cache_hydrated: Cell<bool>,
 }
 
 impl PanelSingleton {
@@ -1330,8 +1338,98 @@ impl PanelSingleton {
             bridge.set_active_project_identity(&identity);
         }
         if let Some(registration) = self.snapshotd_registration.as_ref() {
-            registration.update(path, reason, generation);
+            registration.update(path.clone(), reason, generation);
         }
+        // Session-derived project/status state is daemon-authoritative. The
+        // existing project/thread persistence above remains local, while the
+        // session snapshot cache is written only from authenticated daemon
+        // updates so a local revision-0 write cannot mask a newer snapshot.
+    }
+
+    pub(crate) fn refresh_session_subscription(
+        &self,
+    ) -> Vec<snapflow_session_client::SessionUpdate> {
+        let active_scope = self.model.borrow().active_project.clone();
+        if self.session_cache_scope.borrow().as_ref() != Some(&active_scope) {
+            *self.session_cache_scope.borrow_mut() = Some(active_scope);
+            self.session_cache_hydrated.set(false);
+        }
+        if self.session_subscription.borrow().is_none() {
+            if let Some(endpoint) = snapflow_session_client::SessionEndpoint::discover() {
+                *self.session_subscription.borrow_mut() = Some(
+                    snapflow_session_client::SessionSubscription::start(endpoint),
+                );
+            }
+        }
+        let session_ids: Vec<String> = self
+            .model
+            .borrow()
+            .threads
+            .iter()
+            .filter_map(|thread| thread.session_id.clone())
+            .collect();
+        if !self.session_cache_hydrated.get() {
+            if let Some(store) = self.active_panel_state() {
+                let queue = self
+                    .session_subscription
+                    .borrow()
+                    .as_ref()
+                    .map(|subscription| subscription.updates_handle())
+                    .unwrap_or_else(|| Arc::clone(&self.session_cache_updates));
+                let cached = store.all_session_derived_states().ok();
+                if let Some(cached) = cached {
+                    let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+                    for state in cached {
+                        queue.push_back(snapflow_session_client::SessionUpdate {
+                            client_instance_id: None,
+                            snapshot: snapflow_session_client::SessionSnapshot {
+                                session_id: state.session_id,
+                                acp_session_id: state.acp_session_id,
+                                project_id: state.project_id,
+                                project_path: state.project_path,
+                                connection_status: state.connection_status,
+                                revision: state.revision,
+                                created_at: String::new(),
+                                expires_at: String::new(),
+                            },
+                        });
+                        while queue.len() > 256 {
+                            queue.pop_front();
+                        }
+                    }
+                }
+            }
+            self.session_cache_hydrated.set(true);
+        }
+        if let Some(subscription) = self.session_subscription.borrow().as_ref() {
+            subscription.set_sessions(session_ids);
+        }
+        let mut updates = self
+            .session_cache_updates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect::<Vec<_>>();
+        if let Some(subscription) = self.session_subscription.borrow().as_ref() {
+            updates.extend(subscription.drain());
+        }
+        if let Some(store) = self.active_panel_state() {
+            for update in &updates {
+                let snapshot = &update.snapshot;
+                let state = SessionDerivedState {
+                    session_id: snapshot.session_id.clone(),
+                    acp_session_id: snapshot.acp_session_id.clone(),
+                    project_id: snapshot.project_id.clone(),
+                    project_path: snapshot.project_path.clone(),
+                    connection_status: snapshot.connection_status.clone(),
+                    revision: snapshot.revision,
+                };
+                if let Err(error) = store.save_session_derived_state(&state) {
+                    eprintln!("panel-rust: session-derived SQLite update failed: {error}");
+                }
+            }
+        }
+        updates
     }
 
     /// Move the durable project store during Save-As/first-save. The rename
@@ -1459,34 +1557,13 @@ fn panel_rust_create_with_initial_identity(
     height: c_uint,
     initial_identity: Option<model::ProjectIdentity>,
 ) -> *mut PanelHandle {
-    PANEL.with(|cell| {
+    let existing_handled = PANEL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if let Some(existing) = slot.as_mut() {
             if existing.width != width || existing.height != height {
                 existing
                     .window
                     .set_size(slint::PhysicalSize::new(width, height));
-                // `resize` in place, not `replace(vec![...])` -- a live
-                // window/dock drag fires this on every intermediate
-                // geometry step, and the previous full
-                // fresh-allocate-and-zero-every-pixel approach did real,
-                // avoidable work on every single one of those ticks (a
-                // full heap allocation plus writing every element to the
-                // same default color, discarding the old buffer's already-
-                // reserved capacity every time). `resize` reuses existing
-                // capacity when the new size fits (the common case for
-                // small drag deltas) and only initializes newly-added
-                // elements when growing -- correctness is unaffected by
-                // stale/reinterpreted content from a width change, since
-                // panel_rust_render always redraws every pixel of the
-                // buffer fresh on the next frame regardless (this is a
-                // full-buffer software renderer, not incremental), so
-                // nothing here is ever visible before that overwrite.
-                // Reported symptom this closes: "resize is not smooth,
-                // layout elements bump up and down a bit" -- the
-                // reallocation cost on every drag tick could fall behind
-                // Qt's own frame pacing, visibly desyncing the panel's
-                // content from the window chrome resizing around it.
                 existing.buffer.borrow_mut().resize(
                     (width * height) as usize,
                     PremultipliedRgbaColor {
@@ -1502,8 +1579,14 @@ fn panel_rust_create_with_initial_identity(
                 existing.resize_local_terminals_for_viewport();
                 existing.window.window().request_redraw();
             }
-            return &SENTINEL as *const PanelHandle as *mut PanelHandle;
+            true
+        } else {
+            false
         }
+    });
+    if existing_handled {
+        return &SENTINEL as *const PanelHandle as *mut PanelHandle;
+    }
 
         let window = PLATFORM_WINDOW.with(|platform_window| {
             let mut platform_window = platform_window.borrow_mut();
@@ -1515,11 +1598,10 @@ fn panel_rust_create_with_initial_identity(
                 std::sync::atomic::AtomicBool::new(false);
             let is_first_platform =
                 !FIRST_PLATFORM_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
-            slint::platform::set_platform(Box::new(SpikePlatform {
+            let _ = slint::platform::set_platform(Box::new(SpikePlatform {
                 window: window.clone(),
                 is_first_platform,
-            }))
-            .expect("panel-rust: set_platform must only be called once per process");
+            }));
             // See the `component.window().show()` call below (right after
             // `ChatPanel::new()`) for why that call, not this one, is what
             // actually makes the MCP server's HTTP listener start.
@@ -1889,6 +1971,10 @@ fn panel_rust_create_with_initial_identity(
             // the per-thread cache for a later switch, not to gate any
             // visible render).
             markdown_render_pool: markdown_worker::RenderWorkerPool::new(2),
+            session_subscription: RefCell::new(None),
+            session_cache_updates: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            session_cache_scope: RefCell::new(None),
+            session_cache_hydrated: Cell::new(false),
         };
         // Gateway availability is panel-scoped, independent of project-open.
         // This enables the first `+` thread on the empty-project screen.
@@ -2871,9 +2957,10 @@ fn panel_rust_create_with_initial_identity(
             });
         });
 
-        *slot = Some(panel);
-        &SENTINEL as *const PanelHandle as *mut PanelHandle
-    })
+    PANEL.with(|cell| {
+        *cell.borrow_mut() = Some(panel);
+    });
+    &SENTINEL as *const PanelHandle as *mut PanelHandle
 }
 
 /// Cold-start variant used by the Qt adapter when it already has the host's
@@ -2907,9 +2994,8 @@ pub extern "C" fn panel_rust_destroy(_handle: *mut PanelHandle) {
     // The C ABI handle is a process-local sentinel; the actual ownership is
     // the thread-local singleton. Clearing it drops AgentBridge and stops
     // local actors when Qt destroys or recreates the dock.
-    PANEL.with(|cell| {
-        cell.borrow_mut().take();
-    });
+    let panel = PANEL.with(|cell| cell.borrow_mut().take());
+    drop(panel);
 }
 
 /// Whether *any* editable Slint surface currently owns focus -- the

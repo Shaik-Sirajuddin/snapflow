@@ -150,6 +150,7 @@ impl<'a> ExternalSnapshotSource<'a> {
     }
 
     pub(crate) fn collect_frame_input(&self) -> msg::FrameInput {
+        let session_updates = self.panel.refresh_session_subscription();
         let bridge_events = self
             .panel
             .bridge
@@ -218,6 +219,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             })
             .unwrap_or(false);
         msg::FrameInput {
+            session_updates,
             bridge_events_pending: !bridge_events.is_empty(),
             bridge_events,
             bridge_event_thread_ids,
@@ -490,11 +492,32 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .enumerate()
             .map(|(idx, _)| {
-                self.panel
+                let bridge_path = self
+                    .panel
                     .bridge
                     .as_ref()
                     .and_then(|bridge| bridge.thread_project_path(idx))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let session_path = self
+                    .panel
+                    .model
+                    .borrow()
+                    .threads
+                    .get(idx)
+                    .and_then(|thread| thread.session_id.as_deref())
+                    .and_then(|session_id| {
+                        let model = self.panel.model.borrow();
+                        model
+                            .session_derived
+                            .get(session_id)
+                            .or_else(|| {
+                                model.session_derived.values().find(|snapshot| {
+                                    snapshot.acp_session_id.as_deref() == Some(session_id)
+                                })
+                            })
+                            .and_then(|snapshot| snapshot.project_path.clone())
+                    });
+                session_path.unwrap_or(bridge_path)
             })
             .collect();
         let mut items = models::build_thread_items(
@@ -558,19 +581,25 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default()
                     .into();
-                // PISO-8 (project-isolation-mlt-binding plan): confirms
-                // the badge above isn't just a stale sqlite-recorded
-                // association -- true only when snapshotd's own
-                // daemon.list/listProjects currently reports a live
-                // ("ready") instance for this exact recorded project, per
-                // `models::thread_project_instance_is_live`'s doc
-                // comment.
-                row.project_instance_live = models::thread_project_instance_is_live(
-                    &project_path,
-                    active_project_path.as_deref(),
-                    &model_snapshot.live_daemon_projects,
-                )
-                .into();
+                // Prefer the reconciled thread state for the project-open
+                // indicator; reading raw cached snapshot status here would
+                // turn an expired `connected` lease back into a green marker.
+                let session_live = model_snapshot
+                    .threads
+                    .get(item.real_index)
+                    .and_then(|thread| {
+                        thread
+                            .session_id
+                            .as_ref()
+                            .map(|_| thread.connection_status == "Live connection")
+                    });
+                row.project_instance_live = session_live.unwrap_or_else(|| {
+                    models::thread_project_instance_is_live(
+                        &project_path,
+                        active_project_path.as_deref(),
+                        &model_snapshot.live_daemon_projects,
+                    )
+                });
                 row.project_path = project_path.into();
                 if let Some(thread) = model_snapshot.threads.get(item.real_index) {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();

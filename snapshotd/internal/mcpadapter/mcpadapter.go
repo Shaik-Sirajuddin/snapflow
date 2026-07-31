@@ -48,6 +48,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"snapshotd/internal/sapproxy"
+	"snapshotd/internal/session"
 )
 
 // serverInstructions is the MCP server's top-level `instructions` field: a
@@ -59,10 +60,10 @@ import (
 const serverInstructions = "Video/media editing MCP server. Typical flow: " +
 	"(1) project.create {path, open?} / project.list / project.clone to manage projects " +
 	"(path-first; projectId is returned and still accepted); " +
-	"(2) project.open {path|projectId} to open or attach this session " +
-	"(required before project-scoped edit tools); project.close to release this session only; " +
+	"(2) project.enter {path|projectId} to enter or attach this session " +
+	"(required before project-scoped edit tools); project.exit to release this session only; " +
 	"(3) use typed edit.*/playlist.*/filter.*/file.*/jobs.*/playback.* tools for the edit. " +
-	"Deprecated aliases: project.select/project.exit (same as open/close), " +
+	"The project lifecycle names are project.enter/project.exit; " +
 	"daemon.createProject/daemon.launch/daemon.listProjects (prefer project.*). " +
 	"daemon.list/health/close still manage process instances."
 
@@ -90,6 +91,22 @@ type Handler interface {
 // for embedded/test adapters that do not need project-target defaults.
 type ContextAwareHandler interface {
 	ForwardSAPWithContext(ctx context.Context, sessionID, contextToken string, sink sapproxy.Sink, method string, params json.RawMessage) (json.RawMessage, error)
+}
+
+// SessionStatusHandler is the daemon-side extension used by the authenticated
+// session metadata API. Keeping it optional preserves the small Handler
+// contract used by existing MCP adapter fakes and embedded callers.
+type SessionStatusHandler interface {
+	SessionDetails(sessionID, acpSessionID string) (session.Session, error)
+	SubscribeSession(sessionID string) (session.Session, <-chan session.Session, func(), error)
+}
+
+// SessionContextHandler registers the ACPX identity before the first MCP
+// tool call. It is separate from SessionStatusHandler so existing embedded
+// fakes remain valid while the authenticated status API gains the normal
+// panel lifecycle primitive.
+type SessionContextHandler interface {
+	RegisterSessionContext(contextToken, acpSessionID string) error
 }
 
 // New constructs an MCP server exposing the daemon.* SDP methods as tools,
@@ -130,7 +147,7 @@ func New(h Handler) *server.MCPServer {
 			nil,
 			h),
 		tool("daemon.launch",
-			"[Deprecated: use project.open to open/attach; this only spawns the process] Launch a Snapshot child for a project.",
+			"[Low-level: prefer project.enter] Launch a Snapshot child for a project.",
 			mcp.WithString("projectId", mcp.Description("Project ID to launch (use this or projectPath)")),
 			h,
 			mcp.WithString("projectPath", mcp.Description("Filesystem path to a project folder or legacy .mlt file (use this or projectId)")),
@@ -315,7 +332,7 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 		Tool: mcp.NewTool("sap.call",
 			mcp.WithDescription(
 				"Generic passthrough to the project's live sap-rust process. "+
-					"Call with method=\"project.select\" and params={\"projectId\": ...} first "+
+					"Call with method=\"project.enter\" and params={\"projectId\": ...} first "+
 					"to bind this MCP session to a project (opens or reuses one pooled SAP "+
 					"connection per project). Every other opaque SAP method -- project.*, "+
 					"edit.*, playlist.*, filter.*, transitions.*, generator.*, file.*, jobs.*, "+
@@ -326,7 +343,7 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 					"see snapshotd/README.md.",
 			),
 			mcp.WithString("method", mcp.Required(),
-				mcp.Description(`SAP JSON-RPC method name, e.g. "project.select", "edit.addTrack", "playlist.append"`)),
+				mcp.Description(`SAP JSON-RPC method name, e.g. "project.enter", "edit.addTrack", "playlist.append"`)),
 			mcp.WithObject("params",
 				mcp.Description("Method params, forwarded verbatim as the SAP call's params object (schema depends entirely on `method`; opaque to snapshotd)")),
 		),

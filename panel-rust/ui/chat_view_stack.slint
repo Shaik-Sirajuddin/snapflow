@@ -18,7 +18,7 @@ export component ChatViewStack inherits Rectangle {
     in property <string> agent-badge: "agent . ask";
     in property <string> project-name: "";
     in property <string> project-path: "";
-    in property <bool> project-mcp-live: false;
+    in property <bool> project-open: false;
     in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
@@ -144,7 +144,7 @@ export component ChatViewStack inherits Rectangle {
         agent-badge: root.agent-badge;
         project-name: root.project-name;
         project-path: root.project-path;
-        project-mcp-live: root.project-mcp-live;
+        project-open: root.project-open;
         no-project: root.no-project;
         connection-status: root.connection-status;
         last-error: root.last-error;
@@ -249,7 +249,7 @@ export component ChatViewStack inherits Rectangle {
         agent-badge: root.agent-badge;
         project-name: root.project-name;
         project-path: root.project-path;
-        project-mcp-live: root.project-mcp-live;
+        project-open: root.project-open;
         no-project: root.no-project;
         connection-status: root.connection-status;
         last-error: root.last-error;

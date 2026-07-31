@@ -415,14 +415,13 @@ async fn main() -> Result<()> {
                                 end += 1;
                             }
                             let piece = String::from_utf8_lossy(&bytes[sent..end]).into_owned();
-                            let _ = connection_for_stream.send_notification(
-                                SessionNotification::new(
+                            let _ =
+                                connection_for_stream.send_notification(SessionNotification::new(
                                     session_id_for_stream.clone(),
                                     SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                         ContentBlock::Text(TextContent::new(piece)),
                                     )),
-                                ),
-                            );
+                                ));
                             sent = end;
                             if sent < bytes.len() {
                                 tokio::time::sleep(Duration::from_millis(150)).await;

@@ -54,15 +54,17 @@ export component ChatArea inherits Rectangle {
     in-out property <bool> loading-older-messages: false;
     callback load-older-requested();
     in property <string> agent-badge: "agent . ask";
-    // Phase 16 (topbar_project_indicator): the session's connected
-    // project (the snapshotd MCP bound via the agent). Name shown,
-    // full path in the accessible label; the dot is green while the
-    // MCP connection is live, red when disconnected. Live state is the
-    // source of truth; hosts fall back to the session jsonl record only
-    // during load (answered open question 5). Empty name hides it.
+    // Phase 16 (topbar_project_indicator): the session's project association
+    // (the snapshotd project bound via the agent). Name shown, full path in
+    // the accessible label; the dot is green only while the project is
+    // confirmed open, red otherwise. Transport reachability is exposed by
+    // connection-status separately. Empty name hides it.
     in property <string> project-name: "";
     in property <string> project-path: "";
-    in property <bool> project-mcp-live: false;
+    // Project-open state is independent from MCP transport reachability.
+    // This marker is green only when a live daemon snapshot confirms the
+    // project/session is open.
+    in property <bool> project-open: false;
     in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
@@ -87,6 +89,16 @@ export component ChatArea inherits Rectangle {
     // codegen moved the first `SharedString` use out from under the
     // second in that shape).
     property <string> header-title: active-thread-name != "" ? active-thread-name : "No thread";
+    property <bool> project-hovered: false;
+    property <bool> project-tooltip-visible: false;
+    project-tooltip-delay := Timer {
+        interval: 500ms;
+        running: root.project-hovered && root.project-path != "";
+        triggered => {
+            root.project-tooltip-visible = root.project-hovered;
+            self.running = false;
+        }
+    }
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
@@ -706,27 +718,70 @@ export component ChatArea inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
-                    if root.project-name != "" : HorizontalLayout {
-                        spacing: Metrics.space-1;
-                        horizontal-stretch: 0;
-                        cross-axis-alignment: center;
-                        accessible-role: text;
-                        accessible-label: "Project " + root.project-path
-                            + (root.project-mcp-live ? " (MCP connected)" : " (MCP disconnected)");
-                        Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: root.project-mcp-live ? #22c55e : #ef4444;
+                    if root.project-name != "" : Rectangle {
+                        project-badge := HorizontalLayout {
+                            width: parent.width;
+                            height: parent.height;
+                            spacing: Metrics.space-1;
+                            cross-axis-alignment: center;
+                            accessible-role: text;
+                            accessible-label: "Project " + root.project-path
+                                + (root.project-open ? " (project open)" : " (project not open)");
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: root.project-open ? #22c55e : #ef4444;
+                            }
+                            Text {
+                                text: root.project-name;
+                                color: Theme.text-muted;
+                                opacity: root.project-open ? 1.0 : 0.5;
+                                min-width: 0px;
+                                horizontal-stretch: 1;
+                                font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
+                                font-family: Theme.font-mono;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
                         }
-                        Text {
-                            text: root.project-name;
-                            color: Theme.text-muted;
-                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
-                            font-family: Theme.font-mono;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            max-width: compact ? 70px : 130px;
+                        horizontal-stretch: 0;
+                        min-width: 0px;
+                        max-width: compact ? 100px : 160px;
+                        TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            accessible-role: text;
+                            accessible-label: "Project path: " + root.project-path;
+                            changed has-hover => {
+                                root.project-hovered = self.has-hover;
+                                if (!self.has-hover) {
+                                    root.project-tooltip-visible = false;
+                                }
+                            }
+                        }
+                        if root.project-tooltip-visible : Rectangle {
+                            x: 0px;
+                            y: parent.height + Metrics.space-1;
+                            width: 360px;
+                            height: 28px;
+                            z: 10;
+                            background: Theme.bg-card;
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            border-radius: Theme.radius-sm;
+                            Text {
+                                x: Metrics.space-2;
+                                y: 0px;
+                                width: parent.width - 2 * Metrics.space-2;
+                                height: parent.height;
+                                text: root.project-path;
+                                color: Theme.text-primary;
+                                font-size: 10px * Theme.font-scale;
+                                font-family: Theme.font-mono;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
                         }
                     }
                     Text {

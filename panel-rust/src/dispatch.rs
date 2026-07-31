@@ -183,7 +183,10 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
     // rendered ahead of an actual switch to them.
     let selected_id = {
         let model = panel.model.borrow();
-        model.threads.get(model.selected_thread).map(|t| t.thread_id.clone())
+        model
+            .threads
+            .get(model.selected_thread)
+            .map(|t| t.thread_id.clone())
     };
     if let Some(selected_id) = selected_id {
         spawn_markdown_prewarm_for_other_threads(panel, &selected_id);
@@ -228,7 +231,13 @@ fn messages_needing_prewarm(
         .iter()
         .zip(rows.iter())
         .filter(|(_, row)| row.kind.as_str() == "agent")
-        .filter(|(key, _)| thread.markdown_render_index.borrow().rendered_blocks_for(key).is_none())
+        .filter(|(key, _)| {
+            thread
+                .markdown_render_index
+                .borrow()
+                .rendered_blocks_for(key)
+                .is_none()
+        })
         .map(|(key, row)| (key.clone(), row.text.to_string()))
         .collect()
 }
@@ -278,7 +287,8 @@ fn spawn_markdown_prewarm_for_thread(panel: &PanelSingleton, thread_id: &str) {
     let deliver = |job: Box<dyn FnOnce() + Send>| {
         let _ = slint::invoke_from_event_loop(move || job());
     };
-    let on_chunk = move |chunk: crate::markdown_worker::MessageBlocksChunk, ack: Box<dyn FnOnce() + Send>| {
+    let on_chunk = move |chunk: crate::markdown_worker::MessageBlocksChunk,
+                         ack: Box<dyn FnOnce() + Send>| {
         crate::PANEL.with(|cell| {
             let slot = cell.borrow();
             if let Some(panel) = slot.as_ref() {
@@ -298,7 +308,9 @@ fn spawn_markdown_prewarm_for_thread(panel: &PanelSingleton, thread_id: &str) {
         ack();
     };
     let on_done = |thread_id: String, epoch: u64| {
-        crate::trace_host_input(format_args!("markdown prewarm done thread={thread_id} epoch={epoch}"));
+        crate::trace_host_input(format_args!(
+            "markdown prewarm done thread={thread_id} epoch={epoch}"
+        ));
     };
 
     crate::markdown_worker::spawn_background_render_pooled(
@@ -1412,9 +1424,7 @@ pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
     // state that once crashed Send (dispatch_compose_send's debug_assert)
     // would have hit here too now that selected_real_index no longer
     // fabricates an index in that case.
-    debug_assert!(
-        dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. }))
-    );
+    debug_assert!(dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. })));
 }
 
 pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
@@ -1707,7 +1717,10 @@ mod tests {
 
     fn thread_with_rows(keys_kinds_texts: &[(&str, &str, &str)]) -> ThreadModel {
         let mut thread = ThreadModel::default();
-        thread.transcript_keys = keys_kinds_texts.iter().map(|(k, _, _)| k.to_string()).collect();
+        thread.transcript_keys = keys_kinds_texts
+            .iter()
+            .map(|(k, _, _)| k.to_string())
+            .collect();
         thread.message_rows = keys_kinds_texts
             .iter()
             .enumerate()
@@ -1729,18 +1742,29 @@ mod tests {
             ("tool:1", "tool_use", "ran a command"),
         ]);
         let result = messages_needing_prewarm(&thread, &thread.message_rows);
-        assert_eq!(result, vec![("assistant:1".to_string(), "hello".to_string())]);
+        assert_eq!(
+            result,
+            vec![("assistant:1".to_string(), "hello".to_string())]
+        );
     }
 
     #[test]
     fn messages_needing_prewarm_skips_already_cached_agent_messages() {
         let thread = {
             let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello")]);
-            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello");
-            thread.markdown_render_index.borrow_mut().set_rendered_blocks(
-                "assistant:1",
-                slint::ModelRc::new(slint::VecModel::from(vec![crate::MarkdownBlock::default()])),
-            );
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .record("assistant:1", 0, "hello");
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .set_rendered_blocks(
+                    "assistant:1",
+                    slint::ModelRc::new(slint::VecModel::from(vec![
+                        crate::MarkdownBlock::default(),
+                    ])),
+                );
             thread
         };
         assert!(
@@ -1757,7 +1781,10 @@ mod tests {
         // updated, but no cached ModelRc yet for the new text.
         let thread = {
             let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello again")]);
-            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello again");
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .record("assistant:1", 0, "hello again");
             thread
         };
         assert_eq!(

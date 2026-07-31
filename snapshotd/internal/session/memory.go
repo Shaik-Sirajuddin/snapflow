@@ -113,6 +113,25 @@ func (m *Memory) BindProject(id, projectID string) error {
 	return nil
 }
 
+// Update applies one serialized mutation to a live session. The mutation is
+// intentionally expressed as a closure so the store remains the owner of
+// expiry checks and revision accounting.
+func (m *Memory) Update(id string, mutate func(*Session)) (Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok || time.Now().After(s.ExpiresAt) {
+		delete(m.sessions, id)
+		return Session{}, ErrNotFound
+	}
+	if mutate != nil {
+		mutate(&s)
+	}
+	s.Revision++
+	m.sessions[id] = s
+	return s, nil
+}
+
 func (m *Memory) Expire(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

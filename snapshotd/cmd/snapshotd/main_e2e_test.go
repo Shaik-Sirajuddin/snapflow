@@ -65,7 +65,7 @@ func runCLIErr(t *testing.T, snapshotdBin, homeDir string, args ...string) (stri
 }
 
 func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
-	fixtureBin := buildBinary(t, "snapshotd/internal/procmgr/testdata/fixture", "fixture-bin")
+	fixtureBin := buildBinary(t, "snapshotd/internal/procmgr/testdata/sap_fixture", "fixture-bin")
 	snapshotdBin := buildBinary(t, ".", "snapshotd-bin")
 
 	homeDir := t.TempDir()

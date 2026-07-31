@@ -124,8 +124,14 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             apply_thread_message_row_patch(model, thread_id, *index);
         }
         Dirty::Connection { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_connection_status(thread.connection_status.clone().into());
+            // ChatArea exposes one global connection-status property for the
+            // currently displayed thread. A background thread's daemon
+            // snapshot must update its row/model state without replacing the
+            // selected thread's top-bar status.
+            if displayed_thread_for_id(model, thread_id).is_some() {
+                if let Some(thread) = thread_for_id(model, thread_id) {
+                    component.set_connection_status(thread.connection_status.clone().into());
+                }
             }
         }
         Dirty::Toast => {

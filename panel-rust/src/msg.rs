@@ -328,6 +328,7 @@ pub enum HostMsg {
 /// path; `sync()` only runs when the returned `Dirty` set is nonempty.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FrameInput {
+    pub session_updates: Vec<crate::snapflow_session_client::SessionUpdate>,
     pub bridge_events: Vec<crate::agent_bridge::BridgeEvent>,
     /// Durable thread identity captured at the same time as each bridge
     /// event. The numeric event index is only a bridge lookup location and

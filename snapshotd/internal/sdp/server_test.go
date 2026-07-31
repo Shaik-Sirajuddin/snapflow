@@ -67,7 +67,7 @@ func TestServer_PushesProjectInventoryChanges(t *testing.T) {
 	h.mu.Unlock()
 
 	_ = c.nc.SetReadDeadline(time.Now().Add(3 * time.Second))
-	for {
+	for i := 0; i < 100; i++ {
 		isNotif, notification, _ := c.nextFrame(t)
 		if !isNotif {
 			continue

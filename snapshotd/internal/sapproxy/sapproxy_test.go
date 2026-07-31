@@ -26,6 +26,7 @@ type fakeSapServer struct {
 	mu       sync.Mutex
 	tracks   map[string][]string      // projectID -> track kinds
 	watchers map[string][]chan []byte // projectID -> connections' outbound queues
+	conns    map[net.Conn]struct{}
 }
 
 func newFakeSapServer(token string) *fakeSapServer {
@@ -33,6 +34,7 @@ func newFakeSapServer(token string) *fakeSapServer {
 		token:    token,
 		tracks:   make(map[string][]string),
 		watchers: make(map[string][]chan []byte),
+		conns:    make(map[net.Conn]struct{}),
 	}
 }
 
@@ -49,13 +51,21 @@ func (s *fakeSapServer) serve(t *testing.T, socketPath string) {
 			if err != nil {
 				return
 			}
+			s.mu.Lock()
+			s.conns[conn] = struct{}{}
+			s.mu.Unlock()
 			go s.handleConn(conn)
 		}
 	}()
 }
 
 func (s *fakeSapServer) handleConn(nc net.Conn) {
-	defer nc.Close()
+	defer func() {
+		_ = nc.Close()
+		s.mu.Lock()
+		delete(s.conns, nc)
+		s.mu.Unlock()
+	}()
 	r := bufio.NewReader(nc)
 	var writeMu sync.Mutex
 	write := func(v any) {
@@ -159,6 +169,14 @@ func (s *fakeSapServer) handleConn(nc net.Conn) {
 		default:
 			respond(nil, "method not found: "+req.Method)
 		}
+	}
+}
+
+func (s *fakeSapServer) closeConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn := range s.conns {
+		_ = conn.Close()
 	}
 }
 
@@ -268,6 +286,37 @@ func TestRouter_BindAndCall_ForwardsOpaquely(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if sinkB.count() != before {
 		t.Fatalf("expected unbound session to stop receiving notifications, got %d -> %d", before, sinkB.count())
+	}
+}
+
+func TestRouter_AsynchronousCloseNotifiesAllBoundSessions(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fake.sock")
+	srv := newFakeSapServer("tok-async")
+	srv.serve(t, sock)
+	router := NewRouter(func(string) (string, string, error) {
+		return sock, "tok-async", nil
+	})
+	closed := make(chan []string, 1)
+	router.SetConnectionClosedHandler(func(_ string, sessionIDs []string) {
+		closed <- sessionIDs
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, sessionID := range []string{"session-a", "session-b"} {
+		if _, err := router.Bind(ctx, sessionID, "proj-async", &recordingSink{}); err != nil {
+			t.Fatalf("bind %s: %v", sessionID, err)
+		}
+	}
+	srv.closeConnections()
+
+	select {
+	case got := <-closed:
+		if len(got) != 2 {
+			t.Fatalf("expected both bound sessions in close notification, got %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for asynchronous connection-close notification")
 	}
 }
 

@@ -34,12 +34,16 @@ var ErrNotFound = errors.New("session: not found")
 // SessionMgr sequence diagram (SET session:{id} {clientKind, projectId,
 // role} EX 60) and 01-jsonrpc-spec.md's session->project binding model.
 type Session struct {
-	ID         string
-	ClientKind string // e.g. "mcp", "cli", "raw-jsonrpc"
-	ProjectID  string // bound project, if any ("" means unbound)
-	Role       string // reserved per 05-multi-client-concurrency.md's role field
-	CreatedAt  time.Time
-	ExpiresAt  time.Time
+	ID               string
+	ClientKind       string // e.g. "mcp", "cli", "raw-jsonrpc"
+	ProjectID        string // bound project, if any ("" means unbound)
+	ProjectPath      string // canonical path of ProjectID, if bound
+	ConnectionStatus string // unknown, connecting, connected, disconnected, error
+	ACPSessionID     string // optional explicit ACPX correlation id
+	Revision         uint64 // monotonically increasing derived-state revision
+	Role             string // reserved per 05-multi-client-concurrency.md's role field
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
 }
 
 // Store is the interface the daemon core depends on. Implementations must be
@@ -61,6 +65,10 @@ type Store interface {
 	// BindProject records which project a session is routed to, per the
 	// "no project_id param on every call" session-binding model.
 	BindProject(id, projectID string) error
+
+	// Update applies a mutation to one live session and returns the resulting
+	// snapshot. Implementations must serialize the mutation with lookup/bind.
+	Update(id string, mutate func(*Session)) (Session, error)
 
 	// Expire removes a session immediately (explicit disconnect/logout),
 	// rather than waiting for its TTL to lapse.

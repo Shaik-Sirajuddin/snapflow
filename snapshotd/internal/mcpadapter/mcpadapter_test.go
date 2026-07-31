@@ -49,15 +49,15 @@ func (f *fakeHandler) ForwardSAP(ctx context.Context, sessionID string, sink sap
 	f.lastMethod = method
 	f.lastParams = params
 	switch method {
-	case "project.select":
+	case "project.enter":
 		f.bound = true
-		sink.Notify("project.dirty", json.RawMessage(`{"reason":"select"}`))
+		sink.Notify("project.dirty", json.RawMessage(`{"reason":"enter"}`))
 		return json.Marshal(map[string]any{"projectId": "proj-1"})
 	case "sap.boom":
 		return nil, errors.New("sap: boom")
 	default:
 		if !f.bound {
-			return nil, errors.New("sap: no project selected; call project.select first")
+			return nil, errors.New("sap: no project entered; call project.enter first")
 		}
 		return params, nil
 	}
@@ -99,13 +99,11 @@ func TestMCPAdapter_ToolsListedAndCallable(t *testing.T) {
 		"daemon.list":          false,
 		"daemon.health":        false,
 		"daemon.close":         false,
-		"project.open":         false,
-		"project.close":        false,
+		"project.enter":        false,
+		"project.exit":         false,
 		"project.create":       false,
 		"project.list":         false,
 		"project.clone":        false,
-		"project.select":       false,
-		"project.exit":         false,
 	}
 	for _, tl := range toolsResult.Tools {
 		if _, ok := want[tl.Name]; ok {
@@ -209,12 +207,12 @@ func TestMCPAdapter_AudioToolsHiddenAndMissingBindingOverSSE(t *testing.T) {
 	req.Params.Arguments = map[string]any{"kind": "video"}
 	res, err := c.CallTool(ctx, req)
 	if err != nil {
-		t.Fatalf("call edit.addTrack before project.select: %v", err)
+		t.Fatalf("call edit.addTrack before project.enter: %v", err)
 	}
 	if !res.IsError {
 		t.Fatalf("expected missing project binding to be a tool error, got %s", toolResultText(res))
 	}
-	if got := toolResultText(res); !strings.Contains(got, "no project selected") || !strings.Contains(got, "project.select") {
+	if got := toolResultText(res); !strings.Contains(got, "no project entered") || !strings.Contains(got, "project.enter") {
 		t.Fatalf("expected legible missing-binding error, got %q", got)
 	}
 }
@@ -248,17 +246,17 @@ func TestMCPAdapter_TypedToolForwardsToSAP(t *testing.T) {
 	}
 
 	selectReq := mcp.CallToolRequest{}
-	selectReq.Params.Name = "project.select"
+	selectReq.Params.Name = "project.enter"
 	selectReq.Params.Arguments = map[string]any{"projectId": "proj-1"}
 	selectRes, err := c.CallTool(ctx, selectReq)
 	if err != nil {
-		t.Fatalf("call project.select: %v", err)
+		t.Fatalf("call project.enter: %v", err)
 	}
 	if selectRes.IsError {
 		t.Fatalf("unexpected error result: %+v", selectRes)
 	}
-	if h.lastMethod != "project.select" {
-		t.Fatalf("expected ForwardSAP dispatch to project.select, got %s", h.lastMethod)
+	if h.lastMethod != "project.enter" {
+		t.Fatalf("expected ForwardSAP dispatch to project.enter, got %s", h.lastMethod)
 	}
 
 	echoReq := mcp.CallToolRequest{}

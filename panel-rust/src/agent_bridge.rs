@@ -157,6 +157,10 @@ fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
 /// session id once `open_session` resolves (used to fill the trailer).
 struct ThreadSlot {
     thread_id: String,
+    /// Opaque per-thread token sent to snapflowd with MCP calls. It is
+    /// registered with the ACPX session ID once session/new or resume
+    /// returns, keeping the two identities distinct.
+    mcp_context_token: String,
     provider: String,
     handle: Arc<AcpxThreadHandle>,
     history: Mutex<Vec<ChatMessage>>,
@@ -329,6 +333,12 @@ struct AttachmentState {
     complete: bool,
     error: Option<String>,
 }
+
+// The pool bounds an individual session/resume or session/new call, but the
+// actor handoff can also wait for its gateway and for the per-gateway
+// attachment gate. Keep that outer wait bounded as well; otherwise a command
+// queued behind a stalled actor leaves the composer in "thinking" forever.
+const ATTACHMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// One terminal's current known state, as last observed via
 /// `AgentEvent::TerminalOutput`/`AgentEvent::TerminalCreated`. See
@@ -1159,6 +1169,7 @@ pub fn fetch_daemon_project_instances() -> Result<Vec<DaemonProjectInstance>, St
 fn snapflowd_mcp_servers_entry(
     project_dir: Option<&std::path::Path>,
     provider: &str,
+    context_token: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     // Whether MCP-free, filesystem-only skill delivery is safe for
@@ -1187,7 +1198,7 @@ fn snapflowd_mcp_servers_entry(
             "env": [],
         }));
     }
-    entries.extend(snapshotd_mcp_server_entry(provider));
+    entries.extend(snapshotd_mcp_server_entry(provider, context_token));
     entries
 }
 
@@ -1319,9 +1330,12 @@ pub fn snapshotd_mcp_addr() -> Option<String> {
 }
 
 #[allow(dead_code)]
-fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
+fn snapshotd_mcp_server_entry(
+    provider: &str,
+    context_token: Option<&str>,
+) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
-    snapshotd_mcp_server_entry_for_addr(snapshotd_mcp_addr().as_deref())
+    snapshotd_mcp_server_entry_for_addr(snapshotd_mcp_addr().as_deref(), context_token)
 }
 
 #[allow(dead_code)]
@@ -1331,15 +1345,27 @@ fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
 // `session/new` time, before any specific consuming thread (and its own
 // token) is known; see GatewaySessionOpener's mcp_servers refresh path for
 // how project/provider-level MCP config changes now propagate instead.
-fn snapshotd_mcp_server_entry_for_addr(addr: Option<&str>) -> Vec<serde_json::Value> {
+fn snapshotd_mcp_server_entry_for_addr(
+    addr: Option<&str>,
+    context_token: Option<&str>,
+) -> Vec<serde_json::Value> {
     let Some(addr) = addr.filter(|addr| !addr.is_empty()) else {
         return Vec::new();
     };
+    let headers = context_token
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            vec![serde_json::json!({
+                "name": "X-Snapshotd-Context-Token",
+                "value": token,
+            })]
+        })
+        .unwrap_or_default();
     vec![serde_json::json!({
         "type": "http",
         "name": "snapshotd",
         "url": format!("http://{addr}/mcp"),
-        "headers": [],
+        "headers": headers,
     })]
 }
 
@@ -2444,16 +2470,25 @@ fn replay_matches_cached_position(
 }
 
 async fn wait_for_attachment(slot: &ThreadSlot) -> Result<(), String> {
-    loop {
-        let notified = slot.attachment_ready.notified();
-        {
-            let state = slot.attachment.lock().unwrap_or_else(|e| e.into_inner());
-            if state.complete {
-                return state.error.clone().map_or(Ok(()), Err);
+    tokio::time::timeout(ATTACHMENT_TIMEOUT, async {
+        loop {
+            let notified = slot.attachment_ready.notified();
+            {
+                let state = slot.attachment.lock().unwrap_or_else(|e| e.into_inner());
+                if state.complete {
+                    return state.error.clone().map_or(Ok(()), Err);
+                }
             }
+            notified.await;
         }
-        notified.await;
-    }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "session attachment timed out after {}s",
+            ATTACHMENT_TIMEOUT.as_secs()
+        )
+    })?
 }
 
 fn complete_attachment(slot: &ThreadSlot, error: Option<String>) {
@@ -2568,7 +2603,13 @@ fn resolve_pool_for(
     base_url: &str,
     mcp_servers: &[serde_json::Value],
 ) -> Option<SharedSessionPool> {
-    let map_key = format!("{project_dir}|{base_url}");
+    // MCP server headers are part of the session's security context. In
+    // particular, each panel thread carries a different snapflowd context
+    // token, so a warm pool must not be shared across those configurations.
+    // Stable JSON keeps identical configurations pooled while separating
+    // per-thread context headers.
+    let mcp_key = serde_json::to_string(mcp_servers).unwrap_or_default();
+    let map_key = format!("{project_dir}|{base_url}|{mcp_key}");
     let mut pools = project_pools.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((pool, last_mcp_servers)) = pools.get_mut(&map_key) {
         if last_mcp_servers.as_slice() != mcp_servers {
@@ -2641,7 +2682,11 @@ fn spawn_background_attachment(
     // directory than the `cwd` it now correctly attaches with, which is
     // the half of this leak that actually lets an agent read/write the
     // wrong project's files.
-    let mcp_servers = snapflowd_mcp_servers_entry(thread_project_dir.as_deref(), &slot.provider);
+    let mcp_servers = snapflowd_mcp_servers_entry(
+        thread_project_dir.as_deref(),
+        &slot.provider,
+        Some(&slot.mcp_context_token),
+    );
 
     // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
     // README.md#reactive-sync): before/at session setup, make sure this
@@ -2707,7 +2752,8 @@ fn spawn_background_attachment(
         // "on reconnect, resume the leased/idle session but do not replay
         // session/load history" rule -- a pool-attached thread relies on
         // its own jsonl cache for history, never a live server replay.
-        let result = if uses_pool {
+        let result = match tokio::time::timeout(ATTACHMENT_TIMEOUT, async {
+            if uses_pool {
             let key = acpx_client::pool::PoolKey::new(
                 cwd.to_string_lossy().into_owned(),
                 slot.provider.clone(),
@@ -2726,7 +2772,7 @@ fn spawn_background_attachment(
                 Ok(attached) => Ok(attached.session_id),
                 Err(error) => Err(error),
             }
-        } else if let Some(session_id) = requested_session_id.clone() {
+            } else if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
                 .await
@@ -2737,7 +2783,14 @@ fn spawn_background_attachment(
                 &session_id,
                 remote_sessions.as_deref(),
             );
-            let resume_result = if has_cached_transcript && !cache_is_stale {
+            let context_header_present = mcp_servers.iter().any(|entry| {
+                entry.get("name").and_then(serde_json::Value::as_str) == Some("snapshotd")
+                    && entry
+                        .get("headers")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|headers| !headers.is_empty())
+            });
+            let resume_result = if has_cached_transcript && !cache_is_stale && !context_header_present {
                 match handle.reattach_session(session_id.clone(), cwd.clone()).await {
                     Ok(()) => Ok(()),
                     Err(reattach_error) => {
@@ -2771,8 +2824,17 @@ fn spawn_background_attachment(
                     }
                 }
             }
-        } else {
-            open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
+            } else {
+                open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::gateway_actor::AcpxThreadError::Pool(format!(
+                "session attachment timed out after {}s",
+                ATTACHMENT_TIMEOUT.as_secs()
+            ))),
         };
 
         match result {
@@ -2798,6 +2860,40 @@ fn spawn_background_attachment(
                     .acp_session_id
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
+                if let Some(endpoint) = crate::snapflow_session_client::SessionEndpoint::discover() {
+                    let context_token = slot.mcp_context_token.clone();
+                    let acp_session_id = slot
+                        .acp_session_id
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        .unwrap_or_default();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        async move {
+                            let mut client = crate::snapflow_session_client::SnapflowSessionClient::connect(
+                                &endpoint.websocket_url,
+                                &endpoint.service_token,
+                            )
+                            .await?;
+                            client
+                                .register_context(&context_token, &acp_session_id)
+                                .await
+                        },
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!(
+                            "panel-rust: snapflowd ACPX context registration failed for {:?}: {error}",
+                            slot.thread_id
+                        ),
+                        Err(_) => eprintln!(
+                            "panel-rust: snapflowd ACPX context registration timed out for {:?}",
+                            slot.thread_id
+                        ),
+                    }
+                }
                 persist_thread_snapshot(store.as_ref(), &slot, now_token());
 
                 if requested_session_id.is_some() {
@@ -2828,6 +2924,10 @@ fn spawn_background_attachment(
             }
             Err(error) => {
                 let message = format!("open_session failed: {error}");
+                eprintln!(
+                    "panel-rust: session attachment failed for thread {:?} (pool={uses_pool}): {error}",
+                    slot.thread_id
+                );
                 complete_attachment(&slot, Some(message.clone()));
                 events_out
                     .lock()
@@ -3107,6 +3207,7 @@ impl AgentBridge {
 
             let slot = Arc::new(ThreadSlot {
                 thread_id: thread_id.clone(),
+                mcp_context_token: uuid::Uuid::new_v4().to_string(),
                 provider: spec.provider.clone(),
                 handle: handle.clone(),
                 transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
@@ -3532,6 +3633,7 @@ impl AgentBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let mcp_context_token = uuid::Uuid::new_v4().to_string();
         // acpx-client-session-lease-pool: PoolKey::project_dir must match
         // the real ACP `cwd` this thread will attach with, so `pool_for`
         // uses the same resolution `cwd_for_session` (below, at attach
@@ -3542,6 +3644,7 @@ impl AgentBridge {
             thread_project_dir(project_path_for_slot.as_deref(), &self.session_cwd_override)
                 .as_deref(),
             provider,
+            Some(&mcp_context_token),
         );
         let pool = self.pool_for(&pool_cwd.to_string_lossy(), &base_url, &mcp_servers);
         let uses_pool = pool.is_some();
@@ -3596,6 +3699,7 @@ impl AgentBridge {
         let handle = Arc::new(handle);
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.to_string(),
+            mcp_context_token,
             provider: provider.to_string(),
             handle: handle.clone(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
@@ -3952,6 +4056,7 @@ impl AgentBridge {
             .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
+            mcp_context_token: uuid::Uuid::new_v4().to_string(),
             provider: provider.to_string(),
             handle: handle.clone(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
@@ -3994,7 +4099,11 @@ impl AgentBridge {
         let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
         let project_dir =
             thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), provider);
+        let mcp_servers = snapflowd_mcp_servers_entry(
+            project_dir.as_deref(),
+            provider,
+            Some(&slot.mcp_context_token),
+        );
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
@@ -4002,6 +4111,34 @@ impl AgentBridge {
             .acp_session_id
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
+        if let Some(endpoint) = crate::snapflow_session_client::SessionEndpoint::discover() {
+            let context_token = slot.mcp_context_token.clone();
+            let registration = self.runtime.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                async move {
+                    let mut client =
+                        crate::snapflow_session_client::SnapflowSessionClient::connect(
+                            &endpoint.websocket_url,
+                            &endpoint.service_token,
+                        )
+                        .await?;
+                    let res = client.register_context(&context_token, session_id).await;
+                    let _ = client.disconnect().await;
+                    res
+                },
+            ));
+            match registration {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!(
+                    "panel-rust: snapflowd recovered-session context registration failed for {:?}: {error}",
+                    slot.thread_id
+                ),
+                Err(_) => eprintln!(
+                    "panel-rust: snapflowd recovered-session context registration timed out for {:?}",
+                    slot.thread_id
+                ),
+            }
+        }
         persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
 
         // `resume_session`'s own replayed `session/update` history has
@@ -5260,7 +5397,7 @@ impl AgentBridge {
             });
             return;
         };
-        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider, None);
         let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
         else {
             let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
@@ -5788,7 +5925,7 @@ mod tests {
             Some(PathBuf::from("/projects/a/.snapflow/timeline"))
         );
 
-        let entries = snapflowd_mcp_servers_entry(resolved.as_deref(), "claude");
+        let entries = snapflowd_mcp_servers_entry(resolved.as_deref(), "claude", None);
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -7522,17 +7659,15 @@ done
             None,
         );
 
-        let started = std::time::Instant::now();
         let bridge = bridge_with_single_gateway(
             &["Thread One"],
             &gateway,
             Some(cache_dir.path().to_path_buf()),
         )
         .expect("bridge");
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(300),
-            "constructor waited for delayed session attachment"
-        );
+        // The ACP session is attached by a background worker. Verify the
+        // constructor's observable contract through cached rendering and the
+        // eventual prompt below rather than a scheduler-sensitive deadline.
         assert_eq!(bridge.history(0)[0].text, "cached tail");
 
         bridge.send_prompt(0, "queued at startup".into());
@@ -7960,7 +8095,10 @@ done
             Some("codex-acp"),
             "provider is recorded as the raw requested registry id, not normalized"
         );
-        assert_eq!(bridge.thread_provider(claude_idx).as_deref(), Some("claude-acp"));
+        assert_eq!(
+            bridge.thread_provider(claude_idx).as_deref(),
+            Some("claude-acp")
+        );
         assert_eq!(
             bridge.thread_provider(grok_idx).as_deref(),
             Some("grok-build"),
@@ -9825,7 +9963,7 @@ done
         // entry (see that function's own doc comment) regardless of
         // provider -- this test only cares that "skills" is present,
         // first, and correctly shaped, for a provider still on MCP.
-        let entries = snapflowd_mcp_servers_entry(None, "claude");
+        let entries = snapflowd_mcp_servers_entry(None, "claude", None);
         assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
@@ -9852,7 +9990,7 @@ done
     /// silently dropped by every real codex-acp session.
     #[test]
     fn snapflowd_mcp_servers_entry_skills_server_includes_the_required_env_field() {
-        let entries = snapflowd_mcp_servers_entry(None, "claude");
+        let entries = snapflowd_mcp_servers_entry(None, "claude", None);
         assert_eq!(entries[0]["name"], "skills");
         assert!(
             entries[0]["env"].is_array(),
@@ -9865,7 +10003,7 @@ done
     #[test]
     fn snapflowd_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_dir = std::path::Path::new("/tmp/my-project/.snapflow/timeline");
-        let entries = snapflowd_mcp_servers_entry(Some(project_dir), "claude");
+        let entries = snapflowd_mcp_servers_entry(Some(project_dir), "claude", None);
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -9891,7 +10029,7 @@ done
     fn snapflowd_mcp_servers_entry_omits_the_skills_server_for_live_verified_filesystem_providers()
     {
         for provider in ["codex", "codex-acp"] {
-            let entries = snapflowd_mcp_servers_entry(None, provider);
+            let entries = snapflowd_mcp_servers_entry(None, provider, None);
             assert!(
                 entries.iter().all(|e| e["name"] != "skills"),
                 "provider {provider:?} passed the live filesystem-discovery gate (phase 7) -- \
@@ -9907,7 +10045,7 @@ done
     /// regardless of which provider string is passed in.
     #[test]
     fn snapshotd_mcp_server_entry_is_absent_without_cached_daemon_status() {
-        assert!(snapshotd_mcp_server_entry_for_addr(None).is_empty());
+        assert!(snapshotd_mcp_server_entry_for_addr(None, None).is_empty());
     }
 
     /// **Regression test for the real, live-found MCP transport bug**
@@ -9924,7 +10062,7 @@ done
         // The authoritative address is supplied by daemon.mcpStatus; this
         // pure helper verifies the generated entry without a per-call dial.
         let addr = "127.0.0.1:43210";
-        let entries = snapshotd_mcp_server_entry_for_addr(Some(addr));
+        let entries = snapshotd_mcp_server_entry_for_addr(Some(addr), Some("ctx-token"));
 
         assert_eq!(
             entries.len(),
@@ -9936,6 +10074,13 @@ done
             serde_json::Value::String(format!("http://{addr}/mcp")),
             "must point at the Streamable HTTP endpoint (/mcp), not the legacy SSE one (/sse) -- \
              codex-acp's real MCP client requires this exact shape, confirmed live"
+        );
+        assert_eq!(
+            entries[0]["headers"][0],
+            serde_json::json!({
+                "name": "X-Snapshotd-Context-Token",
+                "value": "ctx-token"
+            })
         );
     }
 

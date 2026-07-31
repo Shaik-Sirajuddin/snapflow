@@ -84,7 +84,7 @@ func TestGUIMatrix_GUIRegistrationPreventsHeadlessDuplicateOnProjectOpen(t *test
 	// The fake GUI socket makes the final SAP bind fail, but the important
 	// invariant is checked before that bind: project.open must not launch a
 	// daemon-owned headless process while the GUI registration is live.
-	_, _ = d.ForwardSAP(ctx, "gui-reuse-session", &fanoutSink{}, "project.open", mustJSON(t, map[string]any{
+	_, _ = d.ForwardSAP(ctx, "gui-reuse-session", &fanoutSink{}, "project.enter", mustJSON(t, map[string]any{
 		"projectId": project.ID,
 	}))
 	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)
@@ -145,7 +145,7 @@ func TestGUIMatrix_MCPOpenPromotesDiscoveryBeforeHeadlessLaunch(t *testing.T) {
 
 	// The fake SAP listener intentionally does not complete project.select;
 	// the invariant under test is checked before SAP bind completes.
-	_, _ = d.ForwardSAP(ctx, "cold-start-mcp", &fanoutSink{}, "project.open", mustJSON(t, map[string]any{
+	_, _ = d.ForwardSAP(ctx, "cold-start-mcp", &fanoutSink{}, "project.enter", mustJSON(t, map[string]any{
 		"projectId": project.ID,
 	}))
 	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)

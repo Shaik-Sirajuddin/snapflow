@@ -130,13 +130,13 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 		t.Fatalf("initialize: %v", err)
 	}
 
-	// project.select via its own typed tool.
+	// project.enter via its own typed tool.
 	selectReq := mcp.CallToolRequest{}
-	selectReq.Params.Name = "project.select"
+	selectReq.Params.Name = "project.enter"
 	selectReq.Params.Arguments = map[string]any{"projectId": proj.ID}
 	selectRes, err := c.CallTool(ctx, selectReq)
 	if err != nil {
-		t.Fatalf("call project.select: %v", err)
+		t.Fatalf("call project.enter: %v", err)
 	}
 	if selectRes.IsError {
 		t.Fatalf("unexpected error result: %+v", toolResultText(selectRes))

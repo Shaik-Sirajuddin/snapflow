@@ -38,7 +38,9 @@ acpx-client = { path = "../acpx/acpx-client" }
 # at lib/skills-manager/, wired in the same path-dependency style as
 # acpx-client above. See memory/acpx/gen/plans/acpx-skills/README.md.
 skills-manager = { path = "../lib/skills-manager" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std", "net", "fs"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

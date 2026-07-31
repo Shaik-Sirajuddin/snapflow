@@ -60,7 +60,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-REG="$REPO_ROOT/memory/team/reserved/port_registry.sh"
+REG="${PORT_REGISTRY_SCRIPT:-$REPO_ROOT/memory/team/reserved/port_registry.sh}"
 SHARED_VNC="$SCRIPT_DIR/vnc_shared_init.sh"
 STATE_BASE="${VNC_STATE_BASE:-${HOME}/.snapflow/state}"
 VNC_SHARED_ROOT="${VNC_SHARED_ROOT:-$STATE_BASE/snapflow/vnc-shared}"
@@ -264,7 +264,7 @@ cmd_start() {
 import sys
 from pathlib import Path
 sys.path.insert(0, "$SCRIPT_DIR")
-sys.path.insert(0, str(Path("$REPO_ROOT") / "memory" / "team" / "testing"))
+sys.path.insert(0, str(Path("$SNAPSHOTD_TEST_INSTANCE").parent))
 from snapshotd_test_instance import ensure_daemon, load_instance
 import os
 scratch = Path("$state_dir") / "snapshotd-scratch"
@@ -421,7 +421,7 @@ cmd_rebuild() {
     FORCE_REBUILD=1 cmd_start "$1" "${2:-codex-acp}"
 }
 
-SNAPSHOTD_TEST_INSTANCE="$REPO_ROOT/memory/team/testing/snapshotd_test_instance.py"
+SNAPSHOTD_TEST_INSTANCE="${SNAPSHOTD_TEST_INSTANCE:-$REPO_ROOT/memory/team/testing/snapshotd_test_instance.py}"
 CLEAN_LOG_DIR="$STATE_BASE/snapflow/vnc-logs"
 mkdir -p "$CLEAN_LOG_DIR" 2>/dev/null || true
 

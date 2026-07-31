@@ -70,7 +70,9 @@ fn profile_from_key(key: &PoolKey) -> Option<&str> {
 /// "no explicit selection, use the server's own default" exactly as
 /// before -- only a real, specific agent id should ever override that.
 fn explicit_agent_id_from_key(key: &PoolKey) -> Option<&str> {
-    if key.agent_id.is_empty() || key.agent_id == crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK {
+    if key.agent_id.is_empty()
+        || key.agent_id == crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK
+    {
         None
     } else {
         Some(key.agent_id.as_str())

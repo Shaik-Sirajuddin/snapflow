@@ -612,7 +612,13 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                     .unwrap_or_default()
                     .into(),
                 text: m.text.clone().into(),
-                markdown_lines: markdown_lines_for(&mut render_index, &i.to_string(), i, kind, &m.text),
+                markdown_lines: markdown_lines_for(
+                    &mut render_index,
+                    &i.to_string(),
+                    i,
+                    kind,
+                    &m.text,
+                ),
                 markdown_blocks: markdown_blocks_for(
                     &mut render_index,
                     &i.to_string(),
@@ -1229,7 +1235,9 @@ pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
 /// Permission-mode selector rows (dedicated compose dropdown) -- same
 /// shape as [`to_reasoning_dropdown_entries`], filtering on
 /// [`is_permission_mode_option_id`] instead.
-pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+pub fn to_permission_mode_dropdown_entries(
+    options: Vec<ConfigOptionInfo>,
+) -> ModelRc<DropdownEntry> {
     let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
         if is_permission_mode_option_id(&option.id) {
@@ -1242,7 +1250,10 @@ pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> Mo
 /// Trigger label for the permission-mode dropdown (current value name, or
 /// ""), same shape as [`current_reasoning_trigger_label`].
 pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> String {
-    for option in options.iter().filter(|o| is_permission_mode_option_id(&o.id)) {
+    for option in options
+        .iter()
+        .filter(|o| is_permission_mode_option_id(&o.id))
+    {
         let Some(cur) = option.current_value.as_ref() else {
             continue;
         };
@@ -2888,7 +2899,10 @@ mod transcript_model_tests {
         let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
         let a = markdown_lines_for(&mut render_index, "k1", 0, "agent", "# First");
         let b = markdown_lines_for(&mut render_index, "k2", 1, "agent", "# Second");
-        assert_ne!(a.row_data(0).unwrap().plain_text, b.row_data(0).unwrap().plain_text);
+        assert_ne!(
+            a.row_data(0).unwrap().plain_text,
+            b.row_data(0).unwrap().plain_text
+        );
     }
 
     #[test]

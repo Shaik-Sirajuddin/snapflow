@@ -38,10 +38,10 @@
 //! Phase 1 and Phase 3 of that plan (keyed identity + frame-projection
 //! reuse), landed in this pass.
 
+use slint::ModelRc;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use slint::ModelRc;
 
 /// One row's bookkeeping: where it currently sits in the projected row
 /// list, a fingerprint of the source text last used to build it, and the
@@ -319,16 +319,25 @@ mod tests {
         // as tokens stream in, same key, same row_index, different text.
         let mut idx = ThreadMessageIndex::default();
         idx.record("assistant:1", 3, "partial");
-        assert_eq!(idx.check("assistant:1", "partial text grew"), RowChange::Changed(3));
+        assert_eq!(
+            idx.check("assistant:1", "partial text grew"),
+            RowChange::Changed(3)
+        );
     }
 
     #[test]
     fn record_after_changed_makes_the_next_check_unchanged() {
         let mut idx = ThreadMessageIndex::default();
         idx.record("assistant:1", 0, "partial");
-        assert_eq!(idx.check("assistant:1", "partial more"), RowChange::Changed(0));
+        assert_eq!(
+            idx.check("assistant:1", "partial more"),
+            RowChange::Changed(0)
+        );
         idx.record("assistant:1", 0, "partial more");
-        assert_eq!(idx.check("assistant:1", "partial more"), RowChange::Unchanged(0));
+        assert_eq!(
+            idx.check("assistant:1", "partial more"),
+            RowChange::Unchanged(0)
+        );
     }
 
     #[test]
@@ -338,7 +347,10 @@ mod tests {
         idx.record("assistant:1", 1, "world");
         idx.record("assistant:1", 1, "world changed");
         assert_eq!(idx.check("user:1", "hello"), RowChange::Unchanged(0));
-        assert_eq!(idx.check("assistant:1", "world changed"), RowChange::Unchanged(1));
+        assert_eq!(
+            idx.check("assistant:1", "world changed"),
+            RowChange::Unchanged(1)
+        );
     }
 
     #[test]
@@ -545,7 +557,10 @@ mod tests {
         );
         // The brand-new row has nothing rendered yet.
         assert!(idx2.rendered_blocks_for("user:2").is_none());
-        assert_eq!(idx2.check("assistant:1", "hello world"), RowChange::Unchanged(1));
+        assert_eq!(
+            idx2.check("assistant:1", "hello world"),
+            RowChange::Unchanged(1)
+        );
     }
 
     #[test]

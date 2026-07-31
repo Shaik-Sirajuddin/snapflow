@@ -121,7 +121,7 @@ func TestForwardSAP_RealSapRust_EndToEnd(t *testing.T) {
 	sinkB := &fanoutSink{}
 
 	// session-a: project.select, then mutate.
-	selectRaw, err := d.ForwardSAP(ctx, "session-a", sinkA, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	selectRaw, err := d.ForwardSAP(ctx, "session-a", sinkA, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("project.select (session-a): %v", err)
 	}
@@ -135,7 +135,7 @@ func TestForwardSAP_RealSapRust_EndToEnd(t *testing.T) {
 
 	// session-b: also bind to the same project (must share the pooled
 	// connection, not open a second one).
-	if _, err := d.ForwardSAP(ctx, "session-b", sinkB, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "session-b", sinkB, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
 		t.Fatalf("project.select (session-b): %v", err)
 	}
 
@@ -271,17 +271,17 @@ func TestForwardSAP_RealSapRust_ProjectSwitchGuard(t *testing.T) {
 
 	sink := &fanoutSink{}
 
-	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.enter", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
 		t.Fatalf("project.select projA: %v", err)
 	}
 
 	// Reselecting the SAME project must stay a no-op success.
-	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.enter", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
 		t.Fatalf("reselecting projA should succeed: %v", err)
 	}
 
 	// Switching to project B without exiting project A must be rejected.
-	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projB.ID})); err == nil {
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.enter", mustJSON(t, map[string]any{"projectId": projB.ID})); err == nil {
 		t.Fatalf("expected project.select to projB to be rejected while still bound to projA")
 	}
 
@@ -295,7 +295,7 @@ func TestForwardSAP_RealSapRust_ProjectSwitchGuard(t *testing.T) {
 	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.exit", mustJSON(t, map[string]any{})); err != nil {
 		t.Fatalf("project.exit: %v", err)
 	}
-	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projB.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.enter", mustJSON(t, map[string]any{"projectId": projB.ID})); err != nil {
 		t.Fatalf("project.select projB after exit should succeed: %v", err)
 	}
 	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "edit.listTracks", nil); err != nil {
@@ -359,10 +359,10 @@ func TestForwardSAP_RealSapRust_PhaseB_SameProjectConcurrentSessions(t *testing.
 
 	sinkA := &fanoutSink{}
 	sinkB := &fanoutSink{}
-	if _, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
 		t.Fatalf("project.select (A): %v", err)
 	}
-	if _, err := d.ForwardSAP(ctx, "phaseb-b", sinkB, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "phaseb-b", sinkB, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
 		t.Fatalf("project.select (B): %v", err)
 	}
 
@@ -450,7 +450,7 @@ func TestForwardSAP_RealSapRust_PhaseB_SameProjectConcurrentSessions(t *testing.
 	// -- A single shared linear undo stack, not one per session: session A
 	// re-selecting reads the project's current undo_depth; session B's
 	// project.undo must visibly decrement it for session A too. --
-	stateBefore, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	stateBefore, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("re-select (A) before undo: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestForwardSAP_RealSapRust_PhaseB_SameProjectConcurrentSessions(t *testing.
 		t.Fatalf("project.undo (B): %v", err)
 	}
 
-	stateAfter, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	stateAfter, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("re-select (A) after undo: %v", err)
 	}
@@ -582,10 +582,10 @@ func TestForwardSAP_RealSapRust_PhaseC_DifferentProjectsIsolation(t *testing.T) 
 
 	sinkA := &fanoutSink{}
 	sinkB := &fanoutSink{}
-	if _, err := d.ForwardSAP(ctx, "phasec-a", sinkA, "project.select", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "phasec-a", sinkA, "project.enter", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
 		t.Fatalf("select A: %v", err)
 	}
-	if _, err := d.ForwardSAP(ctx, "phasec-b", sinkB, "project.select", mustJSON(t, map[string]any{"projectId": projB.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "phasec-b", sinkB, "project.enter", mustJSON(t, map[string]any{"projectId": projB.ID})); err != nil {
 		t.Fatalf("select B: %v", err)
 	}
 

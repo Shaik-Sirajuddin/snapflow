@@ -103,3 +103,23 @@ func TestMemory_List(t *testing.T) {
 		t.Fatalf("expected 2 live sessions, got %d", len(sessions))
 	}
 }
+
+func TestMemory_UpdateIncrementsRevision(t *testing.T) {
+	m := NewMemory(time.Hour)
+	defer m.Close()
+
+	created, err := m.Create("session-update", "mcp", time.Minute)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	updated, err := m.Update(created.ID, func(s *Session) {
+		s.ProjectPath = "/tmp/demo"
+		s.ConnectionStatus = "connected"
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Revision != created.Revision+1 || updated.ProjectPath != "/tmp/demo" || updated.ConnectionStatus != "connected" {
+		t.Fatalf("unexpected updated session: %+v", updated)
+	}
+}

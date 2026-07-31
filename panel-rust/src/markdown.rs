@@ -197,7 +197,11 @@ pub fn heal_open_markers(partial: &str) -> String {
                 // drop the dangling partial tag rather than guess at
                 // attributes; the closing `</font>` push above only
                 // fires once the opening tag itself is fully seen.
-                return format!("{}{}", &partial[..i], open_tags.into_iter().rev().collect::<String>());
+                return format!(
+                    "{}{}",
+                    &partial[..i],
+                    open_tags.into_iter().rev().collect::<String>()
+                );
             }
             if partial[i..].starts_with("</u>") {
                 if open_tags.last() == Some(&"</u>") {
@@ -371,16 +375,17 @@ fn segment_events(
                                 m += 1;
                             }
                             let item_end = m - 1;
-                            let has_block_child = events[item_start..item_end].iter().any(|(e, _)| {
-                                matches!(
-                                    e,
-                                    Event::Start(Tag::Paragraph)
-                                        | Event::Start(Tag::List(_))
-                                        | Event::Start(Tag::CodeBlock(_))
-                                        | Event::Start(Tag::BlockQuote(_))
-                                        | Event::Start(Tag::Table(_))
-                                )
-                            });
+                            let has_block_child =
+                                events[item_start..item_end].iter().any(|(e, _)| {
+                                    matches!(
+                                        e,
+                                        Event::Start(Tag::Paragraph)
+                                            | Event::Start(Tag::List(_))
+                                            | Event::Start(Tag::CodeBlock(_))
+                                            | Event::Start(Tag::BlockQuote(_))
+                                            | Event::Start(Tag::Table(_))
+                                    )
+                                });
                             if has_block_child {
                                 segment_events(events, item_start, item_end, indent + 1, out);
                             } else if item_start < item_end {
@@ -396,7 +401,8 @@ fn segment_events(
                                     // the bullet marker `- `) -- matches
                                     // a Paragraph-wrapped item's range,
                                     // which likewise excludes the marker.
-                                    source_range: events[item_start].1.start..events[item_end].1.end,
+                                    source_range: events[item_start].1.start
+                                        ..events[item_end].1.end,
                                     heading_level: None,
                                     indent: indent + 1,
                                 });
@@ -423,14 +429,16 @@ fn segment_events(
                             let mut k = j + 1;
                             loop {
                                 match &events[k].0 {
-                                    Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
+                                    Event::End(TagEnd::TableRow)
+                                    | Event::End(TagEnd::TableHead) => {
                                         k += 1;
                                         break;
                                     }
                                     Event::Start(Tag::TableCell) => {
                                         let cell_start = events[k].1.start;
                                         let mut m = k + 1;
-                                        while !matches!(&events[m].0, Event::End(TagEnd::TableCell)) {
+                                        while !matches!(&events[m].0, Event::End(TagEnd::TableCell))
+                                        {
                                             m += 1;
                                         }
                                         cells.push(cell_start..events[m].1.end);
@@ -1193,7 +1201,10 @@ mod tests {
         // not here: segment_blocks reports the real span verbatim.
         assert_eq!(source[spans[0].source_range.clone()].trim_end(), "# Title");
         assert_eq!(spans[1].heading_level, None);
-        assert_eq!(source[spans[1].source_range.clone()].trim_end(), "Hello world.");
+        assert_eq!(
+            source[spans[1].source_range.clone()].trim_end(),
+            "Hello world."
+        );
     }
 
     #[test]
@@ -1233,7 +1244,10 @@ mod tests {
         let spans = segment_blocks(source);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].indent, 1);
-        assert_eq!(source[spans[0].source_range.clone()].trim_end(), "quoted text");
+        assert_eq!(
+            source[spans[0].source_range.clone()].trim_end(),
+            "quoted text"
+        );
     }
 
     #[test]
@@ -1245,10 +1259,10 @@ mod tests {
             BlockSpanKind::Table { cells, col_count } => {
                 assert_eq!(*col_count, 2);
                 assert_eq!(cells.len(), 4); // header row (2) + body row (2)
-                // Cell ranges include the table syntax's padding
-                // whitespace around `|` delimiters (real pulldown-cmark
-                // behavior) -- trimmed downstream the same way block
-                // ranges' trailing newlines are.
+                                            // Cell ranges include the table syntax's padding
+                                            // whitespace around `|` delimiters (real pulldown-cmark
+                                            // behavior) -- trimmed downstream the same way block
+                                            // ranges' trailing newlines are.
                 let texts: Vec<&str> = cells.iter().map(|r| source[r.clone()].trim()).collect();
                 assert_eq!(texts, vec!["a", "b", "1", "2"]);
             }
@@ -1287,9 +1301,15 @@ mod tests {
             "real segment_blocks output shape for the dev fixture's checklist source: {spans:?}"
         );
         assert_eq!(spans[0].heading_level, Some(3));
-        assert_eq!(source[spans[2].source_range.clone()].trim_end(), "ordered item");
+        assert_eq!(
+            source[spans[2].source_range.clone()].trim_end(),
+            "ordered item"
+        );
         assert_eq!(spans[2].indent, 1);
-        assert_eq!(source[spans[3].source_range.clone()].trim_end(), "second item");
+        assert_eq!(
+            source[spans[3].source_range.clone()].trim_end(),
+            "second item"
+        );
         assert_eq!(spans[3].indent, 1);
         match &spans[4].kind {
             BlockSpanKind::Table { cells, col_count } => {

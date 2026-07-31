@@ -12,25 +12,24 @@ import (
 
 // projectTools builds the project.* surface (path-first follow-on):
 //
-//	Primary: project.open / project.close / project.create / project.list /
+//	Primary: project.enter / project.exit / project.create / project.list /
 //	         project.clone / getState/save/undo/redo
-//	Deprecated wrappers: project.select / project.exit (same ForwardSAP
-//	methods as open/close)
+//	The public lifecycle is intentionally only project.enter/project.exit.
 //
 // Open/init/close behavior lives in daemon.ForwardSAP (Launch-or-reuse +
 // Bind; Unbind). create/list/clone use Handler.Dispatch for registry work;
 // create with open:true chains open+save in this package.
 func projectTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	return []server.ServerTool{
-		// --- primary agent-facing names ---
-		sapTool(s, h, "project.open", "project.select",
-			"Open or attach this session to a project. Accepts projectId and/or path (filesystem folder or .mlt). Launch-or-reuses the child process, loads saved .mlt on first open (safe no-op attach for later sessions). Preferred over project.select.",
+		// --- lifecycle names ---
+		sapTool(s, h, "project.enter", "project.enter",
+			"Enter or attach this session to a project. Accepts projectId and/or path (filesystem folder or .mlt). Launch-or-reuses the child process and loads the saved .mlt.",
 			mcp.WithString("projectId", mcp.Description("Project ID (from project.create / project.list)")),
 			mcp.WithString("path", mcp.Description("Filesystem path to a project folder or .mlt file (preferred addressing)")),
 			dynamicOutputSchema[ProjectState](),
 		),
-		sapTool(s, h, "project.close", "project.exit",
-			"Close this session's binding to its project (session-scoped unbind only). Other sessions and the running process are unaffected. Preferred over project.exit.",
+		sapTool(s, h, "project.exit", "project.exit",
+			"Exit this session's binding to its project (session-scoped unbind only). Other sessions and the running process are unaffected.",
 			dynamicOutputSchema[EmptyResult](),
 		),
 		projectCreateTool(s, h),
@@ -39,17 +38,6 @@ func projectTools(s *server.MCPServer, h Handler) []server.ServerTool {
 			mcp.WithBoolean("refresh", mcp.Description("If true, probe live process liveness per project instead of DB-only ready status")),
 			h),
 		projectCloneTool(s, h),
-		// --- deprecated aliases (same behavior) ---
-		sapTool(s, h, "project.select", "project.select",
-			"[Deprecated: use project.open] Bind this MCP session to a project. Accepts projectId and/or path.",
-			mcp.WithString("projectId", mcp.Description("Project ID")),
-			mcp.WithString("path", mcp.Description("Filesystem path to project folder or .mlt")),
-			dynamicOutputSchema[ProjectState](),
-		),
-		sapTool(s, h, "project.exit", "project.exit",
-			"[Deprecated: use project.close] Unbind this MCP session from its project.",
-			dynamicOutputSchema[EmptyResult](),
-		),
 		// --- state / history ---
 		sapTool(s, h, "project.getState", "project.getState",
 			"Read the bound project's state, including undo/redo stack depths and projectType.",
@@ -132,7 +120,7 @@ func projectCreateTool(s *server.MCPServer, h Handler) server.ServerTool {
 			}
 			sink := &mcpSink{server: s, sessionID: cs.SessionID()}
 			selectParams, _ := json.Marshal(map[string]string{"projectId": projectID})
-			state, err := forwardSAP(h, ctx, cs.SessionID(), sink, "project.select", selectParams)
+			state, err := forwardSAP(h, ctx, cs.SessionID(), sink, "project.enter", selectParams)
 			if err != nil {
 				return mcp.NewToolResultError("project.create open: " + err.Error()), nil
 			}
@@ -184,7 +172,7 @@ func projectCloneTool(s *server.MCPServer, h Handler) server.ServerTool {
 				}
 				sink := &mcpSink{server: s, sessionID: cs.SessionID()}
 				selectParams, _ := json.Marshal(map[string]string{"projectId": proj.ID})
-				state, err := forwardSAP(h, ctx, cs.SessionID(), sink, "project.select", selectParams)
+				state, err := forwardSAP(h, ctx, cs.SessionID(), sink, "project.enter", selectParams)
 				if err != nil {
 					return mcp.NewToolResultError("project.clone open: " + err.Error()), nil
 				}

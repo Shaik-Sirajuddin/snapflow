@@ -211,6 +211,9 @@ pub struct SkillEditorState {
 #[derive(Clone, Default)]
 pub struct Model {
     pub threads: Vec<ThreadModel>,
+    /// Latest accepted daemon-derived snapshot by snapflow transport session.
+    /// ACPX session IDs are matched separately when folding updates.
+    pub session_derived: HashMap<String, crate::snapflow_session_client::SessionSnapshot>,
     /// O(1) durable identity -> `threads` index lookup for bridge/effect
     /// routing. The vector remains the source of insertion/display order.
     pub(crate) thread_id_index: HashMap<String, usize>,
@@ -486,7 +489,9 @@ impl Default for ThreadModel {
             transcript_keys: Vec::new(),
             #[cfg(test)]
             message_rows: Vec::new(),
-            markdown_render_index: RefCell::new(crate::thread_message_index::ThreadMessageIndex::default()),
+            markdown_render_index: RefCell::new(
+                crate::thread_message_index::ThreadMessageIndex::default(),
+            ),
             markdown_epoch: crate::markdown_worker::EpochCounter::new(),
             markdown_in_flight: crate::markdown_worker::InFlightRegistry::new(),
             has_older_messages: false,

@@ -68,6 +68,16 @@ type Daemon struct {
 	// so a PID+signal-based `stop` command can never work there.
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// sessionWatchers is the daemon-side fan-out for the authenticated
+	// session-status stream. It is keyed by snapflow transport session ID;
+	// each client connection owns its own watcher channel.
+	sessionMu         sync.RWMutex
+	sessionWatchers   map[string]map[uint64]chan session.Session
+	nextWatcherID     uint64
+	sessionReaperStop chan struct{}
+	sessionReaperDone chan struct{}
+	sessionReaperOnce sync.Once
 }
 
 type RegisterExternalInstanceParams struct {
@@ -415,6 +425,29 @@ func (d *Daemon) RegisterMcpContext(ctx context.Context, p RegisterMcpContextPar
 	return *contextRecord, nil
 }
 
+// RegisterSessionContext records the ACPX identity before the first
+// project-scoped MCP call. The project target is intentionally left empty;
+// ForwardSAPWithContext sets it from the caller's first project.select/open.
+// This closes the normal panel lifecycle without requiring the panel to know
+// the MCP transport session ID in advance.
+func (d *Daemon) RegisterSessionContext(contextToken, acpSessionID string) error {
+	if strings.TrimSpace(contextToken) == "" || strings.TrimSpace(acpSessionID) == "" {
+		return fmt.Errorf("daemon: registerSessionContext: contextToken and acpSessionId are required")
+	}
+	contextRecord, err := d.Reg.GetMcpContext(contextToken)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return err
+	}
+	if contextRecord == nil {
+		contextRecord = &registry.McpContext{ContextToken: contextToken}
+	}
+	now := time.Now().UTC()
+	contextRecord.ACPSessionID = acpSessionID
+	contextRecord.LastSeenAt = now
+	contextRecord.LeaseExpiresAt = now.Add(externalInstanceLease)
+	return d.Reg.SaveMcpContext(contextRecord)
+}
+
 func (d *Daemon) SetMcpProjectTarget(ctx context.Context, token, projectID string) (registry.McpContext, error) {
 	contextRecord, err := d.Reg.GetMcpContext(token)
 	if err != nil {
@@ -477,16 +510,31 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 		pm.ConnectTimeout = cfg.LaunchConnectTimeout
 	}
 	d := &Daemon{
-		Cfg:      cfg,
-		Reg:      reg,
-		Sessions: session.NewMemory(session.DefaultSweepInterval),
-		Proc:     pm,
-		Log:      logger,
-		stopCh:   make(chan struct{}),
+		Cfg:               cfg,
+		Reg:               reg,
+		Sessions:          session.NewMemory(session.DefaultSweepInterval),
+		Proc:              pm,
+		Log:               logger,
+		stopCh:            make(chan struct{}),
+		sessionWatchers:   make(map[string]map[uint64]chan session.Session),
+		sessionReaperStop: make(chan struct{}),
+		sessionReaperDone: make(chan struct{}),
 	}
+	go d.runSessionWatcherReaper()
 	d.SAP = sapproxy.NewRouter(d.resolveProjectInstance)
+	d.SAP.SetConnectionClosedHandler(d.handleSAPConnectionClosed)
 	d.Mcp = mcpsupervisor.New(d, cfg.HomeDir, cfg.MCPSSEAddr, logger)
 	return d, nil
+}
+
+// handleSAPConnectionClosed propagates an asynchronous loss of a shared
+// project connection to every still-bound session. The project binding is
+// intentionally retained so the next request can redial and recover it;
+// only the derived live status changes.
+func (d *Daemon) handleSAPConnectionClosed(_ string, sessionIDs []string) {
+	for _, sessionID := range sessionIDs {
+		d.updateSessionStatus(sessionID, "error")
+	}
 }
 
 // resolveProjectInstance implements sapproxy.Resolver. It first checks
@@ -575,6 +623,10 @@ func (d *Daemon) Reconcile(ctx context.Context) ([]registry.ReconcileOutcome, er
 // (per the reconciliation-on-restart design, they are expected to survive a
 // daemon restart).
 func (d *Daemon) Close() error {
+	if d.sessionReaperStop != nil {
+		d.sessionReaperOnce.Do(func() { close(d.sessionReaperStop) })
+		<-d.sessionReaperDone
+	}
 	_ = d.Sessions.Close()
 	return d.Reg.Close()
 }
@@ -1033,6 +1085,166 @@ func (d *Daemon) CloseInstance(ctx context.Context, instanceID string) error {
 
 // --- Generic SAP proxy, per 06-daemon-mcp-proxy.md's proxy requirement ---
 
+// updateSessionDerived records the server-owned metadata that the panel uses
+// for its thread top bar, then publishes the resulting replacement snapshot
+// to every live subscriber for this transport session. The session store
+// remains the source of truth; the watcher map is only delivery state.
+func (d *Daemon) updateSessionDerived(sessionID, projectID, projectPath, status string) {
+	snapshot, err := d.Sessions.Update(sessionID, func(s *session.Session) {
+		s.ProjectID = projectID
+		s.ProjectPath = projectPath
+		s.ConnectionStatus = status
+	})
+	if err != nil {
+		return
+	}
+	d.publishSessionSnapshot(snapshot)
+}
+
+// updateSessionStatus publishes only real connection-state transitions. A
+// successful ordinary SAP call must not create a new revision for every tool
+// invocation, but it should recover an earlier error state.
+func (d *Daemon) updateSessionStatus(sessionID, status string) {
+	current, err := d.Sessions.Lookup(sessionID)
+	if err != nil || current.ConnectionStatus == status {
+		return
+	}
+	snapshot, err := d.Sessions.Update(sessionID, func(s *session.Session) {
+		s.ConnectionStatus = status
+	})
+	if err == nil {
+		d.publishSessionSnapshot(snapshot)
+	}
+}
+
+func (d *Daemon) publishSessionSnapshot(snapshot session.Session) {
+	d.sessionMu.RLock()
+	watchers := d.sessionWatchers[snapshot.ID]
+	chans := make([]chan session.Session, 0, len(watchers))
+	for _, ch := range watchers {
+		chans = append(chans, ch)
+	}
+	d.sessionMu.RUnlock()
+
+	for _, ch := range chans {
+		select {
+		case ch <- snapshot:
+		default:
+			// A slow subscriber must not block project operations or other
+			// subscribers. The next replacement snapshot supersedes this one.
+		}
+	}
+}
+
+func (d *Daemon) runSessionWatcherReaper() {
+	if d.sessionReaperStop == nil || d.sessionReaperDone == nil {
+		return
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	defer close(d.sessionReaperDone)
+	for {
+		select {
+		case <-ticker.C:
+			d.reapExpiredSessionWatchers()
+		case <-d.sessionReaperStop:
+			return
+		}
+	}
+}
+
+func (d *Daemon) reapExpiredSessionWatchers() {
+	if d.Sessions == nil {
+		return
+	}
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	for sessionID, watchers := range d.sessionWatchers {
+		if _, err := d.Sessions.Lookup(sessionID); err == nil {
+			continue
+		}
+		for watcherID, ch := range watchers {
+			close(ch)
+			delete(watchers, watcherID)
+		}
+		delete(d.sessionWatchers, sessionID)
+	}
+}
+
+// SubscribeSession attaches one independent watcher to a live session and
+// returns the current snapshot for immediate delivery. Removing the watcher
+// only affects this client connection; it never expires the transport
+// session or changes another client's subscription.
+func (d *Daemon) SubscribeSession(sessionID string) (session.Session, <-chan session.Session, func(), error) {
+	snapshot, err := d.resolveSessionReference(sessionID)
+	if err != nil {
+		return session.Session{}, nil, nil, err
+	}
+	sessionID = snapshot.ID
+
+	d.sessionMu.Lock()
+	d.nextWatcherID++
+	id := d.nextWatcherID
+	if d.sessionWatchers[sessionID] == nil {
+		d.sessionWatchers[sessionID] = make(map[uint64]chan session.Session)
+	}
+	ch := make(chan session.Session, 16)
+	d.sessionWatchers[sessionID][id] = ch
+	d.sessionMu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			d.sessionMu.Lock()
+			watchers := d.sessionWatchers[sessionID]
+			if _, present := watchers[id]; present {
+				delete(watchers, id)
+				if len(watchers) == 0 {
+					delete(d.sessionWatchers, sessionID)
+				}
+				close(ch)
+			}
+			d.sessionMu.Unlock()
+		})
+	}
+	return snapshot, ch, unsubscribe, nil
+}
+
+// SetSessionCorrelation records the ACPX session identity associated with the
+// daemon-side transport session. They are deliberately separate identifiers:
+// ACPX owns the chat/thread lifecycle while snapflowd owns the MCP transport.
+func (d *Daemon) SetSessionCorrelation(sessionID, acpSessionID string) (session.Session, error) {
+	snapshot, err := d.Sessions.Update(sessionID, func(s *session.Session) {
+		s.ACPSessionID = strings.TrimSpace(acpSessionID)
+	})
+	if err != nil {
+		return session.Session{}, err
+	}
+	d.publishSessionSnapshot(snapshot)
+	return snapshot, nil
+}
+
+func (d *Daemon) resolveSessionReference(reference string) (session.Session, error) {
+	if current, err := d.Sessions.Lookup(reference); err == nil {
+		return current, nil
+	}
+	for _, current := range d.Sessions.List() {
+		if current.ACPSessionID == reference {
+			return current, nil
+		}
+	}
+	return session.Session{}, session.ErrNotFound
+}
+
+// SessionDetails returns the current server-side derived state. If an ACPX
+// correlation is supplied, it is persisted before the snapshot is returned.
+func (d *Daemon) SessionDetails(sessionID, acpSessionID string) (session.Session, error) {
+	if strings.TrimSpace(acpSessionID) != "" {
+		return d.SetSessionCorrelation(sessionID, acpSessionID)
+	}
+	return d.resolveSessionReference(sessionID)
+}
+
 // proxySessionTTL is how long an SDP/MCP session's project binding survives
 // without an intervening call, per 07's session-TTL model applied to this
 // proxy's own session bookkeeping (separate from sap-rust's own connection
@@ -1074,9 +1286,9 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		d.Log.Info("mcp sap edit call", args...)
 	}
 
-	// project.open is the primary name; project.select is the deprecated alias.
-	// Both share this Launch-or-reuse + Bind path.
-	if method == "project.select" || method == "project.open" {
+	// project.enter is the sole public enter operation. The underlying pooled
+	// SAP connection still receives project.select below.
+	if method == "project.enter" {
 		var p struct {
 			ProjectID   string `json:"projectId"`
 			Path        string `json:"path"`
@@ -1104,11 +1316,18 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 			logMethod(err)
 			return nil, err
 		}
-		if _, err := d.Reg.GetProject(p.ProjectID); err != nil {
+		project, err := d.Reg.GetProject(p.ProjectID)
+		if err != nil {
 			err = fmt.Errorf("daemon: project.select: %w", err)
 			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
 		}
+		// Path is a derived registry field rather than a persisted column.
+		// Populate it before copying project metadata into the server-owned
+		// session snapshot; otherwise project.open reports connected while the
+		// panel's session-derived project path remains empty.
+		registry.FillProjectPathFields(project)
+		d.updateSessionDerived(sessionID, p.ProjectID, project.Path, "connecting")
 		// A panel publishes its discovery descriptor before the asynchronous
 		// registration worker necessarily reaches snapshotd. Promote that
 		// verified descriptor here, before the launch decision, so an MCP
@@ -1131,16 +1350,19 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 			headless := true
 			if _, err := d.Launch(ctx, LaunchParams{ProjectID: p.ProjectID, Headless: &headless}); err != nil {
 				err = fmt.Errorf("daemon: project.select: launch: %w", err)
+				d.updateSessionStatus(sessionID, "error")
 				logMethod(err, "projectId", p.ProjectID)
 				return nil, err
 			}
 		}
 		result, err := d.SAP.Bind(ctx, sessionID, p.ProjectID, sink)
 		if err != nil {
+			d.updateSessionStatus(sessionID, "error")
 			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
 		}
 		_ = d.Sessions.BindProject(sessionID, p.ProjectID)
+		d.updateSessionDerived(sessionID, p.ProjectID, project.Path, "connected")
 		// Init audit + persist projectType from response.
 		var st struct {
 			Opened      bool   `json:"opened"`
@@ -1158,8 +1380,8 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		return result, nil
 	}
 
-	// project.close is the primary name; project.exit is the deprecated alias.
-	if method == "project.exit" || method == "project.close" {
+	// project.exit is the sole public exit operation.
+	if method == "project.exit" {
 		// Deliberately NOT forwarded to sap-rust: internal/sapproxy pools one
 		// SAP connection per project, shared by every session bound to that
 		// project, and sap-rust's own project.select gate lives on that one
@@ -1173,11 +1395,22 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		// Bind's already-bound guard.
 		d.SAP.Unbind(sessionID)
 		_ = d.Sessions.BindProject(sessionID, "")
+		d.updateSessionDerived(sessionID, "", "", "disconnected")
 		logMethod(nil)
 		return json.RawMessage(`{}`), nil
 	}
+	if method == "project.open" || method == "project.close" || method == "project.select" {
+		err := fmt.Errorf("daemon: %s was removed; use project.enter or project.exit", method)
+		logMethod(err)
+		return nil, err
+	}
 
 	result, err := d.SAP.Call(ctx, sessionID, method, params)
+	if err != nil {
+		d.updateSessionStatus(sessionID, "error")
+	} else {
+		d.updateSessionStatus(sessionID, "connected")
+	}
 	logMethod(err)
 	return result, err
 }
@@ -1302,8 +1535,22 @@ func (d *Daemon) ForwardSAPWithContext(ctx context.Context, sessionID, contextTo
 	if record.LeaseExpiresAt.Before(time.Now().UTC()) {
 		return nil, fmt.Errorf("daemon: MCP context lease expired")
 	}
+	// The MCP transport session id is the daemon routing key; the context
+	// registry carries the ACPX identity that panel-rust uses for thread
+	// correlation. Record the mapping before project state changes so the
+	// first authoritative snapshot already contains both identities.
+	if _, err := d.Sessions.Lookup(sessionID); err != nil {
+		if _, err := d.Sessions.Create(sessionID, "proxy", proxySessionTTL); err != nil {
+			return nil, fmt.Errorf("daemon: create session: %w", err)
+		}
+	} else {
+		_ = d.Sessions.Touch(sessionID, proxySessionTTL)
+	}
+	if _, err := d.SetSessionCorrelation(sessionID, record.ACPSessionID); err != nil {
+		return nil, err
+	}
 	target := record.TargetProjectID
-	if method == "project.select" {
+	if method == "project.enter" {
 		var requested struct {
 			ProjectID string `json:"projectId"`
 		}
@@ -1328,7 +1575,7 @@ func (d *Daemon) ForwardSAPWithContext(ctx context.Context, sessionID, contextTo
 	}
 	if _, ok := d.SAP.BoundProject(sessionID); !ok {
 		selectParams, _ := json.Marshal(map[string]string{"projectId": target})
-		if _, err := d.ForwardSAP(ctx, sessionID, sink, "project.select", selectParams); err != nil {
+		if _, err := d.ForwardSAP(ctx, sessionID, sink, "project.enter", selectParams); err != nil {
 			return nil, err
 		}
 	}
@@ -1341,6 +1588,13 @@ func (d *Daemon) ForwardSAPWithContext(ctx context.Context, sessionID, contextTo
 // OnUnregisterSession hook).
 func (d *Daemon) UnbindSession(sessionID string) {
 	d.SAP.Unbind(sessionID)
+	if snapshot, err := d.Sessions.Update(sessionID, func(s *session.Session) {
+		s.ProjectID = ""
+		s.ProjectPath = ""
+		s.ConnectionStatus = "disconnected"
+	}); err == nil {
+		d.publishSessionSnapshot(snapshot)
+	}
 	_ = d.Sessions.Expire(sessionID)
 }
 
@@ -1436,6 +1690,16 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return d.RegisterMcpContext(ctx, p)
+
+	case "daemon.registerSessionContext":
+		var p struct {
+			ContextToken string `json:"contextToken"`
+			ACPSessionID string `json:"acpSessionId"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, d.RegisterSessionContext(p.ContextToken, p.ACPSessionID)
 
 	case "daemon.setMcpProjectTarget":
 		var p struct {

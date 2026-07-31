@@ -22,9 +22,20 @@ type Resolver func(projectID string) (socketPath, token string, err error)
 type Router struct {
 	resolve Resolver
 
-	mu             sync.Mutex
-	conns          map[string]*pooledConn // projectID -> connection
-	sessionProject map[string]string      // sessionID -> bound projectID
+	mu                 sync.Mutex
+	conns              map[string]*pooledConn // projectID -> connection
+	sessionProject     map[string]string      // sessionID -> bound projectID
+	onConnectionClosed func(projectID string, sessionIDs []string)
+}
+
+// SetConnectionClosedHandler installs the daemon callback for an asynchronous
+// SAP disconnect. The callback is invoked after the pooled connection is
+// marked closed and receives a snapshot of the sessions still bound to the
+// affected project.
+func (r *Router) SetConnectionClosedHandler(handler func(projectID string, sessionIDs []string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onConnectionClosed = handler
 }
 
 // NewRouter constructs a Router. resolve is called (at most once per
@@ -83,6 +94,7 @@ func (r *Router) getOrDial(ctx context.Context, projectID string) (*pooledConn, 
 	}
 	pc := &pooledConn{conn: conn, sinks: make(map[string]Sink)}
 	conn.onNotification = pc.notify
+	conn.onClose = func(error) { r.connectionClosed(projectID, pc) }
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -94,6 +106,26 @@ func (r *Router) getOrDial(ctx context.Context, projectID string) (*pooledConn, 
 	}
 	r.conns[projectID] = pc
 	return pc, nil
+}
+
+func (r *Router) connectionClosed(projectID string, pc *pooledConn) {
+	r.mu.Lock()
+	if current, ok := r.conns[projectID]; !ok || current != pc {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.conns, projectID)
+	var sessionIDs []string
+	for sessionID, boundProject := range r.sessionProject {
+		if boundProject == projectID {
+			sessionIDs = append(sessionIDs, sessionID)
+		}
+	}
+	handler := r.onConnectionClosed
+	r.mu.Unlock()
+	if handler != nil && len(sessionIDs) > 0 {
+		handler(projectID, sessionIDs)
+	}
 }
 
 // ErrAlreadyBound is (wrapped and) returned by Bind when sessionID is

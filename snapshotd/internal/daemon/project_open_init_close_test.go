@@ -71,7 +71,7 @@ func TestProjectOpen_InitAudit_MultiSessionReuseAndClose(t *testing.T) {
 	sinkB := &fanoutSink{}
 
 	// First open: auto Launch-or-reuse + Bind; expect opened=true and one init audit.
-	selA, err := d.ForwardSAP(ctx, "session-a", sinkA, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	selA, err := d.ForwardSAP(ctx, "session-a", sinkA, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("project.select A: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestProjectOpen_InitAudit_MultiSessionReuseAndClose(t *testing.T) {
 	}
 
 	// Second session open: must reuse process+connection, not reload.
-	selB, err := d.ForwardSAP(ctx, "session-b", sinkB, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	selB, err := d.ForwardSAP(ctx, "session-b", sinkB, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("project.select B: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestProjectOpen_BindOnlyWhenNoMlt(t *testing.T) {
 	// No project.mlt on disk.
 
 	sink := &fanoutSink{}
-	sel, err := d.ForwardSAP(ctx, "s1", sink, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	sel, err := d.ForwardSAP(ctx, "s1", sink, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("project.select: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestProjectOpen_RealSapRust_OpenExistingMlt(t *testing.T) {
 	}
 
 	sink := &fanoutSink{}
-	sel, err := d.ForwardSAP(ctx, "real-a", sink, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	sel, err := d.ForwardSAP(ctx, "real-a", sink, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("project.select real open: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestProjectOpen_RealSapRust_OpenExistingMlt(t *testing.T) {
 
 	// Second session: reuse, no error.
 	sinkB := &fanoutSink{}
-	selB, err := d.ForwardSAP(ctx, "real-b", sinkB, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID}))
+	selB, err := d.ForwardSAP(ctx, "real-b", sinkB, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID}))
 	if err != nil {
 		t.Fatalf("second select: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestProjectOpen_BootReconcileMarksKilledChildCrashed(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	sink := &fanoutSink{}
-	if _, err := d.ForwardSAP(ctx, "s1", sink, "project.select", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
+	if _, err := d.ForwardSAP(ctx, "s1", sink, "project.enter", mustJSON(t, map[string]any{"projectId": proj.ID})); err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	instances, err := d.Reg.ListProcessInstancesByProject(proj.ID)
@@ -395,4 +395,3 @@ func TestProjectOpen_BootReconcileMarksKilledChildCrashed(t *testing.T) {
 		t.Fatalf("expected crashed after kill+reconcile, got %s", updated.Status)
 	}
 }
-

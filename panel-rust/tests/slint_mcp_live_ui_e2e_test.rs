@@ -50,7 +50,9 @@ fn shotcut_bin() -> PathBuf {
     if let Ok(path) = std::env::var("PANEL_MCP_E2E_SHOTCUT_BIN") {
         return PathBuf::from(path);
     }
-    repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
+    std::env::var_os("SNAPFLOW_HOST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("shotcut/build/cc-debug-linux/src/shotcut"))
 }
 
 fn free_x_display() -> u32 {
@@ -220,8 +222,7 @@ impl LiveUiHarness {
             "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
             event_log.to_string_lossy().into_owned(),
         );
-        provision_mock_profile(&base_url, admin_port, &admin_token, persona, mock_agent_env)
-            .await;
+        provision_mock_profile(&base_url, admin_port, &admin_token, persona, mock_agent_env).await;
 
         let settings_dir = state_dir.join("panel-settings");
         std::fs::create_dir_all(&settings_dir).expect("create panel settings dir");
@@ -543,7 +544,8 @@ impl LiveUiHarness {
         // does not itself touch `model.selected_thread`, so this makes the
         // newly created thread the active one regardless of what was
         // selected before, the same as a real user clicking it.
-        self.click_by_exact_label(window_handle, expected_name).await;
+        self.click_by_exact_label(window_handle, expected_name)
+            .await;
         self.click_by_exact_label(window_handle, "Collapse thread sidebar")
             .await;
     }
@@ -555,14 +557,12 @@ impl LiveUiHarness {
     /// `send_message_in_active_thread`.
     async fn send_via_compose(&self, window_handle: &Value, text: &str) {
         let compose = wait_for(Duration::from_secs(10), || async {
-            self.find_by_exact_label(window_handle, "Compose message").await
+            self.find_by_exact_label(window_handle, "Compose message")
+                .await
         })
         .await;
-        self.tool_call(
-            "click_element",
-            json!({"elementHandle": compose["handle"]}),
-        )
-        .await;
+        self.tool_call("click_element", json!({"elementHandle": compose["handle"]}))
+            .await;
         self.tool_call(
             "set_element_value",
             json!({"elementHandle": compose["handle"], "value": text}),
@@ -1120,7 +1120,9 @@ async fn mcp04_live_stream_marker_survives_a_real_unterminated_partial_tail() {
     .await;
 
     wait_for(Duration::from_secs(20), || async {
-        harness.find_by_exact_label(&window, "Copy message text").await
+        harness
+            .find_by_exact_label(&window, "Copy message text")
+            .await
     })
     .await;
 }
@@ -1178,12 +1180,11 @@ async fn mcp04_live_stream_marker_survives_a_real_unterminated_partial_tail() {
 #[tokio::test]
 #[ignore]
 async fn mcp06_live_thread_switch_interrupts_a_slowed_background_prewarm() {
-    let harness =
-        LiveUiHarness::spawn_with_env(&[
-            ("RUI_MARKDOWN_RENDER_TEST_DELAY_MS", "300"),
-            ("RUI_PANEL_INPUT_TRACE", "1"),
-        ])
-        .await;
+    let harness = LiveUiHarness::spawn_with_env(&[
+        ("RUI_MARKDOWN_RENDER_TEST_DELAY_MS", "300"),
+        ("RUI_PANEL_INPUT_TRACE", "1"),
+    ])
+    .await;
     let window = harness.window_handle().await;
 
     harness.create_new_thread(&window, "New thread 1").await;
@@ -1245,7 +1246,9 @@ async fn mcp06_live_thread_switch_interrupts_a_slowed_background_prewarm() {
     harness.click_by_exact_label(&window, "New thread 2").await;
 
     wait_for(Duration::from_secs(20), || async {
-        harness.find_by_exact_label(&window, "Copy message text").await
+        harness
+            .find_by_exact_label(&window, "Copy message text")
+            .await
     })
     .await;
 }
@@ -1291,7 +1294,10 @@ async fn debug_duplicate_thread_row_labels() {
         .filter(|e| e["accessibleLabel"].as_str() == Some("ACTIVE"))
         .map(|e| format!("{e}"))
         .collect();
-    eprintln!("[debug] ACTIVE badge count before click: {}", active_before.len());
+    eprintln!(
+        "[debug] ACTIVE badge count before click: {}",
+        active_before.len()
+    );
 
     harness.click_by_exact_label(&window, "New thread 1").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1478,7 +1484,9 @@ async fn debug_scrollbar_drag() {
     })
     .await;
     wait_for(Duration::from_secs(30), || async {
-        harness.find_by_exact_label(&window, "Copy message text").await
+        harness
+            .find_by_exact_label(&window, "Copy message text")
+            .await
     })
     .await;
 
@@ -1497,11 +1505,17 @@ async fn debug_scrollbar_drag() {
             is_touch_area && w > 0.0 && w < 15.0 && h > 40.0
         })
         .collect();
-    eprintln!("[debug] scrollbar touch-area candidates: {}", candidates.len());
+    eprintln!(
+        "[debug] scrollbar touch-area candidates: {}",
+        candidates.len()
+    );
     for c in &candidates {
         eprintln!("[debug] candidate: {c:#}");
     }
-    assert!(!candidates.is_empty(), "no scrollbar touch-area candidate found");
+    assert!(
+        !candidates.is_empty(),
+        "no scrollbar touch-area candidate found"
+    );
     let touch_area = candidates[0];
     let touch_handle = touch_area["handle"].clone();
     let track_x = touch_area["absolutePosition"]["x"].as_f64().unwrap_or(0.0);

@@ -44,14 +44,18 @@ type Credentials struct {
 // "Streamable HTTP" transport, which POSTs JSON-RPC directly to a single
 // endpoint (/mcp here). Serving both avoids a client-specific config split.
 type SSEServer struct {
-	addr       string
-	sse        *server.SSEServer
-	streamable *server.StreamableHTTPServer
-	sessions   *streamableSessionManager
-	httpServer *http.Server
+	addr        string
+	coreHandler Handler
+	sse         *server.SSEServer
+	streamable  *server.StreamableHTTPServer
+	sessions    *streamableSessionManager
+	httpServer  *http.Server
 
 	credMu sync.RWMutex
 	creds  Credentials
+
+	sessionMu    sync.RWMutex
+	sessionToken string
 }
 
 // NewSSEServer builds an SSE-served MCP adapter listening on addr (e.g.
@@ -62,8 +66,9 @@ func NewSSEServer(h Handler, addr string) *SSEServer {
 	mcpServer := New(h)
 	sessions := newStreamableSessionManager(time.Hour)
 	return &SSEServer{
-		addr: addr,
-		sse:  server.NewSSEServer(mcpServer, server.WithSSEContextFunc(contextWithToken)),
+		addr:        addr,
+		coreHandler: h,
+		sse:         server.NewSSEServer(mcpServer, server.WithSSEContextFunc(contextWithToken)),
 		streamable: server.NewStreamableHTTPServer(mcpServer,
 			server.WithEndpointPath("/mcp"),
 			server.WithSessionIdManager(sessions),
@@ -81,6 +86,15 @@ func (s *SSEServer) SetCredentials(c Credentials) {
 	s.credMu.Lock()
 	s.creds = c
 	s.credMu.Unlock()
+}
+
+// SetSessionServiceToken configures the separate bearer secret required by
+// the session metadata endpoints. MCP Basic Auth and session subscriptions
+// intentionally have independent credentials and rotation paths.
+func (s *SSEServer) SetSessionServiceToken(token string) {
+	s.sessionMu.Lock()
+	s.sessionToken = token
+	s.sessionMu.Unlock()
 }
 
 func (s *SSEServer) checkAuth(r *http.Request) bool {
@@ -120,14 +134,55 @@ func (s *SSEServer) requireAuth(next http.Handler) http.Handler {
 	})
 }
 
+func (s *SSEServer) checkSessionAuth(r *http.Request) bool {
+	s.sessionMu.RLock()
+	token := s.sessionToken
+	s.sessionMu.RUnlock()
+	if token == "" {
+		return false
+	}
+	got := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(got) <= len(prefix) || got[:len(prefix)] != prefix {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got[len(prefix):]), []byte(token)) == 1
+}
+
+func (s *SSEServer) requireSessionAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.checkSessionAuth(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="snapshotd session status"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Handler returns the full auth-wrapped HTTP handler this server would
 // listen with, without binding a socket -- used by Start and directly by
 // tests that want to exercise the auth check via httptest.
 func (s *SSEServer) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", s.streamableHandler())
-	mux.Handle("/", s.sse)
-	return s.requireAuth(mux)
+	if h, ok := s.handler().(SessionStatusHandler); ok {
+		mux.Handle("/session/details", s.requireSessionAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.handleSessionDetails(w, r, h)
+		})))
+		mux.Handle("/session/ws", s.requireSessionAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.handleSessionWebSocket(w, r, h)
+		})))
+	}
+	mux.Handle("/mcp", s.requireAuth(s.streamableHandler()))
+	mux.Handle("/", s.requireAuth(s.sse))
+	return mux
+}
+
+// handler returns the implementation used to construct the MCP server. The
+// MCP server itself intentionally does not expose the daemon handler, so the
+// adapter retains it for the side-channel session API.
+func (s *SSEServer) handler() Handler {
+	return s.coreHandler
 }
 
 func (s *SSEServer) streamableHandler() http.Handler {
