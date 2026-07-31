@@ -148,6 +148,15 @@ cmd_workspace() {
       # launcher pid we tracked from setsid/nohup -- exact-pid match misses
       # it and either never finds the window (wmctrl) or never settles
       # (python). Match the whole descendant tree of $pid.
+      #
+      # main independently added a wmctrl fast-path here that matches the
+      # launcher pid exactly (`wmctrl -lp | awk '$3 == pid'`) and hard-dies
+      # if it never finds a match within 60s. Deliberately NOT adopted on
+      # reconcile: it reintroduces exactly the exact-pid-match failure mode
+      # documented above, and this branch's own descendant-aware python
+      # matcher (below) already does a wmctrl move as its preferred path
+      # once it has found the real window via descendant pids -- so main's
+      # idea is subsumed correctly rather than dropped.
       command -v python3 >/dev/null 2>&1 || die "python3 is required for X11 workspace placement"
       TARGET_PID="$pid" TARGET_DESKTOP="$workspace" python3 - <<'PY'
 import os
