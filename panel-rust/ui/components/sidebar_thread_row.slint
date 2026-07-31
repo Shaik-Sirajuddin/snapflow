@@ -445,7 +445,12 @@ export component SidebarThreadRow inherits HoverSurface {
                     }
                 }
                 // Phase 8: active model (provider · model when known).
-                if expanded && thread.model != "" : Text {
+                // Gated on has-session (a real attached ACP session), not
+                // just a non-empty model string -- a fresh/draft thread can
+                // already carry a pre-selected default provider/model
+                // before the user ever sends anything, and showing that
+                // here read as if the conversation had already started.
+                if expanded && thread.has-session && thread.model != "" : Text {
                     text: thread.provider != "" ? thread.provider + " \u{00B7} " + thread.model : thread.model;
                     color: Theme.text-muted;
                     font-size: 9px * Theme.font-scale;
