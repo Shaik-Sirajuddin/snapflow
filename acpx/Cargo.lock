@@ -24,6 +24,7 @@ dependencies = [
  "acpx-core",
  "acpx-proto",
  "acpx-registry",
+ "agent-client-protocol",
  "anyhow",
  "arc-swap",
  "axum",
