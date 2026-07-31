@@ -244,25 +244,43 @@ export component MarkdownView inherits VerticalLayout {
                         // `Flickable` in `agent_bubble.slint` with no
                         // ellipsis -- the worst case: unreadable AND no
                         // sign anything was cut.
-                        // `wrap: word-wrap` + a `max-width` bound is
-                        // safe to apply per-run (unlike wrapping the
-                        // whole multi-run line declaratively, which the
-                        // module comment above rules out): it only
-                        // engages when *this one run alone* would
-                        // exceed the row's width, and Slint's
-                        // `word-wrap` falls back to breaking mid-word
-                        // when a single word has nowhere else to break,
-                        // same as CSS `overflow-wrap: break-word`. Runs
-                        // that already fit (the common case, since the
-                        // Rust side already wrapped the line) are
-                        // unaffected -- max-width only caps growth, it
-                        // does not force every run to that width.
                         wrap: word-wrap;
-                        max-width: max(24px, root.width
+                        property <length> run-max-width: max(24px, root.width
                             - line.indent * 14px
                             - (is-code ? Metrics.space-4 * 2 : 0px)
                             - (is-quote ? 2px + Metrics.space-2 : 0px)
                             - (is-li ? 14px + Metrics.space-2 : 0px));
+                        // BUG (one-character-per-line collapse): this
+                        // run cluster's `HorizontalLayout` uses
+                        // `alignment: start` (not the Slint default
+                        // `stretch`), so a non-stretch child (`horizontal
+                        // -stretch: 0`, no explicit `width`) is sized to
+                        // its *minimum* width, never its preferred
+                        // (natural) width -- see the Slint skill's
+                        // layout-defaults section. Turning on `wrap:
+                        // word-wrap` (above) makes that auto-computed
+                        // minimum collapse toward the width of a single
+                        // glyph, since `word-wrap`'s mid-word fallback
+                        // means the text CAN always be squeezed
+                        // narrower by breaking again -- same class of
+                        // bug the CSS `overflow-wrap: break-word`
+                        // min-content quirk causes in flex/grid items
+                        // without `min-width: 0` overridden the other
+                        // way. Every run, not just oversized ones, got
+                        // laid out at that collapsed minimum and
+                        // wrapped into a vertical stack of near-single
+                        // characters -- reproduced live (headless
+                        // geometry test) as multiple ~9px-wide, 164px-
+                        // tall `Text` boxes for ordinary short runs at a
+                        // realistic chat-bubble width. Setting an
+                        // explicit `width` (which layout always honors
+                        // over its min/preferred fallback) to the
+                        // smaller of the run's own natural width and
+                        // the row budget keeps normal runs at their
+                        // natural size and only engages `word-wrap`'s
+                        // reflow for the rare run that alone exceeds
+                        // `run-max-width`.
+                        width: min(self.preferred-width, run-max-width);
                         // Ctrl+Click opens the target.
                         if run.link != "" : TouchArea {
                             mouse-cursor: pointer;

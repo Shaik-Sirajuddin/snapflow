@@ -1315,6 +1315,7 @@ fn skill_selection_opens_the_editor_and_close_returns_to_chat() {
         scope: "project".into(),
         path: "/repo/.claude/skills/release-checklist".into(),
         started_from: "".into(),
+        is_dev_only: false,
     }])));
 
     let opened_paths = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -1721,6 +1722,7 @@ fn newly_added_skill_appears_in_the_skills_list() {
         scope: "project".into(),
         path: "/proj/.skills/voice-embedding".into(),
         started_from: "".into(),
+        is_dev_only: false,
     }])));
 
     let skill_row = ElementHandle::find_by_accessible_label(&panel, "Open skill voice-embedding")
@@ -1751,6 +1753,7 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
             scope: "project".into(),
             path: "/p/.skills/project-only".into(),
             started_from: "".into(),
+            is_dev_only: false,
         },
         SkillOption {
             name: "global-only".into(),
@@ -1758,6 +1761,7 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
             scope: "global".into(),
             path: "/cache/skills/global-only".into(),
             started_from: "".into(),
+            is_dev_only: false,
         },
     ])));
 
@@ -1940,4 +1944,78 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
          stretch may still be distributing them",
         max_right - min_x
     );
+}
+
+/// Regression test for the "built by Anthropic..." one-character-per-line
+/// markdown rendering bug. `markdown.rs`'s parser/wrapper produces
+/// perfectly normal runs for this text (see
+/// `markdown::tests::built_by_sentence_with_inline_code_parses_as_normal_runs`)
+/// -- the bug was purely a `markdown_view.slint` layout issue: the per-run
+/// `Text` cluster's `HorizontalLayout` uses `alignment: start`, which sizes
+/// a non-stretch child to its *minimum* width rather than its preferred
+/// width, and turning on `wrap: word-wrap` (added to bound long unbreakable
+/// tokens) let that auto-computed minimum collapse toward a single glyph
+/// for every run, not just oversized ones -- at a realistic (narrow) chat
+/// bubble width, ordinary runs rendered as a handful-of-pixels-wide,
+/// many-lines-tall `Text` box: a vertical stack of near-single characters.
+/// Reproduced here by checking real layout geometry (not just parsed
+/// runs) at a narrow window width where the collapse was visible before
+/// the fix (each run's `Text` box got an explicit `width` clamped to its
+/// own natural size instead of being left to the layout's min-width
+/// fallback).
+#[test]
+fn agent_markdown_run_does_not_collapse_to_one_char_per_line() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(420.0, 700.0));
+    panel.set_sidebar_expanded(false);
+
+    let text = "I'm Claude Sonnet 5 (model ID `claude-sonnet-5`), built by Anthropic, running here as your Claude Code agent.";
+    let markdown_lines = panel_rust::models::skill_markdown_preview(text);
+    panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        can_send_now: false,
+        tool_group_len: 0,
+        kind: "agent".into(),
+        text: text.into(),
+        markdown_lines,
+        expanded: false,
+        index: 0,
+        ..MessageItem::default()
+    }])));
+
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(420.0, 700.0));
+
+    // Every markdown-run `Text` box in the message band. A collapsed run
+    // renders as a narrow-but-very-tall box (many single-character
+    // internal lines stacked vertically); a healthy run is either a
+    // short single line (small height) or a normally word-wrapped
+    // multi-line block (width stays well above a couple of glyphs even
+    // when it wraps internally).
+    let mut boxes: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h)
+    for el in ElementHandle::find_by_element_type_name(&panel, "Text") {
+        let size = el.size();
+        let pos = el.absolute_position();
+        if pos.y > 48.0 && pos.y < 650.0 && pos.x > 48.0 && size.height > 0.0 {
+            boxes.push((pos.x, pos.y, size.width, size.height));
+        }
+    }
+    assert!(
+        !boxes.is_empty(),
+        "expected agent-body markdown Text runs in the message column"
+    );
+    for (x, y, w, h) in &boxes {
+        // A box narrower than ~2 characters (20px) that is also several
+        // lines tall (>30px) is the one-char-per-line collapse signature
+        // -- a healthy run is never both narrow *and* tall at once.
+        assert!(
+            !(*w < 20.0 && *h > 30.0),
+            "markdown run collapsed to one-character-per-line: \
+             x={x:.1} y={y:.1} w={w:.1} h={h:.1} (all boxes: {boxes:?})"
+        );
+    }
 }

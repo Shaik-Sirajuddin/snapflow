@@ -897,5 +897,79 @@ mod tests {
     fn empty_source_renders_nothing() {
         assert!(render_document("", DEFAULT_WRAP_COLS).is_empty());
     }
+
+    #[test]
+    fn built_by_sentence_with_inline_code_parses_as_normal_runs() {
+        // Regression test for a reported "one character per line" render
+        // bug in this exact sentence (parentheses, an inline code span,
+        // commas, a period). Root cause was NOT here: `collect_inline_runs`
+        // and `wrap_runs` already coalesce this text into a small number
+        // of normal, multi-character runs/lines -- confirmed both for a
+        // one-shot `render_document` call and for the same text streamed
+        // in one character at a time through `StreamingMarkdownRenderer`
+        // (which re-parses on every push). The actual bug was a
+        // `markdown_view.slint` layout issue (see
+        // `slint_component_e2e_test::
+        // agent_markdown_run_does_not_collapse_to_one_char_per_line`):
+        // the per-run `Text` cluster's `alignment: start` sized non-
+        // stretch children to their *minimum* width, and `wrap:
+        // word-wrap` let that minimum collapse toward a single glyph for
+        // every run once it was added, not just oversized ones. This test
+        // guards the parsing/wrapping side so a future regression here
+        // (e.g. `Event::Code` handling corrupting run-collection state)
+        // would still be caught even though it wasn't the culprit this
+        // time.
+        let text = "I'm Claude Sonnet 5 (model ID `claude-sonnet-5`), built by Anthropic, running here as your Claude Code agent.";
+
+        let lines = render_document(text, DEFAULT_WRAP_COLS);
+        assert!(
+            lines.len() <= 3,
+            "expected a small number of wrapped lines, not one-per-character: {:?}",
+            lines
+        );
+        for line in &lines {
+            assert!(
+                line.runs.len() <= 4,
+                "expected each line to hold a handful of coalesced runs, not \
+                 one-run-per-character: {:?}",
+                line
+            );
+            for run in &line.runs {
+                assert!(
+                    run.text.chars().count() > 1 || run.text.trim().is_empty(),
+                    "found a suspicious single-character run (would indicate the \
+                     parser itself split text into one-run-per-character): {:?}",
+                    run
+                );
+            }
+        }
+        // The inline code span survives as its own single coalesced run,
+        // not split into individual characters.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .any(|r| r.code && r.text.contains("claude-sonnet-5")),
+            "expected the inline code span to survive as one run: {:?}",
+            lines
+        );
+
+        // Same assertions hold when the identical text arrives streamed in
+        // one character at a time (the real agent-chat delivery path).
+        let mut renderer = StreamingMarkdownRenderer::new(DEFAULT_WRAP_COLS);
+        for ch in text.chars() {
+            renderer.push(&ch.to_string());
+            let streamed = renderer.render();
+            for line in &streamed {
+                assert!(
+                    line.runs.len() <= 4,
+                    "streaming produced a one-run-per-character line mid-stream: {:?}",
+                    line
+                );
+            }
+        }
+        let finished = renderer.finish();
+        assert_eq!(texts(&finished), texts(&lines));
+    }
 }
 
