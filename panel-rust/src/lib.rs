@@ -2092,9 +2092,12 @@ fn panel_rust_create_with_initial_identity(
         // would erase the visible thread list until the user opened a
         // project. Restored records carry their own project_path, so this
         // does not invent a cwd or bind an old session to the host process.
-        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty()
-            && initial_identity.is_some()
-        {
+        // bug3_always_have_a_default_thread: previously also required
+        // `initial_identity.is_some()`, so a cold start with no project
+        // open yet seeded zero threads ("No thread" empty state). The
+        // bridge/gateway below is already constructed unconditionally;
+        // seed the same default thread here too so one is always open.
+        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
                 Ok(v) => {
@@ -2113,7 +2116,7 @@ fn panel_rust_create_with_initial_identity(
                     settings_file::non_default_sentinel(resolved.default_agent_id)
                 });
             cold_start_thread_specs(&seed_names, configured_agent_id)
-        } else if !restored_records.is_empty() {
+        } else {
             restored_records
                 .iter()
                 .map(|record| ThreadSpec {
@@ -2143,8 +2146,6 @@ fn panel_rust_create_with_initial_identity(
                     project_path: record.project_path.clone(),
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
         if let Some(identity) = initial_identity.as_ref() {
             // Fresh and legacy rows in this project-local store inherit the
