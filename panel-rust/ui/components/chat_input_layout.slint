@@ -682,6 +682,18 @@ export component ChatInputLayout inherits Rectangle {
                                 }
                                 return EventResult.reject;
                             }
+                            // Ctrl+A select-all, pinned explicitly so a
+                            // following Ctrl+X reliably has a real
+                            // selection to cut. Offsets clamp out of
+                            // range, so a huge end selects to the real
+                            // end without computing its byte length.
+                            // Reject after so native Ctrl+C/Ctrl+X still
+                            // handle the resulting selection.
+                            if ((event.text == "a" || event.text == "A")
+                                && event.modifiers.control && !event.modifiers.shift) {
+                                self.set-selection-offsets(0, 2147483647);
+                                return EventResult.reject;
+                            }
                             return EventResult.reject;
                         }
                     }
