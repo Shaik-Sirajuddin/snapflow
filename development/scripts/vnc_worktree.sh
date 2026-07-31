@@ -319,9 +319,19 @@ PY
     echo "    SNAPSHOTD_HOME=$snapshotd_home"
 
     echo "==> starting acpx-server..."
+    # Match panel-rust's auto-spawn defaults (agent_bridge.rs): the
+    # library defaults are only 16/tenant and 128 total -- far too low for
+    # a real UI session once session/list re-registers backend history
+    # under the same tenant. Without these, "I only opened 4 threads" hits
+    # `session capacity reached for tenant default: 16/16` after a single
+    # session/list import of foreign claude-acp rows.
     ACPX_HTTP_BIND="0.0.0.0:$gateway_port" \
     ACPX_DEFAULT_AGENT_ID="$agent_id" \
     ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+    ACPX_STORAGE_DIR="$state_dir/acpx/storage" \
+    ACPX_MAX_SESSIONS_PER_TENANT="${ACPX_MAX_SESSIONS_PER_TENANT:-512}" \
+    ACPX_MAX_SESSIONS_TOTAL="${ACPX_MAX_SESSIONS_TOTAL:-2048}" \
+    RUI_MOCK_AGENT_EVENT_LOG="${RUI_MOCK_AGENT_EVENT_LOG:-}" \
         setsid nohup "$worktree_dir/acpx/target/debug/acpx-server" <"$fifo" \
         >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
     local server_pid=$!
@@ -354,8 +364,13 @@ PY
         QT_QUICK_BACKEND=software
         QSG_RENDER_LOOP=basic
         RUI_ACP_CACHE_DIR="$state_dir/panel"
-        RUI_ACPX_CODEX_URL="http://127.0.0.1:$gateway_port"
-        RUI_ACPX_CLAUDE_URL="http://127.0.0.1:$gateway_port"
+        RUI_PANEL_INPUT_TRACE="${RUI_PANEL_INPUT_TRACE:-}"
+        # Development VNC harness only: route every persisted provider profile
+        # through this worktree gateway and prevent panel-rust from spawning a
+        # competing internal acpx-server. Production config does not export
+        # provider-specific localhost URLs.
+        RUI_ACPX_DEFAULT_URL="http://127.0.0.1:$gateway_port"
+        RUI_ACPX_NO_AUTOSPAWN=1
         SNAPSHOTD_HOME="$snapshotd_home"
         SNAPSHOTD_MCP_SSE_ADDR="$mcp_addr"
         SNAPSHOT_SAP_SOCKET="$sap_socket"
@@ -371,9 +386,21 @@ PY
     local shotcut_pid=$!
 
     if [ "${VNC_SHARED:-0}" = "1" ]; then
-        DISPLAY="$vnc_display" "$SHARED_VNC" workspace-place \
-            "$worktree_dir" "$shotcut_pid" "$workspace_id" \
-            || echo "warning: could not place Snapflow pid $shotcut_pid on workspace $workspace_id" >&2
+        if ! DISPLAY="$vnc_display" "$SHARED_VNC" workspace-place \
+            "$worktree_dir" "$shotcut_pid" "$workspace_id"; then
+            # Do not leave an untracked live editor behind when placement
+            # fails.  The old path exited before connect.env was written,
+            # making the next clean unable to discover this process.
+            kill_process_group "$shotcut_pid"
+            kill_process_group "$server_pid"
+            kill_process_group "$fifo_keeper_pid"
+            python3 "$SNAPSHOTD_TEST_INSTANCE" teardown-worktree "$label" \
+                >/dev/null 2>&1 || true
+            "$SHARED_VNC" workspace-release "$worktree_dir" \
+                >/dev/null 2>&1 || true
+            "$REG" release "$gateway_port" >/dev/null 2>&1 || true
+            die "could not place Snapflow pid $shotcut_pid on workspace $workspace_id"
+        fi
     fi
 
     cat > "$state_dir/connect.env" <<EOF

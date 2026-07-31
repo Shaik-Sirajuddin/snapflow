@@ -64,6 +64,12 @@ pub struct SettingsDocument {
     // system-level toggle, not a per-project one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_mode: Option<bool>,
+    // Built-in snapflow (snapshotd daemon) MCP injection into session
+    // `mcpServers`. Global-only like `dev_mode`: not an acpx registry row
+    // (`mcp_servers/*` has no target for it), so enable/disable is a
+    // panel preference that gates client-side injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapflow_mcp_enabled: Option<bool>,
 }
 
 fn schema_version_default() -> u32 {
@@ -274,6 +280,23 @@ impl SettingsPaths {
         doc.dev_mode = Some(enabled);
         save_document(&self.global, &doc)
     }
+
+    /// Whether the built-in snapflow (snapshotd) MCP is injected into
+    /// new/pooled sessions. Defaults to **true** when unset.
+    pub fn snapflow_mcp_enabled(&self) -> bool {
+        load_document(&self.global)
+            .ok()
+            .and_then(|doc| doc.snapflow_mcp_enabled)
+            .unwrap_or(true)
+    }
+
+    /// Persist the built-in snapflow MCP enable preference (Global only).
+    pub fn set_snapflow_mcp_enabled(&self, enabled: bool) -> Result<(), SettingsFileError> {
+        let mut doc = load_document(&self.global).unwrap_or_default();
+        doc.schema_version = 1;
+        doc.snapflow_mcp_enabled = Some(enabled);
+        save_document(&self.global, &doc)
+    }
 }
 
 fn dirs_fallback_config() -> PathBuf {
@@ -402,6 +425,7 @@ mod tests {
             default_agent_id: None,
             harness: None,
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         let global = SettingsDocument {
             schema_version: 1,
@@ -411,6 +435,7 @@ mod tests {
             default_agent_id: Some("codex".into()),
             harness: None,
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         let project = SettingsDocument {
             schema_version: 1,
@@ -424,6 +449,7 @@ mod tests {
                 auto_resume_on_rate_limit_reset: true,
             }),
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         let r = merge_documents(&[&bundled, &global, &project]);
         assert_eq!(r.default_profile.as_deref(), Some("project-prof"));
@@ -499,6 +525,7 @@ mod tests {
             default_agent_id: None,
             harness: Some(HarnessSettings::default()),
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         save_document(&path, &doc).unwrap();
         let loaded = load_document(&path).unwrap();

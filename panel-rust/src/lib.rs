@@ -407,6 +407,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
         default_agent_id: None,
         harness: None,
         dev_mode: None,
+        snapflow_mcp_enabled: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         let message = format!("failed to migrate panel defaults to JSON: {error}");
@@ -1238,6 +1239,27 @@ impl PanelSingleton {
         name: &str,
         enabled: bool,
     ) {
+        // Built-in snapflow: panel preference + pool opener rewrite, not
+        // acpx `mcp_servers/update` (no central registry row exists).
+        if crate::agent_bridge::is_builtin_snapflow_mcp_name(name) {
+            let paths = settings_file::SettingsPaths::from_env();
+            if let Err(error) = paths.set_snapflow_mcp_enabled(enabled) {
+                crate::effect_executor::report_mcp_server_result(Err(format!(
+                    "Failed to persist snapflow MCP enabled={enabled}: {error}"
+                )));
+                return;
+            }
+            if let Some(bridge) = &self.bridge {
+                bridge.set_builtin_snapflow_mcp_enabled(enabled);
+            } else {
+                crate::agent_bridge::set_snapflow_mcp_enabled_flag(enabled);
+            }
+            crate::effect_executor::report_mcp_server_result(Ok(format!(
+                "MCP server \"snapflow\" {}",
+                if enabled { "enabled" } else { "disabled" }
+            )));
+            return;
+        }
         let Some(bridge) = &self.bridge else {
             crate::effect_executor::report_mcp_server_result(Err(
                 "no gateway connection".to_string()
@@ -1921,6 +1943,12 @@ fn panel_rust_create_with_initial_identity(
         let initial_cwd = initial_identity.as_ref().and_then(|identity| {
             crate::project_store::project_store_dir(identity, &resolve_cache_dir())
         });
+        // Seed built-in snapflow MCP injection from Global settings before
+        // any pool/session is built so cold-start openers omit it when off.
+        {
+            let paths = settings_file::SettingsPaths::from_env();
+            crate::agent_bridge::set_snapflow_mcp_enabled_flag(paths.snapflow_mcp_enabled());
+        }
         let (bridge, bridge_available) =
             match AgentBridge::new_with_thread_specs_and_initial_identity(
                 &initial_specs,

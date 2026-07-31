@@ -1518,20 +1518,36 @@ pub fn to_mcp_server_option_rows(
                         .unwrap_or_default(),
                 ),
             };
-            // `status` (live connection health -- Stopped/Starting/Running/
-            // Error) isn't part of the typed model yet (acpx has no
-            // per-connection health probe today, see `McpAuthStatus`'s doc
-            // comment) -- still read as a best-effort passthrough from
-            // `extra` so a future gateway addition surfaces immediately
-            // without another round of plumbing changes here.
+            // Connection status for StatusDot: prefer a real probe value
+            // from `extra["status"]` when the gateway supplies one; else
+            // derive from enable/auth so the enable toggle visibly
+            // rewires the UI (disabled → red "disconnected", auth-needed
+            // → yellow, otherwise green "connected"). Previously this
+            // only read `extra`, which is almost always empty today.
             let status = entry
                 .extra
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    if !enabled {
+                        "disconnected".to_owned()
+                    } else if needs_auth {
+                        "auth required".to_owned()
+                    } else {
+                        "connected".to_owned()
+                    }
+                });
             let tools = mcp_tools_from_entry(&entry);
+            // Kickoff RPC marks server-side toolCatalog Fetching before
+            // returning; until the next list poll lands, also treat an
+            // in-flight `tools_fetch:<name>` key as fetching so the
+            // Fetch button spinner is never stuck waiting on the poll.
             let (tool_fetch_status, tool_fetch_error) = match &entry.tool_catalog {
+                None if is_busy("tools_fetch", &entry.name) => {
+                    ("fetching".to_string(), String::new())
+                }
                 None => (String::new(), String::new()),
                 Some(crate::protocol_types::McpToolCatalog::Fetching) => {
                     ("fetching".to_string(), String::new())
@@ -1552,7 +1568,7 @@ pub fn to_mcp_server_option_rows(
             if !status.is_empty() {
                 parts.push(status.as_str());
             }
-            if !auth.is_empty() {
+            if !auth.is_empty() && auth != "unauthenticated" {
                 parts.push(auth.as_str());
             }
             if !enabled {
@@ -1693,14 +1709,27 @@ pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_t
 /// injection uses (`agent_bridge::snapshotd_mcp_addr`).
 pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption> {
     let addr = addr?;
+    // Live injection gate (Settings toggle) — not always-on once the
+    // user has disabled snapflow; still show the row so they can re-enable.
+    let enabled = crate::agent_bridge::snapflow_mcp_enabled();
+    let status = if enabled {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    let status_line = if enabled {
+        "built-in daemon · injected into sessions"
+    } else {
+        "built-in daemon · disabled (not in live sessions)"
+    };
     Some(McpServerOption {
         name: "snapflow".into(),
         command: String::new().into(),
-        status_line: "built-in daemon · always available".into(),
+        status_line: status_line.into(),
         transport: "http".into(),
         url: format!("http://{addr}/mcp").into(),
-        enabled: true,
-        status: "connected".into(),
+        enabled,
+        status: status.into(),
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
@@ -2097,6 +2126,12 @@ mod tests {
             row.url.contains(addr),
             "must name the same address the session injection uses"
         );
+        // Enabled state tracks the live injection gate (default true).
+        assert_eq!(
+            row.enabled,
+            crate::agent_bridge::snapflow_mcp_enabled(),
+            "built-in row.enabled must mirror injection gate"
+        );
     }
 
     // Registry-derived rows stay removable (only the built-in daemon is not).
@@ -2275,6 +2310,60 @@ mod tests {
         let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "");
         assert!(rows[0].tools.iter().next().is_none());
+    }
+
+    /// In-flight `tools_fetch:<name>` must surface as fetching even when
+    /// the catalog has not yet stamped `toolCatalog` (optimistic UI path).
+    #[test]
+    fn busy_tools_fetch_key_marks_row_fetching() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows =
+            to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "fetching");
+    }
+
+    /// Enable toggle drives StatusDot via derived connection status when
+    /// the gateway does not supply `extra["status"]`.
+    #[test]
+    fn disabled_server_status_is_disconnected() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.enabled = false;
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].status.as_str(), "disconnected");
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn enabled_server_status_is_connected() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.enabled = true;
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].status.as_str(), "connected");
+        assert!(rows[0].enabled);
     }
 
     /// `tools_search_blob` is what the Settings page search bar matches

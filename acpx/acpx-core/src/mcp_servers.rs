@@ -6,14 +6,33 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// True when a central-registry MCP entry should be attached at
+/// `session/new` / resume / load. Missing `enabled` means enabled
+/// (legacy rows written before the field existed). Explicit
+/// `enabled: false` is the Settings toggle — those must not reach the
+/// backend agent even if the profile still lists the name.
+pub fn mcp_entry_is_enabled(entry: &Value) -> bool {
+    entry
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 /// Merge the client's own `mcpServers` array with the profile's centrally
 /// configured servers, keyed by `name`. Client entries win on collision --
 /// see `02-architecture.md`'s "must stay strictly additive" rule. An empty
 /// `central` set makes this a no-op, so a client using no acpx extensions
 /// gets plain native ACP behavior unaffected by this store's existence.
+///
+/// **Disabled central entries are skipped.** Settings' enable toggle only
+/// flips `enabled` on the store row; without this filter a pool-acquired
+/// session would keep receiving `enabled: false` servers forever.
 pub fn merge_mcp_servers(client: &[Value], central: &[Value]) -> Vec<Value> {
     let mut by_name: HashMap<String, Value> = HashMap::new();
     for entry in central {
+        if !mcp_entry_is_enabled(entry) {
+            continue;
+        }
         if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
             by_name.insert(name.to_string(), entry.clone());
         }
@@ -96,11 +115,14 @@ impl McpServerStore {
 
     /// Entries for exactly the given names -- what a
     /// `Profile::mcp_servers` name list resolves to at `session/new`.
+    /// Disabled (`enabled: false`) rows are omitted so a Settings toggle
+    /// off is not silently re-attached by a still-listed profile name.
     pub fn list_named(&self, names: &[String]) -> Vec<Value> {
         let servers = self.lock();
         names
             .iter()
             .filter_map(|name| servers.get(name).cloned())
+            .filter(mcp_entry_is_enabled)
             .collect()
     }
 
@@ -206,5 +228,37 @@ mod tests {
         let client = vec![json!({"name": "git", "command": "client-git"})];
         let merged = merge_mcp_servers(&client, &store.list());
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_skips_disabled_central_entries() {
+        let client = vec![json!({"name": "git", "command": "client-git"})];
+        let central = vec![
+            json!({"name": "fs", "command": "mcp-fs", "enabled": false}),
+            json!({"name": "httpbin", "url": "https://example", "enabled": true}),
+        ];
+        let merged = merge_mcp_servers(&client, &central);
+        let names: Vec<_> = merged
+            .iter()
+            .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"git"));
+        assert!(names.contains(&"httpbin"));
+        assert!(
+            !names.contains(&"fs"),
+            "enabled:false central must not reach session mcpServers"
+        );
+    }
+
+    #[test]
+    fn list_named_omits_disabled() {
+        let store = McpServerStore::new();
+        store.create(fs_entry()).unwrap();
+        store
+            .create(json!({"name": "off", "command": "x", "enabled": false}))
+            .unwrap();
+        let named = store.list_named(&["fs".into(), "off".into()]);
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0]["name"], "fs");
     }
 }

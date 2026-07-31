@@ -206,7 +206,16 @@ export component McpServersView inherits Rectangle {
                 // Per-instance expand state for this server's tool list -- UI-only
                 // and local (Slint has no round-trip need here: nothing persists
                 // it, unlike the chat-view's Rust-side `expanded` vec).
-                property <bool> tools-expanded: false;
+                // Auto-opens once tools land after a real fetch (`ready`),
+                // so the user is not stuck clicking "Tools" after Fetch
+                // finishes; they can still hide manually.
+                property <bool> tools-user-collapsed: false;
+                property <bool> tools-expanded:
+                    !tools-user-collapsed
+                    && (server.tools.length > 0 || server.tool-fetch-status == "fetching");
+                // Filters the expanded tool list (page search already
+                // filters *servers*; this is per-server tool name/desc).
+                property <string> tools-search: "";
 
                 // Pre-formatted in Rust (`McpServerOption.status-line`).
                 property <string> status-line: server.status-line;
@@ -288,40 +297,46 @@ export component McpServersView inherits Rectangle {
                         clicked => { root.mcp-server-logout(server.name); }
                     }
 
-                    // Expand/collapse the per-tool list (when tools are present).
-                    if server.tools.length > 0 : Button {
+                    // Expand/collapse the per-tool list (when tools are present
+                    // or a fetch is in flight and the panel is open).
+                    if server.tools.length > 0 || server.tool-fetch-status == "fetching" : Button {
                         label: (server-block.tools-expanded ? "Hide tools" : "Tools")
-                            + " (" + server.tools.length + ")";
+                            + (server.tools.length > 0 ? " (" + server.tools.length + ")" : "");
                         button-accessible-label: (server-block.tools-expanded ? "Hide" : "Show")
-                            + " " + server.tools.length + " tools for MCP server " + server.name;
+                            + " tools for MCP server " + server.name;
                         btn-width: 88px;
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
-                        clicked => { server-block.tools-expanded = !server-block.tools-expanded; }
+                        clicked => {
+                            if (server-block.tools-expanded) {
+                                server-block.tools-user-collapsed = true;
+                            } else {
+                                server-block.tools-user-collapsed = false;
+                            }
+                        }
                     }
 
                     // Kicks off a real MCP `tools/list` probe
                     // (`mcp_servers/tools_fetch`) -- "Fetch tools" before
                     // the first attempt, "Refresh tools" once a catalog
-                    // (or a failed attempt) exists. `busy` (real Spinner,
-                    // replacing the old text-only "Fetching..." label)
-                    // reads `tool-fetch-status` directly rather than a
-                    // dedicated `mcp_operations_in_flight` key -- the
-                    // catalog fetch itself outlives the kickoff RPC by a
-                    // wide margin, so this is the accurate "still
-                    // fetching" signal, already polled from the same
-                    // catalog (see `AgentBridge::fetch_mcp_server_tools_
-                    // async`'s doc comment).
+                    // (or a failed attempt) exists. `busy` (real Spinner)
+                    // reads `tool-fetch-status` -- optimistically stamped
+                    // Fetching in AgentBridge, then polled from catalog.
                     Button {
-                        label: server.tool-fetch-status == "" ? "Fetch tools" : "Refresh tools";
+                        label: server.tool-fetch-status == "fetching"
+                            ? "Fetching..."
+                            : (server.tool-fetch-status == "" ? "Fetch tools" : "Refresh tools");
                         button-accessible-label: "Fetch real tools list for MCP server " + server.name;
                         btn-width: 88px;
                         btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
                         busy: server.tool-fetch-status == "fetching";
-                        clicked => { root.mcp-server-tools-fetch-requested(server.name); }
+                        clicked => {
+                            server-block.tools-user-collapsed = false;
+                            root.mcp-server-tools-fetch-requested(server.name);
+                        }
                     }
 
                     // Enable/disable without removing the entry -- registry-
@@ -356,22 +371,13 @@ export component McpServersView inherits Rectangle {
                     }
                 }
 
-                // Nested per-tool list -- **view-only**. Real names/
-                // descriptions from the actual `tools/list` fetch, no
-                // enable/disable or deferred controls: checked against
-                // the real ACP schema (`agent-client-protocol-schema`
-                // 1.4.0) and the MCP spec, neither gives a client any way
-                // to actually make a "disabled" tool disappear from what
-                // a session's backend agent sees, so an interactive
-                // toggle here would silently do nothing -- see
-                // `McpToolOption.enabled`'s doc comment in types.slint
-                // for the full investigation. Height-capped with its own
-                // `Flickable` (not just relying on the page's outer
-                // scroll) so one server with many tools can't push every
-                // server below it off-screen.
-                if server-block.tools-expanded && server.tools.length > 0 : Rectangle {
+                // Nested per-tool list -- **view-only** with a local search
+                // bar. Real names/descriptions from the actual `tools/list`
+                // fetch (see `McpToolOption.enabled` for why toggles are
+                // not interactive). Height-capped with its own Flickable.
+                if server-block.tools-expanded : Rectangle {
                     width: parent.width;
-                    height: min(tools-list-content.preferred-height + 2 * Metrics.pad-md, 220px);
+                    height: min(tools-panel-content.preferred-height + 2 * Metrics.pad-md, 260px);
                     background: Theme.bg-sidebar;
                     border-radius: Theme.radius-sm;
                     border-width: 1px;
@@ -381,16 +387,50 @@ export component McpServersView inherits Rectangle {
                     Flickable {
                         width: parent.width;
                         height: parent.height;
-                        viewport-height: tools-list-content.preferred-height + 2 * Metrics.pad-md;
+                        viewport-height: tools-panel-content.preferred-height + 2 * Metrics.pad-md;
 
-                        tools-list-content := VerticalLayout {
+                        tools-panel-content := VerticalLayout {
                             width: parent.width;
                             padding: Metrics.pad-md;
                             padding-left: Metrics.pad-lg;
                             spacing: Metrics.gap-sm;
 
+                            TextField {
+                                width: parent.width;
+                                text <=> server-block.tools-search;
+                                placeholder: "Search tools…";
+                                field-accessible-label: "Search tools for MCP server " + server.name;
+                            }
+
+                            if server.tool-fetch-status == "fetching" : HorizontalLayout {
+                                spacing: Metrics.gap-sm;
+                                Spinner { size: 12px; }
+                                Text {
+                                    text: "Fetching tools from server…";
+                                    color: Theme.text-muted;
+                                    font-size: 9px * Theme.font-scale;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            if server.tool-fetch-status != "fetching" && server.tools.length == 0 : Text {
+                                text: server.tool-fetch-status == "error"
+                                    ? "No tools (fetch failed)."
+                                    : "No tools discovered yet — click Fetch tools.";
+                                color: Theme.text-muted;
+                                font-size: 9px * Theme.font-scale;
+                            }
+
                             for tool in server.tools : VerticalLayout {
                                 spacing: 2px;
+                                // Local tool search — one matches-filter
+                                // call (joined haystack) so Slint codegen
+                                // does not move `tools-search` twice.
+                                visible: server-block.tools-search == ""
+                                    || TextUtil.matches-filter(
+                                        tool.name + "\n" + tool.description,
+                                        server-block.tools-search
+                                    );
 
                                 HorizontalLayout {
                                     spacing: Metrics.gap-md;

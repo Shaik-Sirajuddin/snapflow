@@ -795,6 +795,8 @@ pub enum RouterError {
     NoLaunchableDistribution { profile: String, agent_id: String },
     #[error("backend requires authentication before session/new (advertised authMethods: {0}); configure Profile::auth_method_id to pick one")]
     BackendRequiresAuthentication(serde_json::Value),
+    #[error("backend rejected initialize: {0}")]
+    BackendInitializationError(serde_json::Value),
     #[error("backend rejected authenticate: {0}")]
     BackendAuthenticationError(serde_json::Value),
     #[error("authenticate: acpx's own initialize response advertises no authMethods (requested methodId: {0:?}); no transport-level bearer-token/session auth is bypassed by this -- see acpx-server's own HTTP/WS auth")]
@@ -5383,18 +5385,11 @@ async fn ensure_backend_initialized_with_handshake_timeout(
                     // comment for why opt-in, not opt-out) keeps declaring
                     // both `false`, byte-for-byte the pre-phase-3 behavior.
                     "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access },
-                    // Phase 4: same treatment for the `terminal` capability
-                    // group -- all five sub-methods tied to one profile-level
-                    // opt-in (`Profile::allow_terminal_access`), since
-                    // granular per-sub-method opt-in has no real security
-                    // value (they're meaningless without each other).
-                    "terminal": {
-                        "create": allow_terminal_access,
-                        "output": allow_terminal_access,
-                        "waitForExit": allow_terminal_access,
-                        "kill": allow_terminal_access,
-                        "release": allow_terminal_access
-                    }
+                    // ACP's v1 schema models terminal support as one
+                    // boolean capability. The individual terminal/*
+                    // methods are all covered by this single opt-in;
+                    // granular flags are not valid on the wire.
+                    "terminal": allow_terminal_access
                 }
             }
         });
@@ -5421,6 +5416,9 @@ async fn ensure_backend_initialized_with_handshake_timeout(
         };
         match tokio::time::timeout(handshake_timeout, handshake).await {
             Ok(Ok(value)) => {
+                if let Some(error) = value.get("error") {
+                    return Err(RouterError::BackendInitializationError(error.clone()));
+                }
                 // Capture the backend's real `initialize` result -- its
                 // actual `agentCapabilities`/`authMethods`/negotiated
                 // `protocolVersion` -- instead of discarding it. Surfaced to

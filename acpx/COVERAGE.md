@@ -750,8 +750,8 @@ all five methods, gated on a new `Profile::allow_terminal_access: bool`
 dangerous as arbitrary file I/O). `BackendCallPolicy` gained
 `allow_terminal_access` alongside `allow_fs_access`/`permission_policy`.
 `ensure_backend_initialized` now declares the real value in
-`initialize`'s `clientCapabilities.terminal.{create,output,waitForExit,
-kill,release}` instead of omitting the `terminal` capability entirely.
+`initialize`'s boolean `clientCapabilities.terminal` instead of omitting
+the `terminal` capability entirely.
 
 New `acpx-conductor::terminal` module owns the actual process
 supervision, kept protocol-agnostic on purpose (same crate-boundary
