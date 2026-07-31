@@ -624,13 +624,12 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_tool_enabled_changed(
+                panel.dispatch_mcp_server_tool_enabled_changed(
                     &component,
                     &server_name,
                     &tool_name,
                     enabled,
                 );
-                report_mcp_server_result(result);
             }
             Effect::McpServerToolDeferredChanged {
                 server_name,
@@ -641,13 +640,12 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                let result = panel.dispatch_mcp_server_tool_deferred_changed(
+                panel.dispatch_mcp_server_tool_deferred_changed(
                     &component,
                     &server_name,
                     &tool_name,
                     deferred,
                 );
-                report_mcp_server_result(result);
             }
             Effect::McpServerToolsFetchRequested { server_name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {

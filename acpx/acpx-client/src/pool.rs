@@ -326,6 +326,17 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
         Ok(lease)
     }
 
+    /// Activates a key for background replenishment without taking a lease.
+    /// Used by the panel's bounded default-agent warmup path; the first real
+    /// thread can still acquire one of these idle sessions exclusively.
+    pub async fn prewarm(self: &Arc<Self>, key: PoolKey) {
+        {
+            let mut keys = self.keys.lock().await;
+            keys.entry(key.clone()).or_insert_with(KeyPool::new).activated = true;
+        }
+        self.spawn_warmup_if_needed(key);
+    }
+
     /// Transitions `entry` (still in place inside its `KeyPool::entries`,
     /// never removed) from `Idle` to `Leased`, and builds the
     /// `SessionLease` handle for it. **Must** be called on an entry that

@@ -1302,10 +1302,77 @@ fn snapflowd_mcp_servers_entry(
 static SNAPSHOTD_MCP_STATUS: Mutex<Option<String>> = Mutex::new(None);
 static SNAPSHOTD_WATCHER_STARTED: std::sync::Once = std::sync::Once::new();
 
+/// Last address the watcher successfully pushed into every known acpx
+/// central `McpServerStore` registry via [`sync_snapshotd_registry_if_
+/// changed`] -- separate from `SNAPSHOTD_MCP_STATUS`, which is the last
+/// *observed* address regardless of whether a registry push happened.
+/// `None` means either no push has ever succeeded, or a bridge just
+/// registered a new sync target ([`register_snapshotd_registry_sync_
+/// target`] resets this so the next tick re-syncs unconditionally, since
+/// a freshly-registered gateway has never seen a push even if the
+/// address itself hasn't changed).
+static SNAPSHOTD_MCP_SYNCED: Mutex<Option<String>> = Mutex::new(None);
+
+/// One `AgentBridge`'s worth of gateways this process's snapshotd watcher
+/// can push the synthetic `"snapflow"` registry row into, plus the tokio
+/// `Handle` to actually run that async push on (the watcher itself is a
+/// plain OS thread with no runtime of its own). `Weak` so a bridge that
+/// has since been dropped (e.g. a test's own short-lived `AgentBridge`)
+/// is silently pruned on the next tick instead of leaking.
+struct SnapshotdSyncTarget {
+    gateways: std::sync::Weak<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    runtime: tokio::runtime::Handle,
+}
+
+/// Every live `AgentBridge`'s gateway map the watcher should keep synced.
+/// Registered once per bridge construction (see [`register_snapshotd_
+/// registry_sync_target`]); almost always holds exactly one entry in
+/// production (one panel process, one `AgentBridge`), but nothing here
+/// assumes that -- each independent gateway/router process reachable from
+/// this panel needs its own registry row, since `McpServerStore` is
+/// per-router state, not shared.
+static SNAPSHOTD_SYNC_TARGETS: Mutex<Vec<SnapshotdSyncTarget>> = Mutex::new(Vec::new());
+
+/// Registers `gateways` (an `AgentBridge`'s own gateway-connection cache,
+/// keyed by base URL) as a target the background snapshotd watcher
+/// (`ensure_snapshotd_watcher_started`) should push the synthetic
+/// `"snapflow"` MCP server row into whenever the daemon's live MCP
+/// address changes. Resets [`SNAPSHOTD_MCP_SYNCED`] so the very next
+/// watcher tick pushes to this (and every other still-live) target even
+/// if the address happens to already match the last-synced value --
+/// otherwise a bridge constructed after the address stabilized would
+/// never receive an initial sync.
+fn register_snapshotd_registry_sync_target(
+    gateways: Arc<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    runtime: tokio::runtime::Handle,
+) {
+    SNAPSHOTD_SYNC_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(SnapshotdSyncTarget {
+            gateways: Arc::downgrade(&gateways),
+            runtime,
+        });
+    *SNAPSHOTD_MCP_SYNCED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Live gate for the built-in snapflow (snapshotd) MCP client injection.
 /// Settings UI name is `"snapflow"`; wire `mcpServers` name is
-/// `"snapshotd"`. Not an acpx central-registry row — toggle must flip
-/// this flag and rewrite pool openers, not call `mcp_servers/update`.
+/// `"snapshotd"`. This flag alone still governs the always-correct
+/// per-session `mcpServers` injection path (toggle must flip it and
+/// rewrite pool openers directly -- see
+/// [`AgentBridge::set_builtin_snapflow_mcp_enabled`]); it is *not*
+/// gating the central-registry sync below. As of the `mcp-servers-
+/// settings` fix, the watcher (`ensure_snapshotd_watcher_started`) also
+/// pushes a real `"snapflow"` row into every known acpx central
+/// `McpServerStore` registry (`sync_snapshotd_registry_if_changed`) via
+/// `mcp_servers/create`/`update`, so Settings' "Fetch tools" action --
+/// which calls `mcp_servers/tools_fetch` against whatever name the row
+/// displays -- has a real registry entry to query instead of failing
+/// with "no mcp server named snapflow". That registry sync is additive:
+/// the per-session client-injection mechanism below is unchanged.
 static SNAPFLOW_MCP_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -1406,10 +1473,130 @@ fn ensure_snapshotd_watcher_started() {
             let addr = query_snapshotd_mcp_addr();
             *SNAPSHOTD_MCP_STATUS
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addr;
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addr.clone();
+            sync_snapshotd_registry_if_changed(addr);
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
     });
+}
+
+/// Pushes the just-observed `addr` into every live [`SNAPSHOTD_SYNC_
+/// TARGETS`] registry, but only when it differs from the last address
+/// this watcher successfully synced ([`SNAPSHOTD_MCP_SYNCED`]) -- so a
+/// steady-state daemon (the overwhelmingly common case) costs one string
+/// comparison per 5s tick, not a `mcp_servers/create`/`update` round trip
+/// to every known gateway. Called from the watcher's own OS thread, which
+/// has no tokio runtime of its own; the actual async RPCs are handed off
+/// to each target's own `Handle::spawn` and this function returns without
+/// waiting for them (best-effort -- a failed push is retried whenever the
+/// address next changes, or a new target registers).
+fn sync_snapshotd_registry_if_changed(addr: Option<String>) {
+    let changed = {
+        let mut last_synced = SNAPSHOTD_MCP_SYNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_synced.as_deref() == addr.as_deref() {
+            false
+        } else {
+            *last_synced = addr.clone();
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+    // A `None` tick (daemon down / control socket unreachable) still
+    // updates `SNAPSHOTD_MCP_SYNCED` above so a later real address is
+    // recognized as a change, but there is nothing to push yet.
+    let Some(addr) = addr else {
+        return;
+    };
+    let Some(entry) = builtin_snapflow_registry_entry(&addr) else {
+        return;
+    };
+    // Prune dead (dropped-bridge) targets while collecting live ones, so
+    // this list stays bounded across e.g. many short-lived test bridges
+    // within one process.
+    let mut targets = SNAPSHOTD_SYNC_TARGETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    targets.retain(|target| target.gateways.strong_count() > 0);
+    for target in targets.iter() {
+        let Some(gateways) = target.gateways.upgrade() else {
+            continue;
+        };
+        let entry = entry.clone();
+        target.runtime.spawn(async move {
+            sync_snapflow_registry_entry(&gateways, &entry).await;
+        });
+    }
+}
+
+/// Builds the central-registry `McpServerEntry` for the built-in snapflow
+/// server at `addr`, reusing [`snapshotd_mcp_server_entry_for_addr`] for
+/// the URL shape (the same `http://{addr}/mcp` this crate already injects
+/// per-session) rather than recomputing it a second way. That helper's
+/// wire shape targets ACP's own per-session `mcpServers` array (`"name":
+/// "snapshotd"`, array-of-pairs `headers`) and is also gated on the live
+/// [`snapflow_mcp_enabled`] toggle, neither of which apply to the central
+/// registry row: the Settings UI's row (and therefore what "Fetch tools"
+/// queries) is named `"snapflow"`, uses `McpServerConfig`'s object-shaped
+/// `headers`, and the registry row is what still needs to exist even
+/// while the toggle is off (else re-enabling it would race a fresh watch
+/// tick). Only the `url` field is actually reused across the two shapes.
+fn builtin_snapflow_registry_entry(addr: &str) -> Option<crate::protocol_types::McpServerEntry> {
+    let built = snapshotd_mcp_server_entry_for_addr(Some(addr));
+    let url = built.first()?.get("url")?.as_str()?.to_string();
+    Some(crate::protocol_types::McpServerEntry::new(
+        "snapflow",
+        crate::protocol_types::McpServerConfig::Http {
+            url,
+            headers: std::collections::HashMap::new(),
+            timeout: None,
+            oauth: None,
+        },
+    ))
+}
+
+/// Upserts `entry` into every gateway currently known in `gateways`
+/// (one push per distinct connected acpx-server this panel talks to --
+/// each owns an independent `McpServerStore`). Try-create-then-update-on-
+/// AlreadyExists, the same pattern `acpx-server/src/provisioning.rs`'s
+/// `apply` uses for its own declarative-reapply case, ported to the
+/// client-side `ClientError::Rpc` shape `Gateway::create_mcp_server`
+/// actually returns (the server-side `RouterError::McpServer(McpServer
+/// StoreError::AlreadyExists(_))` `apply` matches on never crosses the
+/// wire as a typed variant -- it collapses to a JSON-RPC error whose
+/// `message` is `McpServerStoreError::AlreadyExists`'s `Display` text,
+/// "mcp server store: mcp server {name} already exists", wrapped by
+/// `RouterError::McpServer`'s own `"mcp server store: {0}"` -- so this
+/// matches on that substring the same way `ClientError::is_transient`
+/// already does for its own message-sniffing cases).
+async fn sync_snapflow_registry_entry(
+    gateways: &Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>,
+    entry: &crate::protocol_types::McpServerEntry,
+) {
+    let live_gateways: Vec<Arc<acpx_client::Gateway>> = gateways
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for gateway in live_gateways {
+        if let Err(err) = gateway.create_mcp_server(entry).await {
+            let already_exists = matches!(
+                &err,
+                acpx_client::raw::ClientError::Rpc { message, .. }
+                    if message.to_ascii_lowercase().contains("already exists")
+            );
+            if already_exists {
+                // Best-effort: a failed update here is retried on the next
+                // address change (or new-target registration), same as any
+                // other failure in this background sync.
+                let _ = gateway.update_mcp_server(entry).await;
+            }
+        }
+    }
 }
 
 /// Non-blocking read of the watcher cache. Starting the watcher is one-time
@@ -3382,6 +3569,16 @@ impl AgentBridge {
             }
         }
 
+        // mcp-servers-settings: this bridge's gateway map is a target the
+        // process-wide snapshotd watcher should keep the central-registry
+        // "snapflow" row synced into (see `register_snapshotd_registry_
+        // sync_target`'s doc comment). Registered here, once per bridge,
+        // rather than only from `snapshotd_mcp_addr()`'s first caller --
+        // that call site has no `Arc<Mutex<HashMap<..., Arc<Gateway>>>>` or
+        // runtime handle to offer, and may run long before any bridge
+        // (and its gateways) exist at all.
+        register_snapshotd_registry_sync_target(gateways.clone(), runtime.handle().clone());
+
         Ok(AgentBridge {
             runtime,
             slots,
@@ -3513,6 +3710,56 @@ impl AgentBridge {
         }
     }
 
+    /// Retires every pool owned by a project whose identity changed. Idle
+    /// sessions are removed immediately; active leases become stale and are
+    /// removed by their owner after the current turn finishes.
+    fn refresh_pools_for_project_dir(&self, project_dir: &Path) {
+        let prefix = format!("{}|", project_dir.to_string_lossy());
+        let pools = {
+            let pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Starts bounded warmup for the resolved default agent when its gateway
+    /// is already available. It activates the pool without taking a thread
+    /// lease and never waits for `session/new` on the caller thread.
+    pub fn prewarm_default_agent(&self, agent_id: &str, profile_name: Option<&str>) {
+        let Some(project_dir) = self
+            .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(agent_id).cloned() else {
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), agent_id);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            return;
+        };
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            agent_id,
+            crate::gateway_actor::provider_profile_key(profile_name),
+        );
+        self.runtime.spawn(async move {
+            pool.prewarm(key).await;
+        });
+    }
+
     /// Async counterpart to [`Self::refresh_pools_for_gateway`] for use
     /// inside already-spawned MCP-settings futures that only hold a
     /// pre-captured `project_pools` Arc (no `&self`).
@@ -3622,8 +3869,18 @@ impl AgentBridge {
     /// An untitled project has no raw MLT path to publish to snapshotd, but it
     /// still owns a staging store and therefore must provide a real ACP cwd.
     pub fn set_active_project_identity(&self, identity: &crate::model::ProjectIdentity) {
+        let previous_store_path = self
+            .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let store_path = crate::project_store::project_store_dir(identity, &resolve_cache_dir());
         let raw_path = identity.saved_path().map(PathBuf::from);
+        if previous_store_path != store_path {
+            if let Some(previous_store_path) = previous_store_path {
+                self.refresh_pools_for_project_dir(&previous_store_path);
+            }
+        }
         *self
             .session_cwd_override
             .lock()
@@ -4495,6 +4752,66 @@ impl AgentBridge {
             .is_ok()
     }
 
+    /// Non-blocking profile create for Settings. The synchronous wrapper is
+    /// retained for compatibility tests, but UI effects must use this
+    /// runtime-owned path so a slow gateway cannot stall Slint.
+    pub fn create_profile_async(
+        &self,
+        idx: usize,
+        entry: serde_json::Value,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let handle = slot.handle.clone();
+        let cache = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .create_profile(entry)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                if let Ok(mut cache) = cache.try_lock() {
+                    cache.last_refresh = None;
+                }
+            }
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking profile delete for Settings; see
+    /// [`Self::create_profile_async`] for the threading contract.
+    pub fn delete_profile_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let handle = slot.handle.clone();
+        let cache = self.gateway_catalog.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_profile(name)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                if let Ok(mut cache) = cache.try_lock() {
+                    cache.last_refresh = None;
+                }
+            }
+            on_complete(result);
+        });
+    }
+
     /// Explicit, opt-in-only `session/close` on thread `idx` -- see
     /// `AcpxThreadHandle::close_session`'s doc comment: this is never
     /// sent implicitly by window/process teardown, only by a real UI
@@ -5056,6 +5373,93 @@ impl AgentBridge {
             // Kickoff returned: server has stamped Fetching (or failed).
             // Drop debounce so the next frame's list poll can pick up
             // Fetching → Ready without waiting the default 2s.
+            if let Ok(mut cache) = catalog.try_lock() {
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking update of one discovered MCP tool preference. The
+    /// read/modify/write sequence stays together on the bridge runtime so a
+    /// UI effect never performs either registry RPC synchronously.
+    pub fn update_mcp_tool_preference_async(
+        &self,
+        idx: usize,
+        server_name: &str,
+        tool_name: &str,
+        field: &str,
+        value: bool,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("tool:{server_name}:{tool_name}:{field}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let catalog = self.gateway_catalog.clone();
+        let project_pools = self.project_pools.clone();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let field = field.to_string();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut entry = handle
+                    .list_mcp_servers()
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.name == server_name)
+                    .ok_or_else(|| {
+                        format!(
+                            "MCP server \"{server_name}\" disappeared before tool preference update"
+                        )
+                    })?;
+                let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
+                if let Some(tools) = tools {
+                    if let Some(tool) = tools.iter_mut().find(|tool| {
+                        tool.get("name").and_then(|name| name.as_str()) == Some(tool_name.as_str())
+                    }) {
+                        if let Some(object) = tool.as_object_mut() {
+                            object.insert(field.clone(), serde_json::Value::Bool(value));
+                        }
+                    } else {
+                        let mut object = serde_json::Map::new();
+                        object.insert("name".to_string(), serde_json::Value::String(tool_name.clone()));
+                        object.insert(field.clone(), serde_json::Value::Bool(value));
+                        tools.push(serde_json::Value::Object(object));
+                    }
+                } else {
+                    let mut object = serde_json::Map::new();
+                    object.insert("name".to_string(), serde_json::Value::String(tool_name.clone()));
+                    object.insert(field.clone(), serde_json::Value::Bool(value));
+                    entry.extra.insert(
+                        "tools".to_string(),
+                        serde_json::Value::Array(vec![serde_json::Value::Object(object)]),
+                    );
+                }
+                handle
+                    .update_mcp_server(entry)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            .await;
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
             if let Ok(mut cache) = catalog.try_lock() {
                 cache.last_refresh = None;
             }

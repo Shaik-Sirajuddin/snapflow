@@ -1041,77 +1041,45 @@ impl PanelSingleton {
         Ok(())
     }
 
-    /// Sets one boolean preference field (`"enabled"` or `"deferred"`) for
-    /// `tool_name` inside `entry`'s opaque `tools` JSON array, creating
-    /// the array/row if this is the first preference ever recorded for
-    /// that tool. Shared by [`Self::dispatch_mcp_server_tool_enabled_
-    /// changed`] and [`Self::dispatch_mcp_server_tool_deferred_changed`]
-    /// -- MCP tool-level preferences aren't part of the typed `McpServer
-    /// Config` (tools are a runtime-discovered capability of a connected
-    /// server, not part of its static config), so this still goes
-    /// through `entry.extra` as a `Map` (no `IndexMut`, hence `.insert`
-    /// instead of `entry.extra[..] = ..`).
-    fn set_mcp_tool_preference_field(
-        entry: &mut crate::protocol_types::McpServerEntry,
-        tool_name: &str,
-        field: &str,
-        value: bool,
-    ) {
-        let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
-        if let Some(tools) = tools {
-            let mut found = false;
-            for tool in tools.iter_mut() {
-                if tool.get("name").and_then(|n| n.as_str()) == Some(tool_name) {
-                    tool[field] = serde_json::Value::Bool(value);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                let mut row = serde_json::Map::new();
-                row.insert("name".to_string(), serde_json::Value::String(tool_name.to_string()));
-                row.insert(field.to_string(), serde_json::Value::Bool(value));
-                tools.push(serde_json::Value::Object(row));
-            }
-        } else {
-            let mut row = serde_json::Map::new();
-            row.insert("name".to_string(), serde_json::Value::String(tool_name.to_string()));
-            row.insert(field.to_string(), serde_json::Value::Bool(value));
-            entry.extra.insert(
-                "tools".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::Object(row)]),
-            );
-        }
-    }
-
-    fn dispatch_mcp_server_tool_preference_changed(
+    fn dispatch_mcp_server_tool_preference_changed_async(
         &self,
         server_name: &str,
         tool_name: &str,
         field: &str,
         value: bool,
         action_past_tense: &str,
-    ) -> Result<String, String> {
+    ) {
         let Some(bridge) = &self.bridge else {
-            return Err("no gateway connection".to_string());
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string(),
+            ));
+            return;
         };
         let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == server_name)
-        else {
-            return Err(format!(
-                "MCP server \"{server_name}\" disappeared before tool {action_past_tense} update"
-            ));
-        };
-        Self::set_mcp_tool_preference_field(&mut entry, tool_name, field, value);
-        bridge
-            .update_mcp_server(gw, entry)
-            .map(|()| format!("Tool \"{tool_name}\" {action_past_tense}"))
-            .map_err(|err| {
-                format!("Failed to update tool \"{tool_name}\" on MCP server \"{server_name}\": {err}")
-            })
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let action_past_tense = action_past_tense.to_string();
+        let callback_server_name = server_name.clone();
+        let callback_tool_name = tool_name.clone();
+        let callback_action = action_past_tense.clone();
+        bridge.update_mcp_tool_preference_async(
+            gw,
+            &server_name,
+            &tool_name,
+            field,
+            value,
+            move |result| {
+                crate::effect_executor::report_mcp_server_result(
+                    result
+                        .map(|()| format!("Tool \"{callback_tool_name}\" {callback_action}"))
+                        .map_err(|err| {
+                            format!(
+                                "Failed to update tool \"{callback_tool_name}\" on MCP server \"{callback_server_name}\": {err}"
+                            )
+                        }),
+                );
+            },
+        );
     }
 
     /// Per-tool enable flag on one MCP server entry. Persists into the
@@ -1122,8 +1090,8 @@ impl PanelSingleton {
         server_name: &str,
         tool_name: &str,
         enabled: bool,
-    ) -> Result<String, String> {
-        self.dispatch_mcp_server_tool_preference_changed(
+    ) {
+        self.dispatch_mcp_server_tool_preference_changed_async(
             server_name,
             tool_name,
             "enabled",
@@ -1140,8 +1108,8 @@ impl PanelSingleton {
         server_name: &str,
         tool_name: &str,
         deferred: bool,
-    ) -> Result<String, String> {
-        self.dispatch_mcp_server_tool_preference_changed(
+    ) {
+        self.dispatch_mcp_server_tool_preference_changed_async(
             server_name,
             tool_name,
             "deferred",
@@ -1382,13 +1350,27 @@ impl PanelSingleton {
             entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
         }
         let gw = self.settings_gateway_index();
-        bridge.create_profile(gw, entry);
+        let profile_name = name.to_string();
+        bridge.create_profile_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Profile \"{profile_name}\" created"))
+                    .map_err(|err| format!("Failed to create profile \"{profile_name}\": {err}")),
+            );
+        });
     }
 
     pub(crate) fn dispatch_profile_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        bridge.delete_profile(gw, name);
+        let profile_name = name.to_string();
+        bridge.delete_profile_async(gw, name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Profile \"{profile_name}\" deleted"))
+                    .map_err(|err| format!("Failed to delete profile \"{profile_name}\": {err}")),
+            );
+        });
     }
 
     pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
@@ -1508,6 +1490,10 @@ impl PanelSingleton {
         };
         if let Some(bridge) = self.bridge.as_ref() {
             bridge.set_active_project_identity(&identity);
+            let default_agent_id = self.model.borrow().default_agent_id.clone();
+            if !default_agent_id.trim().is_empty() {
+                bridge.prewarm_default_agent(&default_agent_id, Some(&default_agent_id));
+            }
         }
         if let Some(registration) = self.snapshotd_registration.as_ref() {
             registration.update(path, reason, generation);
