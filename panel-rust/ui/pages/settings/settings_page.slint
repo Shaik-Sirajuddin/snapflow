@@ -42,7 +42,14 @@ import { ProfileOption, McpServerOption, McpServerFormData, AgentCatalogEntry, R
 export component SettingsPage inherits Rectangle {
     // New shell-only state (settings-pane-redesign plan, phase 1).
     in-out property <string> scope: "project"; // "project" | "global"
-    in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
+    // Default must be a section valid under BOTH scopes -- "mcp_servers"
+    // is Global-only (see settings_scope_visibility_gate below), and the
+    // `changed scope` redirect that guards against landing on it doesn't
+    // fire on initial mount (Rust's model.settings_scope sync is also
+    // "project" by default, so no actual change event occurs), which used
+    // to leave the page opening to a blank pane. "agents" renders under
+    // both scopes.
+    in-out property <string> active-section: "agents"; // "mcp_servers" | "agents" | "harness" | "skills"
     in-out property <string> search-query: "";
     in-out property <bool> sections-expanded: true;
     // See FilterSearchBar.input-has-focus's doc comment. The AgentsView
