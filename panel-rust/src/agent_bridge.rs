@@ -1890,6 +1890,82 @@ fn codex_auth_file_has_chatgpt_login() -> bool {
         .is_some_and(|token| !token.is_empty())
 }
 
+/// Normalizes the free-form `auth_mode` string real `codex` CLI builds
+/// write into `auth.json` into the exact ACP `native_auth_method_id`
+/// value codex-acp expects. Case/hyphen/underscore-insensitive since
+/// only `"chatgpt"` has been directly confirmed on a live system (see
+/// `resolve_codex_native_auth_method_id`'s doc comment) -- other codex
+/// CLI versions may plausibly spell either mode differently
+/// (`"chat-gpt"`, `"ChatGPT"`, `"api-key"`, `"apiKey"`, ...), so this
+/// normalizes defensively rather than matching a single literal.
+/// Returns `None` for anything unrecognized so the caller can fall back
+/// to today's presence-based detection instead of guessing.
+fn normalize_codex_auth_mode(raw: &str) -> Option<&'static str> {
+    let normalized: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    match normalized.as_str() {
+        "chatgpt" => Some("chat-gpt"),
+        "apikey" => Some("api-key"),
+        _ => None,
+    }
+}
+
+/// Reads and normalizes `auth.json`'s own `auth_mode` field (see
+/// `codex_home_dir` for path resolution). `None` covers every "we don't
+/// have a trustworthy declared mode" case alike -- missing file,
+/// unparseable JSON, missing field, or an unrecognized value -- so
+/// callers have one signal to check before falling back.
+fn read_codex_auth_mode_from_file() -> Option<&'static str> {
+    let path = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    value
+        .get("auth_mode")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_codex_auth_mode)
+}
+
+/// Resolves the ACP `native_auth_method_id` this system's real Codex CLI
+/// login implies, mirroring acpx-server's own
+/// `default_codex_native_auth_method` (`acpx-server/src/config.rs`) --
+/// kept as a deliberately separate, hand-mirrored implementation per
+/// that function's own doc comment, not a shared crate, so keep any
+/// future change to this priority order in sync in both places.
+///
+/// **auth_mode-first, live bug this fixes.** Before this function
+/// existed, `spawn_gateway_process` inlined field-presence-only
+/// detection (API key first, then `tokens.access_token`) that completely
+/// ignored `auth.json`'s own `auth_mode` field. Live-confirmed against
+/// this exact system: its real `~/.codex/auth.json` has
+/// `"auth_mode": "chatgpt"` (a real, completed ChatGPT-plan login) *and*
+/// a stale, leftover non-empty `OPENAI_API_KEY` field left over from an
+/// earlier/different login -- so presence-only detection always picked
+/// "api-key" for it, silently contradicting what the file's own
+/// `auth_mode` field declared, and shadowing a real working login with a
+/// wrong one. This now checks `auth_mode` first via
+/// `read_codex_auth_mode_from_file`, and only falls back to the old
+/// presence-based priority (api-key field presence, then
+/// `tokens.access_token`) when `auth_mode` is missing or unrecognized,
+/// so `auth.json` shapes that predate this field (or come from a codex
+/// CLI version that doesn't set it) keep resolving exactly as before.
+fn resolve_codex_native_auth_method_id() -> Option<&'static str> {
+    if let Some(mode) = read_codex_auth_mode_from_file() {
+        return Some(mode);
+    }
+    if read_codex_api_key_from_auth_file().is_some() {
+        return Some("api-key");
+    }
+    if codex_auth_file_has_chatgpt_login() {
+        return Some("chat-gpt");
+    }
+    None
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -2440,14 +2516,33 @@ fn spawn_gateway_process(
         // (`config.rs`'s `default_codex_native_auth_method`): api-key
         // when a real key is found, else chat-gpt when a real ChatGPT
         // OAuth login is found, else leave it unset.
+        //
+        // auth-mode-first fix: the above (field-presence-only) priority
+        // had its own live bug -- this system's real `~/.codex/auth.json`
+        // has `"auth_mode": "chatgpt"` (a real, completed ChatGPT-plan
+        // login) *and* a stale, leftover non-empty `OPENAI_API_KEY` field.
+        // Presence-only detection always resolved that combination to
+        // "api-key", silently discarding the user's actual declared
+        // login mode. `resolve_codex_native_auth_method_id` now checks
+        // the file's own `auth_mode` field first (normalized
+        // case/hyphen-insensitively) and only falls back to this
+        // presence-based priority when `auth_mode` is missing or
+        // unrecognized, so older `auth.json` shapes without the field
+        // keep behaving exactly as before.
         if std::env::var_os("ACPX_NATIVE_AUTH_METHOD_ID").is_none() {
-            if let Some(key) = read_codex_api_key_from_auth_file() {
-                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
-                if std::env::var_os("CODEX_API_KEY").is_none() {
-                    cmd.env("CODEX_API_KEY", key);
+            match resolve_codex_native_auth_method_id() {
+                Some("api-key") => {
+                    cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+                    if std::env::var_os("CODEX_API_KEY").is_none() {
+                        if let Some(key) = read_codex_api_key_from_auth_file() {
+                            cmd.env("CODEX_API_KEY", key);
+                        }
+                    }
                 }
-            } else if codex_auth_file_has_chatgpt_login() {
-                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+                Some("chat-gpt") => {
+                    cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+                }
+                _ => {}
             }
         } else if std::env::var_os("CODEX_API_KEY").is_none() {
             if let Some(key) = read_codex_api_key_from_auth_file() {
@@ -7334,6 +7429,103 @@ mod tests {
 
         assert_eq!(missing_file_result, None);
         assert_eq!(empty_key_result, None);
+    }
+
+    /// Writes `contents` to a disposable temp `auth.json`, points
+    /// `ACPX_CODEX_AUTH_FILE` at it, and returns a guard whose drop
+    /// restores the prior env var and removes the temp dir -- shared
+    /// setup for `resolve_codex_native_auth_method_id`'s regression
+    /// tests below, which each need a fresh file of a specific shape.
+    struct TempCodexAuthFile {
+        dir: PathBuf,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl TempCodexAuthFile {
+        fn write(contents: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rui-codex-auth-mode-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let auth_file = dir.join("auth.json");
+            std::fs::write(&auth_file, contents).expect("write temp auth file");
+            let prior = std::env::var_os("ACPX_CODEX_AUTH_FILE");
+            unsafe {
+                std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+            }
+            Self { dir, prior }
+        }
+    }
+
+    impl Drop for TempCodexAuthFile {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => unsafe { std::env::set_var("ACPX_CODEX_AUTH_FILE", value) },
+                None => unsafe { std::env::remove_var("ACPX_CODEX_AUTH_FILE") },
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Regression test for the actual live bug this plan fixes: this
+    /// developer's real `~/.codex/auth.json` had `"auth_mode": "chatgpt"`
+    /// (a real, completed ChatGPT-plan login) *and* a stale, leftover
+    /// non-empty `OPENAI_API_KEY` field, and the old field-presence-only
+    /// detection always picked "api-key" for that combination, silently
+    /// contradicting the file's own declared mode. `auth_mode` must now
+    /// win regardless of the leftover key's presence.
+    #[test]
+    fn resolve_codex_native_auth_method_id_prefers_declared_chatgpt_over_leftover_api_key() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(
+            r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": "sk-stale-leftover-key", "tokens": {"access_token": "at-real-login"}}"#,
+        );
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
+    }
+
+    /// `auth_mode` absent entirely (an `auth.json` shape from before this
+    /// field existed) must still fall back to the old presence-based
+    /// priority: a real `OPENAI_API_KEY` resolves to "api-key".
+    #[test]
+    fn resolve_codex_native_auth_method_id_falls_back_to_api_key_presence_without_auth_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(r#"{"OPENAI_API_KEY": "sk-test-key"}"#);
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("api-key"));
+    }
+
+    /// `auth_mode: "chatgpt"` must be trusted on its own -- with
+    /// `OPENAI_API_KEY` explicitly `null` and no `tokens` object at all
+    /// (no recognized token evidence whatsoever) -- since acpx's
+    /// `authenticate` call only ever sends `{"methodId": "chat-gpt"}`
+    /// with no credential payload; codex-acp itself re-reads the same
+    /// auth.json natively to actually consume the login.
+    #[test]
+    fn resolve_codex_native_auth_method_id_trusts_declared_chatgpt_with_no_token_evidence() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth =
+            TempCodexAuthFile::write(r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": null}"#);
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
+    }
+
+    /// An unrecognized `auth_mode` value must be ignored (not trusted as
+    /// either mode) and fall back to presence-based detection, same as a
+    /// missing field.
+    #[test]
+    fn resolve_codex_native_auth_method_id_falls_back_on_unrecognized_auth_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(
+            r#"{"auth_mode": "some-future-mode", "OPENAI_API_KEY": "sk-test-key"}"#,
+        );
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("api-key"));
     }
 
     /// read_codex_model_provider_from_config derives the .codex directory

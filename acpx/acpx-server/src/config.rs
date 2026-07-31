@@ -520,6 +520,28 @@ fn registry_spawn_spec(agent: &acpx_registry::Agent) -> Option<SpawnSpec> {
 /// `ACPX_NATIVE_AUTH_METHOD_ID=chat-gpt` was set by hand. Prefers the API
 /// key when (unusually) both are present, since it needs no interactive
 /// device-flow confirmation of any kind.
+///
+/// **auth_mode-first, live bug this fixes.** The above (field-presence-
+/// only) priority had its own live bug: this system's real
+/// `~/.codex/auth.json` has `"auth_mode": "chatgpt"` (a real, completed
+/// ChatGPT-plan login) *and* a stale, leftover non-empty
+/// `OPENAI_API_KEY` field left over from an earlier/different login --
+/// so presence-only detection always resolved that combination to
+/// "api-key", silently contradicting what the file's own `auth_mode`
+/// field declared and shadowing a real working login with a wrong one.
+/// This now checks `auth_mode` first (normalized case/hyphen/underscore-
+/// insensitively via [`normalize_codex_auth_mode`], since only
+/// `"chatgpt"` has been directly confirmed on a live system) and trusts
+/// it outright when recognized -- a declared `"chatgpt"` resolves to
+/// `"chat-gpt"` even with no `tokens.access_token` evidence at all,
+/// since acpx's `authenticate` call only ever sends
+/// `{"methodId": "chat-gpt"}` with no credential payload; the actual
+/// credential consumption happens natively inside the codex-acp
+/// subprocess itself re-reading the same file. Only falls back to the
+/// old presence-based priority (API key field presence, then
+/// `tokens.access_token`) when `auth_mode` is missing or unrecognized,
+/// so `auth.json` shapes that predate this field (or come from a codex
+/// CLI version that doesn't set it) keep resolving exactly as before.
 fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<String> {
     let is_codex_acp = program == "npx"
         && args
@@ -529,6 +551,33 @@ fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<St
         return None;
     }
     let auth = read_codex_auth_file()?;
+
+    if let Some(mode) = auth
+        .get("auth_mode")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_codex_auth_mode)
+    {
+        if mode == "api-key" {
+            if let Some(key) = auth
+                .get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                if std::env::var_os("CODEX_API_KEY").is_none() {
+                    // SAFETY: single-threaded startup, before any backend is
+                    // spawned; `acpx_conductor::SpawnSpec`'s child processes
+                    // inherit the ambient environment on top of their own
+                    // explicit `env` map, so setting it here is enough for
+                    // every future spawn to see it.
+                    unsafe {
+                        std::env::set_var("CODEX_API_KEY", key);
+                    }
+                }
+            }
+        }
+        return Some(mode.to_string());
+    }
+
     if let Some(key) = auth
         .get("OPENAI_API_KEY")
         .and_then(|v| v.as_str())
@@ -554,6 +603,31 @@ fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<St
         return Some("chat-gpt".to_string());
     }
     None
+}
+
+/// Normalizes the free-form `auth_mode` string real `codex` CLI builds
+/// write into `auth.json` into the exact ACP `native_auth_method_id`
+/// value codex-acp expects. Case/hyphen/underscore-insensitive since
+/// only `"chatgpt"` has been directly confirmed on a live system (see
+/// `default_codex_native_auth_method`'s doc comment) -- other codex CLI
+/// versions may plausibly spell either mode differently (`"chat-gpt"`,
+/// `"ChatGPT"`, `"api-key"`, `"apiKey"`, ...), so this normalizes
+/// defensively rather than matching a single literal. Returns `None` for
+/// anything unrecognized so the caller can fall back to the old
+/// presence-based detection instead of guessing. Mirrored exactly in
+/// panel-rust's `agent_bridge.rs` (deliberately duplicated, not shared --
+/// see that function's own doc comment).
+fn normalize_codex_auth_mode(raw: &str) -> Option<&'static str> {
+    let normalized: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    match normalized.as_str() {
+        "chatgpt" => Some("chat-gpt"),
+        "apikey" => Some("api-key"),
+        _ => None,
+    }
 }
 
 /// Reads and parses the real Codex CLI's own `auth.json` --
@@ -814,6 +888,132 @@ mod tests {
         std::fs::write(
             &auth_file,
             r#"{"OPENAI_API_KEY": "sk-test-key", "tokens": {"access_token": "test-access-token"}}"#,
+        )
+        .expect("write temp auth file");
+
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+            std::env::remove_var("CODEX_API_KEY");
+        }
+
+        let result = default_codex_native_auth_method(
+            "npx",
+            &[
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+            ],
+        );
+
+        assert_eq!(result.as_deref(), Some("api-key"));
+        assert_eq!(std::env::var("CODEX_API_KEY").as_deref(), Ok("sk-test-key"));
+    }
+
+    #[test]
+    fn default_codex_native_auth_method_prefers_declared_chatgpt_over_leftover_api_key() {
+        // Regression test for the actual live bug this fix closes: this
+        // developer's real ~/.codex/auth.json has "auth_mode": "chatgpt"
+        // (a real, completed ChatGPT-plan login) *and* a stale, leftover
+        // non-empty OPENAI_API_KEY field left over from an earlier/
+        // different login. The old field-presence-only priority always
+        // resolved that combination to "api-key", silently contradicting
+        // the file's own declared mode. `auth_mode` must now win
+        // regardless of the leftover key's presence.
+        let dir = std::env::temp_dir().join(format!(
+            "acpx-server-codex-auth-test-mode-chatgpt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("auth.json");
+        std::fs::write(
+            &auth_file,
+            r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": "sk-stale-leftover-key", "tokens": {"access_token": "test-access-token"}}"#,
+        )
+        .expect("write temp auth file");
+
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+            std::env::remove_var("CODEX_API_KEY");
+        }
+
+        let result = default_codex_native_auth_method(
+            "npx",
+            &[
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+            ],
+        );
+
+        assert_eq!(result.as_deref(), Some("chat-gpt"));
+        // The declared chat-gpt mode wins outright; the leftover key is
+        // not forwarded since it's not the mode actually in use.
+        assert!(std::env::var("CODEX_API_KEY").is_err());
+    }
+
+    #[test]
+    fn default_codex_native_auth_method_trusts_declared_chatgpt_with_no_token_evidence() {
+        // auth_mode: "chatgpt" must be trusted on its own -- with
+        // OPENAI_API_KEY explicitly null and no `tokens` object at all
+        // (no recognized token evidence whatsoever) -- since acpx's
+        // `authenticate` call only ever sends {"methodId": "chat-gpt"}
+        // with no credential payload; codex-acp itself re-reads the same
+        // auth.json natively to actually consume the login.
+        let dir = std::env::temp_dir().join(format!(
+            "acpx-server-codex-auth-test-mode-chatgpt-no-tokens-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("auth.json");
+        std::fs::write(
+            &auth_file,
+            r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": null}"#,
+        )
+        .expect("write temp auth file");
+
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+            std::env::remove_var("CODEX_API_KEY");
+        }
+
+        let result = default_codex_native_auth_method(
+            "npx",
+            &[
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+            ],
+        );
+
+        assert_eq!(result.as_deref(), Some("chat-gpt"));
+    }
+
+    #[test]
+    fn default_codex_native_auth_method_falls_back_on_unrecognized_auth_mode() {
+        // An unrecognized auth_mode value must not be trusted as either
+        // mode, and must fall back to presence-based detection, same as
+        // a missing field.
+        let dir = std::env::temp_dir().join(format!(
+            "acpx-server-codex-auth-test-mode-unrecognized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("auth.json");
+        std::fs::write(
+            &auth_file,
+            r#"{"auth_mode": "some-future-mode", "OPENAI_API_KEY": "sk-test-key"}"#,
         )
         .expect("write temp auth file");
 
