@@ -810,6 +810,7 @@ export component ChatInputLayout inherits Rectangle {
                 || mode-dropdown.is-open
                 || config-dropdown.is-open
                 || reasoning-dropdown.is-open
+                || permission-mode-dropdown.is-open
                 || root.context-ring-hovered);
             property <length> pan: 0px;
             property <length> overflow: max(0px, row2-strip.preferred-width - self.width);

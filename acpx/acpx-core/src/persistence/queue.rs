@@ -413,11 +413,29 @@ fn read_records(path: &std::path::Path) -> Result<Vec<QueueRecord>, TranscriptEr
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(TranscriptError::from))
-        .collect()
+    let unterminated_tail = !content.ends_with('\n');
+    let lines: Vec<&str> = content.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut records = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            Err(error) if unterminated_tail && index + 1 == lines.len() => {
+                // A process can be killed between append/write and the final
+                // fsync, leaving only a truncated tail record. Earlier lines
+                // are part of the durable history and must remain strict;
+                // only the incomplete tail is safely discardable. Remove it
+                // now so the next append does not turn the recoverable tail
+                // into an interior corrupt record.
+                tracing::warn!(path = %path.display(), %error, "ignoring truncated queue-log tail");
+                let valid_len = content.rfind('\n').map_or(0, |offset| offset + 1);
+                let file = std::fs::OpenOptions::new().write(true).open(path)?;
+                file.set_len(valid_len as u64)?;
+                file.sync_data()?;
+            }
+            Err(error) => return Err(TranscriptError::from(error)),
+        }
+    }
+    Ok(records)
 }
 
 #[derive(Debug, Default)]
@@ -518,7 +536,16 @@ fn compact_if_needed(path: &std::path::Path) -> Result<(), TranscriptError> {
     if records.len() <= COMPACTION_RECORD_LIMIT {
         return Ok(());
     }
+    let record_count = records.len();
     let state = replay_records(records);
+    let live_records = state.queue.len() + state.claimed.len();
+    // Do not rewrite on every append when the queue itself legitimately has
+    // more than the threshold of live entries. Compact only when tombstones
+    // dominate the log; otherwise the compacted file would still exceed the
+    // threshold and immediately trigger another full rewrite.
+    if record_count <= live_records.saturating_add(32) {
+        return Ok(());
+    }
     let temporary = path.with_extension("queue.jsonl.compact");
     let result = (|| {
         let mut file = std::fs::File::create(&temporary)?;
@@ -575,6 +602,7 @@ fn write_record(file: &mut std::fs::File, record: &QueueRecord) -> Result<(), Tr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -808,6 +836,65 @@ mod tests {
             .count();
         assert!(line_count <= COMPACTION_RECORD_LIMIT);
         assert_eq!(store.snapshot("s1").await.unwrap().queue.len(), 105);
+    }
+
+    #[tokio::test]
+    async fn truncated_tail_record_is_ignored_without_losing_prior_queue() {
+        let directory = tempdir().unwrap();
+        let store = QueueStore::new(directory.path());
+        store
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "a".into(),
+                    operation: QueueOperation::Enqueue,
+                    queue_entry_id: None,
+                    text: Some("durable prompt".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let path = directory.path().join("s1.queue.jsonl");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"operation\":\"Enqueue\"")
+            .unwrap();
+
+        let snapshot = store.snapshot("s1").await.unwrap();
+        assert_eq!(snapshot.queue.len(), 1);
+        assert_eq!(snapshot.queue[0].text, "durable prompt");
+
+        store
+            .mutate(
+                "s1",
+                QueueMutationParams {
+                    session_id: "s1".into(),
+                    idempotency_key: "b".into(),
+                    operation: QueueOperation::Enqueue,
+                    queue_entry_id: None,
+                    text: Some("after recovery".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = store.snapshot("s1").await.unwrap();
+        assert_eq!(
+            snapshot.queue.iter().map(|item| item.text.as_str()).collect::<Vec<_>>(),
+            vec!["durable prompt", "after recovery"]
+        );
+    }
+
+    #[tokio::test]
+    async fn newline_terminated_corrupt_record_is_not_silently_dropped() {
+        let directory = tempdir().unwrap();
+        let store = QueueStore::new(directory.path());
+        let path = directory.path().join("s1.queue.jsonl");
+        std::fs::write(&path, b"{not-json}\n").unwrap();
+
+        assert!(store.snapshot("s1").await.is_err());
     }
 
     #[tokio::test]

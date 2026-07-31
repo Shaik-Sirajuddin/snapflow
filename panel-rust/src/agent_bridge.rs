@@ -2855,12 +2855,35 @@ fn spawn_background_attachment(
                         refresh_transcript(&slot);
                     }
                 }
+                complete_attachment(&slot, None);
                 if server_owned_persistence {
-                    if let Err(error) = handle.paginate_history(None).await {
-                        eprintln!("panel-rust: initial remote history page failed for {:?}: {error}", slot.thread_id);
+                    // Attachment readiness must not be held hostage by an
+                    // optional history refresh. Senders can proceed as soon
+                    // as the session is bound; the refresh result is still
+                    // surfaced as an agent error and can be retried by the
+                    // normal pagination path.
+                    let pagination_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        handle.paginate_history(None),
+                    )
+                    .await;
+                    if let Err(error) = match pagination_result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("timed out".to_owned()),
+                    } {
+                        events_out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back(BridgeEvent {
+                                thread_index: idx,
+                                event: AgentEvent::Error(format!(
+                                    "initial remote history page failed for {:?}: {error}",
+                                    slot.thread_id
+                                )),
+                            });
                     }
                 }
-                complete_attachment(&slot, None);
             }
             Err(error) => {
                 let message = format!("open_session failed: {error}");
@@ -2959,8 +2982,13 @@ impl AgentBridge {
         // host supplies `initial_cwd` as the already-derived project store;
         // prefer it here so recreating the panel for Project B cannot restore
         // Project A's JSONL/session binding from one global cache directory.
-        let cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
-        let cache_dir_for_resolver = cache_dir.clone();
+        // Production persistence belongs to acpx-server. Keep the panel's
+        // project store as the ACP cwd, but do not create a second local
+        // transcript owner in the real host constructor. The explicit
+        // `..._and_cache_dir` constructors below remain available to unit
+        // tests and legacy callers that intentionally exercise local JSONL.
+        let gateway_cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
+        let cache_dir_for_resolver = gateway_cache_dir.clone();
         Self::new_with_thread_specs_and_gateway_resolver_and_cache_dir_and_initial_cwd(
             thread_specs,
             move |provider| {
@@ -5081,7 +5109,7 @@ impl AgentBridge {
     /// The server returns the authoritative projection through the queue
     /// callback stream; this method intentionally does not mutate the local
     /// queue a second time.
-    pub fn mutate_queue(&self, idx: usize, params: serde_json::Value) {
+    pub fn mutate_queue(&self, idx: usize, mut params: serde_json::Value) {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
@@ -5099,6 +5127,29 @@ impl AgentBridge {
                     });
                 return;
             }
+            let Some(session_id) = slot
+                .acp_session_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            else {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(
+                            "queue mutation skipped: session attachment completed without a session id"
+                                .to_owned(),
+                        ),
+                    });
+                return;
+            };
+            // The reducer may have emitted this effect while a deferred
+            // thread was still unbound. Resolve the authoritative remote id
+            // only after the attachment gate opens; the local thread slug is
+            // never sent as an ACPX queue key.
+            params["sessionId"] = serde_json::Value::String(session_id);
             if let Err(error) = handle.mutate_queue(params).await {
                 events
                     .lock()

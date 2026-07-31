@@ -138,11 +138,13 @@ impl SendQueue {
         let Some(index) = self.entries.iter().position(|entry| entry.text == text) else {
             return false;
         };
-        self.entries.remove(index);
+        let Some(removed) = self.entries.remove(index) else {
+            return false;
+        };
         // Keep the remaining local entry ids stable.  They are the keys used
         // by the reducer for later cancel/send-now actions; only the removed
         // row's authoritative remote id needs to disappear.
-        self.remote_ids.remove(&QueueEntryId(index as u64));
+        self.remote_ids.remove(&removed.id);
         true
     }
 
@@ -507,5 +509,21 @@ mod tests {
         assert_eq!(q.first().unwrap().text, "second");
         assert_eq!(q.remote_id_for(q.first_id().unwrap()), Some("remote-b"));
         assert!(!q.dequeue_matching_remote_message("first"));
+    }
+
+    #[test]
+    fn resume_user_message_removes_the_matching_remote_id_after_prior_dequeue() {
+        let mut q = SendQueue::new();
+        q.replace_remote_items(
+            [
+                ("remote-a".into(), "first".into()),
+                ("remote-b".into(), "second".into()),
+                ("remote-c".into(), "third".into()),
+            ],
+            false,
+        );
+        assert!(q.dequeue_matching_remote_message("first"));
+        assert!(q.dequeue_matching_remote_message("third"));
+        assert_eq!(q.remote_id_for(q.first_id().unwrap()), Some("remote-b"));
     }
 }

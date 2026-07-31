@@ -7430,6 +7430,7 @@ fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, sessi
                 return;
             }
         }
+        let mut retry_delay = std::time::Duration::from_millis(250);
         loop {
             let (store, hub) = {
                 let router = router.lock().await;
@@ -7472,8 +7473,15 @@ fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, sessi
                         "queued prompt failed and durable requeue also failed"
                     ),
                 }
-                break;
+                // The claim was released, but no turn-boundary callback will
+                // arrive because dispatch never reached the backend. Keep
+                // this dispatcher alive and retry with bounded backoff so a
+                // transient backend/IPC failure cannot strand the FIFO.
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+                continue;
             }
+            retry_delay = std::time::Duration::from_millis(250);
             match store.complete(session_id.clone(), &item).await {
                 Ok(event) => hub.publish(event).await,
                 Err(error) => tracing::error!(

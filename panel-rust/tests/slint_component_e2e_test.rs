@@ -308,6 +308,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         kind: "agent".into(),
         text: "streamed response".into(),
         markdown_lines: Default::default(),
+        markdown_blocks: Default::default(),
         status: "streaming".into(),
         expanded: false,
         index: 0,
@@ -1526,6 +1527,7 @@ fn composer_reasoning_effort_dropdown_dispatches_config_option() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
     let selected = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
     {
         let selected = selected.clone();
@@ -1572,6 +1574,57 @@ fn composer_reasoning_effort_dropdown_dispatches_config_option() {
     assert_eq!(
         selected.borrow().as_slice(),
         &[("reasoning".to_owned(), "high".to_owned())]
+    );
+}
+
+/// Backend-native permissionMode uses the same runtime config-option write
+/// callback as model and reasoning selectors, while remaining its own UI
+/// dropdown.
+#[test]
+fn composer_permission_mode_dropdown_dispatches_config_option() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
+    panel.window().set_size(slint::PhysicalSize::new(1600, 900));
+    let selected = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+    {
+        let selected = selected.clone();
+        panel.on_config_option_selected(move |id, value| {
+            selected
+                .borrow_mut()
+                .push((id.to_string(), value.to_string()));
+        });
+    }
+    panel.set_permission_mode_trigger_label("Permission".into());
+    panel.set_permission_mode_dropdown_entries(ModelRc::new(VecModel::from(vec![
+        DropdownEntry {
+            id: "permissionMode".into(),
+            label: "Accept edits".into(),
+            value: "acceptEdits".into(),
+            is_header: false,
+            is_current: false,
+        },
+        DropdownEntry {
+            id: "permissionMode".into(),
+            label: "Plan".into(),
+            value: "plan".into(),
+            is_header: false,
+            is_current: false,
+        },
+    ])));
+
+    let trigger = ElementHandle::find_by_accessible_label(&panel, "Permission")
+        .next()
+        .expect("permission trigger uses host label");
+    trigger.invoke_accessible_default_action();
+    let accept_edits = ElementHandle::find_by_accessible_label(&panel, "Accept edits")
+        .next()
+        .expect("permission options open in their own popup");
+    accept_edits.invoke_accessible_default_action();
+    assert_eq!(
+        selected.borrow().as_slice(),
+        &[("permissionMode".to_owned(), "acceptEdits".to_owned())]
     );
 }
 

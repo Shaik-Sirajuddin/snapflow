@@ -322,6 +322,8 @@ PY
     ACPX_HTTP_BIND="0.0.0.0:$gateway_port" \
     ACPX_DEFAULT_AGENT_ID="$agent_id" \
     ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+    ACPX_STORAGE_DIR="$state_dir/acpx/storage" \
+    RUI_MOCK_AGENT_EVENT_LOG="${RUI_MOCK_AGENT_EVENT_LOG:-}" \
         setsid nohup "$worktree_dir/acpx/target/debug/acpx-server" <"$fifo" \
         >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
     local server_pid=$!
@@ -354,6 +356,7 @@ PY
         QT_QUICK_BACKEND=software
         QSG_RENDER_LOOP=basic
         RUI_ACP_CACHE_DIR="$state_dir/panel"
+        RUI_PANEL_INPUT_TRACE="${RUI_PANEL_INPUT_TRACE:-}"
         # Development VNC harness only: route every persisted provider profile
         # through this worktree gateway and prevent panel-rust from spawning a
         # competing internal acpx-server. Production config does not export

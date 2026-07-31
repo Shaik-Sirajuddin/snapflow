@@ -97,12 +97,27 @@ impl LiveUiHarness {
         Self::spawn_with_env(&[]).await
     }
 
+    /// Same real host/server harness with transcript and queue persistence
+    /// owned by acpx-server. This is deliberately separate from the older
+    /// local-cache fixtures so the combined retained-view tests exercise the
+    /// production ownership boundary rather than a panel-side fallback.
+    async fn spawn_server_owned() -> Self {
+        Self::spawn_with_persistence(&[], true).await
+    }
+
     /// Same as [`Self::spawn`], plus extra env vars set on the real
     /// `shotcut`/`snapflow` process itself -- e.g. `RUI_SEED_THREADS` (more
     /// than the single default "Chat" thread) or
     /// `RUI_MARKDOWN_RENDER_TEST_DELAY_MS` (markdown-render-cache-layer
     /// MCP-06 hook, see `markdown_worker.rs`'s `render_job`).
     async fn spawn_with_env(extra_shotcut_env: &[(&str, &str)]) -> Self {
+        Self::spawn_with_persistence(extra_shotcut_env, false).await
+    }
+
+    async fn spawn_with_persistence(
+        extra_shotcut_env: &[(&str, &str)],
+        server_owned_persistence: bool,
+    ) -> Self {
         for binary in [mock_agent_bin(), acpx_server_bin(), shotcut_bin()] {
             assert!(
                 binary.exists(),
@@ -119,7 +134,8 @@ impl LiveUiHarness {
                 .expect("system clock")
                 .as_nanos()
         ));
-        std::fs::create_dir_all(state_dir.join("acpx")).expect("create acpx state dir");
+        std::fs::create_dir_all(state_dir.join("acpx/storage"))
+            .expect("create acpx storage state dir");
         std::fs::create_dir_all(state_dir.join("panel")).expect("create panel cache dir");
         std::fs::create_dir_all(state_dir.join("shotcut")).expect("create shotcut appdata dir");
 
@@ -171,6 +187,7 @@ impl LiveUiHarness {
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{gateway_port}"))
             .env("ACPX_DEFAULT_AGENT_ID", persona)
             .env("ACPX_DB_PATH", state_dir.join("acpx/gateway.sqlite3"))
+            .env("ACPX_STORAGE_DIR", state_dir.join("acpx/storage"))
             .env("ACPX_ADMIN_TOKEN", &admin_token)
             .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", acpx_log_level)
@@ -241,16 +258,13 @@ impl LiveUiHarness {
             ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
+            .env("XDG_STATE_HOME", state_dir.join("xdg-state"))
             .env("SLINT_MCP_PORT", mcp_port.to_string())
-            .env("RUI_ACP_CACHE_DIR", state_dir.join("panel"))
-            .env(
-                "RUI_ACPX_CODEX_URL",
-                format!("http://127.0.0.1:{gateway_port}"),
-            )
-            .env(
-                "RUI_ACPX_CLAUDE_URL",
-                format!("http://127.0.0.1:{gateway_port}"),
-            );
+            .env("RUI_PANEL_INPUT_TRACE", "1")
+            .env("RUI_ACPX_DEFAULT_URL", format!("http://127.0.0.1:{gateway_port}"));
+        if !server_owned_persistence {
+            shotcut_command.env("RUI_ACP_CACHE_DIR", state_dir.join("panel"));
+        }
         for (key, value) in extra_shotcut_env {
             shotcut_command.env(key, value);
         }
@@ -871,6 +885,111 @@ async fn live_multiple_messages_remain_on_their_thread_session_after_switch_back
             && event["detail"].as_str() == Some(second)
             && event["session_id"].as_str() == Some(session_a.as_str())
     }));
+}
+
+#[tokio::test]
+async fn server_owned_queue_stays_with_retained_chat_view_and_drains() {
+    let harness = LiveUiHarness::spawn_server_owned().await;
+    let window = harness.window_handle().await;
+
+    harness.create_new_thread(&window, "New thread 1").await;
+    harness
+        .send_via_compose(&window, "slow retained queue turn one")
+        .await;
+    harness
+        .wait_for_prompt_session("slow retained queue turn one")
+        .await;
+    harness
+        .send_via_compose(&window, "retained queue turn two")
+        .await;
+    wait_for(Duration::from_secs(15), || async {
+        harness
+            .find_by_exact_label(&window, "Stop sending")
+            .await
+    })
+    .await;
+
+    harness.create_new_thread(&window, "New thread 2").await;
+    assert!(
+        harness
+            .find_by_exact_label(&window, "Stop sending")
+            .await
+            .is_none(),
+        "thread B must not inherit thread A's server queue row"
+    );
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness
+        .click_by_exact_label(&window, "New thread 1")
+        .await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    wait_for(Duration::from_secs(15), || async {
+        harness
+            .find_by_exact_label(&window, "Stop sending")
+            .await
+    })
+    .await;
+
+    // Finish the active slow turn through the real stop-response control;
+    // the server dispatcher must then promote the persisted queue head.
+    harness
+        .click_by_exact_label(&window, "Stop response")
+        .await;
+    wait_for(Duration::from_secs(20), || async {
+        harness.prompt_event_seen("retained queue turn two").then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn server_owned_pagination_stays_with_retained_chat_view() {
+    let harness = LiveUiHarness::spawn_server_owned().await;
+    let window = harness.window_handle().await;
+    harness.create_new_thread(&window, "New thread 1").await;
+
+    // Thirty completed turns produce more than the server's first 50-message
+    // page while remaining quick with the mock backend.
+    for index in 0..30 {
+        let prompt = format!("retained pagination turn {index:02}");
+        harness.send_via_compose(&window, &prompt).await;
+        harness.wait_for_prompt_session(&prompt).await;
+    }
+    wait_for(Duration::from_secs(15), || async {
+        harness
+            .find_by_exact_label(&window, "Load older messages")
+            .await
+    })
+    .await;
+
+    harness.create_new_thread(&window, "New thread 2").await;
+    assert!(
+        harness
+            .find_by_exact_label(&window, "Load older messages")
+            .await
+            .is_none(),
+        "thread B must not inherit thread A's pagination cursor"
+    );
+    harness
+        .click_by_exact_label(&window, "Expand thread sidebar")
+        .await;
+    harness
+        .click_by_exact_label(&window, "New thread 1")
+        .await;
+    harness
+        .click_by_exact_label(&window, "Collapse thread sidebar")
+        .await;
+    harness
+        .click_by_exact_label(&window, "Load older messages")
+        .await;
+    wait_for(Duration::from_secs(20), || async {
+        harness
+            .find_by_exact_label(&window, "retained pagination turn 00")
+            .await
+    })
+    .await;
 }
 
 #[tokio::test]

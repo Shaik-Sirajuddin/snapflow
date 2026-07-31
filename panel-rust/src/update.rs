@@ -726,17 +726,18 @@ fn queue_entry_id_at(
     Some(crate::send_queue::QueueEntryId(n))
 }
 
-/// ACPX queue operations are keyed by the remote ACP session id, while the
-/// panel's `thread_id` is only a local UI identity. Keep the local fallback
-/// for the short pre-attachment window, but use the bound remote id as soon
-/// as `session/new`/`session/resume` has completed.
-fn queue_session_id<'a>(thread: &'a ThreadModel) -> &'a str {
-    thread.session_id.as_deref().unwrap_or(&thread.thread_id)
+/// ACPX queue operations are keyed by the remote ACP session id. The panel's
+/// `thread_id` is only a local UI identity and must never be sent to the
+/// server as a queue session key. Deferred threads therefore have no queue
+/// mutation with a null session id until `session/new` has completed and the
+/// bridge can replace it with the authoritative remote id.
+fn queue_session_id<'a>(thread: &'a ThreadModel) -> Option<&'a str> {
+    thread.session_id.as_deref()
 }
 
 fn queue_mutation(
     real_index: usize,
-    thread_id: &str,
+    session_id: Option<&str>,
     operation: &str,
     entry_id: Option<crate::send_queue::QueueEntryId>,
     remote_entry_id: Option<String>,
@@ -748,8 +749,14 @@ fn queue_mutation(
     Effect::MutateQueue {
         real_index,
         params: serde_json::json!({
-            "sessionId": thread_id,
-            "idempotencyKey": format!("panel:{thread_id}:{operation}:{stable_id}"),
+            // A deferred thread has no remote id yet. `mutate_queue` waits
+            // for attachment and fills this field from the bound slot before
+            // sending; never serialize the local UI thread slug here.
+            "sessionId": session_id,
+            "idempotencyKey": format!(
+                "panel:{}:{operation}:{stable_id}",
+                session_id.unwrap_or("unbound")
+            ),
             "operation": operation,
             "queueEntryId": remote_entry_id
                 .or_else(|| entry_id.map(|id| format!("queue-{}", id.0))),
@@ -857,8 +864,14 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             // Sending resumes auto-processing after a manual stop.
             let server_queue = thread.server_queue;
             thread.send_queue.resume();
-            let resume_effect = server_queue
-                .then(|| queue_mutation(idx, queue_session_id(thread), "resume", None, None, None));
+            let resume_effect = if server_queue {
+                queue_session_id(thread)
+                    .map(|session_id| {
+                        queue_mutation(idx, Some(session_id), "resume", None, None, None)
+                    })
+            } else {
+                None
+            };
             (
                 [
                     resume_effect,
@@ -893,17 +906,20 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             let server_queue = thread.server_queue;
             thread.send_queue.pause();
             thread.state = ThreadState::Cancelling;
-            (
-                if server_queue {
-                    vec![
-                        Effect::CancelGeneration { real_index: idx },
-                        queue_mutation(idx, queue_session_id(thread), "pause", None, None, None),
-                    ]
-                } else {
-                    vec![Effect::CancelGeneration { real_index: idx }]
-                },
-                vec![thread_row_dirty(model, idx)],
-            )
+            let mut effects = vec![Effect::CancelGeneration { real_index: idx }];
+            if server_queue {
+                if let Some(session_id) = queue_session_id(thread) {
+                    effects.push(queue_mutation(
+                        idx,
+                        Some(session_id),
+                        "pause",
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            (effects, vec![thread_row_dirty(model, idx)])
         }
         ComposeMsg::GenerationStopped => {
             let Some(thread) = model.threads.get_mut(idx) else {
@@ -931,17 +947,22 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             match remove_result {
                 Ok(Some(_)) => {
                     let effects = if model.threads[idx].server_queue {
-                        vec![queue_mutation(
-                            idx,
-                            queue_session_id(&model.threads[idx]),
-                            "cancel",
-                            Some(entry_id),
-                            model.threads[idx]
-                                .send_queue
-                                .remote_id_for(entry_id)
-                                .map(str::to_owned),
-                            None,
-                        )]
+                        queue_session_id(&model.threads[idx])
+                            .map(|session_id| {
+                                queue_mutation(
+                                    idx,
+                                    Some(session_id),
+                                    "cancel",
+                                    Some(entry_id),
+                                    model.threads[idx]
+                                        .send_queue
+                                        .remote_id_for(entry_id)
+                                        .map(str::to_owned),
+                                    None,
+                                )
+                            })
+                            .into_iter()
+                            .collect()
                     } else {
                         vec![]
                     };
@@ -1031,7 +1052,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
-                    let queue_session_id = queue_session_id(thread).to_owned();
+                    let queue_session_id = queue_session_id(thread).map(str::to_owned);
                     let server_queue = thread.server_queue;
                     let remote_entry_id =
                         thread.send_queue.remote_id_for(entry.id).map(str::to_owned);
@@ -1054,7 +1075,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     if server_queue {
                         effects.push(queue_mutation(
                             idx,
-                            &queue_session_id,
+                            queue_session_id.as_deref(),
                             "sendNow",
                             Some(entry.id),
                             remote_entry_id,
@@ -1105,7 +1126,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         return (vec![], vec![]);
                     };
                     let thread_id = thread.thread_id.clone();
-                    let queue_session_id = queue_session_id(thread).to_owned();
+                    let queue_session_id = queue_session_id(thread).map(str::to_owned);
                     let server_queue = thread.server_queue;
                     let remote_entry_id =
                         thread.send_queue.remote_id_for(entry.id).map(str::to_owned);
@@ -1124,7 +1145,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     if server_queue {
                         effects.push(queue_mutation(
                             idx,
-                            &queue_session_id,
+                            queue_session_id.as_deref(),
                             "sendNow",
                             Some(entry.id),
                             remote_entry_id,
@@ -4102,6 +4123,45 @@ mod tests {
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
         assert_eq!(model.threads.len(), 1);
+    }
+
+    #[test]
+    fn deferred_server_queue_never_uses_local_thread_id_before_attach() {
+        let mut model = model_with_threads(&["new thread"]);
+        model.threads[0].server_queue = true;
+        model.threads[0].session_id = None;
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("first".into()))),
+        );
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendPrompt { thread_id, text }
+                if thread_id == "thread-0" && text == "first"
+        )));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::MutateQueue { .. })),
+            "first send must not emit a pre-attachment resume mutation"
+        );
+
+        model.threads[0].state = ThreadState::Loading;
+        let (queued_effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("queued".into()))),
+        );
+        let queue_effect = queued_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::MutateQueue { params, .. } => Some(params),
+                _ => None,
+            })
+            .expect("queued follow-up should be deferred through the attachment gate");
+        assert_eq!(queue_effect["sessionId"], serde_json::Value::Null);
+        assert_ne!(queue_effect["sessionId"], "thread-0");
     }
 
     #[test]
