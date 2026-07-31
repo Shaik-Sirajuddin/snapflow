@@ -148,6 +148,7 @@ export component AgentBubble inherits Rectangle {
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
+                blocks: item.markdown-blocks;
                 lines: item.markdown-lines;
                 fallback-text: item.text;
             }
@@ -169,6 +170,7 @@ export component AgentBubble inherits Rectangle {
                     horizontal-stretch: 1;
                     preferred-width: 0px;
                     min-width: 0px;
+                    blocks: item.markdown-blocks;
                     lines: item.markdown-lines;
                     fallback-text: item.text;
                 }

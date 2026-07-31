@@ -937,8 +937,13 @@ fn projected_thread_rows(model: &Model, owner_id: &str) -> (Vec<String>, Vec<cra
         thread.state,
         crate::models::ThreadState::Loading | crate::models::ThreadState::Cancelling
     );
-    let (mut rows, keys) =
-        crate::models::message_rows_for_thread_with_state(transcript, &[], &queue, in_flight);
+    let (mut rows, keys) = crate::models::message_rows_for_thread_with_state(
+        transcript,
+        &[],
+        &queue,
+        in_flight,
+        &mut thread.markdown_render_index.borrow_mut(),
+    );
     if let (Some(old_keys), Some(old_rows)) = (
         model.thread_view_models.keys(owner_id),
         model.thread_view_models.rows(owner_id),

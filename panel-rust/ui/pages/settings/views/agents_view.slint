@@ -251,8 +251,6 @@ export component AgentsView inherits Rectangle {
             }
         }
 
-        SettingsDivider { width: parent.width; }
-
         // Add Profile -- commented out of view for now (kept in source, not
         // deleted, per request while the Agents view is being reworked into
         // a grid layout). Re-enable once the redesign settles on where
@@ -354,8 +352,6 @@ export component AgentsView inherits Rectangle {
                 }
             }
         }
-
-        SettingsDivider { width: parent.width; }
 
         SettingsSectionHeader { text: Strings.agents; subsection: true; }
 
@@ -484,7 +480,7 @@ export component AgentsView inherits Rectangle {
                     && root.agent-search-query == ""
                     && root.agent-catalog[first-agent-index].status != "installed"
                     && (first-agent-index == 0 || root.agent-catalog[first-agent-index - 1].status == "installed")
-                    : SettingsDivider { width: parent.width; }
+                    : Rectangle { height: 0px; }
 
                 if row-visible : HorizontalLayout {
                     spacing: Metrics.space-6;
@@ -530,8 +526,6 @@ export component AgentsView inherits Rectangle {
                 }
             }
         }
-
-        SettingsDivider { width: parent.width; }
 
         // Recovery/import section (Coverage Matrix `session/list` row):
         // real remote gateway sessions not currently bound to any local

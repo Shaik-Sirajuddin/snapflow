@@ -861,7 +861,7 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
 /// long-lived thread with thousands of cached messages (see `jsonl_
 /// store.rs`'s own 10,000-message test for the underlying primitive's
 /// own bound proof).
-const HISTORY_PAGE_SIZE: usize = 500;
+const HISTORY_PAGE_SIZE: usize = 20;
 
 /// Cold-start seeding for one thread (Phase 3 steps 1-2): loads only
 /// the newest `page_size` cached messages plus the standalone trailer
@@ -11417,7 +11417,16 @@ done
         // Seed a real cache file with more than one page's worth of
         // messages, independent of this bridge (mirrors a prior run's
         // accumulated scrollback).
-        let total_messages = HISTORY_PAGE_SIZE * 2 + 37;
+        // Remainder must stay smaller than HISTORY_PAGE_SIZE so the third
+        // page (the "real start") is reached in exactly one more
+        // `load_older_page` call after the first two full pages -- this
+        // constant shrank from 500 to 20 (see
+        // memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+        // "Cross-check: message loading is already paginated" section);
+        // the original `+ 37` relied on `37 < 500` and silently broke this
+        // test's "two total load_older_page calls reach the start"
+        // assumption once the page size shrank below it.
+        let total_messages = HISTORY_PAGE_SIZE * 2 + 7;
         let seeded_messages: Vec<ChatMessage> = (0..total_messages)
             .map(|i| ChatMessage {
                 // Alternating User/Agent -- a realistic shape (unlike an
@@ -11486,7 +11495,7 @@ done
         );
         assert!(bridge.has_older_page(0));
 
-        // Second call reaches the real start (37 remaining messages).
+        // Second call reaches the real start (7 remaining messages).
         assert!(bridge.load_older_page(0));
         let after_two = bridge.history(0);
         assert_eq!(after_two.len(), total_messages);

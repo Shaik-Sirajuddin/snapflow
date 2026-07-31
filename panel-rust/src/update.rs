@@ -733,6 +733,7 @@ fn rebuild_send_queue_projection(model: &mut Model, idx: usize) -> (String, Vec<
         &expanded,
         &thread.send_queue,
         in_flight,
+        &mut *thread.markdown_render_index.borrow_mut(),
     );
     let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
     thread.transcript_keys = keys;
@@ -811,6 +812,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                             &expanded,
                             &thread.send_queue,
                             in_flight,
+                            &mut *thread.markdown_render_index.borrow_mut(),
                         );
                         let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
                         thread.transcript_keys = keys;
@@ -2061,6 +2063,90 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 },
             }],
         ),
+        // markdown-render-cache-layer plan Phase 2. Three independent
+        // staleness/existence checks before this delivered render is
+        // trusted, matching 00-plan.md's "Correctness rules for
+        // delivery" exactly:
+        // 1. `thread_id` must still resolve to a live thread (it may
+        //    have closed/archived while this render was in flight).
+        // 2. `key` must still have an entry in that thread's own
+        //    `ThreadMessageIndex` (the message may have been removed --
+        //    e.g. history truncation -- since the render was requested).
+        // 3. `source_hash` must match what the index currently has
+        //    recorded for `key` (the source text changed -- most
+        //    commonly, streamed further -- since the render was
+        //    requested; applying it would show stale content for newer
+        //    text). A late/superseded-epoch result is not specifically
+        //    checked here -- letting the worker's own cooperative
+        //    cancellation (`EpochCounter`) handle that is an efficiency
+        //    concern (don't do wasted parse work), not a correctness one
+        //    (this hash check alone is sufficient to never apply stale
+        //    content, even from a very late/never-cancelled delivery).
+        //
+        // Unconditional once validated: this write always lands in the
+        // thread's own `message_rows`/`markdown_render_index`, whether
+        // or not that thread is currently displayed (see the "which
+        // thread is live vs. which thread should render" discussion this
+        // phase is built on) -- `Dirty::MessageRowPatch`'s own existing
+        // `displayed_thread_for_id` gate (unchanged, already tested) is
+        // what decides whether the shared Slint model is actually
+        // touched. A background thread's render is never lost, it's just
+        // not synced to screen until the user switches to it.
+        EffectResultMsg::MarkdownBlocksReady {
+            thread_id,
+            message_key: key,
+            source_hash,
+            blocks,
+        } => {
+            let Some(idx) = model.thread_index_for_id(&thread_id) else {
+                crate::trace_host_input(format_args!(
+                    "markdown worker dropped thread={thread_id} key={key} reason=stale_thread"
+                ));
+                return (vec![], vec![]);
+            };
+            let Some(thread) = model.threads.get_mut(idx) else {
+                crate::trace_host_input(format_args!(
+                    "markdown worker dropped thread={thread_id} key={key} reason=stale_thread"
+                ));
+                return (vec![], vec![]);
+            };
+            let Some(current_hash) = thread.markdown_render_index.borrow().content_hash_for(&key) else {
+                crate::trace_host_input(format_args!(
+                    "markdown worker dropped thread={thread_id} key={key} reason=stale_key"
+                ));
+                return (vec![], vec![]);
+            };
+            if current_hash != source_hash {
+                crate::trace_host_input(format_args!(
+                    "markdown worker dropped thread={thread_id} key={key} reason=stale_hash"
+                ));
+                return (vec![], vec![]);
+            }
+            let Some(row_index) = thread.markdown_render_index.borrow().row_index_for(&key) else {
+                crate::trace_host_input(format_args!(
+                    "markdown worker dropped thread={thread_id} key={key} reason=stale_key"
+                ));
+                return (vec![], vec![]);
+            };
+            let model_rc = crate::models::markdown_block_data_to_model(blocks);
+            // Writing straight into `thread.message_rows` here was the old
+            // row-cache model; that field is test-only now (see its own
+            // doc comment) -- production has no Rust row cache to patch.
+            // Writing into `markdown_render_index` alone is sufficient:
+            // `sync.rs`'s `projected_thread_rows` rebuilds rows fresh via
+            // `models::markdown_blocks_for`, which checks this same cache
+            // and returns the value just set here, so the
+            // `Dirty::MessageRowPatch` below is what actually triggers
+            // that rebuild to pick it up.
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .set_rendered_blocks(&key, model_rc);
+            crate::trace_host_input(format_args!(
+                "markdown worker delivered thread={thread_id} key={key}"
+            ));
+            (vec![], vec![Dirty::MessageRowPatch { thread_id, index: row_index }])
+        }
         // memory/acpx/gen/plans/acpx-skills/ phase 17: one of the 6
         // reactive-sync trigger call sites (create/promote/edit/agent-
         // enable/agent-disable/thread-start) failed to propagate a
@@ -2763,8 +2849,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         }
         // Build expand vec from existing row flags / model.expanded, not
         // a hard clear on every switch (that dropped A→B→A expand state).
-        let transcript_row_count =
-            crate::models::to_message_rows_from_transcript(snapshot.transcript.clone(), &[]).len();
+        // Only the row *count* is needed here -- `transcript_row_keys`
+        // applies the identical Notice-only filter `to_message_rows_
+        // from_transcript` does, without paying for a markdown render
+        // that this call site never even uses.
+        let transcript_row_count = crate::models::transcript_row_keys(&snapshot.transcript).len();
         if model.expanded.len() < transcript_row_count {
             model.expanded.resize(transcript_row_count, false);
         }
@@ -2783,6 +2872,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 &expanded,
                 &thread.send_queue,
                 in_flight,
+                &mut *thread.markdown_render_index.borrow_mut(),
             );
             // Preserve expand-by-key across re-project (live poll + switch).
             merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
@@ -3715,6 +3805,201 @@ mod tests {
         );
     }
 
+    // -- markdown-render-cache-layer plan Phase 2: EffectResultMsg::
+    // MarkdownBlocksReady --
+
+    fn sample_markdown_blocks() -> Vec<crate::models::MarkdownBlockData> {
+        crate::models::build_markdown_block_data("Hello **world**.", false)
+    }
+
+    #[test]
+    fn markdown_blocks_ready_patches_the_thread_cache_and_row_when_valid() {
+        let mut model = model_with_threads(&["a"]);
+        let key = "assistant:m1".to_owned();
+        let text = "Hello **world**.";
+        model.threads[0]
+            .markdown_render_index
+            .borrow_mut()
+            .record(&key, 0, text);
+        model.threads[0].message_rows = vec![crate::MessageItem {
+            kind: "agent".into(),
+            text: text.into(),
+            ..crate::MessageItem::default()
+        }];
+        model.displayed_thread = Some(0);
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::MarkdownBlocksReady {
+                thread_id: "thread-0".to_owned(),
+                message_key: key.clone(),
+                source_hash: crate::thread_message_index::hash_content(text),
+                blocks: sample_markdown_blocks(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            dirty,
+            vec![Dirty::MessageRowPatch {
+                thread_id: "thread-0".to_owned(),
+                index: 0,
+            }]
+        );
+        assert!(model.threads[0]
+            .markdown_render_index
+            .borrow()
+            .rendered_blocks_for(&key)
+            .is_some());
+        // `message_rows` is test-only now (main's retained-per-thread-
+        // ChatView architecture); see the sibling background-thread test
+        // above for why the cache assertion is the meaningful check.
+    }
+
+    #[test]
+    fn markdown_blocks_ready_for_unknown_thread_id_is_dropped_silently() {
+        let mut model = model_with_threads(&["a"]);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::MarkdownBlocksReady {
+                thread_id: "no-such-thread".to_owned(),
+                message_key: "assistant:m1".to_owned(),
+                source_hash: 0,
+                blocks: sample_markdown_blocks(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn markdown_blocks_ready_for_unknown_key_is_dropped_silently() {
+        // The message this render targets no longer exists in the
+        // thread's index (e.g. history truncation/removal since the
+        // render was requested) -- never recorded, so content_hash_for
+        // returns None and the whole delivery is dropped.
+        let mut model = model_with_threads(&["a"]);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::MarkdownBlocksReady {
+                thread_id: "thread-0".to_owned(),
+                message_key: "assistant:never-recorded".to_owned(),
+                source_hash: 12345,
+                blocks: sample_markdown_blocks(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert!(model.threads[0]
+            .markdown_render_index
+            .borrow()
+            .rendered_blocks_for("assistant:never-recorded")
+            .is_none());
+    }
+
+    #[test]
+    fn markdown_blocks_ready_with_stale_source_hash_is_dropped_not_applied() {
+        // The source text changed (most commonly: streamed further)
+        // since this render was requested -- applying it would show
+        // stale content for newer text. Must not patch the row or
+        // overwrite the cache with the stale render.
+        let mut model = model_with_threads(&["a"]);
+        let key = "assistant:m1".to_owned();
+        model.threads[0]
+            .markdown_render_index
+            .borrow_mut()
+            .record(&key, 0, "the text has since grown longer");
+        model.threads[0].message_rows = vec![crate::MessageItem {
+            kind: "agent".into(),
+            text: "the text has since grown longer".into(),
+            ..crate::MessageItem::default()
+        }];
+        model.displayed_thread = Some(0);
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::MarkdownBlocksReady {
+                thread_id: "thread-0".to_owned(),
+                message_key: key.clone(),
+                // Hash of the OLD, shorter text this render was actually
+                // requested for -- deliberately stale against the index.
+                source_hash: crate::thread_message_index::hash_content("the text"),
+                blocks: sample_markdown_blocks(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty(), "a stale-hash delivery must never patch anything");
+        assert!(
+            model.threads[0]
+                .markdown_render_index
+                .borrow()
+                .rendered_blocks_for(&key)
+                .is_none(),
+            "the stale render must not be cached either"
+        );
+        // `message_rows` is test-only now; see the earlier tests' own
+        // note on why the cache assertion above is the meaningful check.
+    }
+
+    #[test]
+    fn markdown_blocks_ready_updates_a_background_non_displayed_thread_cache() {
+        // The core guarantee this phase exists for: a render for a
+        // thread the user is NOT currently looking at still lands in
+        // that thread's own cache/row (ready for an instant switch
+        // later) -- it just doesn't need to (and, via Dirty::
+        // MessageRowPatch's own existing displayed_thread_for_id gate,
+        // won't) touch the shared on-screen model.
+        let mut model = model_with_threads(&["a", "b"]);
+        let key = "assistant:m1".to_owned();
+        let text = "Background thread content.";
+        model.threads[1]
+            .markdown_render_index
+            .borrow_mut()
+            .record(&key, 0, text);
+        model.threads[1].message_rows = vec![crate::MessageItem {
+            kind: "agent".into(),
+            text: text.into(),
+            ..crate::MessageItem::default()
+        }];
+        // Thread 0 (not thread 1) is the one currently displayed.
+        model.displayed_thread = Some(0);
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::MarkdownBlocksReady {
+                thread_id: "thread-1".to_owned(),
+                message_key: key.clone(),
+                source_hash: crate::thread_message_index::hash_content(text),
+                blocks: sample_markdown_blocks(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        // The reducer still emits the patch (sync.rs's own existing gate
+        // decides visibility at apply time, not the reducer) -- what
+        // matters here is the underlying cache/row actually updated.
+        assert_eq!(
+            dirty,
+            vec![Dirty::MessageRowPatch {
+                thread_id: "thread-1".to_owned(),
+                index: 0,
+            }]
+        );
+        assert!(model.threads[1]
+            .markdown_render_index
+            .borrow()
+            .rendered_blocks_for(&key)
+            .is_some());
+        // `message_rows` is test-only now (main's retained-per-thread-
+        // ChatView architecture -- see its own doc comment); production
+        // never writes it directly. `sync.rs`'s `projected_thread_rows`
+        // rebuilds rows fresh from `markdown_render_index` on the next
+        // pass, which is what the cache assertion above already proves
+        // is ready to be picked up -- there's no separate row-patch write
+        // left to check here.
+    }
+
     #[test]
     fn new_thread_never_forwards_the_literal_default_profile_sentinel() {
         // Regression test: "agent default is in crash backoff". The
@@ -4014,11 +4299,13 @@ mod tests {
             .expect("queue");
         // Project once so transcript_keys include queue:{id} rows.
         let expanded = model.expanded.clone();
+        let thread = &mut model.threads[0];
         let (rows, keys) = crate::models::message_rows_for_thread_with_state(
-            model.threads[0].transcript.clone(),
+            thread.transcript.clone(),
             &expanded,
-            &model.threads[0].send_queue,
+            &thread.send_queue,
             true,
+            &mut *thread.markdown_render_index.borrow_mut(),
         );
         model.threads[0].message_rows = rows;
         model.threads[0].transcript_keys = keys;
@@ -4093,11 +4380,13 @@ mod tests {
             .enqueue("edit this".to_owned(), false)
             .expect("queue");
         let expanded = model.expanded.clone();
+        let thread = &mut model.threads[0];
         let (rows, keys) = crate::models::message_rows_for_thread_with_state(
-            model.threads[0].transcript.clone(),
+            thread.transcript.clone(),
             &expanded,
-            &model.threads[0].send_queue,
+            &thread.send_queue,
             true,
+            &mut *thread.markdown_render_index.borrow_mut(),
         );
         model.threads[0].message_rows = rows;
         model.threads[0].transcript_keys = keys;
@@ -4123,11 +4412,13 @@ mod tests {
             .enqueue("go now".to_owned(), false)
             .expect("queue");
         let expanded = model.expanded.clone();
+        let thread = &mut model.threads[0];
         let (rows, keys) = crate::models::message_rows_for_thread_with_state(
-            model.threads[0].transcript.clone(),
+            thread.transcript.clone(),
             &expanded,
-            &model.threads[0].send_queue,
+            &thread.send_queue,
             false,
+            &mut *thread.markdown_render_index.borrow_mut(),
         );
         model.threads[0].message_rows = rows;
         model.threads[0].transcript_keys = keys;
@@ -4163,11 +4454,13 @@ mod tests {
             .enqueue("steer me".to_owned(), false)
             .expect("queue");
         let expanded = model.expanded.clone();
+        let thread = &mut model.threads[0];
         let (rows, keys) = crate::models::message_rows_for_thread_with_state(
-            model.threads[0].transcript.clone(),
+            thread.transcript.clone(),
             &expanded,
-            &model.threads[0].send_queue,
+            &thread.send_queue,
             true,
+            &mut *thread.markdown_render_index.borrow_mut(),
         );
         model.threads[0].message_rows = rows;
         model.threads[0].transcript_keys = keys;

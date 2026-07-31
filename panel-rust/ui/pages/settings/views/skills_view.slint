@@ -2,6 +2,8 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Button } from "../../../base/button.slint";
 import { Toggle } from "../../../base/toggle.slint";
+import { SettingsSearchBar } from "../components/search_bar.slint";
+import { TextUtil } from "../../../base/text_util.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
 import { SkillOption } from "../../../types.slint";
@@ -24,6 +26,8 @@ export component SkillsView inherits Rectangle {
     // is unrelated to this gate and stays as-is.
     in property <string> scope: "project";
     in property <[SkillOption]> skills: [];
+    in-out property <string> page-search-query: "";
+    out property <bool> search-has-focus: skill-search-bar.input-has-focus;
     // Page-level toggle: hide the global-scope rows so a long list of
     // shared global skills doesn't drown out a project's own few local
     // ones (`skills-management`'s "a toggle to show Global Skills or
@@ -50,7 +54,14 @@ export component SkillsView inherits Rectangle {
     content := SettingsSection {
         width: parent.width;
 
-        SettingsSectionHeader { text: "Skills"; }
+        SettingsSectionHeader { text: "Config"; }
+
+        skill-search-bar := SettingsSearchBar {
+            width: parent.width;
+            placeholder: "Search skills...";
+            bar-accessible-label: "Search skills";
+            query <=> root.page-search-query;
+        }
 
         SettingsRow {
             label: "Show global skills";
@@ -83,13 +94,18 @@ export component SkillsView inherits Rectangle {
                 // `show-global-skills` gate below, so toggling dev-mode
                 // reactively re-filters without needing a reload.
                 property <bool> row-visible: (skill.scope != "global" || root.show-global-skills) && (!skill.is-dev-only || root.dev-mode);
+                property <bool> matches-search: TextUtil.matches-filter(
+                    skill.name + "\n" + skill.description + "\n" + skill.scope,
+                    root.page-search-query,
+                );
                 width: parent.width;
                 // No conditional-instantiation of a `for` template item in
                 // Slint (`if` can't follow `:` after a `for` binding) --
                 // collapse to zero height + invisible instead of a nested
                 // `if`, same effect as not rendering the row at all.
-                height: row-visible ? self.row-height + (self.hint == "" ? 0px : 12px) : 0px;
-                visible: row-visible;
+                height: row-visible && matches-search
+                    ? self.row-height + (self.hint == "" ? 0px : 12px) : 0px;
+                visible: row-visible && matches-search;
                 clip: true;
                 label: skill.name;
                 label-font-family: Theme.font-mono;

@@ -10,6 +10,7 @@ import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
 import { AgentBubble } from "./chat-view/components/message/agent_bubble.slint";
 import { QueuedMessageBar } from "./chat-view/components/message/queued_message_bar.slint";
+import { PendingStatusRow } from "./chat-view/components/message/pending_status_row.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { ToolGroupView } from "./chat-view/components/message/tool_group_view.slint";
 import { PermissionCard } from "./components/permission_card.slint";
@@ -491,15 +492,21 @@ export component ChatArea inherits Rectangle {
                 ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                 : 0deg;
             // PUI-011: loading shimmer along the header's bottom border while
-            // the selected ACP's details are being fetched (same signal as the
-            // header spinner). A highlight sweeps left->right on a loop; driven
-            // by animation-tick() so the host repaint trigger keeps it running.
+            // the selected ACP's details are being fetched. Deliberately
+            // scoped to `pool-connecting` alone, NOT `header-spinning` --
+            // header-spinning also goes true on every `root.sending`
+            // (a normal in-flight generation, once the session is already
+            // live), which made this "still connecting" shimmer reappear
+            // on every single send after the thread had already acquired
+            // a real session from the underlying ACP pool. It should show
+            // once, for the actual pool-acquisition wait, then stay gone.
+            property <bool> pool-connecting: connection-status == "Connecting...";
             Rectangle {
                 x: 0;
                 y: parent.height - self.height;
                 width: 100%;
                 height: 2px;
-                visible: header-spinning;
+                visible: pool-connecting;
                 clip: true;
                 Rectangle {
                     height: 100%;
@@ -608,7 +615,21 @@ export component ChatArea inherits Rectangle {
                     }
                     rename-editor := Rectangle {
                         visible: root.rename-editing;
-                        height: root.match-title-bar ? 26px : 30px;
+                        // `visible:` (not `if:`) so rename-input stays a
+                        // valid id reference outside rename mode -- but
+                        // that means this element never leaves the
+                        // layout tree, so an unconditional fixed height
+                        // was silently forcing left-cluster's
+                        // HorizontalLayout to be at least 26/30px tall
+                        // (cross-axis size = max of ALL children's
+                        // heights, visible or not) even while not
+                        // renaming, pushing/squeezing the connection-
+                        // status-indicator spinner off true center --
+                        // worst in collapsed/match-title-bar mode, where
+                        // the header itself is shortest. Same bug class
+                        // (and same fix) already applied once in
+                        // sidebar_thread_row.slint's own rename-editor.
+                        height: root.rename-editing ? (root.match-title-bar ? 26px : 30px) : 0px;
                         background: Theme.bg-sidebar;
                         border-width: 1px;
                         border-color: Theme.border-default;
@@ -876,6 +897,21 @@ export component ChatArea inherits Rectangle {
             message-scroll := Flickable {
                 width: 100%;
                 height: 100%;
+                // Mouse-wheel scroll ticks previously set `viewport-y`
+                // straight to the target step, no interpolation -- felt
+                // jittery/stepped rather than a smooth scroll. Eased here
+                // explicitly (not just relying on the two-way-bound
+                // `ThinScrollbar.viewport-y` below to propagate its own
+                // animate across the binding -- not a guarantee worth
+                // depending on silently), gated on the SAME
+                // `chat-scrollbar.dragging` state that scrollbar uses for
+                // its own side: instant while the thumb is being actively
+                // dragged (1:1 tracking, no lag-behind-cursor), eased for
+                // everything else (wheel ticks, click-to-jump).
+                animate viewport-y {
+                    duration: chat-scrollbar.dragging ? 0ms : 90ms;
+                    easing: ease-out;
+                }
                 // Was relying on Flickable's own auto-inference of
                 // viewport-height from its child, which -- per base/
                 // expandable_panel.slint's own documented fix for the
@@ -1040,20 +1076,26 @@ export component ChatArea inherits Rectangle {
                         clip: true;
                         border-radius: 1.5px;
                         // Dim track only while live; transparent placeholder
-                        // otherwise (same width, no layout shift).
-                        background: is-live-tail
+                        // otherwise (same width, no layout shift). Tool-event
+                        // rows are excluded here -- ToolGroupView already
+                        // draws its own left-edge pulse rail (see its
+                        // `pulse-opacity`/loading rail) while a tool call is
+                        // active, so this traveling highlight would just be
+                        // a second, redundant left-border animation on the
+                        // same row.
+                        background: (is-live-tail && !is-tool-event)
                             ? Theme.bg-primary.with-alpha(0.18)
                             : transparent;
 
                         // Bright segment that travels down the rail.
-                        if is-live-tail : Rectangle {
+                        if is-live-tail && !is-tool-event : Rectangle {
                             width: parent.width;
                             height: min(flow-blob, parent.height);
                             y: (parent.height + flow-blob) * flow-t - flow-blob;
                             border-radius: 1.5px;
                             background: Theme.bg-primary.with-alpha(0.95);
                         }
-                        if is-live-tail : Rectangle {
+                        if is-live-tail && !is-tool-event : Rectangle {
                             width: parent.width;
                             height: min(flow-blob * 0.55, parent.height);
                             y: (parent.height + flow-blob) * flow-t - flow-blob * 1.45;
@@ -1066,37 +1108,16 @@ export component ChatArea inherits Rectangle {
                         width: is-user ? 36px : rail-gap;
                         horizontal-stretch: 0;
                     }
-                    if is-pending : HorizontalLayout {
-                        // No extra padding-left here -- unlike every other
-                        // row kind below (UserBubble/AgentBubble/
+                    if is-pending : PendingStatusRow {
+                        // No padding-left here -- unlike every other row
+                        // kind below (UserBubble/AgentBubble/
                         // ToolGroupView/QueuedMessageBar), this used to add
                         // its own rail-w + gap offset on top of the one
                         // already reserved by the preceding live-rail +
-                        // gap Rectangle siblings, pushing "waiting for
-                        // response" further right than every other row's
-                        // content actually starts.
-                        // Zero gap by request: label first, then the
-                        // pulsing dots immediately after it, no dead room
-                        // between them.
-                        spacing: 0px;
-                        height: 20px;
-                        cross-axis-alignment: center;
-                        property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
-                        Text {
-                            text: "waiting for response ";
-                            color: Theme.text-muted;
-                            opacity: 0.7;
-                            font-size: 9px * Theme.font-scale;
-                            font-italic: true;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: "\u{2022} \u{2022} \u{2022}";
-                            color: Theme.text-muted;
-                            opacity: parent.pulse;
-                            font-size: 11px * Theme.font-scale;
-                            vertical-alignment: center;
-                        }
+                        // gap Rectangle siblings, pushing the status text
+                        // further right than every other row's content
+                        // actually starts.
+                        label: root.last-error != "" ? root.last-error : "waiting for response";
                     }
                     if is-queued : QueuedMessageBar {
                         horizontal-stretch: 1;
@@ -1223,7 +1244,7 @@ export component ChatArea inherits Rectangle {
             }
 
             // Right-side auto-hiding thin scrollbar for chat view
-            ThinScrollbar {
+            chat-scrollbar := ThinScrollbar {
                 x: parent.width - self.width - 2px;
                 y: 4px;
                 visible-height: parent.height - 8px;

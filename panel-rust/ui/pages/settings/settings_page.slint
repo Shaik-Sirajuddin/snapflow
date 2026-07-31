@@ -77,12 +77,16 @@ export component SettingsPage inherits Rectangle {
     // conditional element (`if root.active-section == "mcp_servers"`)
     // that can't be referenced directly outside its own scope.
     property <bool> mcp-servers-focus-mirror: false;
+    property <bool> skills-search-focus-mirror: false;
     changed active-section => {
         if (self.active-section != "agents") {
             self.agents-search-focus-mirror = false;
         }
         if (self.active-section != "mcp_servers") {
             self.mcp-servers-focus-mirror = false;
+        }
+        if (self.active-section != "skills") {
+            self.skills-search-focus-mirror = false;
         }
     }
     // settings_scope_visibility_gate: MCP Servers' left-tab nav item only
@@ -95,7 +99,8 @@ export component SettingsPage inherits Rectangle {
         }
     }
     out property <bool> search-has-focus:
-        top-search-bar.input-has-focus || agents-search-focus-mirror || mcp-servers-focus-mirror;
+        top-search-bar.input-has-focus || agents-search-focus-mirror
+        || mcp-servers-focus-mirror || skills-search-focus-mirror;
 
     // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
     // call site only needs its component name + import swapped.
@@ -418,8 +423,20 @@ export component SettingsPage inherits Rectangle {
                                 skills: root.available-skills;
                                 dev-mode: root.dev-mode;
                                 show-global-skills <=> root.show-global-skills;
+                                // page-search-query/search-has-focus wiring:
+                                // was previously missing entirely on this
+                                // branch, leaving `skills-search-focus-mirror`
+                                // (declared above) dead and the Skills tab's
+                                // search bar non-functional -- SkillsView's
+                                // own `matches-search` filtering already
+                                // depends on `page-search-query` being fed a
+                                // real value (see skills_view.slint).
+                                page-search-query <=> root.search-query;
                                 skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
                                 dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
+                                changed search-has-focus => {
+                                    root.skills-search-focus-mirror = self.search-has-focus;
+                                }
                             }
                         }
                     }

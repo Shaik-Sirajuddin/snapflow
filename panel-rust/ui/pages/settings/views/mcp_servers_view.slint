@@ -182,6 +182,7 @@ export component McpServersView inherits Rectangle {
 
         SettingsRowGroup {
             width: parent.width;
+            cross-axis-alignment: start;
 
             for server in root.servers : server-block := VerticalLayout {
                 width: parent.width;
@@ -517,6 +518,19 @@ export component McpServersView inherits Rectangle {
         }
 
         VerticalLayout {
+            // Explicit width needed now that SettingsSection sets
+            // `cross-axis-alignment: start` (main's settings-page
+            // layout-alignment fix) -- that made SettingsSection size
+            // this direct child off its own natural/preferred width
+            // (bottom-up) instead of forcing it to the section's full
+            // width (top-down, the old default `stretch` behavior).
+            // Several descendants below (SettingsField instances inside
+            // the stdio/http conditional blocks) size themselves via
+            // `width: parent.width`, i.e. top-down off *this* layout --
+            // without a fixed width here that closed into a real binding
+            // loop (layoutinfo-h -> layout-cache-ortho -> width -> ...),
+            // confirmed by `cargo check --lib`/the Slint build script.
+            width: parent.width;
             spacing: Metrics.gap-sm;
             padding-top: Metrics.pad-sm;
 
