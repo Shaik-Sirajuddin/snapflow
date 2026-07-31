@@ -1126,6 +1126,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prewarm_populates_idle_entries_without_any_prior_acquire() {
+        let pool = Arc::new(ProjectSessionPool::new(CountingOpener::new()));
+        let key = test_key();
+
+        // Standalone activation entry point -- no acquire() call for this
+        // key has happened, unlike warmup_replenishes_idle_capacity_to_
+        // warm_target_after_first_acquire above (which relies on acquire's
+        // own activation + spawn_warmup_if_needed). This proves prewarm()
+        // itself activates the key and drives replenishment.
+        pool.clone().prewarm(key.clone()).await;
+
+        // Warmup runs on a spawned task; poll briefly for it to land.
+        for _ in 0..50 {
+            if pool.total_for_key(&key).await >= WARM_TARGET_PER_KEY {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.total_for_key(&key).await, WARM_TARGET_PER_KEY);
+        // Every entry prewarm() produced must be idle -- prewarm never
+        // leases anything itself.
+        assert_eq!(pool.idle_for_key(&key).await, WARM_TARGET_PER_KEY);
+    }
+
+    #[tokio::test]
+    async fn prewarm_does_not_consume_a_lease_so_acquire_can_still_reuse_a_warm_entry() {
+        let opener = CountingOpener::new();
+        let pool = Arc::new(ProjectSessionPool::new(opener));
+        let key = test_key();
+
+        pool.clone().prewarm(key.clone()).await;
+        for _ in 0..50 {
+            if pool.total_for_key(&key).await >= WARM_TARGET_PER_KEY {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.idle_for_key(&key).await, WARM_TARGET_PER_KEY);
+        let creates_after_prewarm = pool.opener().creates.load(Ordering::SeqCst);
+
+        // A real acquire() must be satisfied from the entries prewarm()
+        // already opened (idle -> leased fast path), not by opening a new
+        // session -- proving prewarm() left its entries genuinely
+        // available rather than already leased/consumed.
+        let lease = pool
+            .clone()
+            .acquire(key.clone(), "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire");
+        assert_eq!(
+            pool.opener().creates.load(Ordering::SeqCst),
+            creates_after_prewarm,
+            "acquire after prewarm must reuse a warm idle entry, not open a new session"
+        );
+        assert_eq!(pool.idle_for_key(&key).await, WARM_TARGET_PER_KEY - 1);
+        let _ = lease;
+    }
+
+    #[tokio::test]
     async fn invalidate_removes_entry_and_it_cannot_be_reacquired() {
         let pool = Arc::new(ProjectSessionPool::new(CountingOpener::new()));
         let key = test_key();
