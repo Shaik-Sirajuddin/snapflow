@@ -234,7 +234,15 @@ export component SearchableDropdown inherits Rectangle {
         filter = "";
         open = true;
         root.opened();
-        reselect-closest();
+        // No keyboard pre-highlight on open. `reselect-closest()` used to
+        // run here, which parks `kb-sel` on row 0 and paints it with the
+        // same strong treatment the genuinely-selected row needs -- so
+        // e.g. picking `claude-acp` and reopening showed row 0
+        // (`codex-acp`) as the chosen one. `kb-move()` already treats
+        // kb-sel < 0 as "start at the first visible row", so Up/Down is
+        // unaffected. `changed filter` still pre-highlights the first
+        // match, which is what Enter-to-accept-a-search needs.
+        kb-sel = -1;
     }
 
     function toggle-popup() {
@@ -370,13 +378,14 @@ export component SearchableDropdown inherits Rectangle {
 
         // Was `init =>` when this Rectangle only existed while `open` --
         // that only ever fires once now that it's permanently mounted, so
-        // this needs to re-run reselect-closest() on every open instead.
-        // `changed` only accepts a local property name (not a qualified
-        // `root.open` path), hence this reactive local mirror.
+        // this needs to re-run on every open instead. `changed` only
+        // accepts a local property name (not a qualified `root.open`
+        // path), hence this reactive local mirror. Clears the keyboard
+        // highlight for the same reason `open-popup()` does.
         property <bool> local-open: root.open;
         changed local-open => {
             if (root.open) {
-                root.reselect-closest();
+                root.kb-sel = -1;
             }
         }
 
@@ -427,9 +436,12 @@ export component SearchableDropdown inherits Rectangle {
                         property <bool> hi: !hidden && i == root.kb-sel;
                         height: hidden ? 0px : root.row-h;
                         clip: true;
+                        // The selected row must not share a token with the
+                        // plain hover state -- it did (bg-primary-container
+                        // both), leaving the only cue a 600-vs-400 font
+                        // weight, which read as "my pick didn't register".
                         background: entry.is-header ? transparent
-                            : hi ? Theme.bg-primary
-                            : current ? Theme.bg-primary-container
+                            : (hi || current) ? Theme.bg-primary
                             : row-touch.has-hover ? Theme.bg-primary-container
                             : transparent;
                         animate background { duration: 100ms; }
@@ -459,7 +471,7 @@ export component SearchableDropdown inherits Rectangle {
                             Text {
                                 text: entry.is-header ? entry.label + ":" : entry.label;
                                 color: entry.is-header ? Theme.text-secondary
-                                    : (hi || current) ? (hi ? Theme.text-on-primary : Theme.text-primary)
+                                    : (hi || current) ? Theme.text-on-primary
                                     : Theme.text-primary;
                                 font-family: Theme.font-mono;
                                 font-size: (entry.is-header ? 9px : 10px) * Theme.font-scale;
