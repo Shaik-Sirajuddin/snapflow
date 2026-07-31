@@ -471,14 +471,32 @@ export component McpServersView inherits Rectangle {
                 // surfaced inline rather than only through the shared
                 // settings-page toast, since the toast is transient and
                 // this failure state persists until the next fetch.
-                if server.tool-fetch-status == "error" : Text {
-                    text: "Failed to fetch tools: " + server.tool-fetch-error;
-                    // Same error red `app.slint`'s shared toast border
-                    // uses for `toast-kind == "error"` -- no dedicated
-                    // `Theme.text-danger` token exists yet.
-                    color: #ef4444;
-                    font-size: 9px * Theme.font-scale;
-                    wrap: word-wrap;
+                if server.tool-fetch-status == "error" : Rectangle {
+                    // Give persistent fetch failures their own readable
+                    // surface. The shared toast is intentionally transient;
+                    // this row must retain enough height for the RPC error
+                    // without allowing a long backend message to stretch the
+                    // entire Settings page.
+                    width: parent.width;
+                    height: 34px;
+                    background: #2a1215;
+                    border-color: #ef4444;
+                    border-width: 1px;
+                    border-radius: Theme.radius-sm;
+                    error-text := Text {
+                        x: 8px;
+                        y: 5px;
+                        width: parent.width - 16px;
+                        height: parent.height - 10px;
+                        text: "Failed to fetch tools: " + server.tool-fetch-error;
+                        // Same error red `app.slint`'s shared toast border
+                        // uses for `toast-kind == "error"` -- no dedicated
+                        // `Theme.text-danger` token exists yet.
+                        color: #ef4444;
+                        font-size: 9px * Theme.font-scale;
+                        overflow: elide;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }

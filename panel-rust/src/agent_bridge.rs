@@ -417,6 +417,8 @@ fn mcp_registry_identity(
 ///   local was `Fetching` → keep `Fetching`
 /// - `enabled:<name>` in flight → keep local `enabled` (toggle already
 ///   flipped in the UI; list may still show the pre-update value)
+/// - wire `tool_catalog == None` + local `Error` → keep the last fetch error
+///   until the next fetch explicitly replaces it with `Fetching`
 /// Wire-side Ready/Error always wins over local Fetching.
 fn merge_mcp_list_with_optimistic(
     wire: Vec<crate::protocol_types::McpServerEntry>,
@@ -435,6 +437,14 @@ fn merge_mcp_list_with_optimistic(
                 )
             {
                 entry.tool_catalog = Some(McpToolCatalog::Fetching);
+            }
+            if entry.tool_catalog.is_none()
+                && matches!(
+                    prev.and_then(|p| p.tool_catalog.as_ref()),
+                    Some(McpToolCatalog::Error { .. })
+                )
+            {
+                entry.tool_catalog = prev.and_then(|p| p.tool_catalog.clone());
             }
             if ops.contains(&format!("enabled:{}", entry.name)) {
                 if let Some(prev) = prev {
@@ -5476,7 +5486,7 @@ impl AgentBridge {
         let catalog = self.gateway_catalog.clone();
         self.runtime.spawn(async move {
             let result = handle
-                .fetch_mcp_server_tools(name)
+                .fetch_mcp_server_tools(name.clone())
                 .await
                 .map_err(|err| err.to_string());
             operations
@@ -5486,7 +5496,29 @@ impl AgentBridge {
             // Kickoff returned: server has stamped Fetching (or failed).
             // Drop debounce so the next frame's list poll can pick up
             // Fetching → Ready without waiting the default 2s.
+            if let Err(error) = &result {
+                // Keep the real RPC failure visible on the row after the
+                // short-lived toast disappears. This is also emitted by
+                // the panel process so async errors can be correlated
+                // with acpx/daemon logs.
+                eprintln!(
+                    "panel-rust: mcp_servers/tools_fetch failed for {name}: {error}"
+                );
+            }
             if let Ok(mut cache) = catalog.try_lock() {
+                if let Err(error) = &result {
+                    if let Some(entry) = cache
+                        .mcp_servers
+                        .iter_mut()
+                        .find(|entry| entry.name == name)
+                    {
+                        entry.tool_catalog = Some(
+                            crate::protocol_types::McpToolCatalog::Error {
+                                message: error.clone(),
+                            },
+                        );
+                    }
+                }
                 cache.last_refresh = None;
             }
             on_complete(result);
@@ -11514,6 +11546,27 @@ done
             merged_ready[0].tool_catalog,
             Some(McpToolCatalog::Ready { .. })
         ));
+
+        // An immediate RPC failure must survive the next empty list poll so
+        // the row remains useful after the shared toast expires.
+        let error_message = "300002: no mcp server named snapflow".to_owned();
+        let mut failed = local.clone();
+        failed.tool_catalog = Some(McpToolCatalog::Error {
+            message: error_message.clone(),
+        });
+        let mut empty_catalog = failed.clone();
+        empty_catalog.tool_catalog = None;
+        let merged_error = merge_mcp_list_with_optimistic(
+            vec![empty_catalog],
+            std::slice::from_ref(&failed),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            merged_error[0].tool_catalog,
+            Some(McpToolCatalog::Error {
+                message: error_message,
+            })
+        );
     }
 
     /// lock_audit Layer 1 (F-01/F-02): frame-poll catalog path must never

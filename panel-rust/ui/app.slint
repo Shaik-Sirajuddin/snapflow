@@ -856,6 +856,10 @@ export component ChatPanel inherits Window {
         // Phase 28: the shared toast surface. Bottom-center of the main
         // content area, above the compose box, color-coded by kind.
         if root.toast-visible && root.toast-message != "" : Rectangle {
+            // SettingsPage is a later sibling and otherwise paints over this
+            // shared feedback surface. Keep action errors above every page
+            // overlay, including Settings.
+            z: 10000;
             x: sidebar.width + ((root.width - sidebar.width) - self.width) / 2;
             y: root.height - self.height - 84px;
             width: min(root.width - sidebar.width - 24px, max(220px, toast-text.preferred-width + 28px));
@@ -916,6 +920,7 @@ export component ChatPanel inherits Window {
         // then binds width/height to that parent and never paints even
         // when `settings-open` is true (sidebar click / Ctrl+, look dead).
         if settings-open : Rectangle {
+            z: 7000;
             width: root.width;
             height: root.height;
             // Dim chat behind the sheet so the overlay is obvious.
@@ -935,6 +940,7 @@ export component ChatPanel inherits Window {
         // is the same `width: root.width; height: root.height` Rectangle
         // the dimmer above uses, so the x/y/width math is unchanged.
         settings-page-instance := SettingsPage {
+            z: 8000;
             visible: root.settings-open;
             x: 8px;
             y: 8px;
