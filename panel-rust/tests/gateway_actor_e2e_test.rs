@@ -354,7 +354,7 @@ async fn reattach_session_uses_resume_without_replaying_history() {
     let mut reattacher = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = reattacher.take_events();
     reattacher
-        .reattach_session(session_id, std::env::current_dir().unwrap())
+        .reattach_session(session_id, std::env::current_dir().unwrap(), Vec::new())
         .await
         .expect("session/resume");
 

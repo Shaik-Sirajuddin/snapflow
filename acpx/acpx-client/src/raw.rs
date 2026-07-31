@@ -39,6 +39,11 @@ pub enum ClientError {
     MalformedResponse,
     #[error("WebSocket request to acpx gateway failed: {0}")]
     WebSocket(String),
+    /// Local request-construction failure (e.g. a client-computed
+    /// `mcpServers` entry that does not deserialize as an ACP `McpServer`).
+    /// Not a transport or gateway error -- never retryable.
+    #[error("invalid request parameters: {0}")]
+    InvalidParams(String),
 }
 
 impl ClientError {
@@ -56,7 +61,7 @@ impl ClientError {
                     && !message.contains("authentication")
                     && !message.contains("capacity")
             }
-            Self::MalformedResponse => false,
+            Self::MalformedResponse | Self::InvalidParams(_) => false,
         }
     }
 

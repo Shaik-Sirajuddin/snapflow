@@ -780,6 +780,13 @@ pub enum RouterError {
     Keystore(#[from] crate::keystore::KeystoreError),
     #[error("session/new: no profile named {0}")]
     UnknownProfile(String),
+    /// Malformed `session/resume` / `session/load` params that failed
+    /// typed validation (e.g. a `mcpServers` entry that is not a valid
+    /// ACP `McpServer`). Surfaces as a real error rather than silently
+    /// merging an empty list -- see
+    /// [`Router::merge_mcp_into_session_establish_params`].
+    #[error("invalid session establish params: {0}")]
+    InvalidSessionEstablishParams(String),
     #[error("session/new cannot select both _acpx.profile and _acpx.agentId")]
     ConflictingSessionSelection,
     #[error("profile {profile} references unknown provider {provider}")]
@@ -1365,6 +1372,84 @@ impl Router {
     /// current (or refresh is failing loudly in the logs, in which case
     /// this still injects whatever's cached and lets the backend's own
     /// 401 handling surface the problem).
+    /// Merge the session's profile-attached central MCP registry into
+    /// `session/resume` / `session/load` params, mirroring
+    /// `dispatch_session_new`'s merge for `session/new`.
+    ///
+    /// **Why this stays on `MethodClass::Proxied` (not Hybrid):** Hybrid
+    /// is wired exclusively to `dispatch_session_new`, and
+    /// `rehydrate_session` only accepts `Proxied | SessionFork`. Reclassifying
+    /// resume/load as Hybrid (as an earlier plan draft suggested) would
+    /// either mis-route them into session/new or break restart survival.
+    /// The merge *behavior* is what the plan requires; classification
+    /// stays Proxied so the existing rehydrate + session-resolve path
+    /// keeps working.
+    ///
+    /// Client-supplied `mcpServers` entries are strictly validated as
+    /// ACP `McpServer` values first -- a malformed entry is rejected
+    /// with [`RouterError::InvalidSessionEstablishParams`], not silently
+    /// dropped (the typed `ResumeSessionRequest` deserializer itself
+    /// uses skip-on-error for the array, which is the opposite of what
+    /// we want at this gateway boundary). Only the `mcpServers` field is
+    /// rewritten; other params (including any `_acpx` extension) are
+    /// left intact so a typed full-request round-trip cannot strip them.
+    fn merge_mcp_into_session_establish_params(
+        &self,
+        method: &str,
+        params: &mut serde_json::Value,
+        profile_name: Option<&str>,
+    ) -> Result<(), RouterError> {
+        if method != "session/resume" && method != "session/load" {
+            return Ok(());
+        }
+
+        use acpx_proto::acp::schema::v1::McpServer;
+
+        let client_servers = match params.get("mcpServers") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(arr)) => {
+                for (i, entry) in arr.iter().enumerate() {
+                    serde_json::from_value::<McpServer>(entry.clone()).map_err(|err| {
+                        RouterError::InvalidSessionEstablishParams(format!(
+                            "{method} params.mcpServers[{i}] is not a valid ACP McpServer: {err}"
+                        ))
+                    })?;
+                }
+                arr.clone()
+            }
+            Some(other) => {
+                return Err(RouterError::InvalidSessionEstablishParams(format!(
+                    "{method} params.mcpServers must be an array, got {other}"
+                )));
+            }
+        };
+
+        // No profile attached to this session, or profile has no central
+        // MCP list -- leave client params alone (after validation above).
+        let Some(profile_name) = profile_name else {
+            return Ok(());
+        };
+        let Some(profile) = self.profiles.get(profile_name) else {
+            return Ok(());
+        };
+        if profile.mcp_servers.is_empty() {
+            return Ok(());
+        }
+
+        let central = self.inject_oauth_headers(self.mcp_servers.list_named(&profile.mcp_servers));
+        // Central store keeps raw JSON (same as session/new's merge) --
+        // entries may lack optional-in-practice fields like `env`/`args`
+        // that the strict ACP McpServer type requires. Do not re-validate
+        // the merged list as typed McpServer; only client-supplied entries
+        // above are strictly checked so a *new* malformed client shape is
+        // rejected without changing the existing central-store contract.
+        let merged = crate::mcp_servers::merge_mcp_servers(&client_servers, &central);
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("mcpServers".to_string(), serde_json::json!(merged));
+        }
+        Ok(())
+    }
+
     fn inject_oauth_headers(&self, entries: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         entries
             .into_iter()
@@ -4080,8 +4165,20 @@ impl Router {
             .call_policy_for(profile_name.as_deref(), &agent_id)
             .await;
 
+        // session/resume + session/load: merge the session's profile
+        // central MCP registry into params.mcpServers before forwarding
+        // (see merge_mcp_into_session_establish_params). Must run before
+        // the sessionId rewrite so validation sees the client-shaped
+        // request; the rewrite only touches sessionId.
+        self.merge_mcp_into_session_establish_params(
+            &method,
+            params,
+            profile_name.as_deref(),
+        )?;
+
         // Rewrite gateway id -> backend id in place; everything else in
-        // `params` is forwarded untouched, per the proxied-method contract
+        // `params` is forwarded untouched (except the mcpServers merge
+        // above for resume/load), per the proxied-method contract
         // in 02-architecture.md.
         params["sessionId"] = serde_json::Value::String(backend_session_id);
 
@@ -7863,6 +7960,13 @@ async fn dispatch_proxied_shared(
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
         if let Some(params) = request.get_mut("params") {
+            // Same resume/load registry merge as dispatch_proxied -- must
+            // run before the sessionId rewrite.
+            r.merge_mcp_into_session_establish_params(
+                &method,
+                params,
+                profile_name.as_deref(),
+            )?;
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;

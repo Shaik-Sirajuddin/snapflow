@@ -2747,7 +2747,10 @@ fn spawn_background_attachment(
                 remote_sessions.as_deref(),
             );
             let resume_result = if has_cached_transcript && !cache_is_stale {
-                match handle.reattach_session(session_id.clone(), cwd.clone()).await {
+                match handle
+                    .reattach_session(session_id.clone(), cwd.clone(), mcp_servers.clone())
+                    .await
+                {
                     Ok(()) => Ok(()),
                     Err(reattach_error) => {
                         eprintln!(

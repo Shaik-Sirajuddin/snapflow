@@ -122,10 +122,13 @@ enum Command {
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// ACP's lighter `session/resume` reattachment path. Unlike
-    /// `session/load`, it does not replay prior history.
+    /// `session/load`, it does not replay prior history. Clients are
+    /// expected to resupply `mcpServers` on resume (same list as
+    /// `session/new`); see mcp-registry-live-propagation plan.
     ReattachSession {
         session_id: String,
         cwd: PathBuf,
+        mcp_servers: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// acpx-client-session-lease-pool: acquires an exclusive lease from
@@ -437,17 +440,22 @@ impl AcpxThreadHandle {
     }
 
     /// Attaches this client connection to an existing session with ACP's
-    /// no-history-replay `session/resume` operation.
+    /// no-history-replay `session/resume` operation. `mcp_servers` is the
+    /// same client-computed list `session/new` would send -- required by
+    /// the protocol so a resumed session can reconnect MCP clients under
+    /// the current registry.
     pub async fn reattach_session(
         &self,
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<(), AcpxThreadError> {
         let session_id = session_id.into();
         let cwd = cwd.into();
         self.call(|resp| Command::ReattachSession {
             session_id,
             cwd,
+            mcp_servers,
             resp,
         })
         .await
@@ -1771,12 +1779,20 @@ async fn run_thread_actor(
             Command::ReattachSession {
                 session_id: sid,
                 cwd,
+                mcp_servers,
                 resp,
             } => {
-                let params = serde_json::json!({
-                    "sessionId": sid,
-                    "cwd": cwd.to_string_lossy(),
-                });
+                let params = match acpx_client::build_resume_session_params(
+                    &sid,
+                    &cwd,
+                    &mcp_servers,
+                ) {
+                    Ok(params) => params,
+                    Err(err) => {
+                        let _ = resp.send(Err(err.into()));
+                        continue;
+                    }
+                };
                 client.register_session_replay(&sid, "session/resume", params.clone(), None);
                 let mut early_notifications = client.subscribe_session(&sid);
                 let mut result = Err(AcpxThreadError::ActorGone);
@@ -1858,11 +1874,19 @@ async fn run_thread_actor(
                     // shares this loop's local `live_rx`/`session_id`/
                     // `session_tx` state, which a standalone helper fn
                     // can't borrow across this `select!`-driven loop as
-                    // cleanly as an inline arm can.
-                    let params = serde_json::json!({
-                        "sessionId": sid,
-                        "cwd": cwd.to_string_lossy(),
-                    });
+                    // cleanly as an inline arm can. Carries the same
+                    // client-computed mcpServers list as session/new.
+                    let params = match acpx_client::build_resume_session_params(
+                        &sid,
+                        &cwd,
+                        &mcp_servers,
+                    ) {
+                        Ok(params) => params,
+                        Err(err) => {
+                            let _ = resp.send(Err(err.into()));
+                            continue;
+                        }
+                    };
                     client.register_session_replay(&sid, "session/resume", params.clone(), None);
                     let mut early_notifications = client.subscribe_session(&sid);
                     let mut attempt_result = Err(AcpxThreadError::ActorGone);

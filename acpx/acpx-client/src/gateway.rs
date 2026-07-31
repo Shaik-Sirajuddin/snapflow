@@ -7,10 +7,45 @@
 
 use crate::raw::{ClientError, GatewayClient};
 use crate::ws::{GatewayNotification, GatewayWsClient, SessionSubscription};
+use agent_client_protocol::schema::v1::{McpServer, ResumeSessionRequest, SessionId};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+
+/// Build typed `session/resume` params carrying the current client-computed
+/// MCP server list.
+///
+/// Uses the real ACP `ResumeSessionRequest` builder (not a hand-rolled
+/// `json!({...})` literal) so the wire shape stays aligned with the
+/// protocol schema. `mcp_servers` is the same `Vec<Value>` panel-rust
+/// already computes for `session/new` (`snapflowd_mcp_servers_entry`);
+/// each entry is deserialized into `McpServer` at this boundary -- a
+/// shape mismatch is a real bug and is surfaced via
+/// [`ClientError::InvalidParams`], never silently dropped to empty.
+pub fn build_resume_session_params(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    mcp_servers: &[serde_json::Value],
+) -> Result<serde_json::Value, ClientError> {
+    let typed_servers = mcp_servers
+        .iter()
+        .cloned()
+        .map(|entry| {
+            serde_json::from_value::<McpServer>(entry).map_err(|err| {
+                ClientError::InvalidParams(format!(
+                    "mcpServers entry failed to deserialize as ACP McpServer: {err}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = ResumeSessionRequest::new(SessionId::new(session_id), PathBuf::from(cwd.as_ref()))
+        .mcp_servers(typed_servers);
+    serde_json::to_value(&request).map_err(|err| {
+        ClientError::InvalidParams(format!("failed to serialize ResumeSessionRequest: {err}"))
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportMode {
@@ -254,10 +289,20 @@ impl Gateway {
                 "no WebSocket available for session rehydration".to_owned(),
             ));
         };
-        let params = serde_json::json!({
-            "sessionId": session_id,
-            "cwd": replay.params.get("cwd").cloned().unwrap_or_default(),
-        });
+        // Prefer the cwd/mcpServers recorded when the session was first
+        // bound (OpenSession registers them on the load replay contract;
+        // create/resume paths should too). Fall back to empty cwd / empty
+        // mcp list only when the registered params genuinely lack them.
+        let cwd = replay
+            .params
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mcp_servers = match replay.params.get("mcpServers") {
+            Some(serde_json::Value::Array(entries)) => entries.as_slice(),
+            _ => &[],
+        };
+        let params = build_resume_session_params(session_id, cwd, mcp_servers)?;
         client
             .call(
                 "session/resume",
@@ -597,5 +642,64 @@ mod tests {
             .lock()
             .expect("replay registry lock")
             .contains_key("failed-session"));
+    }
+
+    #[test]
+    fn build_resume_session_params_includes_mcp_servers() {
+        let mcp = vec![serde_json::json!({
+            "name": "skills",
+            "command": "/usr/bin/snapflowd-mcp",
+            "args": ["--global-dir", "/tmp/skills"],
+            "env": [],
+        })];
+        let params = build_resume_session_params("sess-1", "/tmp/project", &mcp)
+            .expect("well-formed mcpServers must serialize");
+        assert_eq!(params["sessionId"], "sess-1");
+        assert_eq!(params["cwd"], "/tmp/project");
+        let servers = params["mcpServers"]
+            .as_array()
+            .expect("mcpServers key must be present");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], "skills");
+        assert_eq!(servers[0]["command"], "/usr/bin/snapflowd-mcp");
+        assert_eq!(
+            servers[0]["args"],
+            serde_json::json!(["--global-dir", "/tmp/skills"])
+        );
+    }
+
+    #[test]
+    fn build_resume_session_params_rejects_malformed_mcp_entry() {
+        let mcp = vec![serde_json::json!({
+            "name": "broken",
+            // stdio McpServer requires `command`; a bare object is not a
+            // valid ACP McpServer of any transport variant.
+            "notARealField": true,
+        })];
+        let err = build_resume_session_params("sess-1", "/tmp", &mcp)
+            .expect_err("malformed entry must not be silently dropped");
+        match err {
+            ClientError::InvalidParams(message) => {
+                assert!(
+                    message.contains("mcpServers"),
+                    "error should name the field: {message}"
+                );
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_session_params_allows_empty_mcp_list() {
+        let params = build_resume_session_params("sess-2", "/home/me", &[])
+            .expect("empty mcp list is valid");
+        assert_eq!(params["sessionId"], "sess-2");
+        assert_eq!(params["cwd"], "/home/me");
+        // ResumeSessionRequest skips serializing empty mcpServers
+        // (`skip_serializing_if = "Vec::is_empty"`), so the key may be
+        // absent rather than `[]` -- either is fine for the wire.
+        if let Some(servers) = params.get("mcpServers") {
+            assert_eq!(servers, &serde_json::json!([]));
+        }
     }
 }
