@@ -533,6 +533,18 @@ fn save_panel_prefs_to_json(
     settings_file::save_document(path, &doc).map_err(|error| error.to_string())
 }
 
+/// Feature-flag gate for the "default profile"/"permission profile"
+/// Settings controls (`agents_view.slint`). Both are genuinely dual-tier
+/// (visible under Project and Global scope alike -- unlike the six
+/// categories gated Global-only in 6745aa0e), but until this is explicitly
+/// turned on they're hidden entirely, in both scopes. Defaults OFF (unset
+/// env var => hidden) so an unset environment never surfaces them.
+fn profile_wiring_enabled() -> bool {
+    std::env::var("PANEL_PROFILE_WIRING_ENABLED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
 /// default because key text may be sensitive; when enabled, this writes only
 /// to Shotcut's stderr and never changes input routing.
@@ -2020,6 +2032,7 @@ fn panel_rust_create_with_initial_identity(
             startup_warnings,
         };
         let mut model = model::Model::default();
+        model.profile_wiring_enabled = profile_wiring_enabled();
         let thread_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();

@@ -38,9 +38,35 @@ export component AgentsView inherits Rectangle {
     in property <string> scope: "project";
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
+    // Env-var feature-flag gate (PANEL_PROFILE_WIRING_ENABLED, read in
+    // lib.rs's profile_wiring_enabled() and threaded down through
+    // settings_page.slint / app.slint). Off by default: the default-
+    // profile/permission-profile SettingsFields below are hidden
+    // entirely (not just disabled) in both Project and Global scope
+    // until this is turned on. Orthogonal to `scope` -- unlike the
+    // profile-registry chip picker below (gated Global-only in
+    // 6745aa0e), these two fields stay dual-tier once the flag is on.
+    in property <bool> profile-wiring-enabled: false;
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
+    // Mirror pattern (see settings_page.slint's agents-search-focus-mirror
+    // doc comment): now that the default-profile/permission-profile
+    // TextFields live inside `if root.profile-wiring-enabled` blocks below,
+    // they're conditional elements and can't be referenced directly from
+    // search-has-focus outside their own scope. These mirrors are updated
+    // from inside each block's own `changed has-focus` handler instead, and
+    // reset to false when the flag flips off (the block tears down, so
+    // nothing else would ever clear a stale `true` left over from
+    // switching away mid-focus).
+    property <bool> default-profile-focus-mirror: false;
+    property <bool> permission-profile-focus-mirror: false;
+    changed profile-wiring-enabled => {
+        if (!self.profile-wiring-enabled) {
+            self.default-profile-focus-mirror = false;
+            self.permission-profile-focus-mirror = false;
+        }
+    }
     // See FilterSearchBar.input-has-focus's doc comment. Also covers the
     // plain TextField instances below (default-profile/permission-profile)
     // -- those never had any focus state to aggregate here at all until
@@ -48,8 +74,8 @@ export component AgentsView inherits Rectangle {
     // silently dropped every keystroke typed into either field.
     out property <bool> search-has-focus:
         agent-search-bar.input-has-focus
-        || default-profile-field.has-focus
-        || permission-profile-field.has-focus;
+        || default-profile-focus-mirror
+        || permission-profile-focus-mirror;
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -119,13 +145,16 @@ export component AgentsView inherits Rectangle {
 
         SettingsSectionHeader { text: Strings.chat-defaults; }
 
-        SettingsField {
+        if root.profile-wiring-enabled : SettingsField {
             width: parent.width;
             label: Strings.profile;
             default-profile-field := TextField {
                 text <=> root.default-profile;
                 field-accessible-label: "Default profile";
                 field-font-size: 12px;
+                changed has-focus => {
+                    root.default-profile-focus-mirror = self.has-focus;
+                }
             }
         }
 
@@ -294,13 +323,16 @@ export component AgentsView inherits Rectangle {
         }
         */
 
-        SettingsField {
+        if root.profile-wiring-enabled : SettingsField {
             width: parent.width;
             label: Strings.permission-profile;
             permission-profile-field := TextField {
                 text <=> root.permission-profile;
                 field-accessible-label: "Permission profile";
                 field-font-size: 12px;
+                changed has-focus => {
+                    root.permission-profile-focus-mirror = self.has-focus;
+                }
             }
         }
 

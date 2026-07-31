@@ -262,6 +262,14 @@ pub struct Model {
     pub background_default: bool,
     pub default_agent_id: String,
     pub dev_mode: bool,
+    /// Feature-flag gate (env-var driven, see `PANEL_PROFILE_WIRING_ENABLED`
+    /// in lib.rs) for the "default profile"/"permission profile" settings
+    /// controls in `agents_view.slint`. Both are genuinely dual-tier
+    /// (visible/working under Project and Global scope alike, unlike the
+    /// six categories gated Global-only in 6745aa0e) but are hidden
+    /// entirely, in both scopes, until this flag is turned on. Computed
+    /// once at startup from the environment and never mutated afterward.
+    pub profile_wiring_enabled: bool,
     pub background_override_set: bool,
     pub background_override: bool,
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,

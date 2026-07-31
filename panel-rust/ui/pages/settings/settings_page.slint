@@ -91,6 +91,10 @@ export component SettingsPage inherits Rectangle {
     // call site only needs its component name + import swapped.
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
+    // Env-var feature-flag gate (PANEL_PROFILE_WIRING_ENABLED) for the
+    // default-profile/permission-profile controls above -- see
+    // app.slint's own doc comment for this same property.
+    in property <bool> profile-wiring-enabled: false;
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
     in-out property <bool> background-override-set: false;
@@ -322,6 +326,7 @@ export component SettingsPage inherits Rectangle {
                             scope: root.scope;
                             default-profile <=> root.default-profile;
                             permission-profile <=> root.permission-profile;
+                            profile-wiring-enabled: root.profile-wiring-enabled;
                             default-agent-id <=> root.default-agent-id;
                             available-profiles: root.available-profiles;
                             agent-catalog: root.agent-catalog;

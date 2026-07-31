@@ -165,6 +165,12 @@ export component ChatPanel inherits Window {
     // PUI-003: the active thread's ACP agent slash-commands for the `/` menu.
     in property <[SkillOption]> available-commands: [];
     in property <bool> dev-mode: false;
+    // Env-var feature-flag gate (PANEL_PROFILE_WIRING_ENABLED, see
+    // lib.rs's profile_wiring_enabled()) for the "default profile"/
+    // "permission profile" Settings controls in agents_view.slint. Off by
+    // default -- those two settings are hidden entirely, in both Project
+    // and Global scope, until this is explicitly turned on.
+    in property <bool> profile-wiring-enabled: false;
     // `active_pane_and_editor_view` phase: which surface the main content
     // area shows -- "chat" (ChatArea, the default) or "skill" (a live
     // SkillEditorView for the sidebar's currently-selected skill).
@@ -933,6 +939,7 @@ export component ChatPanel inherits Window {
             sections-expanded <=> root.settings-sections-expanded;
             default-profile <=> default-profile;
             permission-profile <=> permission-profile;
+            profile-wiring-enabled: root.profile-wiring-enabled;
             background-default <=> background-default;
             default-agent-id <=> root.default-agent-id;
             background-override-set <=> background-override-set;
