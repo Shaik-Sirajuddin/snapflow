@@ -272,6 +272,12 @@ pub struct Model {
     pub profile_wiring_enabled: bool,
     pub background_override_set: bool,
     pub background_override: bool,
+    /// Skills settings view's "Show global skills" row
+    /// (`skills_view.slint`). Genuinely dual-tier, same
+    /// Project-overrides-Global mechanism as `background_default` --
+    /// see `settings_file::SettingsDocument::show_global_skills`'s doc
+    /// comment.
+    pub show_global_skills: bool,
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,

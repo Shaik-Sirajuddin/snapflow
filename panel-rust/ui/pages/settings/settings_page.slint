@@ -97,6 +97,10 @@ export component SettingsPage inherits Rectangle {
     in property <bool> profile-wiring-enabled: false;
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
+    // Genuinely dual-tier like `background-default` -- see
+    // `settings_file::SettingsDocument::show_global_skills`'s doc comment.
+    // Forwarded to `SkillsView` below via `<=>` the same way.
+    in-out property <bool> show-global-skills: true;
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <[ProfileOption]> available-profiles: [];
@@ -356,6 +360,7 @@ export component SettingsPage inherits Rectangle {
                             scope: root.scope;
                             skills: root.available-skills;
                             dev-mode: root.dev-mode;
+                            show-global-skills <=> root.show-global-skills;
                             skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
                             dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
                         }

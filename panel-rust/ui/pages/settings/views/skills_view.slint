@@ -20,16 +20,21 @@ export component SkillsView inherits Rectangle {
     // `settings_file::SettingsDocument::dev_mode`'s doc comment,
     // bypassing the generic Project-overrides-Global merge entirely), so
     // editing it under Project today silently wrote/read the same single
-    // global value with no project-scoped effect. `show-global-skills`
-    // and the skill list itself are unrelated to this gate and stay as-is.
+    // global value with no project-scoped effect. The skill list itself
+    // is unrelated to this gate and stays as-is.
     in property <string> scope: "project";
     in property <[SkillOption]> skills: [];
     // Page-level toggle: hide the global-scope rows so a long list of
     // shared global skills doesn't drown out a project's own few local
     // ones (`skills-management`'s "a toggle to show Global Skills or
-    // not"). UI-only local state -- no round trip needed, this is a
-    // pure client-side list filter.
-    property <bool> show-global-skills: true;
+    // not"). Genuinely dual-tier (settings-scoping bug report fix): was
+    // previously component-local Slint state only -- no round trip at
+    // all, in either scope -- which is why toggling it looked identical
+    // regardless of the Project/Global scope tab. Now forwarded
+    // two-way (`<=>`) from `SettingsPage`/`app.slint` down to here, and
+    // persisted per-scope exactly like `background-default`, via
+    // `settings_file::SettingsDocument::show_global_skills`.
+    in-out property <bool> show-global-skills: true;
     callback skill-promote-to-global(string /* path */);
     // `dev-mode` task's "Dev mode option for the system" -- Global-tier
     // only (see `settings_file::SettingsDocument::dev_mode`'s doc

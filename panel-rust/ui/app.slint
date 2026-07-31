@@ -91,6 +91,12 @@ export component ChatPanel inherits Window {
     in-out property <string> permission-profile: "";
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
+    // Skills settings view's "Show global skills" row -- genuinely
+    // dual-tier like `background-default` above (see
+    // `settings_file::SettingsDocument::show_global_skills`'s doc
+    // comment), staged here and committed on the Save button along with
+    // the rest of the form.
+    in-out property <bool> show-global-skills: true;
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <string> connection-status: "Connecting...";
@@ -942,6 +948,7 @@ export component ChatPanel inherits Window {
             profile-wiring-enabled: root.profile-wiring-enabled;
             background-default <=> background-default;
             default-agent-id <=> root.default-agent-id;
+            show-global-skills <=> show-global-skills;
             background-override-set <=> background-override-set;
             background-override <=> background-override;
             available-profiles: available-profiles;

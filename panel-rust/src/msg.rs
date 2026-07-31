@@ -261,6 +261,9 @@ pub struct SettingsSaveInput {
     pub selected_thread_id: Option<String>,
     pub background_override_set: bool,
     pub background_override: bool,
+    // Genuinely dual-tier like `background_default` above -- see
+    // `settings_file::SettingsDocument::show_global_skills`'s doc comment.
+    pub show_global_skills: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -435,6 +438,7 @@ pub struct SettingsPreferencesSnapshot {
     pub dev_mode: bool,
     pub background_override_set: bool,
     pub background_override: bool,
+    pub show_global_skills: bool,
 }
 
 /// Read-only bridge data collected for the currently displayed thread during

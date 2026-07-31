@@ -961,6 +961,7 @@ pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPa
         selected_thread_id,
         background_override_set: model.background_override_set,
         background_override: model.background_override,
+        show_global_skills: model.show_global_skills,
     };
     drop(model);
     let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))));

@@ -405,6 +405,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
         permission_profile: defaults.permission_profile,
         background_session_default: Some(defaults.background_session),
         default_agent_id: None,
+        show_global_skills: None,
         harness: None,
         dev_mode: None,
         snapflow_mcp_enabled: None,
@@ -443,6 +444,7 @@ fn load_panel_prefs(
 struct ScopedPanelPrefs {
     defaults: PanelDefaults,
     default_agent_id: Option<String>,
+    show_global_skills: bool,
 }
 
 fn scoped_settings_path<'a>(
@@ -510,16 +512,19 @@ fn load_scoped_panel_prefs(
     Some(ScopedPanelPrefs {
         defaults: settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
         default_agent_id: resolved.default_agent_id,
+        show_global_skills: resolved.show_global_skills,
     })
 }
 
-/// Persist profile / permission / background-default / default-agent into the
-/// selected JSON tier. Existing unrelated fields (harness, dev mode, ...) are
-/// retained by the read-modify-write operation.
+/// Persist profile / permission / background-default / default-agent /
+/// show-global-skills into the selected JSON tier. Existing unrelated
+/// fields (harness, dev mode, ...) are retained by the read-modify-write
+/// operation.
 fn save_panel_prefs_to_json(
     scope: &str,
     defaults: &PanelDefaults,
     default_agent_id: Option<String>,
+    show_global_skills: bool,
 ) -> Result<(), String> {
     let paths = settings_file::SettingsPaths::from_env();
     let path = scoped_settings_path(&paths, scope)
@@ -530,6 +535,7 @@ fn save_panel_prefs_to_json(
     doc.permission_profile = defaults.permission_profile.clone();
     doc.background_session_default = Some(defaults.background_session);
     doc.default_agent_id = default_agent_id;
+    doc.show_global_skills = Some(show_global_skills);
     settings_file::save_document(path, &doc).map_err(|error| error.to_string())
 }
 
@@ -543,6 +549,232 @@ fn profile_wiring_enabled() -> bool {
     std::env::var("PANEL_PROFILE_WIRING_ENABLED")
         .map(|value| value == "1")
         .unwrap_or(false)
+}
+
+/// Verifies the Project-vs-Global tiering that `HarnessView`'s
+/// "Background sessions" toggle (`background_session_default`) is
+/// supposed to have, end to end through the exact functions the UI save
+/// path calls (`save_panel_prefs_to_json`/`load_scoped_panel_prefs`/
+/// `scoped_settings_path`) rather than re-testing `settings_file.rs`'s
+/// already-covered `merge_documents` in isolation. Mirrors
+/// `settings_file.rs`'s own env-driven `SettingsPaths::from_env` tests,
+/// and the save/restore-env-var shape `lifecycle_tests::
+/// panel_create_destroy_create_reuses_slint_platform` already uses in this
+/// file for other `RUI_*`-driven state.
+#[cfg(test)]
+mod scoped_panel_prefs_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `SettingsPaths::from_env` reads process-wide env vars, and Rust
+    /// runs `#[test]` functions in parallel by default -- without this,
+    /// this module's two tests race on `RUI_PANEL_SETTINGS_DIR`/
+    /// `RUI_PANEL_PROJECT_ROOT` and spuriously observe each other's
+    /// tempdirs. Serialize them the same way any env-var-mutating test
+    /// suite must.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard: snapshots and restores the handful of `RUI_PANEL_*` env
+    /// vars `SettingsPaths::from_env` reads, so this test can't leak state
+    /// into any test that runs after it in the same process. Holds the
+    /// serialization lock for its whole lifetime.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = env_lock();
+            let keys = [
+                "RUI_PANEL_SETTINGS_DIR",
+                "RUI_ACP_CACHE_DIR",
+                "RUI_PANEL_PROJECT_ROOT",
+                "RUI_PANEL_SETTINGS_DEFAULT",
+            ];
+            let saved = keys
+                .iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect();
+            Self {
+                _lock: lock,
+                saved,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn defaults_with_background(background_session: bool) -> PanelDefaults {
+        PanelDefaults {
+            profile_name: None,
+            permission_profile: None,
+            background_session,
+            selected_thread_id: None,
+        }
+    }
+
+    /// Setting `background_session_default` under Project scope must land
+    /// only in the project JSON file, leaving a separately-read Global
+    /// value untouched -- and vice versa. This is the exact "set under one
+    /// scope, confirm the other scope's separately-read value is
+    /// unaffected" shape called for by the bug report, run through the
+    /// real UI save/load functions instead of the lower-level
+    /// `merge_documents` helper `settings_file.rs` already covers.
+    #[test]
+    fn background_session_default_persists_independently_per_scope() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        let paths = settings_file::SettingsPaths::from_env();
+        let global_path = paths.global.clone();
+        let project_path = paths.project.clone().expect("project path resolved");
+        assert_ne!(
+            global_path, project_path,
+            "project and global settings paths must never collide"
+        );
+
+        // Global starts true, Project starts unset (inherits Global).
+        save_panel_prefs_to_json("global", &defaults_with_background(true), None, true)
+            .expect("save global");
+        let mut warnings = Vec::new();
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(global_prefs.defaults.background_session);
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project (inherits global)");
+        assert!(
+            project_prefs.defaults.background_session,
+            "project scope must inherit the global value when it has no override"
+        );
+
+        // Now set Project to false: this must only touch the project
+        // file, and Global's own separately-read value must stay true.
+        save_panel_prefs_to_json("project", &defaults_with_background(false), None, true)
+            .expect("save project");
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project after override");
+        assert!(
+            !project_prefs.defaults.background_session,
+            "project override must take effect for project scope"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global after project write");
+        assert!(
+            global_prefs.defaults.background_session,
+            "a project-scope write must not affect the separately-read global value"
+        );
+
+        // And the raw files on disk confirm the write actually targeted
+        // separate paths, not the same one under two names.
+        let global_doc = settings_file::load_document(&global_path).expect("read global doc");
+        let project_doc = settings_file::load_document(&project_path).expect("read project doc");
+        assert_eq!(global_doc.background_session_default, Some(true));
+        assert_eq!(project_doc.background_session_default, Some(false));
+    }
+
+    /// Same shape, opposite direction: a Global-scope write after a
+    /// Project override exists must not clobber or be read back through
+    /// the Project file.
+    #[test]
+    fn global_write_does_not_affect_an_existing_project_override() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        save_panel_prefs_to_json("project", &defaults_with_background(true), None, true)
+            .expect("save project override");
+        save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
+            .expect("save global default");
+
+        let mut warnings = Vec::new();
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project");
+        assert!(
+            project_prefs.defaults.background_session,
+            "existing project override must survive an unrelated global write"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(!global_prefs.defaults.background_session);
+    }
+
+    /// Same end-to-end shape as `background_session_default_persists_
+    /// independently_per_scope`, for `show_global_skills` -- the other
+    /// setting named in the bug report (`skills_view.slint`'s "Show
+    /// global skills" toggle). Before this fix it was pure component-local
+    /// Slint UI state that never called into `save_panel_prefs_to_json`/
+    /// `load_scoped_panel_prefs` at all, so it could never have collided
+    /// on a shared file -- but it also never round-tripped through
+    /// Project/Global scope like the bug report expected. This proves the
+    /// newly-added wiring gives it the exact same per-scope isolation
+    /// `background_session_default` already has.
+    #[test]
+    fn show_global_skills_persists_independently_per_scope() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        // Global starts true, Project starts unset (inherits Global).
+        save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
+            .expect("save global");
+        let mut warnings = Vec::new();
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(global_prefs.show_global_skills);
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project (inherits global)");
+        assert!(
+            project_prefs.show_global_skills,
+            "project scope must inherit the global value when it has no override"
+        );
+
+        // Set Project to false: must only touch the project file: Global's
+        // own separately-read value must stay true.
+        save_panel_prefs_to_json("project", &defaults_with_background(false), None, false)
+            .expect("save project");
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project after override");
+        assert!(
+            !project_prefs.show_global_skills,
+            "project override must take effect for project scope"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global after project write");
+        assert!(
+            global_prefs.show_global_skills,
+            "a project-scope write must not affect the separately-read global value"
+        );
+    }
 }
 
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
@@ -1012,6 +1244,7 @@ impl PanelSingleton {
             input.scope.as_str(),
             &defaults,
             non_empty(input.default_agent_id),
+            input.show_global_skills,
         ) {
             return Err(effect::EffectError::new(format!(
                 "failed to save panel settings JSON: {error}"

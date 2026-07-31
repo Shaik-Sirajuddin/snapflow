@@ -1283,6 +1283,7 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.default_agent_id = input.default_agent_id.clone();
             model.background_override_set = input.background_override_set;
             model.background_override = input.background_override;
+            model.show_global_skills = input.show_global_skills;
             model.settings_open = false;
             (
                 vec![Effect::SaveSettings { input }],
@@ -2673,7 +2674,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             || model.default_agent_id != snapshot.default_agent_id
             || model.dev_mode != snapshot.dev_mode
             || model.background_override_set != snapshot.background_override_set
-            || model.background_override != snapshot.background_override;
+            || model.background_override != snapshot.background_override
+            || model.show_global_skills != snapshot.show_global_skills;
         if changed {
             model.settings_scope = snapshot.scope;
             model.default_profile = snapshot.default_profile;
@@ -2683,6 +2685,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.dev_mode = snapshot.dev_mode;
             model.background_override_set = snapshot.background_override_set;
             model.background_override = snapshot.background_override;
+            model.show_global_skills = snapshot.show_global_skills;
             dirty.push(Dirty::Settings);
         }
     }
@@ -3809,6 +3812,7 @@ mod tests {
             selected_thread_id: None,
             background_override_set: false,
             background_override: false,
+            show_global_skills: true,
         };
 
         update(
