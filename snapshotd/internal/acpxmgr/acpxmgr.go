@@ -11,9 +11,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -29,11 +29,9 @@ import (
 	"snapshotd/internal/acpnode"
 )
 
-// AdminBind is the fixed loopback address acpx-server's admin plane binds
-// to when acpxmgr enables it -- fixed (not per-run-reserved) because
-// acpxmgr only ever spawns exactly one acpx-server instance at a time
-// (unlike panel-rust's own per-provider dev-fallback spawn path, which
-// does need a fresh port per instance).
+// AdminBind is the default loopback address acpx-server's admin plane binds
+// to when acpxmgr enables it. Callers that can run multiple daemon instances
+// (for example the per-worktree VNC harness) may provide Config.AdminBind.
 const AdminBind = "127.0.0.1:8791"
 
 const maxPortBumpAttempts = 100
@@ -55,6 +53,10 @@ type Config struct {
 	DefaultAcpCommand string
 	// DefaultAgentID is optional ACPX_DEFAULT_AGENT_ID (default "default").
 	DefaultAgentID string
+	// AdminBind is the loopback address for acpx-server's admin plane. Empty
+	// uses AdminBind; daemon test/worktree instances should reserve a unique
+	// port and provide it here.
+	AdminBind string
 	// ExtraEnv is merged into the child environment.
 	ExtraEnv []string
 	// Log is optional; if nil, slog.Default is used.
@@ -156,6 +158,37 @@ func McpHTTPURL(mcpBind string) string {
 // than needing a new Config field, since ConfigPath is always required.
 func pidFilePath(cfg Config) string {
 	return filepath.Join(filepath.Dir(cfg.ConfigPath), "acpx-server.pid")
+}
+
+// httpBindFilePath is the shared discovery location for the HTTP bind
+// acpx-server actually ended up listening on. Start's port-walk
+// (nextAvailableTCPBind, below) can silently rebind to a port other than
+// the one the caller requested when that port is already occupied --
+// acpxmgr itself tracks and health-checks the resolved address fine, but
+// nothing external learns about it unless it's written down somewhere.
+// Real regression this fixes: vnc_worktree.sh reserves a gateway port
+// through its own port registry and then hard-polls exactly that port for
+// /health, assuming it's what the daemon-managed acpx-server bound to; if
+// that port happened to already be occupied (stale process, another
+// worktree's leaked child, a genuine race in a multi-worktree dev
+// environment), acpx-server quietly moved to a different port and the
+// external health poll spun until timeout and died -- even though
+// acpx-server was completely healthy, just not where the poller was
+// looking. Sibling of pidFilePath/adminTokenPath for the same
+// cross-process discovery reason.
+func httpBindFilePath(cfg Config) string {
+	return filepath.Join(filepath.Dir(cfg.ConfigPath), "acpx-http-bind")
+}
+
+func writeHTTPBindFile(cfg Config) {
+	// Best-effort: a failure to write this file only degrades external
+	// callers back to assuming the originally-requested bind (today's
+	// behavior), not a fatal condition for acpx-server itself.
+	_ = os.WriteFile(httpBindFilePath(cfg), []byte(cfg.HttpBind+"\n"), 0o644)
+}
+
+func removeHTTPBindFile(cfg Config) {
+	_ = os.Remove(httpBindFilePath(cfg))
 }
 
 // adminTokenPath is the shared discovery location for acpx's admin-plane
@@ -284,6 +317,12 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	if err := WriteConfig(cfg.ConfigPath, cfg.McpURL, agentID); err != nil {
 		return nil, fmt.Errorf("acpxmgr: write config: %w", err)
 	}
+	// Written unconditionally (not just on the port-bump path), before
+	// spawning, so an external caller polling for this file never has to
+	// distinguish "not written yet" from "no bump happened" -- and so it
+	// reflects the true bind even if the caller starts polling for it
+	// before Start's own health-poll loop below completes.
+	writeHTTPBindFile(cfg)
 	reapStalePidFile(cfg, log)
 
 	// setup-followups plan, agent_settings_ordering_and_install_enable_
@@ -339,6 +378,17 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		"ACPX_MAX_SESSIONS_PER_TENANT=512",
 		"ACPX_MAX_SESSIONS_TOTAL=2048",
 	)
+	// acpx-server's tracing subscriber is EnvFilter-driven off RUST_LOG and
+	// writes to stderr, which this daemon already redirects into
+	// snapshotd_stdout.log. Without RUST_LOG it defaults to emitting
+	// nothing, so daemon-managed mode logged only lifecycle lines and no
+	// per-request tracing at all -- a real grok-build session/new failure
+	// was invisible on disk and only diagnosable by running acpx-server by
+	// hand outside the daemon. An inherited RUST_LOG still wins (Go keeps
+	// the last occurrence of a key).
+	if os.Getenv("RUST_LOG") == "" {
+		cmd.Env = append(cmd.Env, "RUST_LOG=info,acpx_core=debug,acpx_server=debug")
+	}
 	if cfg.DbPath != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DB_PATH="+cfg.DbPath)
 	}
@@ -351,9 +401,13 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_AGENT_ID="+agentID)
 	}
 	if adminToken != "" {
+		adminBind := cfg.AdminBind
+		if adminBind == "" {
+			adminBind = AdminBind
+		}
 		cmd.Env = append(cmd.Env,
 			"ACPX_ADMIN_TOKEN="+adminToken,
-			"ACPX_ADMIN_BIND="+AdminBind,
+			"ACPX_ADMIN_BIND="+adminBind,
 		)
 	}
 	cmd.Env = append(cmd.Env, cfg.ExtraEnv...)
@@ -380,6 +434,7 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		m.err = err
 		m.mu.Unlock()
 		removePidFile(cfg)
+		removeHTTPBindFile(cfg)
 		close(m.done)
 	}()
 

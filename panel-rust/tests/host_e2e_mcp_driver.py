@@ -100,6 +100,21 @@ def find_element_by_qualified_id(client, window_handle, qualified_id):
     return handles[0]
 
 
+def wait_for_element_by_qualified_id(client, window_handle, qualified_id, timeout=15):
+    """Retry qualified-id lookup across Slint component-tree recreation."""
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            return find_element_by_qualified_id(client, window_handle, qualified_id)
+        except (McpError, RuntimeError) as error:
+            last_error = error
+            time.sleep(0.2)
+    raise RuntimeError(
+        f"element id {qualified_id!r} never appeared within {timeout}s: {last_error}"
+    )
+
+
 def find_elements_by_accessible_label(client, root_handle, label, max_elements=600):
     tree = client.call_tool(
         "get_element_tree",
@@ -279,8 +294,8 @@ def scenario_send_now(args):
     open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
     window_handle, root_handle = get_root_element(client)
 
-    compose_handle = find_element_by_qualified_id(
-        client, window_handle, "ChatInputLayout::compose"
+    compose_handle = wait_for_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose", timeout=args.timeout
     )
     # dispatch_key_event routes to the window's current keyboard focus,
     # unlike set_element_value (which sets content directly regardless of
@@ -357,8 +372,8 @@ def scenario_fast_track(args):
     open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
     window_handle, root_handle = get_root_element(client)
 
-    compose_handle = find_element_by_qualified_id(
-        client, window_handle, "ChatInputLayout::compose"
+    compose_handle = wait_for_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose", timeout=args.timeout
     )
     click(client, compose_handle)
 
@@ -694,8 +709,8 @@ def scenario_real_agent_smoke(args):
     window_handle, root_handle = get_root_element(client)
     ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
 
-    compose_handle = find_element_by_qualified_id(
-        client, window_handle, "ChatInputLayout::compose"
+    compose_handle = wait_for_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose", timeout=args.timeout
     )
     click(client, compose_handle)
     prompt_text = "Reply with exactly the single word: OK"

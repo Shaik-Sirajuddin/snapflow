@@ -13,8 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownBlock, MarkdownLine, MarkdownRun,
-    McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
-    TerminalItem, ThreadItem,
+    McpServerFormData, McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption,
+    SkillOption, TerminalItem, ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -243,6 +243,76 @@ pub struct MarkdownBlockData {
     pub code_text: String,
 }
 
+/// Builds one [`MarkdownBlockData`] from a single already-segmented
+/// `span`, parsing/styling only that block's own source slice. Factored
+/// out of [`build_markdown_block_data`] so [`build_markdown_block_data_
+/// incremental`] (below) can call it per-block too -- rebuilding only
+/// the blocks that actually changed, instead of every block in the
+/// message.
+fn build_one_block_data(
+    text: &str,
+    span: markdown::MarkdownBlockSpan,
+    is_streaming_tail: bool,
+) -> MarkdownBlockData {
+    let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
+        // `segment_blocks`' byte ranges are pulldown-cmark's own
+        // verbatim block spans -- they legitimately include a
+        // trailing newline (block ranges) or table-cell padding
+        // whitespace around `|` delimiters, neither of which is
+        // real content (see markdown.rs's segment_blocks tests).
+        let raw = text[range].trim();
+        let candidate = if is_streaming_tail {
+            markdown::heal_open_markers(raw)
+        } else {
+            raw.to_string()
+        };
+        slint::StyledText::from_markdown(&candidate)
+            .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
+    };
+    match span.kind {
+        markdown::BlockSpanKind::Text => MarkdownBlockData {
+            kind: "text",
+            text: styled_text_for(span.source_range),
+            default_font_size: heading_font_size(span.heading_level),
+            indent: span.indent as i32,
+            table_cells: Vec::new(),
+            table_col_count: 0,
+            code_text: String::new(),
+        },
+        markdown::BlockSpanKind::Code(body) => MarkdownBlockData {
+            kind: "code",
+            text: slint::StyledText::default(),
+            default_font_size: 0.0_f32,
+            indent: span.indent as i32,
+            table_cells: Vec::new(),
+            table_col_count: 0,
+            code_text: body,
+        },
+        markdown::BlockSpanKind::Rule => MarkdownBlockData {
+            kind: "rule",
+            text: slint::StyledText::default(),
+            default_font_size: 0.0_f32,
+            indent: span.indent as i32,
+            table_cells: Vec::new(),
+            table_col_count: 0,
+            code_text: String::new(),
+        },
+        markdown::BlockSpanKind::Table { cells, col_count } => {
+            let cell_styled: Vec<slint::StyledText> =
+                cells.into_iter().map(styled_text_for).collect();
+            MarkdownBlockData {
+                kind: "table",
+                text: slint::StyledText::default(),
+                default_font_size: 0.0_f32,
+                indent: span.indent as i32,
+                table_cells: cell_styled,
+                table_col_count: col_count as i32,
+                code_text: String::new(),
+            }
+        }
+    }
+}
+
 /// Segments+styles `text` into [`MarkdownBlockData`] -- the `Send`-safe,
 /// `ModelRc`-free half of Architecture v2's per-block rendering. Pure
 /// function of `(text, is_streaming_tail)`, no caching, no Slint model
@@ -252,69 +322,114 @@ pub struct MarkdownBlockData {
 /// the worker calls it directly and does its own `ModelRc` wrapping in
 /// its UI-thread delivery closure.
 pub fn build_markdown_block_data(text: &str, is_streaming_tail: bool) -> Vec<MarkdownBlockData> {
-    let spans = markdown::segment_blocks(text);
-    spans
+    markdown::segment_blocks(text)
         .into_iter()
-        .map(|span| {
-            let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
-                // `segment_blocks`' byte ranges are pulldown-cmark's own
-                // verbatim block spans -- they legitimately include a
-                // trailing newline (block ranges) or table-cell padding
-                // whitespace around `|` delimiters, neither of which is
-                // real content (see markdown.rs's segment_blocks tests).
-                let raw = text[range].trim();
-                let candidate = if is_streaming_tail {
-                    markdown::heal_open_markers(raw)
-                } else {
-                    raw.to_string()
-                };
-                slint::StyledText::from_markdown(&candidate)
-                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
-            };
-            match span.kind {
-                markdown::BlockSpanKind::Text => MarkdownBlockData {
-                    kind: "text",
-                    text: styled_text_for(span.source_range),
-                    default_font_size: heading_font_size(span.heading_level),
-                    indent: span.indent as i32,
-                    table_cells: Vec::new(),
-                    table_col_count: 0,
-                    code_text: String::new(),
-                },
-                markdown::BlockSpanKind::Code(body) => MarkdownBlockData {
-                    kind: "code",
-                    text: slint::StyledText::default(),
-                    default_font_size: 0.0_f32,
-                    indent: span.indent as i32,
-                    table_cells: Vec::new(),
-                    table_col_count: 0,
-                    code_text: body,
-                },
-                markdown::BlockSpanKind::Rule => MarkdownBlockData {
-                    kind: "rule",
-                    text: slint::StyledText::default(),
-                    default_font_size: 0.0_f32,
-                    indent: span.indent as i32,
-                    table_cells: Vec::new(),
-                    table_col_count: 0,
-                    code_text: String::new(),
-                },
-                markdown::BlockSpanKind::Table { cells, col_count } => {
-                    let cell_styled: Vec<slint::StyledText> =
-                        cells.into_iter().map(styled_text_for).collect();
-                    MarkdownBlockData {
-                        kind: "table",
-                        text: slint::StyledText::default(),
-                        default_font_size: 0.0_f32,
-                        indent: span.indent as i32,
-                        table_cells: cell_styled,
-                        table_col_count: col_count as i32,
-                        code_text: String::new(),
-                    }
+        .map(|span| build_one_block_data(text, span, is_streaming_tail))
+        .collect()
+}
+
+/// Same output as calling [`build_markdown_block_data`] fresh, but reuses
+/// `prev` (this same key's block list from the previous call, `(source_
+/// hash, MarkdownBlockData)` pairs in block order) for any block whose
+/// own source byte range is textually unchanged since then -- only
+/// genuinely new or changed blocks get (re-)parsed and (re-)styled.
+///
+/// **Why this exists** (the live-streaming freeze root cause): a
+/// streaming agent message calls into this module again on every new
+/// chunk with the *entire accumulated text so far*, not just the newly
+/// arrived tail. `build_markdown_block_data` (and, before this function
+/// existed, `markdown_blocks_for`'s only path) re-ran `segment_blocks`
+/// AND re-ran `StyledText::from_markdown` -- real inline parsing plus
+/// real pixel-width text layout -- for every block in the message on
+/// every single chunk, including every already-finalized heading/
+/// paragraph/code block from earlier in the same message that hadn't
+/// changed at all. That's O(already-rendered-length) work repeated on
+/// every incoming token, i.e. O(final-length^2) total over one streamed
+/// response, running synchronously on the UI thread (the background
+/// `markdown_worker.rs`/`RenderWorkerPool` pipeline is not wired into
+/// this live-dispatch call path -- see that module's own doc comment) --
+/// exactly the kind of per-chunk cost that stalls scrolling/repainting
+/// while a message is streaming.
+///
+/// `segment_blocks` itself must still run on the full text every call
+/// (block boundaries can only be found by parsing from the start), but
+/// that's cheap: block-level structural parsing, not the per-block
+/// inline-styling + real text-shaping/layout `StyledText::from_markdown`
+/// does. This function keeps paying that cheap part every call while
+/// skipping the expensive per-block styling for every block whose source
+/// slice (by content, not just position) matches what `prev` already has
+/// at the same index -- which, for the common streaming shape (new
+/// tokens appended at the end, only the last block still growing), is
+/// every block except the last one or two.
+///
+/// Falls back to a full rebuild of any block (including a positionally
+/// later block that happens to still hash-match) whenever `prev` doesn't
+/// have a same-index entry with a matching hash -- safe by construction:
+/// a hash mismatch or missing entry just means "rebuild it", never stale
+/// data reuse.
+pub fn build_markdown_block_data_incremental(
+    text: &str,
+    is_streaming_tail: bool,
+    prev: &[(u64, MarkdownBlockData)],
+) -> Vec<(u64, MarkdownBlockData)> {
+    markdown::segment_blocks(text)
+        .into_iter()
+        .enumerate()
+        .map(|(i, span)| {
+            let hash = block_span_content_hash(text, &span);
+            if let Some((prev_hash, prev_data)) = prev.get(i) {
+                if *prev_hash == hash {
+                    return (hash, prev_data.clone());
                 }
             }
+            (hash, build_one_block_data(text, span, is_streaming_tail))
         })
         .collect()
+}
+
+/// Fingerprint of a block span's *semantic* content -- what actually
+/// feeds `build_one_block_data`, not its raw `source_range` bytes.
+///
+/// Live-caught during this fix's own testing, not by static reasoning:
+/// `segment_blocks`' block ranges legitimately include a trailing
+/// newline only when another block follows (pulldown-cmark's own
+/// behavior -- a block at end-of-document has no trailing separator to
+/// include, one immediately followed by more content does). So the exact
+/// same paragraph's `source_range` byte slice differs by one trailing
+/// `\n` the moment a new block appears after it, even though the trimmed
+/// text `build_one_block_data` actually renders (`text[range].trim()`)
+/// is byte-identical -- hashing the untrimmed slice caused a spurious
+/// one-time cache miss on every block precisely when it stopped being
+/// the last block, which is the single most common transition during
+/// live streaming. Hashing the same normalized content the builder
+/// itself uses (trimmed text / already-extracted code body / cell texts)
+/// keeps the two in agreement.
+fn block_span_content_hash(text: &str, span: &markdown::MarkdownBlockSpan) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    span.indent.hash(&mut hasher);
+    match &span.kind {
+        markdown::BlockSpanKind::Text => {
+            0u8.hash(&mut hasher);
+            span.heading_level.hash(&mut hasher);
+            text[span.source_range.clone()].trim().hash(&mut hasher);
+        }
+        markdown::BlockSpanKind::Code(body) => {
+            1u8.hash(&mut hasher);
+            body.hash(&mut hasher);
+        }
+        markdown::BlockSpanKind::Rule => {
+            2u8.hash(&mut hasher);
+        }
+        markdown::BlockSpanKind::Table { cells, col_count } => {
+            3u8.hash(&mut hasher);
+            col_count.hash(&mut hasher);
+            for cell in cells {
+                text[cell.clone()].trim().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// Wraps `Vec<MarkdownBlockData>` into the `ModelRc<MarkdownBlock>` Slint
@@ -381,6 +496,22 @@ fn markdown_blocks_for(
         if let crate::thread_message_index::RowChange::Unchanged(_) = change {
             if let Some(cached) = render_index.rendered_blocks_for(key) {
                 crate::trace_host_input(format_args!("markdown cache hit key={key} kind=blocks"));
+                // This message has settled (unchanged since the last
+                // tick that already produced a whole-message cache hit)
+                // -- its per-block incremental cache (`block_cache`,
+                // below) is never consulted again from this point on
+                // (every future call for this key keeps hitting this
+                // same early return), so free it now rather than let it
+                // sit as a second, redundant copy of `cached`'s content
+                // for the rest of this message's lifetime in the
+                // thread's history. `block_cache_is_empty` makes this a
+                // no-op read on every subsequent idle tick instead of a
+                // repeated write, so a long-settled thread's idle-poll
+                // cost here does not regress versus before this
+                // block-level cache existed.
+                if !render_index.block_cache_is_empty(key) {
+                    render_index.clear_block_cache(key);
+                }
                 return cached;
             }
         }
@@ -400,11 +531,40 @@ fn markdown_blocks_for(
             }
         ));
     }
-    let built = markdown_block_data_to_model(build_markdown_block_data(text, is_streaming_tail));
+    // Block-level incremental reuse (see `build_markdown_block_data_
+    // incremental`'s doc comment for the full "why"): the whole-message
+    // cache-hit check above only helps when `text` is byte-identical to
+    // the last call -- never true while a message is actively streaming,
+    // since its content_hash changes on essentially every poll tick. But
+    // most *individual blocks* inside a growing `text` are still
+    // byte-identical to the previous call (only the actively-growing
+    // tail block, and occasionally a newly-started one, actually
+    // changed) -- reuse those instead of re-parsing and re-styling every
+    // already-finalized block on every single chunk. `block_cache_for`
+    // returns empty for a key with no entry yet (first render) or while
+    // `is_streaming_tail` (see below), which just means every block
+    // rebuilds this call, same as before this optimization existed.
+    let prev_blocks = render_index.block_cache_for(key);
+    let new_blocks = build_markdown_block_data_incremental(text, is_streaming_tail, &prev_blocks);
+    let built = markdown_block_data_to_model(new_blocks.iter().map(|(_, d)| d.clone()).collect());
     if !is_streaming_tail {
         render_index.record(key, row_index, text);
         render_index.set_rendered_blocks(key, built.clone());
+        // Must run after `record`, which (on a real content change)
+        // replaces the entry wholesale and would otherwise wipe this --
+        // `set_block_cache` is a no-op against a missing entry.
+        render_index.set_block_cache(key, new_blocks);
     }
+    // `is_streaming_tail == true`: matches this function's pre-existing
+    // "index never read or written for this key" contract (see this
+    // function's own doc comment) -- `set_block_cache` is skipped here
+    // too, not just `record`/`set_rendered_blocks`. Not currently
+    // production-reachable (every live call site still hardcodes
+    // `is_streaming_tail: false`, per `to_message_rows_from_transcript`'s
+    // comment), so this leaves no incremental-reuse benefit on that path
+    // today; a future caller wiring the real streaming-tail signal
+    // through would need `block_cache_for`/`set_block_cache` to work
+    // without a full `record()` first to get the same speedup there.
     built
 }
 
@@ -890,10 +1050,13 @@ pub fn message_rows_for_thread_with_state(
     render_index: &mut crate::thread_message_index::ThreadMessageIndex,
 ) -> (Vec<MessageItem>, Vec<String>) {
     let mut keys = transcript_row_keys(&transcript);
-    let last_is_user = transcript
-        .last()
-        .map(|item| matches!(item, crate::conversation::TranscriptItem::User { .. }))
-        .unwrap_or(false);
+    // Note: the render_index-threading call below is main's addition (new
+    // markdown-render pipeline); the transcript-tail `last_is_user` check
+    // that main computed here is intentionally NOT kept -- this branch's
+    // fix (see the comment below, "Checked against `rows`") already
+    // recomputes an equivalent, more-correct `last_is_user` from `rows`
+    // after they're built, so keeping both would just shadow/waste the
+    // earlier one.
     let mut rows = to_message_rows_from_transcript(transcript, expanded, render_index);
     // Phase 18 (send_feedback_and_empty_states): the instant the user's
     // message is the transcript tail and a generation is in flight,
@@ -901,6 +1064,18 @@ pub fn message_rows_for_thread_with_state(
     // chat shows immediate feedback before any real agent event
     // arrives. Rendered as a subtle thinking-style item with a loading
     // animation, deliberately distinct from real "thinking" rows.
+    //
+    // Checked against `rows` (the actually-displayed, post-filter list),
+    // not the raw transcript: `to_message_rows_from_transcript` can drop
+    // a trailing item (e.g. `filter_map` skipping an empty in-progress
+    // chunk), which let a stale "user is last" read survive even after a
+    // real "thinking" row had already landed -- rendering both "Agent is
+    // working..." and "Thinking" at once instead of the pending
+    // placeholder yielding to the real one, as intended.
+    let last_is_user = rows
+        .last()
+        .map(|row| row.kind == "user")
+        .unwrap_or(false);
     if generation_in_flight && last_is_user {
         rows.push(MessageItem {
             kind: "pending".into(),
@@ -1749,82 +1924,119 @@ pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile
 }
 
 /// Builds the settings sheet's MCP-server list row model from a real
-/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`). Each
-/// entry is an opaque JSON object on the Rust side (`acpx-core::
-/// McpServerStore` never interprets more than `"name"`) -- this only
-/// extracts the two fields the list view shows, `"command"` falling
-/// back to an empty string for an entry that omits it (still a valid
-/// MCP server entry per ACP's own schema, e.g. a URL-based server with
-/// no `command` field at all).
+/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`), now typed
+/// end to end (`crate::protocol_types::McpServerEntry`, re-exported from
+/// `acpx_client::mcp`) -- `transport`/`command`/`url`/`needs_auth`/
+/// `auth_status` below are read from real struct fields, not guessed out
+/// of an opaque JSON blob's inconsistently-named keys the way this used
+/// to work.
 pub fn to_mcp_server_options(
     servers: Vec<crate::protocol_types::McpServerEntry>,
 ) -> ModelRc<McpServerOption> {
-    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers)))
+    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers, &[])))
 }
 
+/// `busy_keys` is `AgentBridge::mcp_operations_in_flight`'s raw output
+/// (`"<action>:<server-name>"` per in-flight RPC, see that method's doc
+/// comment) -- folded here into each row's `remove-busy`/`enabled-busy`/
+/// `authenticate-busy`/`logout-busy` booleans so the Spinner in
+/// `mcp_servers_view.slint` shows precisely on the button whose action is
+/// actually in flight for *that* server, not a global spinner. Tools-fetch
+/// deliberately reads `tool_fetch_status` instead (see `AgentBridge::
+/// fetch_mcp_server_tools_async`'s doc comment for why).
 pub fn to_mcp_server_option_rows(
     servers: Vec<crate::protocol_types::McpServerEntry>,
+    busy_keys: &[String],
 ) -> Vec<McpServerOption> {
+    use crate::protocol_types::{McpAuthStatus, McpServerConfig};
+
+    let is_busy = |action: &str, name: &str| {
+        busy_keys
+            .iter()
+            .any(|key| key == &format!("{action}:{name}"))
+    };
+
     servers
         .into_iter()
         .map(|entry| {
-            let enabled = entry
-                .extra
-                .get("enabled")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true);
-            let url = entry
-                .extra
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            // Prefer explicit transport; fall back to type: remote/http or
-            // presence of a url field (opencode remote servers).
-            let transport = entry
-                .extra
-                .get("transport")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .or_else(|| {
-                    entry
-                        .extra
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|t| match t {
-                            "remote" | "http" | "sse" | "streamable_http" => "http".to_owned(),
-                            "local" | "stdio" => "stdio".to_owned(),
-                            other => other.to_owned(),
-                        })
-                })
-                .unwrap_or_else(|| {
-                    if !url.is_empty() {
-                        "http".to_owned()
-                    } else {
-                        String::new()
-                    }
-                });
+            let enabled = entry.enabled;
+            let transport = entry.config.transport_name().to_owned();
+            let command = entry.command().unwrap_or("").to_owned();
+            let url = entry.url().unwrap_or("").to_owned();
+            let needs_auth = entry.needs_auth();
+            let auth = match entry.auth_status {
+                Some(McpAuthStatus::Authenticated) => "authenticated",
+                Some(McpAuthStatus::Unauthenticated) => "unauthenticated",
+                None => "",
+            }
+            .to_owned();
+            let (args, env, headers, timeout, oauth_client_id) = match &entry.config {
+                McpServerConfig::Stdio {
+                    args, env, timeout, ..
+                } => (
+                    args.join(" "),
+                    format_kv_lines(env, "="),
+                    String::new(),
+                    timeout.map(|t| t.to_string()).unwrap_or_default(),
+                    String::new(),
+                ),
+                McpServerConfig::Http {
+                    headers,
+                    timeout,
+                    oauth,
+                    ..
+                } => (
+                    String::new(),
+                    String::new(),
+                    format_kv_lines(headers, ": "),
+                    timeout.map(|t| t.to_string()).unwrap_or_default(),
+                    oauth
+                        .as_ref()
+                        .map(|o| o.client_id.clone())
+                        .unwrap_or_default(),
+                ),
+            };
+            // Connection status for StatusDot: prefer a real probe value
+            // from `extra["status"]` when the gateway supplies one; else
+            // derive from enable/auth so the enable toggle visibly
+            // rewires the UI (disabled → red "disconnected", auth-needed
+            // → yellow, otherwise green "connected"). Previously this
+            // only read `extra`, which is almost always empty today.
             let status = entry
                 .extra
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let auth = entry
-                .extra
-                .get("auth_status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let needs_auth = entry
-                .extra
-                .get("needs_auth")
-                .and_then(|v| v.as_bool())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    // Remote HTTP servers that are not yet authenticated.
-                    transport == "http" && auth != "authenticated"
+                    if !enabled {
+                        "disconnected".to_owned()
+                    } else if needs_auth {
+                        "auth required".to_owned()
+                    } else {
+                        "connected".to_owned()
+                    }
                 });
-            let tools = mcp_tools_from_extra(&entry.extra);
+            let tools = mcp_tools_from_entry(&entry);
+            // Kickoff RPC marks server-side toolCatalog Fetching before
+            // returning; until the next list poll lands, also treat an
+            // in-flight `tools_fetch:<name>` key as fetching so the
+            // Fetch button spinner is never stuck waiting on the poll.
+            let (tool_fetch_status, tool_fetch_error) = match &entry.tool_catalog {
+                None if is_busy("tools_fetch", &entry.name) => {
+                    ("fetching".to_string(), String::new())
+                }
+                None => (String::new(), String::new()),
+                Some(crate::protocol_types::McpToolCatalog::Fetching) => {
+                    ("fetching".to_string(), String::new())
+                }
+                Some(crate::protocol_types::McpToolCatalog::Ready { .. }) => {
+                    ("ready".to_string(), String::new())
+                }
+                Some(crate::protocol_types::McpToolCatalog::Error { message }) => {
+                    ("error".to_string(), message.clone())
+                }
+            };
             // Pre-format status subtitle in Rust (audit §4.3) so Slint
             // does not concatenate nested ternaries.
             let mut parts: Vec<&str> = Vec::new();
@@ -1834,16 +2046,29 @@ pub fn to_mcp_server_option_rows(
             if !status.is_empty() {
                 parts.push(status.as_str());
             }
-            if !auth.is_empty() {
+            if !auth.is_empty() && auth != "unauthenticated" {
                 parts.push(auth.as_str());
             }
             if !enabled {
                 parts.push("disabled");
             }
             let status_line = parts.join(" · ");
+            // Lets the page search bar find a server by one of its real
+            // discovered tool names/descriptions, same reasoning as
+            // widening the predicate to args/env/headers earlier.
+            let tools_search_blob = tools
+                .iter()
+                .flat_map(|t| [t.name.as_str(), t.description.as_str()])
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let remove_busy = is_busy("delete", &entry.name);
+            let enabled_busy = is_busy("enabled", &entry.name);
+            let authenticate_busy = is_busy("authenticate", &entry.name);
+            let logout_busy = is_busy("logout", &entry.name);
             McpServerOption {
                 name: entry.name.into(),
-                command: entry.command.unwrap_or_default().into(),
+                command: command.into(),
                 status_line: status_line.into(),
                 transport: transport.into(),
                 url: url.into(),
@@ -1852,14 +2077,104 @@ pub fn to_mcp_server_option_rows(
                 needs_auth,
                 auth_status: auth.into(),
                 tools: ModelRc::new(VecModel::from(tools)),
+                tool_fetch_status: tool_fetch_status.into(),
+                tool_fetch_error: tool_fetch_error.into(),
+                tools_search_blob: tools_search_blob.into(),
                 // Every acpx `mcp_servers/list` row is a user-added registry
                 // entry -- removable. The one non-removable row (the built-in
                 // snapshotd daemon) is prepended separately, see
                 // [`builtin_snapshotd_option`].
                 removable: true,
+                remove_busy,
+                enabled_busy,
+                authenticate_busy,
+                logout_busy,
+                args: args.into(),
+                env: env.into(),
+                headers: headers.into(),
+                timeout: timeout.into(),
+                oauth_client_id: oauth_client_id.into(),
             }
         })
         .collect()
+}
+
+/// Formats a `HashMap<String, String>` (env vars or HTTP headers) as
+/// `key<sep>value` lines, one per entry, sorted by key for deterministic
+/// output (a `HashMap`'s iteration order is otherwise unspecified, which
+/// would make the form's textarea re-shuffle lines on every reload).
+fn format_kv_lines(map: &std::collections::HashMap<String, String>, sep: &str) -> String {
+    let mut pairs: Vec<(&String, &String)> = map.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}{sep}{v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parses `format_kv_lines`' inverse: one `key<sep>value` pair per
+/// non-empty line, splitting on the *first* `sep` only (so an HTTP
+/// header's value may itself contain `:` -- `Authorization: Bearer a:b`
+/// stays intact). Blank lines and lines with an empty key are silently
+/// skipped rather than erroring -- this is user-typed free text in a
+/// settings form, not a wire payload with a validation contract to
+/// enforce.
+fn parse_kv_lines(text: &str, sep: char) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (key, value) = line.split_once(sep)?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Builds a full typed [`crate::protocol_types::McpServerEntry`] from the
+/// add/edit form's submitted [`McpServerFormData`] -- the Rust-side
+/// counterpart to `mcp_servers_view.slint`'s `mcp-server-submit`
+/// callback. `args` is whitespace-split (`str::split_whitespace`, no
+/// shell-style quoting/escaping); `timeout` is parsed as whole seconds,
+/// `None` on empty/invalid input rather than erroring, since 0 is a
+/// meaningless timeout and the field is optional.
+pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_types::McpServerEntry {
+    use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
+
+    let timeout = data.timeout.trim().parse::<u64>().ok();
+    let config = if data.transport.as_str() == "http" {
+        let client_id = data.oauth_client_id.trim();
+        McpServerConfig::Http {
+            url: data.url.trim().to_string(),
+            headers: parse_kv_lines(&data.headers, ':'),
+            timeout,
+            oauth: if client_id.is_empty() {
+                None
+            } else {
+                Some(OAuthClientConfig {
+                    client_id: client_id.to_string(),
+                })
+            },
+        }
+    } else {
+        McpServerConfig::Stdio {
+            command: data.command.trim().to_string(),
+            args: data
+                .args
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            env: parse_kv_lines(&data.env, '='),
+            timeout,
+        }
+    };
+    McpServerEntry::new(data.name.trim(), config)
 }
 
 /// PUI-015: the built-in `snapflow` daemon MCP row for the Settings list,
@@ -1872,49 +2187,116 @@ pub fn to_mcp_server_option_rows(
 /// injection uses (`agent_bridge::snapshotd_mcp_addr`).
 pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption> {
     let addr = addr?;
+    // Live injection gate (Settings toggle) — not always-on once the
+    // user has disabled snapflow; still show the row so they can re-enable.
+    let enabled = crate::agent_bridge::snapflow_mcp_enabled();
+    let status = if enabled {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    let status_line = if enabled {
+        "built-in daemon · injected into sessions"
+    } else {
+        "built-in daemon · disabled (not in live sessions)"
+    };
     Some(McpServerOption {
         name: "snapflow".into(),
         command: String::new().into(),
-        status_line: "built-in daemon · always available".into(),
+        status_line: status_line.into(),
         transport: "http".into(),
         url: format!("http://{addr}/mcp").into(),
-        enabled: true,
-        status: "connected".into(),
+        enabled,
+        status: status.into(),
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
+        // The built-in daemon isn't a registry entry at all -- there's no
+        // `mcp_servers/tools_fetch` target for it, so it never has a
+        // fetch status to show.
+        tool_fetch_status: String::new().into(),
+        tool_fetch_error: String::new().into(),
+        tools_search_blob: String::new().into(),
         removable: false,
+        // Not a registry entry -- none of these actions have a target to
+        // dispatch against for this row, so never busy.
+        remove_busy: false,
+        enabled_busy: false,
+        authenticate_busy: false,
+        logout_busy: false,
+        args: String::new().into(),
+        env: String::new().into(),
+        headers: String::new().into(),
+        timeout: String::new().into(),
+        oauth_client_id: String::new().into(),
     })
 }
 
-/// Parse a persisted `tools` array from an MCP server registry entry.
-fn mcp_tools_from_extra(extra: &serde_json::Value) -> Vec<McpToolOption> {
-    let Some(arr) = extra.get("tools").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|tool| {
-            let name = tool.get("name")?.as_str()?.to_owned();
-            let enabled = tool
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let deferred = tool
-                .get("deferred")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let token_usage = tool
-                .get("token_usage")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            Some(McpToolOption {
-                name: name.into(),
+/// Reconciles a server's live-fetched tool catalog (`entry.tool_catalog`,
+/// populated by the real `mcp_servers/tools_fetch` background probe --
+/// see `crate::protocol_types::McpToolCatalog`'s doc comment) with its
+/// durable per-tool preferences (`entry.extra["tools"]`, written by
+/// `dispatch_mcp_server_tool_enabled_changed`/`dispatch_mcp_server_tool_
+/// deferred_changed`) into one row list for the settings UI.
+///
+/// A tool present in the live catalog with no persisted preference yet
+/// defaults to `enabled: true, deferred: false` (same default a freshly
+/// discovered ACP capability gets). A tool with a persisted preference
+/// but currently absent from the live catalog (never fetched yet, or the
+/// server just doesn't currently advertise it) still shows up, carrying
+/// its last-known preference -- toggling something once must never
+/// silently vanish just because a later fetch didn't happen to include
+/// it.
+fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<McpToolOption> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut preferences: HashMap<String, (bool, bool, i32)> = HashMap::new();
+    if let Some(arr) = entry.extra.get("tools").and_then(|v| v.as_array()) {
+        for tool in arr {
+            let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let enabled = tool.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let deferred = tool.get("deferred").and_then(|v| v.as_bool()).unwrap_or(false);
+            let token_usage = tool.get("token_usage").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            preferences.insert(name.to_string(), (enabled, deferred, token_usage));
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(crate::protocol_types::McpToolCatalog::Ready { tools }) = &entry.tool_catalog {
+        for tool in tools {
+            let (enabled, deferred, token_usage) =
+                preferences.get(&tool.name).copied().unwrap_or((true, false, 0));
+            seen.insert(tool.name.clone());
+            rows.push(McpToolOption {
+                name: tool.name.clone().into(),
+                description: tool.description.clone().unwrap_or_default().into(),
                 enabled,
                 deferred,
                 token_usage,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    let mut leftover: Vec<(String, (bool, bool, i32))> = preferences
+        .into_iter()
+        .filter(|(name, _)| !seen.contains(name))
+        .collect();
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, (enabled, deferred, token_usage)) in leftover {
+        rows.push(McpToolOption {
+            name: name.into(),
+            description: String::new().into(),
+            enabled,
+            deferred,
+            token_usage,
+        });
+    }
+
+    rows
 }
 
 /// Builds the skill-manager sidebar/settings row model from discovered
@@ -1934,6 +2316,7 @@ pub fn to_skill_option_rows(entries: Vec<SkillEntry>) -> Vec<SkillOption> {
             scope: entry.scope.as_str().into(),
             path: entry.path.to_string_lossy().into_owned().into(),
             started_from: entry.started_from.unwrap_or_default().into(),
+            is_dev_only: entry.is_dev_only,
         })
         .collect()
 }
@@ -2009,6 +2392,7 @@ pub fn to_agent_catalog_entry_rows(
                 id: id.clone().into(),
                 name: entry.name.into(),
                 version: entry.version.into(),
+                website: entry.website.into(),
                 status: entry.status.as_wire_str().into(),
                 enabled: entry.enabled,
                 loading: loading_ids.iter().any(|loading_id| loading_id == &id),
@@ -2107,6 +2491,7 @@ mod tests {
             id: id.to_owned(),
             name: id.to_owned(),
             version: String::new(),
+            website: String::new(),
             status,
             enabled: true,
         }
@@ -2222,19 +2607,409 @@ mod tests {
             row.url.contains(addr),
             "must name the same address the session injection uses"
         );
+        // Enabled state tracks the live injection gate (default true).
+        assert_eq!(
+            row.enabled,
+            crate::agent_bridge::snapflow_mcp_enabled(),
+            "built-in row.enabled must mirror injection gate"
+        );
     }
 
     // Registry-derived rows stay removable (only the built-in daemon is not).
     #[test]
     fn registry_mcp_rows_are_removable() {
-        let entry = crate::protocol_types::McpServerEntry {
-            name: "my-server".to_string(),
-            command: Some("do-thing".to_string()),
-            extra: serde_json::json!({}),
-        };
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "my-server",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "do-thing".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].removable, "user-added registry rows are removable");
+    }
+
+    #[test]
+    fn stdio_option_row_surfaces_args_and_env_as_formatted_lines() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec!["--root".to_string(), "/tmp".to_string()],
+                env: std::collections::HashMap::from([
+                    ("B_KEY".to_string(), "2".to_string()),
+                    ("A_KEY".to_string(), "1".to_string()),
+                ]),
+                timeout: Some(30),
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].args.as_str(), "--root /tmp");
+        // Sorted by key for deterministic output, not HashMap iteration order.
+        assert_eq!(rows[0].env.as_str(), "A_KEY=1\nB_KEY=2");
+        assert_eq!(rows[0].timeout.as_str(), "30");
+        assert_eq!(rows[0].headers.as_str(), "");
+        assert_eq!(rows[0].oauth_client_id.as_str(), "");
+    }
+
+    #[test]
+    fn http_option_row_surfaces_headers_and_oauth_client_id() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "remote",
+            crate::protocol_types::McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer abc".to_string(),
+                )]),
+                timeout: None,
+                oauth: Some(crate::protocol_types::OAuthClientConfig {
+                    client_id: "client-123".to_string(),
+                }),
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].headers.as_str(), "Authorization: Bearer abc");
+        assert_eq!(rows[0].oauth_client_id.as_str(), "client-123");
+        assert_eq!(rows[0].args.as_str(), "");
+        assert_eq!(rows[0].env.as_str(), "");
+        assert_eq!(rows[0].timeout.as_str(), "");
+    }
+
+    /// A tool present in a real `Ready` live catalog with no persisted
+    /// preference yet must still show up, defaulting to enabled/not
+    /// deferred.
+    #[test]
+    fn tool_row_defaults_to_enabled_when_only_seen_in_the_live_catalog() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![crate::protocol_types::McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        let tools: Vec<_> = rows[0].tools.iter().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_str(), "read_file");
+        assert!(tools[0].enabled);
+        assert!(!tools[0].deferred);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "ready");
+        assert_eq!(rows[0].tool_fetch_error.as_str(), "");
+    }
+
+    /// A tool's persisted preference (set by a previous enabled/deferred
+    /// toggle) must override the live catalog's bare-discovery default,
+    /// and must survive even when the live catalog temporarily doesn't
+    /// include that tool (e.g. before the first fetch, or a fetch that
+    /// failed).
+    #[test]
+    fn persisted_tool_preference_overrides_live_default_and_survives_a_missing_catalog_entry() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                {"name": "read_file", "enabled": false, "deferred": true, "token_usage": 42},
+                {"name": "vanished_tool", "enabled": true, "deferred": false},
+            ]),
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![crate::protocol_types::McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        let tools: Vec<_> = rows[0].tools.iter().collect();
+        assert_eq!(tools.len(), 2);
+        let read_file = tools.iter().find(|t| t.name == "read_file").expect("read_file row");
+        assert!(!read_file.enabled, "persisted preference must override the live default");
+        assert!(read_file.deferred);
+        assert_eq!(read_file.token_usage, 42);
+        let vanished = tools
+            .iter()
+            .find(|t| t.name == "vanished_tool")
+            .expect("a tool absent from the live catalog must still show its last preference");
+        assert!(vanished.enabled);
+        assert!(!vanished.deferred);
+    }
+
+    /// `tool_fetch_status`/`tool_fetch_error` reflect a failed background
+    /// probe -- distinct from "never fetched" (empty string).
+    #[test]
+    fn tool_fetch_error_state_surfaces_the_real_message() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Error {
+            message: "process exited before responding".to_string(),
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "error");
+        assert_eq!(rows[0].tool_fetch_error.as_str(), "process exited before responding");
+    }
+
+    /// Never-fetched entries (no `tool_catalog` at all) must not be
+    /// confused with a `Fetching` state -- both differ from "ready"/
+    /// "error", but only one means "nothing has ever been requested".
+    #[test]
+    fn never_fetched_entry_has_empty_fetch_status() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "");
+        assert!(rows[0].tools.iter().next().is_none());
+    }
+
+    /// In-flight `tools_fetch:<name>` must surface as fetching even when
+    /// the catalog has not yet stamped `toolCatalog` (optimistic UI path).
+    #[test]
+    fn busy_tools_fetch_key_marks_row_fetching() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows =
+            to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "fetching");
+    }
+
+    /// Enable toggle drives StatusDot via derived connection status when
+    /// the gateway does not supply `extra["status"]`.
+    #[test]
+    fn disabled_server_status_is_disconnected() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.enabled = false;
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].status.as_str(), "disconnected");
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn enabled_server_status_is_connected() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.enabled = true;
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].status.as_str(), "connected");
+        assert!(rows[0].enabled);
+    }
+
+    /// `tools_search_blob` is what the Settings page search bar matches
+    /// against (see `mcp_servers_view.slint`'s widened predicate) --
+    /// verify it actually joins every real discovered tool's name and
+    /// description, and skips empty descriptions rather than leaving a
+    /// stray blank line that would still (harmlessly, but confusingly)
+    /// match an empty query.
+    #[test]
+    fn tools_search_blob_joins_real_tool_names_and_descriptions() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![
+                crate::protocol_types::McpToolInfo {
+                    name: "read_file".to_string(),
+                    description: Some("Reads a file from disk".to_string()),
+                },
+                crate::protocol_types::McpToolInfo {
+                    name: "ping".to_string(),
+                    description: None,
+                },
+            ],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(
+            rows[0].tools_search_blob.as_str(),
+            "read_file\nReads a file from disk\nping"
+        );
+    }
+
+    #[test]
+    fn tools_search_blob_is_empty_when_no_tools_have_ever_been_fetched() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].tools_search_blob.as_str(), "");
+    }
+
+    #[test]
+    fn parse_kv_lines_splits_on_first_separator_and_skips_malformed_lines() {
+        let parsed = parse_kv_lines(
+            "A=1\n\nB=2\nNO_SEPARATOR_HERE\n=empty-key\nC=has=equals=too",
+            '=',
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.get("A").map(String::as_str), Some("1"));
+        assert_eq!(parsed.get("B").map(String::as_str), Some("2"));
+        // Splits on the FIRST '=' only -- the value keeps any further '='s.
+        assert_eq!(parsed.get("C").map(String::as_str), Some("has=equals=too"));
+    }
+
+    #[test]
+    fn parse_kv_lines_keeps_colons_inside_a_header_value() {
+        let parsed = parse_kv_lines("Authorization: Bearer a:b:c", ':');
+        assert_eq!(
+            parsed.get("Authorization").map(String::as_str),
+            Some("Bearer a:b:c")
+        );
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_builds_a_stdio_entry() {
+        let form = McpServerFormData {
+            name: "fs".into(),
+            transport: "stdio".into(),
+            command: "mcp-fs".into(),
+            args: "--root /tmp  --verbose".into(),
+            env: "TOKEN=abc\nDEBUG=1".into(),
+            url: "".into(),
+            headers: "".into(),
+            timeout: "30".into(),
+            oauth_client_id: "".into(),
+            is_edit: false,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        assert_eq!(entry.name, "fs");
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Stdio {
+                command,
+                args,
+                env,
+                timeout,
+            } => {
+                assert_eq!(command, "mcp-fs");
+                assert_eq!(args, vec!["--root", "/tmp", "--verbose"]);
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("abc"));
+                assert_eq!(timeout, Some(30));
+            }
+            other => panic!("expected Stdio config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_builds_an_http_entry_with_oauth() {
+        let form = McpServerFormData {
+            name: "remote".into(),
+            transport: "http".into(),
+            command: "".into(),
+            args: "".into(),
+            env: "".into(),
+            url: "https://example.com/mcp".into(),
+            headers: "Authorization: Bearer xyz".into(),
+            timeout: "".into(),
+            oauth_client_id: "client-abc".into(),
+            is_edit: true,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Http {
+                url,
+                headers,
+                timeout,
+                oauth,
+            } => {
+                assert_eq!(url, "https://example.com/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer xyz")
+                );
+                assert_eq!(timeout, None, "blank timeout must parse to None, not 0");
+                assert_eq!(
+                    oauth.map(|o| o.client_id),
+                    Some("client-abc".to_string())
+                );
+            }
+            other => panic!("expected Http config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_treats_blank_oauth_client_id_as_no_oauth() {
+        let form = McpServerFormData {
+            name: "remote".into(),
+            transport: "http".into(),
+            command: "".into(),
+            args: "".into(),
+            env: "".into(),
+            url: "https://example.com/mcp".into(),
+            headers: "".into(),
+            timeout: "".into(),
+            oauth_client_id: "   ".into(),
+            is_edit: false,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Http { oauth, .. } => {
+                assert!(oauth.is_none());
+            }
+            other => panic!("expected Http config, got {other:?}"),
+        }
     }
 
     const NAMES: &[&str] = &[
@@ -2584,17 +3359,28 @@ mod tests {
 
     #[test]
     fn to_mcp_server_options_extracts_name_and_command_falling_back_to_empty() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
         let servers = vec![
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "central-fs", "command": "mcp-central-fs"
-            }))
-            .unwrap(),
-            // No "command" field at all -- still a valid MCP server
-            // entry (e.g. URL-based), must not panic or drop the row.
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "url-only"
-            }))
-            .unwrap(),
+            McpServerEntry::new(
+                "central-fs",
+                McpServerConfig::Stdio {
+                    command: "mcp-central-fs".to_string(),
+                    args: vec![],
+                    env: Default::default(),
+                    timeout: None,
+                },
+            ),
+            // A URL-based (http transport) server -- must not panic or
+            // drop the row, and must fall back to an empty `command`.
+            McpServerEntry::new(
+                "url-only",
+                McpServerConfig::Http {
+                    url: "https://example.com/mcp".to_string(),
+                    headers: Default::default(),
+                    timeout: None,
+                    oauth: None,
+                },
+            ),
         ];
         let model = to_mcp_server_options(servers);
         assert_eq!(model.row_count(), 2);
@@ -2608,20 +3394,27 @@ mod tests {
 
     #[test]
     fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
         use slint::Model;
-        let servers = vec![
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "remote-tools",
-                "url": "https://example.com/mcp",
-                "type": "remote",
-                "auth_status": "not authenticated",
-                "tools": [
-                    { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
-                    { "name": "write", "enabled": false, "deferred": true }
-                ]
-            }))
-            .unwrap(),
-        ];
+        let mut entry = McpServerEntry::new(
+            "remote-tools",
+            McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: Some(OAuthClientConfig {
+                    client_id: "client-123".to_string(),
+                }),
+            },
+        );
+        entry.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
+                { "name": "write", "enabled": false, "deferred": true }
+            ]),
+        );
+        let servers = vec![entry];
         let model = to_mcp_server_options(servers);
         let row = model.row_data(0).unwrap();
         assert_eq!(row.transport.as_str(), "http");
@@ -2993,6 +3786,165 @@ mod transcript_model_tests {
     }
 
     #[test]
+    fn build_markdown_block_data_incremental_reuses_matching_blocks_and_rebuilds_only_new_ones() {
+        // The core claim of the streaming-freeze fix: growing `text` by
+        // appending a new block must reuse the *unchanged* earlier
+        // blocks' already-built data rather than re-parsing/re-styling
+        // them from scratch on every call.
+        let first_text = "First paragraph.\n\nSecond paragraph.";
+        let first = build_markdown_block_data_incremental(first_text, false, &[]);
+        assert_eq!(first.len(), 2);
+
+        let grown_text = format!("{first_text}\n\nThird paragraph.");
+        let grown = build_markdown_block_data_incremental(&grown_text, false, &first);
+        assert_eq!(grown.len(), 3);
+        assert_eq!(grown[0].0, first[0].0, "unchanged block keeps the same source hash");
+        assert_eq!(grown[1].0, first[1].0, "unchanged block keeps the same source hash");
+
+        // Prove the *data itself* -- not just the hash -- was reused
+        // rather than recomputed: tamper with the cached entry's content
+        // in a way that a real rebuild would never independently
+        // reproduce, and confirm the tampered value survives into the
+        // diffed output for the unchanged block, but NOT for the
+        // genuinely new third block (which has no matching prior entry
+        // and so must actually be rebuilt).
+        let mut tampered = first.clone();
+        tampered[0].1.kind = "tampered-marker";
+        let diffed = build_markdown_block_data_incremental(&grown_text, false, &tampered);
+        assert_eq!(
+            diffed[0].1.kind, "tampered-marker",
+            "an unchanged block's data must come from the cache, not a fresh rebuild"
+        );
+        assert_ne!(
+            diffed[2].1.kind, "tampered-marker",
+            "a genuinely new block must be rebuilt, never mistaken for cached data"
+        );
+    }
+
+    #[test]
+    fn build_markdown_block_data_incremental_rebuilds_a_block_whose_content_actually_changed() {
+        // A prior entry at the same index with a *different* hash (the
+        // tail block growing mid-stream) must not be reused -- safety
+        // property of the diff: hash mismatch always means rebuild.
+        let step1 = build_markdown_block_data_incremental("Hel", false, &[]);
+        let step2 = build_markdown_block_data_incremental("Hello world", false, &step1);
+        assert_ne!(step1[0].0, step2[0].0, "growing text changes the block's source hash");
+        // Rebuilt data reflects the new, longer text, not the stale
+        // cached entry -- `StyledText` derives `PartialEq`, so comparing
+        // against a fresh direct build (bypassing the incremental path
+        // entirely) confirms step2 is a real rebuild, not a stale reuse.
+        let direct = build_markdown_block_data("Hello world", false);
+        assert_eq!(step2[0].1.text, direct[0].text);
+        assert_ne!(step2[0].1.text, step1[0].1.text);
+    }
+
+    #[test]
+    fn markdown_blocks_for_reuses_earlier_blocks_across_a_growing_streamed_message() {
+        // End-to-end through the actual production call path
+        // (`markdown_blocks_for`, `is_streaming_tail: false` -- matches
+        // `to_message_rows_from_transcript`'s real call site): as an
+        // agent message's accumulated text grows tick over tick, earlier
+        // blocks' cached entries must carry over unchanged instead of
+        // being rebuilt on every tick.
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let step1 = "First paragraph.\n\nSecond paragraph.";
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", step1, false);
+        let cache_after_step1 = render_index.block_cache_for("k");
+        assert_eq!(cache_after_step1.len(), 2);
+
+        let step2 = format!("{step1}\n\nThird paragraph.");
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", &step2, false);
+        let cache_after_step2 = render_index.block_cache_for("k");
+        assert_eq!(cache_after_step2.len(), 3);
+        assert_eq!(
+            cache_after_step2[0].0, cache_after_step1[0].0,
+            "first block's hash must be unchanged across the append"
+        );
+        assert_eq!(
+            cache_after_step2[1].0, cache_after_step1[1].0,
+            "second block's hash must be unchanged across the append"
+        );
+    }
+
+    #[test]
+    fn markdown_blocks_for_frees_the_per_block_cache_once_a_message_settles() {
+        // Memory-bound check for the block-level cache added by the
+        // live-streaming-freeze fix: `block_cache` exists only to help a
+        // message that's still actively changing tick over tick. Once a
+        // message stops changing (settles -- the normal end state for
+        // every historical message in a thread, not just the one
+        // currently streaming), it must not sit around forever as a
+        // second, `ModelRc`-free duplicate of what `rendered_blocks`
+        // already holds -- that would make a long thread's memory
+        // footprint scale with total historical message count instead of
+        // just however many messages are actually still streaming.
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let text = "First paragraph.\n\nSecond paragraph.";
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert!(
+            !render_index.block_cache_is_empty("k"),
+            "block cache is populated immediately after a real (first) build"
+        );
+
+        // Next tick: identical text (the message has stopped changing --
+        // matches a real turn-ended/settled message being re-projected on
+        // every subsequent idle poll tick).
+        let cached = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(cached.row_count(), 2, "still returns the correct rendered rows");
+        assert!(
+            render_index.block_cache_is_empty("k"),
+            "settling (a whole-message cache hit) must free the now-redundant per-block cache"
+        );
+
+        // A further idle tick with the same settled text must keep
+        // returning the correct content without ever re-populating
+        // block_cache (there's nothing left to diff against, and nothing
+        // in this message is changing) -- proves the free above isn't
+        // itself a one-tick fluke that silently rebuilds again right
+        // after.
+        let cached_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(cached_again.row_count(), 2);
+        assert!(render_index.block_cache_is_empty("k"));
+    }
+
+    #[test]
+    fn markdown_blocks_for_settled_message_does_no_block_level_work_on_repeat_ticks() {
+        // Companion to the memory-bound test above, from the CPU side:
+        // once settled, repeat calls with unchanged text must take the
+        // whole-message cache-hit fast path and never touch
+        // segment_blocks/StyledText::from_markdown again -- verified
+        // indirectly by asserting the returned ModelRc is the exact same
+        // Rc-backed instance every time (a fresh rebuild would allocate a
+        // brand new VecModel each call; `ModelRc`'s `PartialEq` in this
+        // crate's Slint version is pointer identity, matching the
+        // pre-existing `record_with_matching_hash_does_not_wipe_an_
+        // already_rendered_payload` regression test's own reasoning).
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let text = "Some **markdown** paragraph.";
+        let first = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let second = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let third = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(first, second, "settled repeat calls return the identical cached ModelRc");
+        assert_eq!(second, third, "settled repeat calls return the identical cached ModelRc");
+    }
+
+    #[test]
+    fn build_markdown_block_data_incremental_pays_no_more_hashing_than_segment_blocks_already_needs() {
+        // Cold-start / never-before-seen-message sanity check: with an
+        // empty `prev` cache (exactly the state for a message the thread
+        // is rendering for the very first time, e.g. cold hydration of a
+        // long thread history), the incremental path must produce
+        // byte-identical output to the plain, non-incremental builder --
+        // this fix must not change what cold-start renders, only what
+        // gets skipped on a *repeat* call for the same key.
+        let text = "# Heading\n\nA paragraph with `code` and **bold**.\n\n```\nfn main() {}\n```";
+        let direct = build_markdown_block_data(text, false);
+        let incremental: Vec<MarkdownBlockData> =
+            build_markdown_block_data_incremental(text, false, &[]).into_iter().map(|(_, d)| d).collect();
+        assert_eq!(direct, incremental, "cold start (empty prev cache) must match the non-incremental builder exactly");
+    }
+
+    #[test]
     fn current_config_trigger_label_prefers_option_display_name() {
         let options = vec![ConfigOptionInfo {
             id: "model".into(),
@@ -3200,6 +4152,7 @@ mod transcript_model_tests {
                 id: id.to_owned(),
                 name: id.to_owned(),
                 version: String::new(),
+                website: String::new(),
                 status,
                 enabled: true,
             }

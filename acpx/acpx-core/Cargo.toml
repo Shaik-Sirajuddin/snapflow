@@ -36,6 +36,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # swap in a real OS-keychain/KMS provider later without changing callers).
 aes-gcm = "0.10"
 rand = "0.8"
+# MCP OAuth 2.1 (`src/oauth.rs`): PKCE's S256 code_challenge is a SHA-256
+# digest of the code_verifier -- no other crate here already exposes a
+# general-purpose hash, so this is the one new OAuth-specific dependency.
+sha2 = "0.11"
 
 [dev-dependencies]
 tokio = { workspace = true }

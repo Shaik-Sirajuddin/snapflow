@@ -47,7 +47,33 @@ export component SettingsRow inherits Rectangle {
         padding-left: Metrics.space-4;
         padding-right: Metrics.space-4;
         spacing: Metrics.space-4;
-        alignment: center;
+        // Row-items-should-be-left-aligned fix: an explicit `alignment`
+        // (any value other than the layout default `stretch`) makes
+        // Slint size every child to its own preferred width and lay the
+        // whole set out as a group per that alignment -- it does NOT
+        // merely pick where leftover space goes, it also suppresses each
+        // child's own `horizontal-stretch` from filling that space. With
+        // `center` here, the label `VerticalLayout` below (which sets
+        // `horizontal-stretch: 1` expecting to fill the row) instead
+        // collapsed to its text's natural width, so the whole label+
+        // control group rendered as a compact island floating in the
+        // middle of the row instead of the label starting at the row's
+        // left edge and the control(s) trailing at its right (confirmed
+        // live via slint-viewer: Harness's "Background sessions" row had
+        // a large empty left margin before the label text started).
+        // `stretch` (Slint's own layout default -- explicit here per
+        // `markdown_view.slint`'s own doc comment on why this codebase
+        // states it explicitly rather than relying on the implicit
+        // default) restores the label `VerticalLayout`'s
+        // `horizontal-stretch: 1` actually filling the row's leftover
+        // width, so the label starts at the row's left edge and the
+        // trailing control(s) dock at its right edge -- `start` alone
+        // was tried first and confirmed (via slint-viewer) to still
+        // suppress per-child stretch, just anchoring the now-compact
+        // label+control island to the left instead of centering it,
+        // which collapsed the gap between label and control instead of
+        // spanning the full row.
+        alignment: stretch;
         cross-axis-alignment: center;
 
         VerticalLayout {

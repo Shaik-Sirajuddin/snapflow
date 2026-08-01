@@ -124,8 +124,17 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             apply_thread_message_row_patch(model, thread_id, *index);
         }
         Dirty::Connection { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_connection_status(thread.connection_status.clone().into());
+            // Bug fix (same class as Dirty::PendingRequest, e30b6d2c): this
+            // used `thread_for_id` (any thread by id), so a *background*
+            // thread's connection-status change clobbered the singleton
+            // `connection_status` Slint property even though it's only
+            // ever read as "the displayed thread's connection status".
+            // Gate on `displayed_thread_for_id` like the other per-thread
+            // singleton-property syncs in this file.
+            if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_connection_status(thread.connection_status.clone().into());
+                }
             }
         }
         Dirty::Toast => {
@@ -159,10 +168,31 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::PendingRequest { thread_id } => {
             // Empty id = transition clear on thread switch (leak_audit §2.3).
+            //
+            // Bug fix: this used `thread_for_id` (any thread by id), so a
+            // *background* thread's pending-request change -- e.g. its
+            // request resolving while a different thread is displayed --
+            // clobbered the singleton `pending_request` Slint property even
+            // though that property is only ever read as "the displayed
+            // thread's pending request" (see `shown-pending`/`status-
+            // needs-attention` in chat_area.slint). Concretely: viewing
+            // thread A with a live approval card up, thread B (background)
+            // resolves its own unrelated request, and this handler fired
+            // for B's `thread_id`, finding no match against A only by
+            // accident of iteration order -- or worse, matching and
+            // overwriting A's real pending state with B's (now-cleared)
+            // one, silently dropping A's approval indicator. Gate on
+            // `displayed_thread_for_id` like every other per-thread
+            // singleton-property sync in this file (see
+            // `sync_has_older_messages`, `Dirty::Error`'s `for_displayed`)
+            // so only the currently-displayed thread's pending request can
+            // ever reach the component.
             if thread_id.is_empty() {
                 component.set_pending_request(crate::PendingRequestItem::default());
-            } else if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_pending_request(thread.pending_request.clone());
+            } else if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_pending_request(thread.pending_request.clone());
+                }
             }
         }
         Dirty::Terminal { .. } => {
@@ -219,6 +249,8 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_default(model.background_default);
             component.set_default_agent_id(model.default_agent_id.clone().into());
             component.set_dev_mode(model.dev_mode);
+            component.set_show_global_skills(model.show_global_skills);
+            component.set_profile_wiring_enabled(model.profile_wiring_enabled);
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);
@@ -249,7 +281,23 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::SkillEditor => sync_skill_editor_state(model, component),
         Dirty::Capabilities { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
+            // Bug fix (same class as Dirty::PendingRequest, e30b6d2c): this
+            // used `thread_for_id` (any thread by id), so a *background*
+            // thread's capability change (mode/reasoning/fast-mode options,
+            // profile/model dropdowns, plan entries, live session title,
+            // context-usage ring) clobbered these singleton `ChatPanel`
+            // properties even though every one of them is only ever read
+            // as "the displayed thread's" value -- e.g. viewing thread A,
+            // background thread B's config_options resolve or its plan
+            // updates, and this handler fired for B's `thread_id` and
+            // overwrote A's on-screen mode label / plan list / context
+            // ring / session title with B's state. Gate on
+            // `displayed_thread_for_id` like the other per-thread
+            // singleton-property syncs in this file.
+            if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                let Some(thread) = model.threads.get(idx) else {
+                    return;
+                };
                 component.set_mode_trigger_label(
                     crate::models::current_mode_name(&thread.session_modes).into(),
                 );
@@ -1237,6 +1285,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     }
     mcp_rows.extend(crate::models::to_mcp_server_option_rows(
         model.available_mcp_servers.clone(),
+        &model.mcp_operations_in_flight,
     ));
     mcp_keys.extend(
         model
@@ -1250,16 +1299,38 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         &mcp_keys,
         &mcp_rows,
     );
+    // Total real tools discovered across every server's reconciled list
+    // (`mcp_tools_from_entry` already merges live-fetched + persisted
+    // rows) -- shown as a summary next to the "MCP Servers" section
+    // header, computed here rather than in Slint since it has no
+    // array-sum/reduce.
+    let mcp_tools_total_count: i32 =
+        mcp_rows.iter().map(|row| row.tools.row_count() as i32).sum();
 
-    let agent_rows = crate::models::to_agent_catalog_entry_rows(
-        model.agent_catalog.clone(),
-        &model.agent_operations_in_flight,
-    );
-    let agent_keys: Vec<String> = model
+    // Settings > Project is an installed-agent view. Filter the UI model at
+    // reconciliation time so hidden catalog entries do not consume grid
+    // rows or leave an incorrect non-empty state. Keep model.agent_catalog
+    // untouched: the complete gateway catalog is still needed by profile
+    // resolution and Global settings. Re-running this on every Settings
+    // snapshot also picks up install/uninstall/status changes immediately.
+    let visible_agents: Vec<_> = model
         .agent_catalog
         .iter()
-        .map(|agent| agent.id.clone())
+        .filter(|agent| {
+            model.settings_scope != "project"
+                || matches!(
+                    &agent.status,
+                    crate::protocol_types::AgentStatus::Installed
+                        | crate::protocol_types::AgentStatus::InstalledNoSession
+                )
+        })
+        .cloned()
         .collect();
+    let agent_rows = crate::models::to_agent_catalog_entry_rows(
+        visible_agents.clone(),
+        &model.agent_operations_in_flight,
+    );
+    let agent_keys: Vec<String> = visible_agents.iter().map(|agent| agent.id.clone()).collect();
     crate::list_model::reconcile(
         &model.agent_catalog_model,
         &mut model.agent_catalog_model_keys.borrow_mut(),
@@ -1285,6 +1356,16 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
 
     component.set_available_profiles(slint::ModelRc::from(model.profiles_model.clone()));
     component.set_available_mcp_servers(slint::ModelRc::from(model.mcp_servers_model.clone()));
+    component.set_mcp_tools_total_count(mcp_tools_total_count);
+    // Only one add/edit form can be open at a time, so "any create/update
+    // in flight" is an accurate proxy for "the visible form's own submit
+    // is in flight" without needing to match a specific server name (see
+    // `McpServersView.submit-busy`'s own doc comment).
+    let mcp_server_submit_busy = model
+        .mcp_operations_in_flight
+        .iter()
+        .any(|key| key.starts_with("create:") || key.starts_with("update:"));
+    component.set_mcp_server_submit_busy(mcp_server_submit_busy);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),
@@ -2316,6 +2397,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/some-local-skill"),
                 scope: crate::skills_state::SkillScope::Global,
                 started_from: None,
+                is_dev_only: false,
             },
             crate::skills_state::SkillEntry {
                 name: "another-skill".to_owned(),
@@ -2323,6 +2405,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/another-skill"),
                 scope: crate::skills_state::SkillScope::Project,
                 started_from: None,
+                is_dev_only: false,
             },
         ];
         let thread = crate::model::ThreadModel {
@@ -2353,6 +2436,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/some-local-skill"),
             scope: crate::skills_state::SkillScope::Global,
             started_from: None,
+            is_dev_only: false,
         }];
         let thread = crate::model::ThreadModel {
             available_commands: vec![crate::protocol_types::AvailableCommandInfo {

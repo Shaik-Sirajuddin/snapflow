@@ -123,6 +123,20 @@ pub struct SessionEntry {
     /// it, whereas `pinned` exempts a session from idle reaping
     /// entirely regardless of any TTL.
     pub custom_idle_ttl: Option<std::time::Duration>,
+    /// Whether this session currently occupies a slot in the gateway's
+    /// live-session admission counters (`AdmissionState` in `router.rs`).
+    ///
+    /// **Capacity semantics (live fix):** admission exists to bound *live*
+    /// work (a real `session/new`, recovery of a real gateway session, or
+    /// the first in-flight turn against a session), **not** passive
+    /// catalog imports. `session/list` bulk-registration of backend
+    /// history sets this to `false` so an empty discovery burst cannot
+    /// saturate `max_sessions_per_tenant` before the user opens a single
+    /// new thread. The first real turn (`set_in_flight` 0→N / proxied
+    /// prompt path) promotes the session and flips this to `true`.
+    /// Default `true` preserves pre-existing behavior for every path that
+    /// already called `admit_session` before registering.
+    pub capacity_counted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -190,9 +204,23 @@ impl SessionRegistry {
                 in_flight_since: None,
                 pinned: false,
                 custom_idle_ttl: None,
+                // Callers that register without a prior admit_session
+                // (session/list discovery) must flip this to false
+                // explicitly -- see `capacity_counted`'s doc comment.
+                capacity_counted: true,
             },
         );
         gateway_id
+    }
+
+    /// Mutable resolve -- used when promoting a discovery-only session to
+    /// capacity-counted on first real turn.
+    pub fn resolve_mut(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_id: &GatewaySessionId,
+    ) -> Option<&mut SessionEntry> {
+        self.sessions.get_mut(tenant_id)?.get_mut(&gateway_id.0)
     }
 
     pub fn resolve(

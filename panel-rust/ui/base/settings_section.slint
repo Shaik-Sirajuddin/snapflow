@@ -71,6 +71,14 @@ export component SettingsRowGroup inherits VerticalLayout {
 // tighter caption-to-Select gap, which stays as-is by design).
 export component SettingsField inherits VerticalLayout {
     in property <string> label;
+    // Real inline validation/submit-error text shown below the child
+    // control -- "" (default) renders nothing extra, matching this
+    // component's previous byte-for-byte behavior for every call site
+    // that doesn't set it. Same error red (#ef4444) `mcp_servers_view.
+    // slint`'s tool-fetch-error text and `app.slint`'s shared toast
+    // border already use; no dedicated `Theme.text-danger` token exists
+    // yet.
+    in property <string> error: "";
     spacing: Metrics.gap-sm;
     alignment: start;
     cross-axis-alignment: start;
@@ -81,6 +89,12 @@ export component SettingsField inherits VerticalLayout {
         font-size: 11px * Theme.font-scale;
     }
     @children
+    if root.error != "" : Text {
+        text: root.error;
+        color: #ef4444;
+        font-size: 10px * Theme.font-scale;
+        wrap: word-wrap;
+    }
 }
 
 // A 1px section rule. One place for the height + color so every view's

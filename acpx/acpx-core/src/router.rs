@@ -166,9 +166,17 @@ pub fn classify(method: &str) -> MethodClass {
         "profiles/create" | "profiles/list" | "profiles/update" | "profiles/delete" => {
             MethodClass::GatewayNative
         }
-        "mcp_servers/create" | "mcp_servers/list" | "mcp_servers/update" | "mcp_servers/delete" => {
-            MethodClass::GatewayNative
-        }
+        "mcp_servers/create"
+        | "mcp_servers/list"
+        | "mcp_servers/update"
+        | "mcp_servers/delete"
+        | "mcp_servers/authenticate"
+        | "mcp_servers/logout"
+        // Real `tools/list` preview for the Settings UI (see `crate::
+        // mcp_client`'s module doc comment). Fire-and-forget kickoff --
+        // never touches a backend process, so this is gateway-native like
+        // every other `mcp_servers/*` method, not `Proxied`.
+        | "mcp_servers/tools_fetch" => MethodClass::GatewayNative,
         // `retention_administration` (`acpx-session-lifecycle`). Not a
         // real ACP method -- an acpx-only extension namespace, same
         // category as `profiles/*`/`mcp_servers/*` above. Tenant-scoped
@@ -300,6 +308,19 @@ pub struct Router {
     /// every call. No TTL/invalidation yet; a later phase can add one if
     /// the registry needs to be re-polled for changes mid-run.
     registry_cache: Option<acpx_registry::Registry>,
+    /// Set when `registry_cache` holds the bundled offline snapshot rather
+    /// than a live fetch. The snapshot carries three agents; the live
+    /// registry carries ~38, so caching a fallback permanently (which is
+    /// what a plain `is_none()` guard did) made one unlucky cold start
+    /// hide every other agent -- `grok-build` included -- from
+    /// `agents/list` for the rest of the process. While this is set,
+    /// `ensure_registry_loaded` retries the live fetch, rate-limited by
+    /// `registry_retry_not_before`.
+    registry_cache_is_fallback: bool,
+    /// Earliest instant `ensure_registry_loaded` may re-attempt a live
+    /// fetch while serving the fallback, so a persistently offline host
+    /// doesn't pay the network timeout on every `agents/list`.
+    registry_retry_not_before: Option<std::time::Instant>,
     /// Cached results from disposable backend capability probes. Unlike the
     /// registry cache this stores adapter-runtime data (`configOptions`,
     /// permission modes, and auth methods), not launch metadata.
@@ -351,6 +372,23 @@ pub struct Router {
     /// client entries always win on collision, see
     /// `crate::mcp_servers::merge_mcp_servers`.
     mcp_servers: McpServerStore,
+    /// In-memory MCP OAuth 2.1 access/refresh tokens (`crate::oauth`),
+    /// keyed by MCP server name -- consulted by `inject_oauth_headers` at
+    /// `session/new` to attach a live `Authorization: Bearer <token>`
+    /// header to an HTTP-transport server's entry without ever writing
+    /// the raw token into `mcp_servers`' plaintext-JSON config row.
+    /// Cheaply `Clone` (an `Arc` internally) for the same reason
+    /// `McpServerStore` is -- `authenticate_mcp_server`'s completion runs
+    /// in a detached background task, well past the original RPC call's
+    /// `&mut Router` borrow.
+    oauth_tokens: crate::oauth::OAuthTokenCache,
+    /// Real `tools/list` preview data for the Settings UI (`crate::
+    /// mcp_client`). Populated by a detached background probe kicked off
+    /// by `mcp_servers/tools_fetch` (see `Self::spawn_mcp_tools_fetch`),
+    /// never inline in a request's own critical section -- same
+    /// off-lock-I/O rationale as `oauth_tokens`/`spawn_oauth_refresh_loop`.
+    /// Merged into each entry's `tools` field by `mcp_servers/list`.
+    mcp_tool_catalog: crate::mcp_client::McpToolCatalogCache,
     /// **Phase 14 addition.** Live `session/update` fan-out to whichever
     /// persistent transport connection (stdio/WS) currently owns a given
     /// gateway session -- see `crate::notify`'s module doc comment for
@@ -771,6 +809,13 @@ pub enum RouterError {
     Keystore(#[from] crate::keystore::KeystoreError),
     #[error("session/new: no profile named {0}")]
     UnknownProfile(String),
+    /// Malformed `session/resume` / `session/load` params that failed
+    /// typed validation (e.g. a `mcpServers` entry that is not a valid
+    /// ACP `McpServer`). Surfaces as a real error rather than silently
+    /// merging an empty list -- see
+    /// [`Router::merge_mcp_into_session_establish_params`].
+    #[error("invalid session establish params: {0}")]
+    InvalidSessionEstablishParams(String),
     #[error("session/new cannot select both _acpx.profile and _acpx.agentId")]
     ConflictingSessionSelection,
     #[error("profile {profile} references unknown provider {provider}")]
@@ -779,6 +824,8 @@ pub enum RouterError {
     NoLaunchableDistribution { profile: String, agent_id: String },
     #[error("backend requires authentication before session/new (advertised authMethods: {0}); configure Profile::auth_method_id to pick one")]
     BackendRequiresAuthentication(serde_json::Value),
+    #[error("backend rejected initialize: {0}")]
+    BackendInitializationError(serde_json::Value),
     #[error("backend rejected authenticate: {0}")]
     BackendAuthenticationError(serde_json::Value),
     #[error("authenticate: acpx's own initialize response advertises no authMethods (requested methodId: {0:?}); no transport-level bearer-token/session auth is bypassed by this -- see acpx-server's own HTTP/WS auth")]
@@ -822,6 +869,10 @@ pub enum RouterError {
     RotationRequiresDurableConfig,
     #[error("master keyring I/O error: {0}")]
     KeyringIo(String),
+    #[error("mcp_servers/authenticate: {0}")]
+    OAuth(#[from] crate::oauth::OAuthError),
+    #[error("mcp_servers/authenticate: server {0} has no \"url\" field -- OAuth only applies to HTTP-transport MCP servers")]
+    OAuthRequiresHttpTransport(String),
     #[error(
         "session/retention/pin: tenant {tenant_id} already has {current} of at most {limit} \
          pinned sessions"
@@ -1025,6 +1076,8 @@ impl Router {
                 .build()
                 .expect("valid HTTP client configuration"),
             registry_cache: None,
+            registry_cache_is_fallback: false,
+            registry_retry_not_before: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
             transcripts: None,
@@ -1038,6 +1091,8 @@ impl Router {
             keystore: Keystore::new(),
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
+            oauth_tokens: crate::oauth::OAuthTokenCache::new(),
+            mcp_tool_catalog: crate::mcp_client::McpToolCatalogCache::new(),
             secret_keyring: None,
             keyring_path: None,
             notification_hub: NotificationHub::new(),
@@ -1173,6 +1228,22 @@ impl Router {
         for raw in persistence.load_profiles().await? {
             if let Ok(profile) = serde_json::from_value::<Profile>(raw) {
                 self.profiles.create(profile)?;
+            }
+        }
+
+        for (server_name, ciphertext, nonce, key_version) in
+            persistence.load_all_oauth_tokens().await?
+        {
+            match keyring
+                .decrypt(key_version, &nonce, &ciphertext)
+                .ok()
+                .and_then(|plaintext| serde_json::from_slice::<crate::oauth::OAuthTokens>(&plaintext).ok())
+            {
+                Some(tokens) => self.oauth_tokens.insert(server_name, tokens),
+                None => tracing::warn!(
+                    server = %server_name,
+                    "failed to decrypt persisted oauth tokens, this MCP server will need re-authentication"
+                ),
             }
         }
 
@@ -1313,6 +1384,489 @@ impl Router {
             return Ok(());
         };
         persistence.delete_mcp_server(name).await?;
+        Ok(())
+    }
+
+    /// Attaches a live `Authorization: Bearer <token>` header to any
+    /// `entries` this router holds a current OAuth access token for
+    /// (`self.oauth_tokens`, keyed by the entry's `"name"`). Called on
+    /// the `central` MCP server list right before `merge_mcp_servers` at
+    /// `session/new`, so the raw access token is only ever attached to
+    /// the copy handed to a backend process -- it never gets written back
+    /// into `mcp_servers`' own plaintext-JSON persisted config row (see
+    /// `oauth_tokens`'s own doc comment).
+    ///
+    /// Deliberately synchronous and does no I/O, including no refresh
+    /// check: both call sites (`dispatch_session_new`/
+    /// `dispatch_session_new_shared`) run this while holding this
+    /// router's single global `Arc<Mutex<Router>>` lock (`SharedRouter`
+    /// in `acpx-server`), so any real network call here -- a refresh is
+    /// exactly that -- would block every other in-flight request on this
+    /// gateway for as long as the HTTP round trip takes. See
+    /// `spawn_oauth_refresh_loop`'s doc comment for where refresh
+    /// actually happens instead: entirely off-lock, on a timer, so by the
+    /// time `session/new` reads `oauth_tokens` here the token is already
+    /// current (or refresh is failing loudly in the logs, in which case
+    /// this still injects whatever's cached and lets the backend's own
+    /// 401 handling surface the problem).
+    /// Merge the session's profile-attached central MCP registry into
+    /// `session/resume` / `session/load` params, mirroring
+    /// `dispatch_session_new`'s merge for `session/new`.
+    ///
+    /// **Why this stays on `MethodClass::Proxied` (not Hybrid):** Hybrid
+    /// is wired exclusively to `dispatch_session_new`, and
+    /// `rehydrate_session` only accepts `Proxied | SessionFork`. Reclassifying
+    /// resume/load as Hybrid (as an earlier plan draft suggested) would
+    /// either mis-route them into session/new or break restart survival.
+    /// The merge *behavior* is what the plan requires; classification
+    /// stays Proxied so the existing rehydrate + session-resolve path
+    /// keeps working.
+    ///
+    /// Client-supplied `mcpServers` entries are strictly validated as
+    /// ACP `McpServer` values first -- a malformed entry is rejected
+    /// with [`RouterError::InvalidSessionEstablishParams`], not silently
+    /// dropped (the typed `ResumeSessionRequest` deserializer itself
+    /// uses skip-on-error for the array, which is the opposite of what
+    /// we want at this gateway boundary). Only the `mcpServers` field is
+    /// rewritten; other params (including any `_acpx` extension) are
+    /// left intact so a typed full-request round-trip cannot strip them.
+    fn merge_mcp_into_session_establish_params(
+        &self,
+        method: &str,
+        params: &mut serde_json::Value,
+        profile_name: Option<&str>,
+    ) -> Result<(), RouterError> {
+        if method != "session/resume" && method != "session/load" {
+            return Ok(());
+        }
+
+        use acpx_proto::acp::schema::v1::McpServer;
+
+        let client_servers = match params.get("mcpServers") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(arr)) => {
+                for (i, entry) in arr.iter().enumerate() {
+                    serde_json::from_value::<McpServer>(entry.clone()).map_err(|err| {
+                        RouterError::InvalidSessionEstablishParams(format!(
+                            "{method} params.mcpServers[{i}] is not a valid ACP McpServer: {err}"
+                        ))
+                    })?;
+                }
+                arr.clone()
+            }
+            Some(other) => {
+                return Err(RouterError::InvalidSessionEstablishParams(format!(
+                    "{method} params.mcpServers must be an array, got {other}"
+                )));
+            }
+        };
+
+        // No profile attached to this session, or profile has no central
+        // MCP list -- leave client params alone (after validation above).
+        let Some(profile_name) = profile_name else {
+            return Ok(());
+        };
+        let Some(profile) = self.profiles.get(profile_name) else {
+            return Ok(());
+        };
+        if profile.mcp_servers.is_empty() {
+            return Ok(());
+        }
+
+        let central = self.inject_oauth_headers(self.mcp_servers.list_named(&profile.mcp_servers));
+        // Central store keeps raw JSON (same as session/new's merge) --
+        // entries may lack optional-in-practice fields like `env`/`args`
+        // that the strict ACP McpServer type requires. Do not re-validate
+        // the merged list as typed McpServer; only client-supplied entries
+        // above are strictly checked so a *new* malformed client shape is
+        // rejected without changing the existing central-store contract.
+        let merged = crate::mcp_servers::merge_mcp_servers(&client_servers, &central);
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("mcpServers".to_string(), serde_json::json!(merged));
+        }
+        Ok(())
+    }
+
+    fn inject_oauth_headers(&self, entries: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        entries
+            .into_iter()
+            .map(|mut entry| {
+                let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+                    return entry;
+                };
+                let Some(tokens) = self.oauth_tokens.get(name) else {
+                    return entry;
+                };
+                if let Some(obj) = entry.as_object_mut() {
+                    let headers = obj
+                        .entry("headers")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(headers_obj) = headers.as_object_mut() {
+                        headers_obj.insert(
+                            "Authorization".to_string(),
+                            serde_json::json!(format!("Bearer {}", tokens.access_token)),
+                        );
+                    }
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// `mcp_servers/list`'s real payload: every centrally-registered
+    /// server entry, each with a `toolCatalog` field merged in from
+    /// whatever `mcp_tool_catalog` currently holds for it (`{"status":
+    /// "fetching"}`, `{"status": "ready", "tools": [...]}`, or `{"status":
+    /// "error", "message": "..."}`, matching `crate::mcp_client::
+    /// ToolCatalogState`'s serialization) -- entries with no catalog
+    /// state yet (never fetched) get no `toolCatalog` field at all,
+    /// letting the UI tell "never fetched" apart from "fetch in
+    /// progress" without a fourth enum variant. Deliberately a
+    /// *different* key than the entry's own persisted `tools` array
+    /// (`crate::mcp_servers`' opaque per-server JSON, holding the user's
+    /// enable/deferred *preference* for each tool by name) -- that array
+    /// is durable config the client round-trips through `mcp_servers/
+    /// update`; this is ephemeral, server-computed, never round-tripped.
+    fn mcp_servers_list_with_tool_catalog(&self) -> Vec<serde_json::Value> {
+        self.mcp_servers
+            .list()
+            .into_iter()
+            .map(|mut entry| {
+                let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+                    return entry;
+                };
+                let Some(state) = self.mcp_tool_catalog.get(name) else {
+                    return entry;
+                };
+                if let (Some(obj), Ok(tools_value)) =
+                    (entry.as_object_mut(), serde_json::to_value(&state))
+                {
+                    obj.insert("toolCatalog".to_string(), tools_value);
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// Spawns a detached background loop that periodically refreshes any
+    /// cached OAuth token past `OAuthTokens::needs_refresh`'s threshold.
+    /// Intended call site: once, at startup, right alongside
+    /// `warm_default_profiles` -- like that method, this must never run
+    /// lazily inside a request's own critical section (see `inject_oauth_
+    /// headers`'s doc comment for exactly why: this router's single
+    /// global lock must never be held across the real network I/O a
+    /// refresh requires). Uses only the cheap-clone `oauth_tokens`/
+    /// `mcp_servers`/`persistence`/`secret_keyring`/`http` handles this
+    /// method captures up front, the same "detached task, no `&Router`
+    /// borrow" shape `authenticate_mcp_server`'s own completion task
+    /// already uses -- this loop never touches `self` again after
+    /// spawning.
+    pub fn spawn_oauth_refresh_loop(&self, interval: std::time::Duration) {
+        let oauth_tokens = self.oauth_tokens.clone();
+        let mcp_servers = self.mcp_servers.clone();
+        let persistence = self.persistence.clone();
+        let keyring = self.secret_keyring.clone();
+        let http = self.http.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first `tick()` fires immediately; skip it so a
+            // freshly-started gateway doesn't try to refresh every
+            // just-loaded token before anything has had a chance to
+            // actually expire.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                for entry in mcp_servers.list() {
+                    let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+                        continue;
+                    };
+                    let Some(tokens) = oauth_tokens.get(name) else {
+                        continue;
+                    };
+                    if !tokens.needs_refresh() {
+                        continue;
+                    }
+                    let Some(refresh_token) = tokens.refresh_token.clone() else {
+                        continue;
+                    };
+                    let Some(url) = entry.get("url").and_then(|u| u.as_str()) else {
+                        continue;
+                    };
+
+                    let metadata = match crate::oauth::discover(&http, url).await {
+                        Ok(metadata) => metadata,
+                        Err(err) => {
+                            tracing::warn!(%err, server = %name, "oauth discovery failed during background refresh");
+                            continue;
+                        }
+                    };
+                    let refreshed = match crate::oauth::refresh(
+                        &http,
+                        &metadata,
+                        &tokens.client_id,
+                        tokens.client_secret.as_deref(),
+                        &refresh_token,
+                    )
+                    .await
+                    {
+                        Ok(refreshed) => refreshed,
+                        Err(err) => {
+                            tracing::warn!(%err, server = %name, "oauth token refresh failed, will retry next tick");
+                            continue;
+                        }
+                    };
+
+                    oauth_tokens.insert(name.to_string(), refreshed.clone());
+                    if let (Some(persistence), Some(keyring_lock)) = (&persistence, &keyring) {
+                        let plaintext =
+                            serde_json::to_vec(&refreshed).expect("OAuthTokens always serializes");
+                        let (version, nonce, ciphertext) = {
+                            let keyring = keyring_lock
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            keyring.encrypt(&plaintext)
+                        };
+                        let now = now_rfc3339();
+                        if let Err(err) = persistence
+                            .upsert_oauth_tokens(name.to_string(), ciphertext, nonce, version, now.clone(), now)
+                            .await
+                        {
+                            tracing::warn!(%err, server = %name, "failed to persist refreshed oauth tokens");
+                        }
+                    }
+                    tracing::info!(server = %name, "mcp server oauth token refreshed (background loop)");
+                }
+            }
+        });
+    }
+
+    /// **Settings-only MCP `tools/list` preview.** Fire-and-forget kickoff
+    /// for `mcp_servers/tools_fetch`: if a fetch for `name` isn't already
+    /// in flight, immediately marks the catalog `Fetching` and spawns a
+    /// detached task that runs the real probe (`crate::mcp_client::
+    /// probe`) and writes `Ready`/`Error` back into `mcp_tool_catalog`
+    /// once it finishes. Always returns immediately -- the real result
+    /// comes back through a later `mcp_servers/list` call, which merges
+    /// whatever `mcp_tool_catalog` currently holds into each entry's
+    /// `tools` field (see that method's dispatch arm). This mirrors
+    /// `spawn_oauth_refresh_loop`'s "kick off real I/O using only
+    /// cheap-clone handles, no `&Router` borrow held across the await"
+    /// shape -- a slow/hung MCP server's probe must never block this
+    /// router's single global lock (`inject_oauth_headers`'s doc comment
+    /// explains why that lock exists and what holding it across I/O would
+    /// cost).
+    ///
+    /// Errors returned here are argument-validation only (unknown server
+    /// name, or an entry with no recognizable stdio/http transport) --
+    /// once the probe itself is running, its own failure is reported as
+    /// an `Error` catalog entry, not a `RouterError`, since by then the
+    /// original RPC call has already returned.
+    pub fn spawn_mcp_tools_fetch(&self, name: &str) -> Result<(), RouterError> {
+        let entry = self
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| crate::mcp_servers::McpServerStoreError::NotFound(name.to_string()))?;
+
+        if self.mcp_tool_catalog.is_fetching(name) {
+            return Ok(());
+        }
+
+        let entry_with_auth = self
+            .inject_oauth_headers(vec![entry])
+            .into_iter()
+            .next()
+            .expect("exactly one entry in, exactly one entry out");
+        let Some(spec) = crate::mcp_client::probe_spec_from_entry(&entry_with_auth) else {
+            self.mcp_tool_catalog.insert(
+                name.to_string(),
+                crate::mcp_client::ToolCatalogState::Error {
+                    message: "mcp server entry has no recognizable stdio/http transport"
+                        .to_string(),
+                },
+            );
+            return Ok(());
+        };
+
+        self.mcp_tool_catalog
+            .insert(name.to_string(), crate::mcp_client::ToolCatalogState::Fetching);
+
+        let catalog = self.mcp_tool_catalog.clone();
+        let http = self.http.clone();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let result =
+                crate::mcp_client::probe(&http, spec, Duration::from_secs(15)).await;
+            let state = match result {
+                Ok(tools) => crate::mcp_client::ToolCatalogState::Ready { tools },
+                Err(err) => {
+                    tracing::warn!(%err, server = %name, "mcp tools/list probe failed");
+                    crate::mcp_client::ToolCatalogState::Error {
+                        message: err.to_string(),
+                    }
+                }
+            };
+            catalog.insert(name, state);
+        });
+
+        Ok(())
+    }
+
+    /// Begins the MCP OAuth 2.1 flow for the HTTP-transport server named
+    /// `name` (RFC 9728/8414 discovery, RFC 7591 dynamic client
+    /// registration unless the entry already names an `oauth.client_id`,
+    /// PKCE). Returns the `authorization_url` the caller must have the
+    /// user open in a browser; the rest of the flow (waiting for the
+    /// loopback redirect, exchanging the code, persisting tokens) runs in
+    /// a detached background task, since this RPC has to return the URL
+    /// well before the user finishes signing in. See `McpServerStore` and
+    /// `oauth_tokens`'s doc comments for why both are cheap-clone/
+    /// interior-mutable types -- that's what lets this background task
+    /// safely patch server/token state after `&self` here has long since
+    /// returned.
+    pub async fn authenticate_mcp_server(&self, name: &str) -> Result<String, RouterError> {
+        let entry = self
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| crate::mcp_servers::McpServerStoreError::NotFound(name.to_string()))?;
+        let url = entry
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| RouterError::OAuthRequiresHttpTransport(name.to_string()))?
+            .to_string();
+        let client_id_override = entry
+            .get("oauth")
+            .and_then(|o| o.get("client_id"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+
+        let http_client = self.http.clone();
+        let metadata = crate::oauth::discover(&http_client, &url).await?;
+        let (redirect_uri, listener_handle) = crate::oauth::start_loopback_listener().await?;
+
+        let registration = if let Some(client_id) = client_id_override {
+            crate::oauth::ClientRegistration {
+                client_id,
+                client_secret: None,
+            }
+        } else {
+            crate::oauth::register_client(&http_client, &metadata, &redirect_uri).await?
+        };
+
+        let pkce = crate::oauth::generate_pkce_pair();
+        let state = uuid::Uuid::new_v4().to_string();
+        let authorization_url = crate::oauth::build_authorization_url(
+            &metadata,
+            &registration.client_id,
+            &redirect_uri,
+            &state,
+            &pkce,
+        )?;
+
+        let server_name = name.to_string();
+        let mcp_servers = self.mcp_servers.clone();
+        let oauth_tokens_cache = self.oauth_tokens.clone();
+        let persistence = self.persistence.clone();
+        let keyring = self.secret_keyring.clone();
+        let expected_state = state.clone();
+        let pkce_verifier = pkce.verifier.clone();
+
+        tokio::spawn(async move {
+            let callback = match listener_handle.await {
+                Ok(Ok(callback)) => callback,
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, server = %server_name, "oauth loopback callback failed");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, server = %server_name, "oauth loopback task panicked");
+                    return;
+                }
+            };
+            if crate::oauth::verify_state(&expected_state, &callback.state).is_err() {
+                tracing::warn!(server = %server_name, "oauth callback state mismatch, discarding");
+                return;
+            }
+
+            let tokens = match crate::oauth::exchange_code(
+                &http_client,
+                &metadata,
+                &registration.client_id,
+                registration.client_secret.as_deref(),
+                &callback.code,
+                &redirect_uri,
+                &pkce_verifier,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    tracing::warn!(%err, server = %server_name, "oauth token exchange failed");
+                    return;
+                }
+            };
+
+            oauth_tokens_cache.insert(server_name.clone(), tokens.clone());
+
+            if let Some(mut entry) = mcp_servers.get(&server_name) {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("auth_status".to_string(), serde_json::json!("authenticated"));
+                    obj.insert("needs_auth".to_string(), serde_json::json!(false));
+                }
+                if mcp_servers.update(entry.clone()).is_ok() {
+                    if let Some(persistence) = &persistence {
+                        if let Err(err) = persistence.upsert_mcp_server(server_name.clone(), entry).await {
+                            tracing::warn!(%err, server = %server_name, "failed to persist mcp server auth_status");
+                        }
+                    }
+                }
+            }
+
+            if let (Some(persistence), Some(keyring_lock)) = (&persistence, &keyring) {
+                let plaintext =
+                    serde_json::to_vec(&tokens).expect("OAuthTokens always serializes");
+                let (version, nonce, ciphertext) = {
+                    let keyring = keyring_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    keyring.encrypt(&plaintext)
+                };
+                let now = now_rfc3339();
+                if let Err(err) = persistence
+                    .upsert_oauth_tokens(server_name.clone(), ciphertext, nonce, version, now.clone(), now)
+                    .await
+                {
+                    tracing::warn!(%err, server = %server_name, "failed to persist oauth tokens");
+                }
+            }
+
+            tracing::info!(server = %server_name, "mcp server oauth flow completed");
+        });
+
+        Ok(authorization_url)
+    }
+
+    /// Forgets any live OAuth token for `name` (in-memory and, if durable
+    /// config is enabled, on disk) and marks the server as needing
+    /// authentication again. No-op (not an error) if the server was never
+    /// authenticated -- matches `Self::authenticate_mcp_server`'s own
+    /// "safe to call unconditionally" shape.
+    pub async fn logout_mcp_server(&self, name: &str) -> Result<(), RouterError> {
+        self.oauth_tokens.remove(name);
+        if let Some(mut entry) = self.mcp_servers.get(name) {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("auth_status".to_string(), serde_json::json!("unauthenticated"));
+                obj.insert("needs_auth".to_string(), serde_json::json!(true));
+            }
+            if self.mcp_servers.update(entry.clone()).is_ok() {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    persistence.upsert_mcp_server(name, entry).await?;
+                }
+            }
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_oauth_tokens(name).await?;
+        }
         Ok(())
     }
 
@@ -1671,6 +2225,47 @@ impl Router {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.release_live(tenant_id);
+    }
+
+    /// Promote a discovery-only (not capacity-counted) session to a live
+    /// capacity slot the first time real work starts against it.
+    ///
+    /// **Live sessions** for admission are ones the gateway is actually
+    /// driving (session/new, recovery, or first in-flight turn) -- not
+    /// passive `session/list` catalog rows. Idempotent when
+    /// `capacity_counted` is already true.
+    fn ensure_capacity_for_active_turn(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Result<(), RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        let needs_admit = self
+            .sessions
+            .resolve(tenant_id, &gateway_id)
+            .is_some_and(|entry| !entry.capacity_counted);
+        if !needs_admit {
+            return Ok(());
+        }
+        let permit = self.admit_session(tenant_id)?;
+        if let Some(entry) = self.sessions.resolve_mut(tenant_id, &gateway_id) {
+            entry.capacity_counted = true;
+        }
+        permit.commit();
+        Ok(())
+    }
+
+    /// Release admission only if this session actually consumed a slot.
+    /// Discovery-only list-import rows never called `admit_session`, so
+    /// they must not call `release_live` (would underflow the counters).
+    fn release_live_session_if_counted(
+        &self,
+        tenant_id: &TenantId,
+        capacity_counted: bool,
+    ) {
+        if capacity_counted {
+            self.release_live_session(tenant_id);
+        }
     }
 
     /// Register how to spawn a given agent id. Mirrors
@@ -2534,7 +3129,7 @@ impl Router {
                 }
             }
             if let Some(removed) = self.sessions.remove(&tenant_id, &gateway_id) {
-                self.release_live_session(&tenant_id);
+                self.release_live_session_if_counted(&tenant_id, removed.capacity_counted);
                 self.stop_if_session_scoped(&removed.agent_id).await;
                 self.mark_unreferenced_if_idle(&removed.agent_id);
                 report.closed += 1;
@@ -2637,6 +3232,9 @@ impl Router {
                 custom_idle_ttl: record
                     .custom_idle_ttl_seconds
                     .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
+                // Recovery re-admits below -- these are real prior live
+                // sessions, not passive list-import catalog rows.
+                capacity_counted: true,
             },
             admission,
             backend,
@@ -2654,13 +3252,46 @@ impl Router {
         }
     }
 
+    /// How long to serve the bundled fallback before re-attempting a live
+    /// registry fetch.
+    const REGISTRY_FALLBACK_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
     /// Ensure the registry cache is populated, fetching (live, falling
     /// back to the bundled snapshot on any error) if it hasn't been yet.
-    /// See `acpx_registry::fetch_registry_or_fallback` -- this never
-    /// itself fails, matching that function's contract.
+    /// Never fails.
+    ///
+    /// A live result is cached for the process lifetime. A *fallback*
+    /// result is only cached provisionally: the bundled snapshot holds
+    /// three agents against the live registry's ~38, so treating it as
+    /// final meant a single slow or failed cold-start fetch permanently
+    /// truncated `agents/list` (the reported "grok-build is not detected
+    /// as installed" -- its adapter was installed and ready on disk, but
+    /// the id was absent from the catalog entirely). Retry the live fetch
+    /// on later calls, throttled to `REGISTRY_FALLBACK_RETRY_INTERVAL`.
     async fn ensure_registry_loaded(&mut self) -> &acpx_registry::Registry {
-        if self.registry_cache.is_none() {
-            self.registry_cache = Some(acpx_registry::fetch_registry_or_fallback(&self.http).await);
+        let retry_due = self
+            .registry_retry_not_before
+            .is_none_or(|not_before| std::time::Instant::now() >= not_before);
+        if self.registry_cache.is_none() || (self.registry_cache_is_fallback && retry_due) {
+            match acpx_registry::fetch_registry(&self.http).await {
+                Ok(registry) => {
+                    self.registry_cache = Some(registry);
+                    self.registry_cache_is_fallback = false;
+                    self.registry_retry_not_before = None;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        url = acpx_registry::REGISTRY_URL,
+                        "failed to fetch live ACP registry, serving the bundled \
+                         registry.fallback.json until the next retry"
+                    );
+                    self.registry_cache = Some(acpx_registry::fallback_registry());
+                    self.registry_cache_is_fallback = true;
+                    self.registry_retry_not_before =
+                        Some(std::time::Instant::now() + Self::REGISTRY_FALLBACK_RETRY_INTERVAL);
+                }
+            }
         }
         self.registry_cache.as_ref().expect("just populated")
     }
@@ -2926,7 +3557,8 @@ impl Router {
         // never see an `mcpServers` field appear out of nowhere.
         if let Some(profile) = &profile {
             if !profile.mcp_servers.is_empty() {
-                let central = self.mcp_servers.list_named(&profile.mcp_servers);
+                let central =
+                    self.inject_oauth_headers(self.mcp_servers.list_named(&profile.mcp_servers));
                 let params = request
                     .get_mut("params")
                     .ok_or(RouterError::MissingParams)?;
@@ -3233,7 +3865,13 @@ impl Router {
                 return None;
             }
         }
-        let admission = self.admit_session(tenant_id).ok()?;
+        // Discovery-only registration: do **not** consume live admission
+        // capacity. A shared backend's session/list can report dozens of
+        // historical sessions (empty burst) that are only catalog rows
+        // until the client actually attaches/turns. Counting them as live
+        // was saturating max_sessions_per_tenant (16 default) after a few
+        // real thread opens. Capacity is promoted on first real turn via
+        // `ensure_capacity_for_active_turn`.
         let gateway_id = self.sessions.register(
             tenant_id,
             agent_id.to_string(),
@@ -3241,7 +3879,9 @@ impl Router {
             profile_name,
             cwd,
         );
-        admission.commit();
+        if let Some(entry) = self.sessions.resolve_mut(tenant_id, &gateway_id) {
+            entry.capacity_counted = false;
+        }
         *new_registrations_used += 1;
         Some(gateway_id.0)
     }
@@ -3503,6 +4143,9 @@ impl Router {
             custom_idle_ttl: record
                 .custom_idle_ttl_seconds
                 .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
+            // On-demand rehydrate of a real gateway id is a live attach;
+            // admit_session below commits capacity for it.
+            capacity_counted: true,
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -3682,8 +4325,26 @@ impl Router {
             .call_policy_for(profile_name.as_deref(), &agent_id)
             .await;
 
+        // session/resume + session/load: merge the session's profile
+        // central MCP registry into params.mcpServers before forwarding
+        // (see merge_mcp_into_session_establish_params). Must run before
+        // the sessionId rewrite so validation sees the client-shaped
+        // request; the rewrite only touches sessionId.
+        self.merge_mcp_into_session_establish_params(
+            &method,
+            params,
+            profile_name.as_deref(),
+        )?;
+
+        // Promote discovery-only list-import rows to capacity-counted
+        // live sessions on first real use (not on close/cancel).
+        if method != "session/close" {
+            self.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
+        }
+
         // Rewrite gateway id -> backend id in place; everything else in
-        // `params` is forwarded untouched, per the proxied-method contract
+        // `params` is forwarded untouched (except the mcpServers merge
+        // above for resume/load), per the proxied-method contract
         // in 02-architecture.md.
         params["sessionId"] = serde_json::Value::String(backend_session_id);
 
@@ -3756,7 +4417,7 @@ impl Router {
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             ) {
-                self.release_live_session(tenant_id);
+                self.release_live_session_if_counted(tenant_id, removed.capacity_counted);
                 self.stop_if_session_scoped(&removed.agent_id).await;
                 self.mark_unreferenced_if_idle(&removed.agent_id);
             }
@@ -4345,6 +5006,7 @@ impl Router {
                         "id": agent.id,
                         "name": agent.name,
                         "version": agent.version,
+                        "website": agent.website,
                         "status": crate::detect::detect(&agent.id, &agent.distribution),
                         "enabled": enabled,
                         "source": AgentSource::Registry,
@@ -4360,6 +5022,7 @@ impl Router {
                             "id": agent.id,
                             "name": agent.name,
                             "version": "custom",
+                            "website": serde_json::Value::Null,
                             "status": AgentStatus::Configured,
                             "enabled": enabled,
                             "source": AgentSource::Custom,
@@ -4572,7 +5235,7 @@ impl Router {
                 entry
             }
             "mcp_servers/list" => {
-                serde_json::json!({ "servers": self.mcp_servers.list() })
+                serde_json::json!({ "servers": self.mcp_servers_list_with_tool_catalog() })
             }
             "mcp_servers/delete" => {
                 let name = request
@@ -4584,6 +5247,36 @@ impl Router {
                 self.mcp_servers.delete(&name)?;
                 self.delete_persisted_mcp_server_if_durable(&name).await?;
                 serde_json::json!({ "name": name, "deleted": true })
+            }
+            "mcp_servers/authenticate" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                let authorization_url = self.authenticate_mcp_server(&name).await?;
+                serde_json::json!({ "name": name, "authorizationUrl": authorization_url })
+            }
+            "mcp_servers/logout" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                self.logout_mcp_server(&name).await?;
+                serde_json::json!({ "name": name, "loggedOut": true })
+            }
+            "mcp_servers/tools_fetch" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                self.spawn_mcp_tools_fetch(&name)?;
+                serde_json::json!({ "name": name, "status": "fetching" })
             }
             "session/retention/get" => {
                 let gateway_session_id = request
@@ -4896,6 +5589,72 @@ async fn write_cancel_notification_best_effort(
     }
 }
 
+/// Picks the `methodId` to send in `authenticate`, constrained to what the
+/// backend actually advertised in its own `initialize` result.
+///
+/// **The live bug this closes.** `Router::call_policy` falls back to the
+/// process-global `native_auth_method_id` (`ACPX_NATIVE_AUTH_METHOD_ID`,
+/// auto-derived from `~/.codex/auth.json` for the *default* agent, see
+/// `acpx-server`'s `default_codex_native_auth_method`) for every profile
+/// that doesn't carry one of its own. Auto-seeded registry profiles never
+/// carry one, so every non-codex agent inherited codex's method id and
+/// acpx sent a `methodId` the agent had never advertised. Confirmed live
+/// against a real daemon-managed instance: `session/new` with
+/// `_acpx.profile = "grok-build"` failed instantly with
+/// `backend rejected authenticate: {"code":-32602,"message":"Invalid
+/// params","data":"unsupported auth method: chat-gpt"}` -- grok advertises
+/// `["cached_token", "grok.com"]` and never `chat-gpt`, so grok-build
+/// could never open a session at all and no session row was ever
+/// persisted for it.
+///
+/// Resolution order:
+/// 1. the configured id, but **only if the backend advertises it** (keeps
+///    codex-acp's real `chat-gpt` behavior byte-for-byte);
+/// 2. the backend's own `_meta.defaultAuthMethodId`, when it advertises
+///    one (grok reports `"cached_token"` here -- the same method the
+///    manual raw-ACP handshake used successfully). This is the agent
+///    explicitly nominating a method, not acpx guessing one;
+/// 3. `None`, leaving the caller to surface
+///    `BackendRequiresAuthentication` with the real advertised list.
+///    Deliberately *not* "auto-pick the only advertised method" -- acpx
+///    refusing to silently invent an auth method the operator never
+///    configured is an existing tested contract (`authenticate_test.rs`'s
+///    `session_new_is_refused_with_a_clear_error_when_backend_requires_
+///    auth_and_none_is_configured`).
+fn select_auth_method_id(
+    configured: Option<&str>,
+    auth_methods: &[serde_json::Value],
+    initialize_result: Option<&serde_json::Value>,
+) -> Option<String> {
+    let advertises = |id: &str| {
+        auth_methods
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .any(|advertised| advertised == id)
+    };
+
+    if let Some(id) = configured.filter(|id| advertises(id)) {
+        return Some(id.to_string());
+    }
+    if configured.is_some() {
+        tracing::warn!(
+            configured,
+            "configured auth method id is not advertised by this backend; falling back to the \
+             backend's own advertised methods (a process-global \
+             ACPX_NATIVE_AUTH_METHOD_ID applies to every agent, not just the one it was \
+             derived from)"
+        );
+    }
+
+    let default_id = initialize_result
+        .and_then(|r| r.get("_meta"))
+        .and_then(|m| m.get("defaultAuthMethodId"))
+        .and_then(|v| v.as_str());
+    default_id
+        .filter(|id| advertises(id))
+        .map(str::to_string)
+}
+
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
     call_policy: BackendCallPolicy,
@@ -4934,18 +5693,11 @@ async fn ensure_backend_initialized_with_handshake_timeout(
                     // comment for why opt-in, not opt-out) keeps declaring
                     // both `false`, byte-for-byte the pre-phase-3 behavior.
                     "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access },
-                    // Phase 4: same treatment for the `terminal` capability
-                    // group -- all five sub-methods tied to one profile-level
-                    // opt-in (`Profile::allow_terminal_access`), since
-                    // granular per-sub-method opt-in has no real security
-                    // value (they're meaningless without each other).
-                    "terminal": {
-                        "create": allow_terminal_access,
-                        "output": allow_terminal_access,
-                        "waitForExit": allow_terminal_access,
-                        "kill": allow_terminal_access,
-                        "release": allow_terminal_access
-                    }
+                    // ACP's v1 schema models terminal support as one
+                    // boolean capability. The individual terminal/*
+                    // methods are all covered by this single opt-in;
+                    // granular flags are not valid on the wire.
+                    "terminal": allow_terminal_access
                 }
             }
         });
@@ -4972,6 +5724,9 @@ async fn ensure_backend_initialized_with_handshake_timeout(
         };
         match tokio::time::timeout(handshake_timeout, handshake).await {
             Ok(Ok(value)) => {
+                if let Some(error) = value.get("error") {
+                    return Err(RouterError::BackendInitializationError(error.clone()));
+                }
                 // Capture the backend's real `initialize` result -- its
                 // actual `agentCapabilities`/`authMethods`/negotiated
                 // `protocolVersion` -- instead of discarding it. Surfaced to
@@ -5021,11 +5776,25 @@ async fn ensure_backend_initialized_with_handshake_timeout(
             .cloned()
             .unwrap_or_default();
         if !auth_methods.is_empty() {
-            let Some(method_id) = call_policy.auth_method_id.as_deref() else {
+            let Some(method_id) = select_auth_method_id(
+                call_policy.auth_method_id.as_deref(),
+                &auth_methods,
+                proc.agent_capabilities.as_ref(),
+            ) else {
                 return Err(RouterError::BackendRequiresAuthentication(
                     serde_json::Value::Array(auth_methods),
                 ));
             };
+            let method_id = method_id.as_str();
+            tracing::debug!(
+                method_id,
+                configured = ?call_policy.auth_method_id,
+                advertised = ?auth_methods
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>(),
+                "authenticating backend"
+            );
             let request = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": AUTHENTICATE_REQUEST_ID,
@@ -7860,6 +8629,13 @@ async fn dispatch_proxied_shared(
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
         if let Some(params) = request.get_mut("params") {
+            // Same resume/load registry merge as dispatch_proxied -- must
+            // run before the sessionId rewrite.
+            r.merge_mcp_into_session_establish_params(
+                &method,
+                params,
+                profile_name.as_deref(),
+            )?;
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
@@ -7869,6 +8645,13 @@ async fn dispatch_proxied_shared(
         // overlapping work.
         if !r.process_reader_demux {
             r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
+        // First real turn / proxied work: promote list-import discovery
+        // rows into capacity-counted live sessions (close is handled
+        // without promoting so an unused catalog row can still be
+        // discarded free).
+        if method != "session/close" {
+            r.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
         }
         r.sessions.set_in_flight(
             tenant_id,
@@ -8031,7 +8814,7 @@ async fn dispatch_proxied_shared(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
         ) {
-            r.release_live_session(tenant_id);
+            r.release_live_session_if_counted(tenant_id, removed.capacity_counted);
             r.stop_if_session_scoped(&removed.agent_id).await;
             r.mark_unreferenced_if_idle(&removed.agent_id);
         }
@@ -8352,7 +9135,7 @@ async fn dispatch_session_new_shared(
 
         if let Some(profile) = &profile {
             if !profile.mcp_servers.is_empty() {
-                let central = r.mcp_servers.list_named(&profile.mcp_servers);
+                let central = r.inject_oauth_headers(r.mcp_servers.list_named(&profile.mcp_servers));
                 let params = request
                     .get_mut("params")
                     .ok_or(RouterError::MissingParams)?;
@@ -8369,6 +9152,16 @@ async fn dispatch_session_new_shared(
         }
 
         let admission = r.admit_session(tenant_id)?;
+        // The only per-request visibility into which agent a `session/new`
+        // actually resolved to and what it spawns for it. Without this the
+        // whole stretch between `"acpx received request"` and the response
+        // is dark, which is exactly what made a real grok-build failure
+        // undiagnosable from outside the process.
+        tracing::debug!(
+            agent_id = %agent_id,
+            spawn = ?r.supervisor.spec(&agent_id).map(|s| (&s.program, &s.args)),
+            "session/new resolved agent; ensuring backend process is running"
+        );
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         // The demux consumer (spawned below, once handshake completes)
         // subsumes the idle scavenger's job for this process -- see
@@ -8799,6 +9592,7 @@ mod tests {
         assert_eq!(classify("mcp_servers/list"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/update"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/delete"), MethodClass::GatewayNative);
+        assert_eq!(classify("mcp_servers/tools_fetch"), MethodClass::GatewayNative);
     }
 
     /// **Phase 9.** `session/delete` and `logout` were entirely
@@ -9100,5 +9894,310 @@ mod tests {
              or ACPX_CONFIG_FILE) should widen what the bridge probes"
         );
         assert_eq!(seeded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticate_mcp_server_errors_on_unknown_name() {
+        let router = Router::new("default");
+        let result = router.authenticate_mcp_server("does-not-exist").await;
+        assert!(matches!(
+            result,
+            Err(RouterError::McpServer(
+                crate::mcp_servers::McpServerStoreError::NotFound(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticate_mcp_server_requires_http_transport() {
+        let router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({"name": "fs", "command": "mcp-fs"}))
+            .expect("create stdio server");
+        let result = router.authenticate_mcp_server("fs").await;
+        assert!(matches!(
+            result,
+            Err(RouterError::OAuthRequiresHttpTransport(name)) if name == "fs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn logout_mcp_server_is_a_safe_no_op_when_never_authenticated() {
+        let router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({"name": "remote", "url": "https://example.com/mcp"}))
+            .expect("create http server");
+        assert!(router.logout_mcp_server("remote").await.is_ok());
+        assert!(router.logout_mcp_server("never-existed").await.is_ok());
+    }
+
+    #[test]
+    fn inject_oauth_headers_attaches_bearer_token_only_when_known() {
+        let router = Router::new("default");
+        router.oauth_tokens.insert(
+            "remote",
+            crate::oauth::OAuthTokens {
+                access_token: "tok-123".to_string(),
+                refresh_token: None,
+                expires_in: None,
+                obtained_at_unix: 0,
+                client_id: String::new(),
+                client_secret: None,
+            },
+        );
+        let entries = vec![
+            serde_json::json!({"name": "remote", "url": "https://example.com/mcp"}),
+            serde_json::json!({"name": "fs", "command": "mcp-fs"}),
+        ];
+        let injected = router.inject_oauth_headers(entries);
+        assert_eq!(
+            injected[0]["headers"]["Authorization"],
+            "Bearer tok-123"
+        );
+        assert!(injected[1].get("headers").is_none());
+    }
+
+    /// Real end-to-end proof of `spawn_oauth_refresh_loop`: a manufactured
+    /// already-expiring token gets refreshed against a real (stub) token
+    /// endpoint on the loop's own timer, with no caller triggering it
+    /// directly -- proving the loop itself observes `needs_refresh`,
+    /// posts a real `grant_type=refresh_token` request, and writes the
+    /// result back into `oauth_tokens`.
+    #[tokio::test]
+    async fn spawn_oauth_refresh_loop_refreshes_an_expiring_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub token server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let origin_for_task = origin.clone();
+        let refresh_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let refresh_calls_for_task = refresh_calls.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let origin = origin_for_task.clone();
+                let refresh_calls = refresh_calls_for_task.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let request_line = request.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                    let (status, resp_body) = match (method, path) {
+                        ("GET", "/.well-known/oauth-protected-resource") => {
+                            ("404 Not Found", String::new())
+                        }
+                        ("GET", "/.well-known/oauth-authorization-server") => (
+                            "200 OK",
+                            format!(
+                                r#"{{"authorization_endpoint":"{origin}/authorize","token_endpoint":"{origin}/token"}}"#
+                            ),
+                        ),
+                        ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                            refresh_calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                r#"{"access_token":"refreshed-access-token","refresh_token":"same-refresh-token","expires_in":3600}"#
+                                    .to_string(),
+                            )
+                        }
+                        _ => ("404 Not Found", String::new()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({
+                "name": "remote",
+                "type": "http",
+                "url": format!("{origin}/mcp"),
+            }))
+            .expect("create http server");
+        // Already past its expiry (obtained at unix epoch, 10-second
+        // lifetime) -- `needs_refresh()` must read this as refresh-eligible
+        // the moment the loop's first tick lands.
+        router.oauth_tokens.insert(
+            "remote",
+            crate::oauth::OAuthTokens {
+                access_token: "stale-access-token".to_string(),
+                refresh_token: Some("original-refresh-token".to_string()),
+                expires_in: Some(10),
+                obtained_at_unix: 0,
+                client_id: "test-client".to_string(),
+                client_secret: None,
+            },
+        );
+
+        router.spawn_oauth_refresh_loop(std::time::Duration::from_millis(50));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut refreshed = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(tokens) = router.oauth_tokens.get("remote") {
+                if tokens.access_token == "refreshed-access-token" {
+                    refreshed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            refreshed,
+            "expected the background loop to refresh the expiring token within the timeout"
+        );
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) >= 1,
+            "expected at least one real grant_type=refresh_token request to reach the stub token endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_mcp_tools_fetch_errors_on_unknown_name() {
+        let router = Router::new("default");
+        let result = router.spawn_mcp_tools_fetch("does-not-exist");
+        assert!(matches!(
+            result,
+            Err(RouterError::McpServer(
+                crate::mcp_servers::McpServerStoreError::NotFound(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_mcp_tools_fetch_reports_an_error_state_for_an_unprobeable_entry() {
+        let router = Router::new("default");
+        // No `"type"` field at all -- `probe_spec_from_entry` returns
+        // `None` for this, which must surface as a real `Error` catalog
+        // state (not a panic, not a silently-empty tool list).
+        router
+            .mcp_servers
+            .create(serde_json::json!({"name": "weird"}))
+            .expect("create entry with no transport");
+        router
+            .spawn_mcp_tools_fetch("weird")
+            .expect("kickoff itself should not error for a known server");
+        let state = router
+            .mcp_tool_catalog
+            .get("weird")
+            .expect("catalog should have an entry immediately");
+        assert!(matches!(
+            state,
+            crate::mcp_client::ToolCatalogState::Error { .. }
+        ));
+    }
+
+    /// Real end-to-end proof of `spawn_mcp_tools_fetch` + `mcp_servers/
+    /// list`'s catalog merge: a real subprocess speaking real MCP
+    /// `initialize`/`tools/list` JSON-RPC, probed entirely through the
+    /// background-fetch-and-poll path (not `mcp_client::probe` called
+    /// directly) -- proving the RPC handler, the detached task, the
+    /// cache, and the list-merge all actually connect end to end.
+    #[tokio::test]
+    async fn mcp_servers_list_reflects_a_real_background_stdio_tools_fetch() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stub_mcp_server.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"tools/list"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping"}]}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write stub MCP server script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
+
+        let mut router = Router::new("default");
+        router
+            .mcp_servers
+            .create(serde_json::json!({
+                "name": "stub",
+                "type": "stdio",
+                "command": "sh",
+                "args": [script_path.to_string_lossy()],
+            }))
+            .expect("create stdio server");
+
+        let dispatch_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "mcp_servers/tools_fetch",
+            "params": {"name": "stub"},
+        });
+        let kickoff = router
+            .dispatch(dispatch_request)
+            .await
+            .expect("tools_fetch dispatch should succeed");
+        assert_eq!(kickoff["result"]["status"], "fetching");
+
+        let list_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "mcp_servers/list",
+            "params": {},
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut observed_tools = None;
+        while std::time::Instant::now() < deadline {
+            let reply = router
+                .dispatch(list_request.clone())
+                .await
+                .expect("mcp_servers/list dispatch should succeed");
+            let servers = reply["result"]["servers"].as_array().cloned().unwrap_or_default();
+            let stub_entry = servers
+                .iter()
+                .find(|entry| entry.get("name").and_then(|n| n.as_str()) == Some("stub"));
+            if let Some(entry) = stub_entry {
+                if entry.get("toolCatalog").and_then(|t| t.get("status")).and_then(|s| s.as_str())
+                    == Some("ready")
+                {
+                    observed_tools = entry["toolCatalog"]["tools"].as_array().cloned();
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let tools = observed_tools.expect(
+            "expected mcp_servers/list to report a ready tool catalog for \"stub\" \
+             within the timeout",
+        );
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "ping");
     }
 }

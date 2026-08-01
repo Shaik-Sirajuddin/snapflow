@@ -10,8 +10,8 @@ use crate::gateway_actor::classify_raw_update;
 use crate::gateway_actor::session_opener::GatewaySessionOpener;
 use crate::protocol_types::{AgentEvent, QueueItemInfo};
 use crate::protocol_types::{
-    AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
-    TerminalCreatedEvent, TerminalOutputEvent,
+    AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
+    SessionModesEvent, TerminalCreatedEvent, TerminalOutputEvent,
 };
 use acpx_client::pool::{OpenSpec, PoolKey, ProjectSessionPool, SessionLease};
 use acpx_client::raw::ClientError;
@@ -64,12 +64,17 @@ fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
 }
 
 /// Result of [`AcpxThreadHandle::acquire_and_attach`]. `resumed_from_saved`
-/// distinguishes a session the pool resumed from a persisted id (which
-/// already carries capability/config info from its `session/resume`
-/// response, emitted as the usual capability events) from one the pool
-/// freshly created (whose capabilities are not yet known to this actor --
-/// callers should fall back to `models/list` per the plan's capability-
-/// loading precedence rather than expect capability events for that case).
+/// distinguishes a session the pool resumed from a persisted id from one
+/// the pool freshly created. Not currently consumed by any caller --
+/// `Command::AcquireAndAttach`'s own handler already emits capability
+/// events uniformly for both cases (resumed: from the `session/resume`
+/// response; freshly created: from `SessionLease::capabilities`, which
+/// `ProjectSessionPool` populates from `session/new`'s response and
+/// carries through even a warm-pool reuse, see `pool.rs`'s
+/// `reusing an idle entry must not drop its captured capabilities` test)
+/// -- so no caller-side models/list fallback decision needs this flag.
+/// Kept for now as a cheap diagnostic signal (e.g. logging) rather than
+/// removed outright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedSession {
     pub session_id: String,
@@ -122,10 +127,13 @@ enum Command {
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// ACP's lighter `session/resume` reattachment path. Unlike
-    /// `session/load`, it does not replay prior history.
+    /// `session/load`, it does not replay prior history. Clients are
+    /// expected to resupply `mcpServers` on resume (same list as
+    /// `session/new`); see mcp-registry-live-propagation plan.
     ReattachSession {
         session_id: String,
         cwd: PathBuf,
+        mcp_servers: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// acpx-client-session-lease-pool: acquires an exclusive lease from
@@ -229,19 +237,41 @@ enum Command {
     ListMcpServers {
         resp: oneshot::Sender<Result<Vec<crate::protocol_types::McpServerEntry>, AcpxThreadError>>,
     },
-    /// `mcp_servers/create`. `entry` must include a `"name"` field (the
-    /// merge key `acpx-core::mcp_servers::McpServerStore` uses).
+    /// `mcp_servers/create`.
     CreateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/update` -- same payload shape as create.
     UpdateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/delete`.
     DeleteMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/authenticate` -- begins the MCP OAuth 2.1 flow server
+    /// side (see `acpx_core::router::Router::authenticate_mcp_server`'s
+    /// doc comment) and returns the `authorizationUrl` the caller must
+    /// open in a browser.
+    AuthenticateMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<String, AcpxThreadError>>,
+    },
+    /// `mcp_servers/logout`.
+    LogoutMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe (see `acpx_core::router::Router::spawn_mcp_
+    /// tools_fetch`'s doc comment). The real tool list is not this
+    /// command's result -- it comes back through a later `ListMcpServers`
+    /// call's `tool_catalog` field, once the gateway's detached probe
+    /// finishes.
+    FetchMcpServerTools {
         name: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
@@ -423,17 +453,22 @@ impl AcpxThreadHandle {
     }
 
     /// Attaches this client connection to an existing session with ACP's
-    /// no-history-replay `session/resume` operation.
+    /// no-history-replay `session/resume` operation. `mcp_servers` is the
+    /// same client-computed list `session/new` would send -- required by
+    /// the protocol so a resumed session can reconnect MCP clients under
+    /// the current registry.
     pub async fn reattach_session(
         &self,
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<(), AcpxThreadError> {
         let session_id = session_id.into();
         let cwd = cwd.into();
         self.call(|resp| Command::ReattachSession {
             session_id,
             cwd,
+            mcp_servers,
             resp,
         })
         .await
@@ -603,11 +638,11 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListMcpServers { resp }).await
     }
 
-    /// `mcp_servers/create`. `entry` must include a `"name"` field.
+    /// `mcp_servers/create`.
     pub async fn create_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::CreateMcpServer { entry, resp })
             .await
     }
@@ -615,8 +650,8 @@ impl AcpxThreadHandle {
     /// `mcp_servers/update` -- same payload shape as `create_mcp_server`.
     pub async fn update_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::UpdateMcpServer { entry, resp })
             .await
     }
@@ -625,6 +660,36 @@ impl AcpxThreadHandle {
     pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
         self.call(|resp| Command::DeleteMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/authenticate` -- returns the authorization URL to open
+    /// in a browser. See `Command::AuthenticateMcpServer`'s doc comment.
+    pub async fn authenticate_mcp_server(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<String, AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::AuthenticateMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/logout`.
+    pub async fn logout_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::LogoutMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/tools_fetch`. See `Command::FetchMcpServerTools`'s
+    /// doc comment -- returns once the gateway has scheduled the
+    /// background probe, not once it finishes.
+    pub async fn fetch_mcp_server_tools(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::FetchMcpServerTools { name, resp })
             .await
     }
 
@@ -944,10 +1009,33 @@ async fn run_respond_worker(
 /// [`spawn_out_of_band_notification_forwarder`]'s job now (see that
 /// function's doc comment for why they were split out of this
 /// function).
+///
+/// `suppress_user_echo`: some ACP backends (observed live with
+/// `grok-build`) emit a `user_message_chunk` notification that simply
+/// echoes the prompt the client itself just sent as part of the very
+/// `session/prompt` turn currently in flight. `panel-rust/src/lib.rs`'s
+/// `start_send_prompt` already appends that exact text as a local
+/// `MessageKind::User` row (`AgentBridge::push_local`) *before* the
+/// `session/prompt` call goes out, so forwarding this echo too used to
+/// double the row up as a second, indistinguishable `AgentEvent::Message`
+/// (see `spawn_event_forwarder`'s unconditional push in
+/// `agent_bridge.rs` -- it has no way to tell "this is the same message
+/// I already have" from "this is new", especially since
+/// `classify_raw_update` never attaches an id to `user_message_chunk`
+/// entries). Callers draining updates that belong to the turn *this
+/// actor itself just started* (i.e. `Command::SendPrompt`'s own
+/// `session/prompt` round trip) pass `true` here to drop that echo at
+/// the source, since the local optimistic copy already covers it.
+/// Callers replaying a backend's own history independent of any local
+/// echo -- `session/load`/`session/resume` attachment and the idle
+/// out-of-turn `live_rx` listener -- pass `false`, so genuine past user
+/// turns replayed from the backend (which have no local counterpart at
+/// all) still render.
 fn forward_updates(
     updates: &[serde_json::Value],
     active_session_id: Option<&str>,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    suppress_user_echo: bool,
 ) {
     for update in updates {
         let Some(active_session_id) = active_session_id else {
@@ -989,9 +1077,109 @@ fn forward_updates(
             continue;
         }
         if let Some(msg) = classify_raw_update(update) {
+            if suppress_user_echo && msg.kind == MessageKind::User {
+                continue;
+            }
             let _ = event_tx.send(AgentEvent::Message(msg));
         } else if let Some(event) = parse_capability_update(update) {
             let _ = event_tx.send(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod forward_updates_user_echo_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_message_chunk_update(session_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    fn agent_message_chunk_update(session_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    /// Reproduces the live grok-build bug: a backend echoing the user's
+    /// own prompt back as a `user_message_chunk` during the very
+    /// `session/prompt` turn the client just started must NOT become a
+    /// second rendered `AgentEvent::Message(User)` -- `lib.rs`'s
+    /// `start_send_prompt` already pushed a local optimistic copy before
+    /// this update ever arrives. Without `suppress_user_echo` (i.e. the
+    /// pre-fix `forward_updates(updates, session, event_tx)` two-arg
+    /// call this test would use), this update forwards unconditionally
+    /// and the send-a-message-once/see-it-twice bug reproduces.
+    #[test]
+    fn suppress_user_echo_drops_user_message_chunk_during_own_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![user_message_chunk_update("s1", "hello")];
+        forward_updates(&updates, Some("s1"), &tx, true);
+        drop(tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a user_message_chunk echo for the in-flight turn must be suppressed, \
+             not forwarded as a duplicate AgentEvent::Message"
+        );
+    }
+
+    /// Non-user updates (the real agent reply) must still forward
+    /// normally even with the echo suppressed -- this isn't a blanket
+    /// "ignore everything" flag, only the user-role echo is dropped.
+    #[test]
+    fn suppress_user_echo_still_forwards_agent_message_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![agent_message_chunk_update("s1", "hi there")];
+        forward_updates(&updates, Some("s1"), &tx, true);
+        drop(tx);
+        let event = rx.try_recv().expect("agent message should forward");
+        match event {
+            AgentEvent::Message(msg) => {
+                assert_eq!(msg.kind, MessageKind::Agent);
+                assert_eq!(msg.text, "hi there");
+            }
+            _ => panic!("expected AgentEvent::Message"),
+        }
+    }
+
+    /// Replayed history (`session/load`/`session/resume` attachment,
+    /// where there is no local optimistic echo at all -- the message
+    /// never went through this client's own `push_local`) must still
+    /// render: `suppress_user_echo: false` is the path those call sites
+    /// use, and a `user_message_chunk` there is genuine, unseen-before
+    /// content, not a duplicate of anything.
+    #[test]
+    fn suppress_user_echo_false_still_forwards_user_message_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![user_message_chunk_update("s1", "past turn")];
+        forward_updates(&updates, Some("s1"), &tx, false);
+        drop(tx);
+        let event = rx.try_recv().expect("replayed user message should forward");
+        match event {
+            AgentEvent::Message(msg) => {
+                assert_eq!(msg.kind, MessageKind::User);
+                assert_eq!(msg.text, "past turn");
+            }
+            _ => panic!("expected AgentEvent::Message"),
         }
     }
 }
@@ -1277,6 +1465,148 @@ fn parse_model_catalog(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
     }]
 }
 
+/// grok-build's real vendor extension to `session/new`'s result: no
+/// top-level `configOptions`/`modes` key at all (verified against the
+/// real `grok agent stdio` binary -- its `session/new` result has
+/// exactly three top-level keys: `sessionId`, `models`, `_meta`).
+/// Instead the model catalog lives at `models: {currentModelId,
+/// availableModels: [{modelId, name, description?, _meta: {
+/// supportsReasoningEffort, reasoningEffort, reasoningEfforts: [{id,
+/// value, label, description?, default}]}}]}`. This maps that shape into
+/// this crate's `ConfigOptionInfo` vocabulary exactly like
+/// `parse_model_catalog` does for its own vendor shape: one `{id:
+/// "model", category: "model"}` entry (picked up by
+/// `to_config_dropdown_entries`/`model_name_from_config`/the sidebar's
+/// provider·model label, all keyed on that `id`), plus -- when any
+/// model reports reasoning-effort choices -- one `{id: "reasoning_
+/// effort", category: "reasoning"}` entry (picked up by the existing
+/// `to_reasoning_dropdown_entries`/`is_reasoning_option_id`, which
+/// already accepts that id). Without this, grok's real model/reasoning
+/// data was silently dropped: `parse_config_options` only ever looks at
+/// `configOptions`, which grok never sends.
+fn parse_grok_model_config(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let models = value.get("models");
+    let current_model_id = models
+        .and_then(|m| m.get("currentModelId"))
+        .and_then(|v| v.as_str());
+    let Some(available) = models
+        .and_then(|m| m.get("availableModels"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let model_options: Vec<ConfigOptionValue> = available
+        .iter()
+        .filter_map(|model| {
+            Some(ConfigOptionValue {
+                value: model.get("modelId")?.as_str()?.to_owned(),
+                name: model
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: model
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    if model_options.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = vec![ConfigOptionInfo {
+        id: "model".to_owned(),
+        name: "Model".to_owned(),
+        description: None,
+        category: Some("model".to_owned()),
+        kind: "select".to_owned(),
+        current_value: current_model_id.map(str::to_owned),
+        options: model_options,
+    }];
+
+    // Reasoning effort lives per-model (`_meta.reasoningEfforts`), keyed
+    // to whichever model is currently selected -- fall back to the first
+    // model that advertises any efforts at all if `currentModelId` is
+    // absent or doesn't match (still better than silently dropping the
+    // reasoning-effort picker).
+    let reasoning_model = current_model_id
+        .and_then(|id| {
+            available
+                .iter()
+                .find(|m| m.get("modelId").and_then(|v| v.as_str()) == Some(id))
+        })
+        .or_else(|| available.first());
+    if let Some(model) = reasoning_model {
+        let meta = model.get("_meta");
+        let reasoning_options: Vec<ConfigOptionValue> = meta
+            .and_then(|m| m.get("reasoningEfforts"))
+            .and_then(|v| v.as_array())
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(|effort| {
+                        let value = effort
+                            .get("value")
+                            .or_else(|| effort.get("id"))
+                            .and_then(|v| v.as_str())?
+                            .to_owned();
+                        Some(ConfigOptionValue {
+                            value,
+                            name: effort
+                                .get("label")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            description: effort
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .map(str::to_owned),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !reasoning_options.is_empty() {
+            entries.push(ConfigOptionInfo {
+                id: "reasoning_effort".to_owned(),
+                name: "Reasoning Effort".to_owned(),
+                description: None,
+                category: Some("reasoning".to_owned()),
+                kind: "select".to_owned(),
+                current_value: meta
+                    .and_then(|m| m.get("reasoningEffort"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                options: reasoning_options,
+            });
+        }
+    }
+
+    entries
+}
+
+/// Extracts a `session/new`/`session/load`/`session/resume` response's
+/// selectable config options, tolerating both the standard ACP
+/// `configOptions[]` shape and grok-build's real vendor extension (see
+/// [`parse_grok_model_config`]'s doc comment) -- grok's real response has
+/// no top-level `configOptions` at all, so the standard parse always
+/// comes back empty for it and this falls back to the vendor shape
+/// instead of leaving the compose bar's Model dropdown and the sidebar's
+/// model label empty for every grok-build thread.
+fn extract_config_options(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let standard = value
+        .get("configOptions")
+        .and_then(parse_config_options)
+        .unwrap_or_default();
+    if !standard.is_empty() {
+        return standard;
+    }
+    parse_grok_model_config(value)
+}
+
 /// Emits [`AgentEvent::SessionModes`]/[`AgentEvent::ConfigOptions`] for
 /// whichever of a `session/new`/`session/load`/`session/resume`
 /// response's `modes`/`configOptions` fields are actually present --
@@ -1287,7 +1617,8 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
     if let Some(modes) = value.get("modes").and_then(parse_session_modes) {
         let _ = event_tx.send(AgentEvent::SessionModes(modes));
     }
-    if let Some(options) = value.get("configOptions").and_then(parse_config_options) {
+    let options = extract_config_options(value);
+    if !options.is_empty() {
         let _ = event_tx.send(AgentEvent::ConfigOptions(options));
     }
 }
@@ -1643,7 +1974,7 @@ async fn run_thread_actor(
     loop {
         let cmd = tokio::select! {
             Some(update) = live_rx.recv() => {
-                forward_updates(&[update], session_id.as_deref(), &event_tx);
+                forward_updates(&[update], session_id.as_deref(), &event_tx, false);
                 continue;
             }
             command = cmd_rx.recv() => match command {
@@ -1736,7 +2067,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, Some(&sid), &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx, false);
                             // A session/load replay is allowed to start
                             // before its RPC response, but a busy real
                             // host can schedule the WS reader just after
@@ -1749,10 +2080,10 @@ async fn run_thread_actor(
                             )
                             .await
                             {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, false);
                             }
                             while let Ok(update) = live_rx.try_recv() {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, false);
                             }
                             if let Some(notifications) = early_notifications.as_mut() {
                                 if let Ok(Ok(update)) = tokio::time::timeout(
@@ -1761,10 +2092,10 @@ async fn run_thread_actor(
                                 )
                                 .await
                                 {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                                 while let Ok(update) = notifications.try_recv() {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                             }
                             session_id = Some(sid.clone());
@@ -1792,12 +2123,20 @@ async fn run_thread_actor(
             Command::ReattachSession {
                 session_id: sid,
                 cwd,
+                mcp_servers,
                 resp,
             } => {
-                let params = serde_json::json!({
-                    "sessionId": sid,
-                    "cwd": cwd.to_string_lossy(),
-                });
+                let params = match acpx_client::build_resume_session_params(
+                    &sid,
+                    &cwd,
+                    &mcp_servers,
+                ) {
+                    Ok(params) => params,
+                    Err(err) => {
+                        let _ = resp.send(Err(err.into()));
+                        continue;
+                    }
+                };
                 client.register_session_replay(&sid, "session/resume", params.clone(), None);
                 let mut early_notifications = client.subscribe_session(&sid);
                 let mut result = Err(AcpxThreadError::ActorGone);
@@ -1808,7 +2147,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, Some(&sid), &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx, false);
                             if let Some(notifications) = early_notifications.as_mut() {
                                 if let Ok(Ok(update)) = tokio::time::timeout(
                                     std::time::Duration::from_millis(250),
@@ -1816,10 +2155,10 @@ async fn run_thread_actor(
                                 )
                                 .await
                                 {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                                 while let Ok(update) = notifications.try_recv() {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                             }
                             session_id = Some(sid.clone());
@@ -1879,11 +2218,19 @@ async fn run_thread_actor(
                     // shares this loop's local `live_rx`/`session_id`/
                     // `session_tx` state, which a standalone helper fn
                     // can't borrow across this `select!`-driven loop as
-                    // cleanly as an inline arm can.
-                    let params = serde_json::json!({
-                        "sessionId": sid,
-                        "cwd": cwd.to_string_lossy(),
-                    });
+                    // cleanly as an inline arm can. Carries the same
+                    // client-computed mcpServers list as session/new.
+                    let params = match acpx_client::build_resume_session_params(
+                        &sid,
+                        &cwd,
+                        &mcp_servers,
+                    ) {
+                        Ok(params) => params,
+                        Err(err) => {
+                            let _ = resp.send(Err(err.into()));
+                            continue;
+                        }
+                    };
                     client.register_session_replay(&sid, "session/resume", params.clone(), None);
                     let mut early_notifications = client.subscribe_session(&sid);
                     let mut attempt_result = Err(AcpxThreadError::ActorGone);
@@ -1894,8 +2241,8 @@ async fn run_thread_actor(
                         {
                             Ok((value, updates)) => {
                                 emit_capability_events(&value, &event_tx);
-                                attach_config_options_raw = value.get("configOptions").cloned();
-                                forward_updates(&updates, Some(&sid), &event_tx);
+                                attach_config_options_raw = Some(value.clone());
+                                forward_updates(&updates, Some(&sid), &event_tx, false);
                                 if let Some(notifications) = early_notifications.as_mut() {
                                     if let Ok(Ok(update)) = tokio::time::timeout(
                                         std::time::Duration::from_millis(250),
@@ -1903,10 +2250,10 @@ async fn run_thread_actor(
                                     )
                                     .await
                                     {
-                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                        forward_updates(&[update], Some(&sid), &event_tx, false);
                                     }
                                     while let Ok(update) = notifications.try_recv() {
-                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                        forward_updates(&[update], Some(&sid), &event_tx, false);
                                     }
                                 }
                                 Ok(())
@@ -1950,7 +2297,7 @@ async fn run_thread_actor(
                     // the opener genuinely didn't report a response.
                     if let Some(value) = lease.capabilities.as_ref() {
                         emit_capability_events(value, &event_tx);
-                        attach_config_options_raw = value.get("configOptions").cloned();
+                        attach_config_options_raw = Some(value.clone());
                     }
                     client.register_session_replay(
                         &sid,
@@ -1975,7 +2322,7 @@ async fn run_thread_actor(
                         current_lease = Some(lease);
                         baseline_config_options = attach_config_options_raw
                             .as_ref()
-                            .and_then(parse_config_options)
+                            .map(extract_config_options)
                             .unwrap_or_default();
                         config_overrides.clear();
                     }
@@ -1992,6 +2339,76 @@ async fn run_thread_actor(
                 let _ = resp.send(result);
             }
             Command::SendPrompt { text, resp } => {
+                if session_id.is_none() {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                }
+                // mcp-registry-live-propagation: if the pool generation
+                // bumped (registry change) while we held a lease but had
+                // not yet started a turn, release+reacquire so the first
+                // prompt lands on a session opened under the current
+                // registry merge. Safe because turn is still NotStarted
+                // (ActiveTurnNotReleasable cannot fire). Prefer
+                // session/new (saved_session_id: None) so backends that
+                // ignore mcpServers on resume still get a real reconnect.
+                let stale = match (pool.as_ref(), current_lease.as_ref()) {
+                    (Some(pool), Some(lease)) => pool.is_lease_stale(lease).await,
+                    _ => false,
+                };
+                if stale {
+                    if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                        let key = lease.key.clone();
+                        let thread_id = lease.thread_id.clone();
+                        match pool.release(&lease).await {
+                            Ok(()) => match pool
+                                .acquire(
+                                    key,
+                                    thread_id,
+                                    OpenSpec {
+                                        saved_session_id: None,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(new_lease) => {
+                                    let new_sid = new_lease.session_id.clone();
+                                    if let Some(value) = new_lease.capabilities.as_ref() {
+                                        emit_capability_events(value, &event_tx);
+                                        baseline_config_options = extract_config_options(value);
+                                        config_overrides.clear();
+                                    }
+                                    client.register_session_replay(
+                                        &new_sid,
+                                        "session/load",
+                                        serde_json::json!({
+                                            "sessionId": new_sid,
+                                            "cwd": new_lease.key.project_dir,
+                                            "mcpServers": [],
+                                        }),
+                                        None,
+                                    );
+                                    let _ = client.subscribe_session(&new_sid);
+                                    session_id = Some(new_sid.clone());
+                                    let _ = session_tx.send(Some(new_sid));
+                                    current_lease = Some(new_lease);
+                                }
+                                Err(err) => {
+                                    session_id = None;
+                                    let _ = session_tx.send(None);
+                                    let _ = resp.send(Err(AcpxThreadError::Pool(err.to_string())));
+                                    continue;
+                                }
+                            },
+                            Err(err) => {
+                                // Put the lease back; still try the prompt.
+                                current_lease = Some(lease);
+                                eprintln!(
+                                    "panel-rust: pool.release of stale lease before prompt failed ({err}) -- sending on original session"
+                                );
+                            }
+                        }
+                    }
+                }
                 let Some(sid) = session_id.clone() else {
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
@@ -2024,7 +2441,7 @@ async fn run_thread_actor(
                     tokio::select! {
                         update = live_rx.recv() => {
                             if let Some(update) = update {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, true);
                             }
                         }
                         result = &mut prompt => break result,
@@ -2032,7 +2449,7 @@ async fn run_thread_actor(
                 };
                 match outcome {
                     Ok((result, updates)) => {
-                        forward_updates(&updates, Some(&sid), &event_tx);
+                        forward_updates(&updates, Some(&sid), &event_tx, true);
                         // A resumed WS subscription can receive a burst of
                         // final notifications just after the prompt response.
                         // Keep draining until the stream is briefly quiet,
@@ -2046,7 +2463,7 @@ async fn run_thread_actor(
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
                                 Ok(Some(update)) => {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, true);
                                     wait = std::time::Duration::from_millis(75);
                                 }
                                 Ok(None) | Err(_) => break,
@@ -2362,47 +2779,39 @@ async fn run_thread_actor(
                 break;
             }
             Command::ListMcpServers { resp } => {
-                // Deliberately `client.call(...)` (the transport-neutral
-                // `Gateway` facade this actor already holds), not
-                // `acpx_client::ext::mcp_servers::list` -- that helper is
-                // typed against the raw HTTP-only `GatewayClient`, which
-                // would silently drop this actor onto HTTP even in a live
-                // WS session. Same reasoning `ListProfiles`/`ListSessions`
-                // above already follow.
-                let result = client
-                    .call("mcp_servers/list", serde_json::json!({}), None)
-                    .await
-                    .map(|value| {
-                        value
-                            .get("servers")
-                            .and_then(|s| s.as_array())
-                            .map(|entries| {
-                                entries
-                                    .iter()
-                                    .filter_map(crate::protocol_types::McpServerEntry::from_json)
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    });
+                // Deliberately `client.list_mcp_servers()` (a typed method
+                // on the transport-neutral `Gateway` facade this actor
+                // already holds, `acpx_client::mcp`), not `acpx_client::
+                // ext::mcp_servers::list` -- that helper is typed against
+                // the raw HTTP-only `GatewayClient`, which would silently
+                // drop this actor onto HTTP even in a live WS session.
+                // Same reasoning `ListProfiles`/`ListSessions` above
+                // already follow.
+                let result = client.list_mcp_servers().await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/create", entry, None).await;
+                let result = client.create_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::UpdateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/update", entry, None).await;
+                let result = client.update_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::DeleteMcpServer { name, resp } => {
-                let result = client
-                    .call(
-                        "mcp_servers/delete",
-                        serde_json::json!({ "name": name }),
-                        None,
-                    )
-                    .await
-                    .map(|_| ());
+                let result = client.delete_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::AuthenticateMcpServer { name, resp } => {
+                let result = client.authenticate_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::LogoutMcpServer { name, resp } => {
+                let result = client.logout_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::FetchMcpServerTools { name, resp } => {
+                let result = client.fetch_mcp_server_tools(&name).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateProfile { entry, resp } => {
@@ -2603,6 +3012,102 @@ mod capability_parsing_tests {
         assert_eq!(parsed[0].current_value.as_deref(), Some("gpt-5"));
         assert_eq!(parsed[0].options.len(), 2);
         assert_eq!(parsed[0].options[1].description.as_deref(), Some("Cheaper"));
+    }
+
+    /// Real `session/new` result shape captured from a live
+    /// `grok agent stdio` (`~/.grok/bin/grok`) subprocess -- grok has no
+    /// top-level `configOptions`/`modes` at all; this is exactly what
+    /// `parse_grok_model_config`/`extract_config_options` must handle.
+    fn real_grok_session_new_result() -> serde_json::Value {
+        json!({
+            "sessionId": "019fbc0e-55b2-7f42-97eb-0a59bed5f63b",
+            "models": {
+                "currentModelId": "grok-4.5",
+                "availableModels": [{
+                    "modelId": "grok-4.5",
+                    "name": "Grok 4.5",
+                    "description": "SpaceXAI's new frontier model",
+                    "_meta": {
+                        "totalContextTokens": 500000,
+                        "agentType": "grok-build-plan",
+                        "supportsReasoningEffort": true,
+                        "reasoningEffort": "medium",
+                        "reasoningEfforts": [
+                            {"id": "high", "value": "high", "label": "High Effort", "default": true},
+                            {"id": "medium", "value": "medium", "label": "Medium Effort", "default": false},
+                            {"id": "low", "value": "low", "label": "Low Effort", "default": false}
+                        ]
+                    }
+                }]
+            },
+            "_meta": {
+                "x.ai/sessionConfig": {
+                    "options": [
+                        {"id": "grok-4.5", "category": "model", "label": "Grok 4.5", "selected": true},
+                        {"id": "high", "category": "mode", "label": "High Effort", "selected": false},
+                        {"id": "medium", "category": "mode", "label": "Medium Effort", "selected": true},
+                        {"id": "low", "category": "mode", "label": "Low Effort", "selected": false}
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn extract_config_options_is_empty_for_grok_with_only_the_standard_acp_parse() {
+        // Regression guard: confirms the bug this fix addresses actually
+        // exists in the standard-shape-only parse -- grok's real
+        // response genuinely has no top-level `configOptions`, so the
+        // plain ACP parse must come back empty (this is what left the
+        // compose bar's Model dropdown and sidebar model label blank for
+        // grok-build before `parse_grok_model_config` existed).
+        let value = real_grok_session_new_result();
+        assert!(value.get("configOptions").and_then(parse_config_options).is_none());
+    }
+
+    #[test]
+    fn parse_grok_model_config_reads_real_grok_model_and_reasoning_shape() {
+        let value = real_grok_session_new_result();
+        let parsed = parse_grok_model_config(&value);
+        assert_eq!(parsed.len(), 2, "expected a model entry and a reasoning_effort entry");
+
+        let model = parsed.iter().find(|o| o.id == "model").expect("model entry");
+        assert_eq!(model.category.as_deref(), Some("model"));
+        assert_eq!(model.current_value.as_deref(), Some("grok-4.5"));
+        assert_eq!(model.options.len(), 1);
+        assert_eq!(model.options[0].value, "grok-4.5");
+        assert_eq!(model.options[0].name, "Grok 4.5");
+
+        let reasoning = parsed
+            .iter()
+            .find(|o| o.id == "reasoning_effort")
+            .expect("reasoning_effort entry");
+        assert_eq!(reasoning.current_value.as_deref(), Some("medium"));
+        assert_eq!(reasoning.options.len(), 3);
+        assert!(reasoning.options.iter().any(|o| o.value == "high" && o.name == "High Effort"));
+    }
+
+    #[test]
+    fn extract_config_options_falls_back_to_grok_shape_when_configoptions_is_absent() {
+        let value = real_grok_session_new_result();
+        let extracted = extract_config_options(&value);
+        assert!(
+            extracted.iter().any(|o| o.id == "model" && o.current_value.as_deref() == Some("grok-4.5")),
+            "extract_config_options must recover grok's real model catalog via the vendor-shape fallback, got {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn extract_config_options_prefers_the_standard_shape_when_both_are_present() {
+        let mut value = real_grok_session_new_result();
+        value["configOptions"] = json!([{
+            "id": "model",
+            "currentValue": "standard-shape-model",
+            "options": [{"value": "standard-shape-model", "name": "Standard"}]
+        }]);
+        let extracted = extract_config_options(&value);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].current_value.as_deref(), Some("standard-shape-model"));
     }
 
     #[test]

@@ -2,9 +2,11 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Strings } from "../tokens/strings.slint";
 import { Icon } from "../base/icon.slint";
+import { Spinner } from "../base/spinner.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
+import { ThinScrollbar } from "../base/thin_scrollbar.slint";
 import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { MentionPickRow } from "../base/mention_pick_row.slint";
@@ -681,6 +683,18 @@ export component ChatInputLayout inherits Rectangle {
                                 }
                                 return EventResult.reject;
                             }
+                            // Ctrl+A select-all, pinned explicitly so a
+                            // following Ctrl+X reliably has a real
+                            // selection to cut. Offsets clamp out of
+                            // range, so a huge end selects to the real
+                            // end without computing its byte length.
+                            // Reject after so native Ctrl+C/Ctrl+X still
+                            // handle the resulting selection.
+                            if ((event.text == "a" || event.text == "A")
+                                && event.modifiers.control && !event.modifiers.shift) {
+                                self.set-selection-offsets(0, 2147483647);
+                                return EventResult.reject;
+                            }
                             return EventResult.reject;
                         }
                     }
@@ -725,7 +739,7 @@ export component ChatInputLayout inherits Rectangle {
                     // audit-fixes animation_tick_loaders: continuous spin
                     // via animation-tick (no dynamic iteration-count).
                     property <angle> load-spin: root.sending
-                        ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                        ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                         : 0deg;
                     if root.sending : VerticalLayout {
                         // Without this wrapper the ring rendered pinned to
@@ -737,15 +751,13 @@ export component ChatInputLayout inherits Rectangle {
                         alignment: center;
                         HorizontalLayout {
                             alignment: center;
-                            Icon {
+                            Spinner {
                                 // Larger than the stop icon (icon-sm, 12px)
                                 // so it reads as a ring around it, not an
                                 // overlapping duplicate at the same size.
-                                source: @image-url("../assets/icons/loader-circle.svg");
                                 size: 26px;
-                                color: Theme.text-secondary.with-alpha(0.55);
-                                transform-rotation: load-spin;
-                                transform-origin: { x: self.width / 2, y: self.height / 2 };
+                                stroke: Theme.text-secondary.with-alpha(0.55);
+                                stroke-width: 2px;
                             }
                         }
                     }
@@ -803,9 +815,14 @@ export component ChatInputLayout inherits Rectangle {
             width: 100%;
             height: root.row2-h;
             // Clip only while nothing paints outside the 24px band. Open
-            // dropdowns *and* the context-ring hover card both paint upward;
-            // without context-ring.has-hover here the session-context hover
-            // card was fully clipped (never visible in the compose bar).
+            // dropdowns paint upward as children of their own trigger, still
+            // inside this panned strip, so they need clip off here to escape
+            // the band. The context-ring hover card does NOT: it is a
+            // top-level sibling of this whole row (see below), positioned
+            // via absolute-position rather than nested in this pan/clip
+            // host, specifically so hovering it never needs to touch this
+            // clip gate (context_ring_hover_left_overflow -- see that
+            // overlay's own doc comment for why).
             clip: !(profile-dropdown.is-open
                 || mode-dropdown.is-open
                 || config-dropdown.is-open
@@ -830,6 +847,16 @@ export component ChatInputLayout inherits Rectangle {
             }
         row2-strip := HorizontalLayout {
             x: row2-host.overflow > 0px ? row2-host.pan : 0px;
+            // row2_strip_shrink_to_fit: previously always widened to at
+            // least `row2-host.width`, so a near-empty row (few select
+            // items) still reserved the whole bar's width as dead
+            // trailing space. Shrink-to-fit here; overflow math above
+            // already keys off `preferred-width` too, so scroll still
+            // engages once content genuinely overflows. Trade-off:
+            // `context-ring`'s trailing spacer has no slack to absorb
+            // now, so it sits right after the last control instead of
+            // flush against the bar's edge.
+            width: self.preferred-width;
             height: root.row2-h;
             preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
@@ -1015,6 +1042,19 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
 
+            // NOTE: no trailing stretch spacer here. row2-strip's own
+            // `width` above is bound to `self.preferred-width`
+            // (row2_strip_shrink_to_fit), which by definition leaves no
+            // slack for any stretch child to absorb in *any* state -- not
+            // just once overflowing. A `horizontal-stretch: 1` spacer was
+            // tried here to pin `context-ring` flush against the bar's
+            // right end, but it could never receive any width under that
+            // sizing rule, so it was dead code; removed rather than kept
+            // around implying behavior that can't happen. `context-ring`
+            // simply trails immediately after the last visible control
+            // (see the row2_strip_shrink_to_fit comment above for the
+            // documented trade-off).
+
             // Hidden below row2-compact's width threshold -- see its own
             // doc comment. Least essential of row 2's three controls
             // (decorative usage indicator, not a picker), so it's the one
@@ -1037,6 +1077,27 @@ export component ChatInputLayout inherits Rectangle {
                 context-view-requested => { root.context-view-requested(); }
             }
         }
+
+            // Visible horizontal scrollbar for the pan above -- reuses the
+            // same auto-hiding thin-scrollbar pattern/component the
+            // message list already uses (chat_area.slint's vertical
+            // ThinScrollbar), so a narrow dock gets a consistent, visible
+            // affordance that this row scrolls instead of merely relying
+            // on an undiscoverable wheel/trackpad pan.
+            ThinScrollbar {
+                horizontal: true;
+                x: 0px;
+                y: root.row2-h - self.thumb-width;
+                visible-width: row2-host.width;
+                viewport-width: row2-host.width + row2-host.overflow;
+                viewport-x <=> row2-host.pan;
+                thumb-width: 3px;
+                // Press-and-hold only, not plain hover -- hovering the row
+                // (to reach a dropdown trigger) shouldn't light up the
+                // scrollbar; it should only appear while actually being
+                // dragged.
+                active: row2-scroll.pressed;
+            }
         }
 
         // PUI-002a: background-terminals chip, own row below the row2
@@ -1065,6 +1126,75 @@ export component ChatInputLayout inherits Rectangle {
                     label: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
                     clicked => { root.terminals-clicked(); }
                 }
+            }
+        }
+    }
+
+    // context-ring hover card — sibling of the main VerticalLayout, same
+    // idiom as the / @ # mention popup just below: positioned via explicit
+    // x/y outside any layout so it can paint above this bar without being
+    // clipped. This used to be rendered *inside* ContextRing itself (a
+    // descendant of row2-host, the pan host for row 2's selector strip),
+    // which required row2-host to disable its own `clip` whenever the ring
+    // was hovered. row2-host also horizontally pans row2-strip so an
+    // overflowing set of dropdowns stays reachable -- context-ring sits at
+    // the trailing end of that strip, so reaching it on a narrow/crowded
+    // dock means panning strip content far to the left, off row2-host's
+    // visible bounds (still clipped, so invisible -- by design). Disabling
+    // row2-host.clip for the hover card ALSO un-hid that panned-off content
+    // (Provider/Mode/etc triggers), which then rendered past this
+    // component's own left edge (root.clip is deliberately false) and
+    // overlapped whatever sat underneath -- live-reported as the Provider/
+    // agent dropdowns painting on top of the sidebar's Settings footer,
+    // "left overflow" (context_ring_hover_left_overflow). Anchoring this
+    // card via absolute-position instead of nesting it inside row2-host
+    // sidesteps the pan/clip host entirely, so row2-host's clip no longer
+    // needs to react to hover at all (see its own clip binding above).
+    Rectangle {
+        visible: root.context-ring-hovered;
+        property <length> card-w: 168px;
+        property <length> card-h: 64px;
+        // Right-align the card's right edge to the ring's right edge, same
+        // as the old inline card did relative to its own parent -- just
+        // computed here via absolute-position (both root and context-ring
+        // report window-relative coordinates; the difference is
+        // context-ring's position in this component's own local space,
+        // matching how root.mention-open's popup below is positioned).
+        x: (context-ring.absolute-position.x - root.absolute-position.x)
+            + context-ring.width - self.card-w;
+        y: (context-ring.absolute-position.y - root.absolute-position.y)
+            - self.card-h - 8px;
+        width: self.card-w;
+        height: self.card-h;
+        z: 9000;
+        background: Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 10px;
+        drop-shadow-color: #000000.with-alpha(0.35);
+        drop-shadow-offset-y: 2px;
+        VerticalLayout {
+            padding: 8px;
+            spacing: 3px;
+            Text {
+                text: Strings.session-context;
+                color: Theme.text-secondary;
+                font-size: 9px * Theme.font-scale;
+                font-weight: 700;
+                font-family: Theme.font-mono;
+            }
+            Text {
+                text: root.context-used-tokens + " / " + root.context-limit-tokens + " tokens";
+                color: Theme.text-primary;
+                font-size: 11px * Theme.font-scale;
+                font-family: Theme.font-sans;
+            }
+            Text {
+                text: context-ring.pct + "% used";
+                color: context-ring.ring-color;
+                font-size: 10px * Theme.font-scale;
+                font-family: Theme.font-mono;
             }
         }
     }

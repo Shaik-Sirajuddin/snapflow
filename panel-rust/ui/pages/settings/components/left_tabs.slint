@@ -9,9 +9,22 @@ import { NavItem } from "../../../base/nav_item.slint";
 // plan notes Project mirrors Global's section list). Controlled by
 // `SettingsPage` via `active-section`/`section-selected`, same "dumb
 // strip" pattern as `SettingsTopTabs`.
+//
+// settings_scope_visibility_gate: `MCP Servers` is the one section that is
+// *entirely* global-only (the whole McpServerStore registry has no
+// per-project dimension at all -- see settings_page.slint's own doc
+// comment), so its nav item is conditionally instantiated on `scope`
+// instead of just hiding its content pane -- a visible-but-empty "MCP
+// Servers" tab under Project would be more confusing than not offering
+// the tab at all. Agents/Harness/Skills stay unconditional: each mixes at
+// least one genuinely dual-tier field (default profile, permission
+// profile, default agent id, background-session-default) with global-only
+// pieces, so those three views gate their own global-only rows
+// internally instead (see agents_view.slint / skills_view.slint).
 export component SettingsLeftTabs inherits Rectangle {
     in property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
     in property <bool> expanded: true;
+    in property <string> scope: "project"; // "project" | "global"
     callback section-selected(string);
     callback collapse-requested();
 
@@ -22,7 +35,7 @@ export component SettingsLeftTabs inherits Rectangle {
     VerticalLayout {
         spacing: Metrics.space-2;
 
-        NavItem {
+        if root.scope == "global" : NavItem {
             height: 34px;
             label: Strings.mcp-servers;
             button-accessible-label: Strings.mcp-servers-section;
@@ -31,7 +44,9 @@ export component SettingsLeftTabs inherits Rectangle {
             show-label: root.expanded;
             centered: !root.expanded;
             icon-source: @image-url("../../../assets/icons/plug-zap.svg");
-            icon-size: root.expanded ? 14px : 15px;
+            // Keep the icon's box stable while the label appears/disappears;
+            // changing it between states makes the tab contents jump by a px.
+            icon-size: 14px;
             clicked => { root.section-selected("mcp_servers"); }
             double-clicked => { root.collapse-requested(); }
         }
@@ -44,7 +59,7 @@ export component SettingsLeftTabs inherits Rectangle {
             show-label: root.expanded;
             centered: !root.expanded;
             icon-source: @image-url("../../../assets/icons/sparkles.svg");
-            icon-size: root.expanded ? 14px : 15px;
+            icon-size: 14px;
             clicked => { root.section-selected("agents"); }
             double-clicked => { root.collapse-requested(); }
         }
@@ -57,7 +72,7 @@ export component SettingsLeftTabs inherits Rectangle {
             show-label: root.expanded;
             centered: !root.expanded;
             icon-source: @image-url("../../../assets/icons/terminal.svg");
-            icon-size: root.expanded ? 14px : 15px;
+            icon-size: 14px;
             clicked => { root.section-selected("harness"); }
             double-clicked => { root.collapse-requested(); }
         }
@@ -70,7 +85,7 @@ export component SettingsLeftTabs inherits Rectangle {
             show-label: root.expanded;
             centered: !root.expanded;
             icon-source: @image-url("../../../assets/icons/book-open.svg");
-            icon-size: root.expanded ? 14px : 15px;
+            icon-size: 14px;
             clicked => { root.section-selected("skills"); }
             double-clicked => { root.collapse-requested(); }
         }

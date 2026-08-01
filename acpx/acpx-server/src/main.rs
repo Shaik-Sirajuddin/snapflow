@@ -6,10 +6,10 @@
 //! (many concurrent remote clients) run concurrently against the same
 //! router, so they share one session registry and one set of supervised
 //! backend processes regardless of which transport a client used. If
-//! `ACPX_DB_PATH` is set, session metadata is persisted to that sqlite file
-//! (see `acpx_core::persistence`); otherwise persistence
-//! is skipped entirely (`Router::with_persistence` is optional). Setting
-//! `ACPX_DB_PATH` also enables the durable secret/config store
+//! session metadata + transcripts are always persisted to a sqlite file
+//! (see `acpx_core::persistence`) at `ACPX_DB_PATH` if set, otherwise the
+//! default `~/.acpx/acpx.db` (created on first use). This also enables the
+//! durable secret/config store
 //! (`Router::enable_durable_config`, see `acpx_core::keystore`'s module
 //! doc comment): profiles, MCP servers, providers, and encrypted secret
 //! material all survive a restart too, not just session metadata.
@@ -24,6 +24,24 @@
 mod config;
 mod provisioning;
 mod transport;
+
+/// Resolves the sqlite persistence file path: `ACPX_DB_PATH` if set,
+/// otherwise `~/.acpx/acpx.db` (created on first use). Durable
+/// persistence used to be entirely opt-in via `ACPX_DB_PATH`, which meant
+/// an operator who never set it silently lost MCP servers/profiles/
+/// providers/session history on every restart with no indication anything
+/// was wrong -- defaulting to a fixed path (the same `~/.acpx/` home this
+/// workspace already uses for adapter installs, see
+/// `acpx_registry::install`'s `default_adapters_dir`) makes persistence
+/// durable out of the box while `ACPX_DB_PATH` remains available to point
+/// at a different file.
+fn default_db_path() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".acpx")
+        .join("acpx.db")
+}
 
 use acpx_core::{
     recover_open_sessions_shared, router::Router, NotificationHub, StartupRecoveryPolicy,
@@ -99,7 +117,26 @@ async fn main() -> anyhow::Result<()> {
         config.default_acp_command.clone(),
     );
 
-    if let Ok(db_path) = std::env::var("ACPX_DB_PATH") {
+    let db_path = std::env::var("ACPX_DB_PATH").unwrap_or_else(|_| {
+        let path = default_db_path();
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                tracing::warn!(
+                    %err,
+                    dir = %parent.display(),
+                    "failed to create default ACPX_DB_PATH directory, persistence may fail to open"
+                );
+            }
+        }
+        path.to_string_lossy().into_owned()
+    });
+    {
+        // Kept as a bare block (rather than flattening the `match` out a
+        // level) so this diff stays a minimal change against the
+        // historically `if let Ok(db_path) = ...` gated version below --
+        // persistence is no longer conditional on `ACPX_DB_PATH` being
+        // set, only on `PersistenceStore::open` succeeding at whichever
+        // path was resolved above.
         match acpx_core::PersistenceStore::open(std::path::Path::new(&db_path)) {
             Ok(store) => {
                 tracing::info!(%db_path, "session persistence enabled");
@@ -165,6 +202,15 @@ async fn main() -> anyhow::Result<()> {
     // silently reseed and shadow an operator's own customization of one
     // of the auto-seeded default names (e.g. `codex-acp`) every time.
     router.warm_default_profiles().await;
+
+    // MCP OAuth token auto-refresh -- deliberately a detached background
+    // loop, not something `session/new` triggers inline (see `Router::
+    // inject_oauth_headers`'s doc comment for exactly why: this router's
+    // single global lock must never be held across the real network I/O
+    // a refresh requires). One-minute cadence: `OAuthTokens::needs_refresh`
+    // already has a 30-second lead time before actual expiry, so a tick
+    // any coarser risks a token going stale between ticks.
+    router.spawn_oauth_refresh_loop(std::time::Duration::from_secs(60));
 
     // The admin plane changes gateway-wide launch policy, so it is never
     // allowed to run with ephemeral state. Load one registry snapshot now

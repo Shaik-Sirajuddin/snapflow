@@ -90,6 +90,10 @@ type Config struct {
 	// AcpxConfigPath is the generated ACPX_CONFIG_FILE path.
 	AcpxConfigPath string
 
+	// AcpxAdminBind is the loopback address for acpx-server's admin plane.
+	// Defaults to acpxmgr.AdminBind; worktree instances may override it.
+	AcpxAdminBind string
+
 	// AcpxDefaultAcpCommand is optional ACPX_DEFAULT_ACP_COMMAND for the
 	// bundled acpx-server native-mode default agent
 	// (SNAPSHOTD_ACPX_DEFAULT_ACP_COMMAND; legacy alias
@@ -155,6 +159,10 @@ func Default() Config {
 	if acpxConfig == "" {
 		acpxConfig = filepath.Join(home, "acpx-config.json")
 	}
+	acpxAdminBind := os.Getenv("SNAPSHOTD_ACPX_ADMIN_BIND")
+	if acpxAdminBind == "" {
+		acpxAdminBind = "127.0.0.1:8791"
+	}
 	acpxEnabled := false
 	if v, ok := os.LookupEnv("SNAPSHOTD_ACPX_ENABLED"); ok {
 		acpxEnabled, _ = strconv.ParseBool(v)
@@ -183,6 +191,7 @@ func Default() Config {
 		AcpxBinPath:           acpxBin,
 		AcpxHttpBind:          acpxBind,
 		AcpxConfigPath:        acpxConfig,
+		AcpxAdminBind:         acpxAdminBind,
 		AcpxDefaultAcpCommand: acpxDefaultAcpCommand,
 	}
 }

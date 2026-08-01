@@ -53,6 +53,16 @@ pub struct SettingsDocument {
     pub background_session_default: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent_id: Option<String>,
+    // `show_global_skills` -- Skills settings view's "Show global skills"
+    // row (`skills_view.slint`). Genuinely dual-tier like `default_profile`
+    // et al: a Project-tier value overrides Global, same
+    // `merge_documents` layering below. This field did not exist before
+    // the settings-scoping bug report -- the toggle was previously
+    // component-local Slint state only (see `skills_view.slint`'s history),
+    // never round-tripped through this document at all, which is why it
+    // appeared to ignore the Project/Global scope tabs entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_global_skills: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessSettings>,
     // `dev_mode` -- `dev-mode` task's "Dev mode option for the system".
@@ -64,6 +74,12 @@ pub struct SettingsDocument {
     // system-level toggle, not a per-project one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_mode: Option<bool>,
+    // Built-in snapflow (snapshotd daemon) MCP injection into session
+    // `mcpServers`. Global-only like `dev_mode`: not an acpx registry row
+    // (`mcp_servers/*` has no target for it), so enable/disable is a
+    // panel preference that gates client-side injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapflow_mcp_enabled: Option<bool>,
 }
 
 fn schema_version_default() -> u32 {
@@ -77,6 +93,7 @@ pub struct ResolvedSettings {
     pub permission_profile: Option<String>,
     pub background_session_default: bool,
     pub default_agent_id: Option<String>,
+    pub show_global_skills: bool,
     pub harness: HarnessSettings,
 }
 
@@ -87,6 +104,9 @@ impl Default for ResolvedSettings {
             permission_profile: None,
             background_session_default: false,
             default_agent_id: None,
+            // Matches `skills_view.slint`'s pre-existing local-property
+            // default -- global skills show by default.
+            show_global_skills: true,
             harness: HarnessSettings::default(),
         }
     }
@@ -123,6 +143,9 @@ pub fn merge_documents(layers: &[&SettingsDocument]) -> ResolvedSettings {
         }
         if let Some(ref v) = doc.default_agent_id {
             out.default_agent_id = non_empty_opt(v.clone());
+        }
+        if let Some(v) = doc.show_global_skills {
+            out.show_global_skills = v;
         }
         if let Some(ref h) = doc.harness {
             out.harness = h.clone();
@@ -274,6 +297,23 @@ impl SettingsPaths {
         doc.dev_mode = Some(enabled);
         save_document(&self.global, &doc)
     }
+
+    /// Whether the built-in snapflow (snapshotd) MCP is injected into
+    /// new/pooled sessions. Defaults to **true** when unset.
+    pub fn snapflow_mcp_enabled(&self) -> bool {
+        load_document(&self.global)
+            .ok()
+            .and_then(|doc| doc.snapflow_mcp_enabled)
+            .unwrap_or(true)
+    }
+
+    /// Persist the built-in snapflow MCP enable preference (Global only).
+    pub fn set_snapflow_mcp_enabled(&self, enabled: bool) -> Result<(), SettingsFileError> {
+        let mut doc = load_document(&self.global).unwrap_or_default();
+        doc.schema_version = 1;
+        doc.snapflow_mcp_enabled = Some(enabled);
+        save_document(&self.global, &doc)
+    }
 }
 
 fn dirs_fallback_config() -> PathBuf {
@@ -400,8 +440,10 @@ mod tests {
             permission_profile: Some("read".into()),
             background_session_default: Some(false),
             default_agent_id: None,
+            show_global_skills: None,
             harness: None,
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         let global = SettingsDocument {
             schema_version: 1,
@@ -409,8 +451,10 @@ mod tests {
             permission_profile: None,
             background_session_default: Some(true),
             default_agent_id: Some("codex".into()),
+            show_global_skills: Some(false),
             harness: None,
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         let project = SettingsDocument {
             schema_version: 1,
@@ -418,18 +462,23 @@ mod tests {
             permission_profile: None,
             background_session_default: None,
             default_agent_id: None,
+            show_global_skills: None,
             harness: Some(HarnessSettings {
                 notifications_enabled: false,
                 notify_on_input_required: true,
                 auto_resume_on_rate_limit_reset: true,
             }),
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         let r = merge_documents(&[&bundled, &global, &project]);
         assert_eq!(r.default_profile.as_deref(), Some("project-prof"));
         assert_eq!(r.permission_profile.as_deref(), Some("read"));
         assert!(r.background_session_default);
         assert_eq!(r.default_agent_id.as_deref(), Some("codex"));
+        // Project doesn't set show_global_skills, so the Global value
+        // (false) is inherited, same precedence as every other field here.
+        assert!(!r.show_global_skills);
         assert!(!r.harness.notifications_enabled);
         assert!(r.harness.auto_resume_on_rate_limit_reset);
     }
@@ -448,6 +497,7 @@ mod tests {
             permission_profile: Some("default".to_owned()),
             background_session_default: true,
             default_agent_id: Some("codex".to_owned()),
+            show_global_skills: true,
             harness: HarnessSettings::default(),
         };
         let defaults = resolved_to_panel_defaults(&poisoned, None);
@@ -497,14 +547,17 @@ mod tests {
             permission_profile: Some("full".into()),
             background_session_default: Some(true),
             default_agent_id: None,
+            show_global_skills: Some(false),
             harness: Some(HarnessSettings::default()),
             dev_mode: None,
+            snapflow_mcp_enabled: None,
         };
         save_document(&path, &doc).unwrap();
         let loaded = load_document(&path).unwrap();
         assert_eq!(loaded.default_profile.as_deref(), Some("default"));
         assert_eq!(loaded.permission_profile.as_deref(), Some("full"));
         assert_eq!(loaded.background_session_default, Some(true));
+        assert_eq!(loaded.show_global_skills, Some(false));
     }
 
     #[test]
@@ -557,6 +610,45 @@ mod tests {
         let reloaded = load_document(&global).unwrap();
         assert_eq!(reloaded.default_profile.as_deref(), Some("kept"));
         assert_eq!(reloaded.dev_mode, Some(true));
+    }
+
+    /// `show_global_skills` regression coverage: this field is new (added
+    /// to fix the settings-scoping bug report that "show global skills"
+    /// and "background sessions" behaved as if Project and Global scope
+    /// shared one file). Proves it follows the exact same
+    /// Project-overrides-Global precedence `merge_project_overrides_global`
+    /// already proves for `default_profile`/`background_session_default`/
+    /// `default_agent_id`, plus the "no files at all" default and the
+    /// "Project sets it back to unset -- falls back to Global" case
+    /// (mirroring `settings_reflection_matrix`'s scenario 5 for
+    /// `default_profile`).
+    #[test]
+    fn show_global_skills_follows_project_overrides_global_precedence() {
+        // No layers at all: defaults to true (skills_view.slint's
+        // pre-existing local-property default).
+        assert!(merge_documents(&[]).show_global_skills);
+
+        let global = SettingsDocument {
+            show_global_skills: Some(false),
+            ..Default::default()
+        };
+        let project_overrides = SettingsDocument {
+            show_global_skills: Some(true),
+            ..Default::default()
+        };
+        let r = merge_documents(&[&global, &project_overrides]);
+        assert!(
+            r.show_global_skills,
+            "project-tier true must override global-tier false"
+        );
+
+        // Project sets no value at all: Global's value passes through.
+        let project_unset = SettingsDocument::default();
+        let r = merge_documents(&[&global, &project_unset]);
+        assert!(
+            !r.show_global_skills,
+            "an unset project-tier value must inherit global, not silently reset to the default"
+        );
     }
 
     #[test]

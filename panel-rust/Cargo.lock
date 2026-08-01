@@ -131,6 +131,7 @@ name = "acpx-client"
 version = "0.1.0"
 dependencies = [
  "acpx-proto",
+ "agent-client-protocol",
  "anyhow",
  "futures-util",
  "reqwest",

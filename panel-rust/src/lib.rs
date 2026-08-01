@@ -407,8 +407,10 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
         permission_profile: defaults.permission_profile,
         background_session_default: Some(defaults.background_session),
         default_agent_id: None,
+        show_global_skills: None,
         harness: None,
         dev_mode: None,
+        snapflow_mcp_enabled: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         let message = format!("failed to migrate panel defaults to JSON: {error}");
@@ -444,6 +446,7 @@ fn load_panel_prefs(
 struct ScopedPanelPrefs {
     defaults: PanelDefaults,
     default_agent_id: Option<String>,
+    show_global_skills: bool,
 }
 
 fn scoped_settings_path<'a>(
@@ -511,16 +514,19 @@ fn load_scoped_panel_prefs(
     Some(ScopedPanelPrefs {
         defaults: settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
         default_agent_id: resolved.default_agent_id,
+        show_global_skills: resolved.show_global_skills,
     })
 }
 
-/// Persist profile / permission / background-default / default-agent into the
-/// selected JSON tier. Existing unrelated fields (harness, dev mode, ...) are
-/// retained by the read-modify-write operation.
+/// Persist profile / permission / background-default / default-agent /
+/// show-global-skills into the selected JSON tier. Existing unrelated
+/// fields (harness, dev mode, ...) are retained by the read-modify-write
+/// operation.
 fn save_panel_prefs_to_json(
     scope: &str,
     defaults: &PanelDefaults,
     default_agent_id: Option<String>,
+    show_global_skills: bool,
 ) -> Result<(), String> {
     let paths = settings_file::SettingsPaths::from_env();
     let path = scoped_settings_path(&paths, scope)
@@ -531,7 +537,246 @@ fn save_panel_prefs_to_json(
     doc.permission_profile = defaults.permission_profile.clone();
     doc.background_session_default = Some(defaults.background_session);
     doc.default_agent_id = default_agent_id;
+    doc.show_global_skills = Some(show_global_skills);
     settings_file::save_document(path, &doc).map_err(|error| error.to_string())
+}
+
+/// Feature-flag gate for the "default profile"/"permission profile"
+/// Settings controls (`agents_view.slint`). Both are genuinely dual-tier
+/// (visible under Project and Global scope alike -- unlike the six
+/// categories gated Global-only in 6745aa0e), but until this is explicitly
+/// turned on they're hidden entirely, in both scopes. Defaults OFF (unset
+/// env var => hidden) so an unset environment never surfaces them.
+fn profile_wiring_enabled() -> bool {
+    std::env::var("PANEL_PROFILE_WIRING_ENABLED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// Verifies the Project-vs-Global tiering that `HarnessView`'s
+/// "Background sessions" toggle (`background_session_default`) is
+/// supposed to have, end to end through the exact functions the UI save
+/// path calls (`save_panel_prefs_to_json`/`load_scoped_panel_prefs`/
+/// `scoped_settings_path`) rather than re-testing `settings_file.rs`'s
+/// already-covered `merge_documents` in isolation. Mirrors
+/// `settings_file.rs`'s own env-driven `SettingsPaths::from_env` tests,
+/// and the save/restore-env-var shape `lifecycle_tests::
+/// panel_create_destroy_create_reuses_slint_platform` already uses in this
+/// file for other `RUI_*`-driven state.
+#[cfg(test)]
+mod scoped_panel_prefs_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `SettingsPaths::from_env` reads process-wide env vars, and Rust
+    /// runs `#[test]` functions in parallel by default -- without this,
+    /// this module's two tests race on `RUI_PANEL_SETTINGS_DIR`/
+    /// `RUI_PANEL_PROJECT_ROOT` and spuriously observe each other's
+    /// tempdirs. Serialize them the same way any env-var-mutating test
+    /// suite must.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard: snapshots and restores the handful of `RUI_PANEL_*` env
+    /// vars `SettingsPaths::from_env` reads, so this test can't leak state
+    /// into any test that runs after it in the same process. Holds the
+    /// serialization lock for its whole lifetime.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = env_lock();
+            let keys = [
+                "RUI_PANEL_SETTINGS_DIR",
+                "RUI_ACP_CACHE_DIR",
+                "RUI_PANEL_PROJECT_ROOT",
+                "RUI_PANEL_SETTINGS_DEFAULT",
+            ];
+            let saved = keys
+                .iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect();
+            Self {
+                _lock: lock,
+                saved,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn defaults_with_background(background_session: bool) -> PanelDefaults {
+        PanelDefaults {
+            profile_name: None,
+            permission_profile: None,
+            background_session,
+            selected_thread_id: None,
+        }
+    }
+
+    /// Setting `background_session_default` under Project scope must land
+    /// only in the project JSON file, leaving a separately-read Global
+    /// value untouched -- and vice versa. This is the exact "set under one
+    /// scope, confirm the other scope's separately-read value is
+    /// unaffected" shape called for by the bug report, run through the
+    /// real UI save/load functions instead of the lower-level
+    /// `merge_documents` helper `settings_file.rs` already covers.
+    #[test]
+    fn background_session_default_persists_independently_per_scope() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        let paths = settings_file::SettingsPaths::from_env();
+        let global_path = paths.global.clone();
+        let project_path = paths.project.clone().expect("project path resolved");
+        assert_ne!(
+            global_path, project_path,
+            "project and global settings paths must never collide"
+        );
+
+        // Global starts true, Project starts unset (inherits Global).
+        save_panel_prefs_to_json("global", &defaults_with_background(true), None, true)
+            .expect("save global");
+        let mut warnings = Vec::new();
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(global_prefs.defaults.background_session);
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project (inherits global)");
+        assert!(
+            project_prefs.defaults.background_session,
+            "project scope must inherit the global value when it has no override"
+        );
+
+        // Now set Project to false: this must only touch the project
+        // file, and Global's own separately-read value must stay true.
+        save_panel_prefs_to_json("project", &defaults_with_background(false), None, true)
+            .expect("save project");
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project after override");
+        assert!(
+            !project_prefs.defaults.background_session,
+            "project override must take effect for project scope"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global after project write");
+        assert!(
+            global_prefs.defaults.background_session,
+            "a project-scope write must not affect the separately-read global value"
+        );
+
+        // And the raw files on disk confirm the write actually targeted
+        // separate paths, not the same one under two names.
+        let global_doc = settings_file::load_document(&global_path).expect("read global doc");
+        let project_doc = settings_file::load_document(&project_path).expect("read project doc");
+        assert_eq!(global_doc.background_session_default, Some(true));
+        assert_eq!(project_doc.background_session_default, Some(false));
+    }
+
+    /// Same shape, opposite direction: a Global-scope write after a
+    /// Project override exists must not clobber or be read back through
+    /// the Project file.
+    #[test]
+    fn global_write_does_not_affect_an_existing_project_override() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        save_panel_prefs_to_json("project", &defaults_with_background(true), None, true)
+            .expect("save project override");
+        save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
+            .expect("save global default");
+
+        let mut warnings = Vec::new();
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project");
+        assert!(
+            project_prefs.defaults.background_session,
+            "existing project override must survive an unrelated global write"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(!global_prefs.defaults.background_session);
+    }
+
+    /// Same end-to-end shape as `background_session_default_persists_
+    /// independently_per_scope`, for `show_global_skills` -- the other
+    /// setting named in the bug report (`skills_view.slint`'s "Show
+    /// global skills" toggle). Before this fix it was pure component-local
+    /// Slint UI state that never called into `save_panel_prefs_to_json`/
+    /// `load_scoped_panel_prefs` at all, so it could never have collided
+    /// on a shared file -- but it also never round-tripped through
+    /// Project/Global scope like the bug report expected. This proves the
+    /// newly-added wiring gives it the exact same per-scope isolation
+    /// `background_session_default` already has.
+    #[test]
+    fn show_global_skills_persists_independently_per_scope() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        // Global starts true, Project starts unset (inherits Global).
+        save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
+            .expect("save global");
+        let mut warnings = Vec::new();
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(global_prefs.show_global_skills);
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project (inherits global)");
+        assert!(
+            project_prefs.show_global_skills,
+            "project scope must inherit the global value when it has no override"
+        );
+
+        // Set Project to false: must only touch the project file: Global's
+        // own separately-read value must stay true.
+        save_panel_prefs_to_json("project", &defaults_with_background(false), None, false)
+            .expect("save project");
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project after override");
+        assert!(
+            !project_prefs.show_global_skills,
+            "project override must take effect for project scope"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global after project write");
+        assert!(
+            global_prefs.show_global_skills,
+            "a project-scope write must not affect the separately-read global value"
+        );
+    }
 }
 
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
@@ -1017,6 +1262,7 @@ impl PanelSingleton {
             input.scope.as_str(),
             &defaults,
             non_empty(input.default_agent_id),
+            input.show_global_skills,
         ) {
             return Err(effect::EffectError::new(format!(
                 "failed to save panel settings JSON: {error}"
@@ -1058,83 +1304,45 @@ impl PanelSingleton {
         Ok(())
     }
 
-    pub(crate) fn dispatch_mcp_server_create(
+    fn dispatch_mcp_server_tool_preference_changed_async(
         &self,
-        _component: &ChatPanel,
-        name: &str,
-        command: &str,
+        server_name: &str,
+        tool_name: &str,
+        field: &str,
+        value: bool,
+        action_past_tense: &str,
     ) {
-        let Some(bridge) = &self.bridge else { return };
-        let entry = if command.is_empty() {
-            serde_json::json!({ "name": name })
-        } else {
-            serde_json::json!({ "name": name, "command": command })
-        };
-        let gw = self.settings_gateway_index();
-        bridge.create_mcp_server(gw, entry);
-    }
-
-    pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        bridge.delete_mcp_server(gw, name);
-    }
-
-    pub(crate) fn dispatch_mcp_server_enabled_changed(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-        enabled: bool,
-    ) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == name)
-        else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before its enabled state could update",
-                name
-            );
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string(),
+            ));
             return;
         };
-        entry.extra["enabled"] = serde_json::Value::Bool(enabled);
-        if !bridge.update_mcp_server(gw, entry.extra) {
-            eprintln!(
-                "panel-rust: failed to update enabled state for MCP server {:?}",
-                name
-            );
-        }
-    }
-
-    /// Registry-side "Connect" for remote MCP servers. There is no
-    /// `mcp_servers/authenticate` RPC on acpx; this persists
-    /// `auth_status`/`needs_auth` on the entry via `mcp_servers/update`
-    /// so the Connect button can clear and the status line updates on
-    /// the next settings gateway snapshot.
-    pub(crate) fn dispatch_mcp_server_authenticate(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == name)
-        else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before authenticate could run",
-                name
-            );
-            return;
-        };
-        entry.extra["auth_status"] = serde_json::Value::String("authenticated".to_owned());
-        entry.extra["needs_auth"] = serde_json::Value::Bool(false);
-        if !bridge.update_mcp_server(gw, entry.extra) {
-            eprintln!(
-                "panel-rust: failed to persist auth state for MCP server {:?}",
-                name
-            );
-        }
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let action_past_tense = action_past_tense.to_string();
+        let callback_server_name = server_name.clone();
+        let callback_tool_name = tool_name.clone();
+        let callback_action = action_past_tense.clone();
+        bridge.update_mcp_tool_preference_async(
+            gw,
+            &server_name,
+            &tool_name,
+            field,
+            value,
+            move |result| {
+                crate::effect_executor::report_mcp_server_result(
+                    result
+                        .map(|()| format!("Tool \"{callback_tool_name}\" {callback_action}"))
+                        .map_err(|err| {
+                            format!(
+                                "Failed to update tool \"{callback_tool_name}\" on MCP server \"{callback_server_name}\": {err}"
+                            )
+                        }),
+                );
+            },
+        );
     }
 
     /// Per-tool enable flag on one MCP server entry. Persists into the
@@ -1146,47 +1354,245 @@ impl PanelSingleton {
         tool_name: &str,
         enabled: bool,
     ) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == server_name)
-        else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before tool enable update",
-                server_name
-            );
+        self.dispatch_mcp_server_tool_preference_changed_async(
+            server_name,
+            tool_name,
+            "enabled",
+            enabled,
+            if enabled { "enabled" } else { "disabled" },
+        )
+    }
+
+    /// Per-tool deferred (lazy-load) flag -- same persisted `tools` JSON
+    /// array as the enabled toggle, different field.
+    pub(crate) fn dispatch_mcp_server_tool_deferred_changed(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+        tool_name: &str,
+        deferred: bool,
+    ) {
+        self.dispatch_mcp_server_tool_preference_changed_async(
+            server_name,
+            tool_name,
+            "deferred",
+            deferred,
+            if deferred { "set to deferred" } else { "set to eager" },
+        )
+    }
+
+    /// The seven `dispatch_mcp_server_*_async` methods below are the only
+    /// live dispatchers for "Fetch tools"/"Refresh tools" and the other
+    /// six real UI-reachable MCP settings actions (Add/Save, Remove,
+    /// enable toggle, Connect, Disconnect) -- PUI-013-style fix for the
+    /// reported "jittery lag" while toggling/acting on an MCP server: a
+    /// prior synchronous generation of these dispatchers each ended in
+    /// `AgentBridge::block_on`, which ran on the Slint UI callback thread
+    /// and froze the whole panel for the RPC's duration. These call the
+    /// matching `AgentBridge::*_async` method instead (kicks the RPC off
+    /// on the bridge's own tokio runtime) and pass a completion closure
+    /// that formats the same success/failure
+    /// message text the synchronous versions produce, then feeds it
+    /// through `effect_executor::report_mcp_server_result` -- the closure
+    /// runs on the runtime thread, not the UI thread, but `report_mcp_
+    /// server_result` already re-enters the event loop itself (`slint::
+    /// invoke_from_event_loop`), same as every other background-thread
+    /// completion in this codebase, so this is thread-safe without an
+    /// extra hop back through this type.
+    pub(crate) fn dispatch_mcp_server_create_async(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
             return;
         };
-        let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
-        if let Some(tools) = tools {
-            let mut found = false;
-            for tool in tools.iter_mut() {
-                if tool.get("name").and_then(|n| n.as_str()) == Some(tool_name) {
-                    tool["enabled"] = serde_json::Value::Bool(enabled);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                tools.push(serde_json::json!({
-                    "name": tool_name,
-                    "enabled": enabled,
-                }));
-            }
-        } else {
-            entry.extra["tools"] = serde_json::json!([{
-                "name": tool_name,
-                "enabled": enabled,
-            }]);
-        }
-        if !bridge.update_mcp_server(gw, entry.extra) {
-            eprintln!(
-                "panel-rust: failed to update tool {:?} on MCP server {:?}",
-                tool_name, server_name
+        let gw = self.settings_gateway_index();
+        let name = entry.name.clone();
+        bridge.create_mcp_server_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{name}\" created"))
+                    .map_err(|err| format!("Failed to create MCP server \"{name}\": {err}")),
             );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_update_async(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = entry.name.clone();
+        bridge.update_mcp_server_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{name}\" updated"))
+                    .map_err(|err| format!("Failed to update MCP server \"{name}\": {err}")),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_delete_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.delete_mcp_server_async(gw, &name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{callback_name}\" removed"))
+                    .map_err(|err| {
+                        format!("Failed to remove MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_enabled_changed_async(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+        enabled: bool,
+    ) {
+        // Built-in snapflow: panel preference + pool opener rewrite, not
+        // acpx `mcp_servers/update` (no central registry row exists).
+        if crate::agent_bridge::is_builtin_snapflow_mcp_name(name) {
+            let paths = settings_file::SettingsPaths::from_env();
+            if let Err(error) = paths.set_snapflow_mcp_enabled(enabled) {
+                crate::effect_executor::report_mcp_server_result(Err(format!(
+                    "Failed to persist snapflow MCP enabled={enabled}: {error}"
+                )));
+                return;
+            }
+            if let Some(bridge) = &self.bridge {
+                bridge.set_builtin_snapflow_mcp_enabled(enabled);
+            } else {
+                crate::agent_bridge::set_snapflow_mcp_enabled_flag(enabled);
+            }
+            crate::effect_executor::report_mcp_server_result(Ok(format!(
+                "MCP server \"snapflow\" {}",
+                if enabled { "enabled" } else { "disabled" }
+            )));
+            return;
         }
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.set_mcp_server_enabled_async(gw, &name, enabled, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| {
+                        format!(
+                            "MCP server \"{callback_name}\" {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        )
+                    })
+                    .map_err(|err| {
+                        format!(
+                            "Failed to update enabled state for MCP server \"{callback_name}\": {err}"
+                        )
+                    }),
+            );
+        });
+    }
+
+    /// Non-blocking Connect. `opener::open` (opening the returned
+    /// authorization URL in the default browser) is a fast, fire-and-forget
+    /// OS call, so it still runs synchronously inside the completion
+    /// closure -- only the network round-trip that discovers/starts the
+    /// OAuth flow moves off the UI thread.
+    pub(crate) fn dispatch_mcp_server_authenticate_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.authenticate_mcp_server_async(gw, &name, move |result| {
+            let outcome = match result {
+                Ok(authorization_url) => match opener::open(&authorization_url) {
+                    Ok(()) => Ok(format!("Opened browser to connect \"{callback_name}\"")),
+                    Err(error) => Err(format!(
+                        "MCP server \"{callback_name}\": failed to open browser for OAuth: {error}"
+                    )),
+                },
+                Err(err) => Err(format!(
+                    "Failed to start OAuth flow for MCP server \"{callback_name}\": {err}"
+                )),
+            };
+            crate::effect_executor::report_mcp_server_result(outcome);
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_logout_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.logout_mcp_server_async(gw, &name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Disconnected \"{callback_name}\""))
+                    .map_err(|err| {
+                        format!("Failed to disconnect MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_tools_fetch_async(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let server_name = server_name.to_string();
+        let callback_name = server_name.clone();
+        bridge.fetch_mcp_server_tools_async(gw, &server_name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Fetching tools for \"{callback_name}\"..."))
+                    .map_err(|err| {
+                        format!("Failed to fetch tools for MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
     }
 
     pub(crate) fn dispatch_profile_create(
@@ -1207,13 +1613,27 @@ impl PanelSingleton {
             entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
         }
         let gw = self.settings_gateway_index();
-        bridge.create_profile(gw, entry);
+        let profile_name = name.to_string();
+        bridge.create_profile_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Profile \"{profile_name}\" created"))
+                    .map_err(|err| format!("Failed to create profile \"{profile_name}\": {err}")),
+            );
+        });
     }
 
     pub(crate) fn dispatch_profile_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        bridge.delete_profile(gw, name);
+        let profile_name = name.to_string();
+        bridge.delete_profile_async(gw, name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Profile \"{profile_name}\" deleted"))
+                    .map_err(|err| format!("Failed to delete profile \"{profile_name}\": {err}")),
+            );
+        });
     }
 
     pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
@@ -1235,6 +1655,18 @@ impl PanelSingleton {
         // PUI-013: fire-and-forget so the admin-plane enable/disable
         // round-trip does not block the Slint UI thread.
         bridge.set_agent_enabled_async(agent_id, enabled);
+    }
+
+    /// Opens a registry-provided official website from an agent card. Only
+    /// web URLs are accepted here; registry metadata must never turn the
+    /// card into a general local-file or command opener.
+    pub(crate) fn dispatch_agent_website_clicked(&self, website: &str) {
+        let website = website.trim();
+        if website.starts_with("https://") || website.starts_with("http://") {
+            open_md_link_target(website);
+        } else if !website.is_empty() {
+            eprintln!("panel-rust: refusing non-web agent website URL: {website}");
+        }
     }
 
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
@@ -1332,7 +1764,25 @@ impl PanelSingleton {
             )
         };
         if let Some(bridge) = self.bridge.as_ref() {
+            // project-close-session-teardown: release every thread session
+            // still bound to the project that is about to stop being
+            // active -- BEFORE `set_active_project_identity` below
+            // overwrites the bridge's own record of which project that is.
+            // "switched"/"closed"/"opened"/"created_untitled" all mean the
+            // previously active project (if any) is being left for real;
+            // "saved_as" is deliberately excluded (see `release_sessions_
+            // for_current_project`'s doc comment) since a Save-As/first-
+            // save relabels the SAME live project rather than leaving it,
+            // and releasing there would sever conversations mid-turn for
+            // no reason.
+            if reason != "saved_as" {
+                bridge.release_sessions_for_current_project();
+            }
             bridge.set_active_project_identity(&identity);
+            let default_agent_id = self.model.borrow().default_agent_id.clone();
+            if !default_agent_id.trim().is_empty() {
+                bridge.prewarm_default_agent(&default_agent_id, Some(&default_agent_id));
+            }
         }
         if let Some(registration) = self.snapshotd_registration.as_ref() {
             registration.update(path, reason, generation);
@@ -1686,9 +2136,12 @@ fn panel_rust_create_with_initial_identity(
         // would erase the visible thread list until the user opened a
         // project. Restored records carry their own project_path, so this
         // does not invent a cwd or bind an old session to the host process.
-        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty()
-            && initial_identity.is_some()
-        {
+        // bug3_always_have_a_default_thread: previously also required
+        // `initial_identity.is_some()`, so a cold start with no project
+        // open yet seeded zero threads ("No thread" empty state). The
+        // bridge/gateway below is already constructed unconditionally;
+        // seed the same default thread here too so one is always open.
+        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
                 Ok(v) => {
@@ -1707,7 +2160,7 @@ fn panel_rust_create_with_initial_identity(
                     settings_file::non_default_sentinel(resolved.default_agent_id)
                 });
             cold_start_thread_specs(&seed_names, configured_agent_id)
-        } else if !restored_records.is_empty() {
+        } else {
             restored_records
                 .iter()
                 .map(|record| ThreadSpec {
@@ -1737,8 +2190,6 @@ fn panel_rust_create_with_initial_identity(
                     project_path: record.project_path.clone(),
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
         if let Some(identity) = initial_identity.as_ref() {
             // Fresh and legacy rows in this project-local store inherit the
@@ -1768,6 +2219,12 @@ fn panel_rust_create_with_initial_identity(
         let initial_cwd = initial_identity.as_ref().and_then(|identity| {
             crate::project_store::project_store_dir(identity, &resolve_cache_dir())
         });
+        // Seed built-in snapflow MCP injection from Global settings before
+        // any pool/session is built so cold-start openers omit it when off.
+        {
+            let paths = settings_file::SettingsPaths::from_env();
+            crate::agent_bridge::set_snapflow_mcp_enabled_flag(paths.snapflow_mcp_enabled());
+        }
         let (bridge, bridge_available) =
             match AgentBridge::new_with_thread_specs_and_initial_identity(
                 &initial_specs,
@@ -1839,6 +2296,7 @@ fn panel_rust_create_with_initial_identity(
             server_queue: true,
         };
         let mut model = model::Model::default();
+        model.profile_wiring_enabled = profile_wiring_enabled();
         let thread_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();
@@ -1954,6 +2412,16 @@ fn panel_rust_create_with_initial_identity(
                 load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings)
             });
         panel.sync_runtime_defaults(&defaults);
+        // bug4_new_thread_default_provider: `scoped_prefs.default_agent_id`
+        // was computed above but never applied to `model.default_agent_id`
+        // (what `ThreadMsg::New` reads for a new thread's provider) -- that
+        // was previously only set via the Settings "Save" button. Apply it
+        // here too so a fresh thread respects the configured default.
+        if let Some(configured_agent_id) = scoped_prefs.as_ref().and_then(|prefs| {
+            settings_file::non_default_sentinel(prefs.default_agent_id.clone())
+        }) {
+            panel.model.borrow_mut().default_agent_id = configured_agent_id;
+        }
         for message in post_hydration_warnings {
             let _ = dispatch::update_persistent(
                 &panel,
@@ -2133,18 +2601,18 @@ fn panel_rust_create_with_initial_identity(
             });
 
         let component_weak = panel.component.as_weak();
-        panel.component.on_mcp_server_create(move |name, command| {
+        panel.component.on_mcp_server_submit(move |data| {
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
+            let entry = models::mcp_server_entry_from_form(&data);
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_mcp_server_create(
-                        panel,
-                        &component,
-                        name.to_string(),
-                        command.to_string(),
-                    );
+                    if data.is_edit {
+                        dispatch::dispatch_mcp_server_update(panel, &component, entry);
+                    } else {
+                        dispatch::dispatch_mcp_server_create(panel, &component, entry);
+                    }
                 }
             });
         });
@@ -2197,6 +2665,18 @@ fn panel_rust_create_with_initial_identity(
         });
 
         let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_logout(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_mcp_server_logout(panel, &component, name.to_string());
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_tool_enabled_changed(
             move |server_name, tool_name, enabled| {
                 let Some(component) = component_weak.upgrade() else {
@@ -2215,6 +2695,44 @@ fn panel_rust_create_with_initial_identity(
                 });
             },
         );
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_tool_deferred_changed(
+            move |server_name, tool_name, deferred| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tool_deferred_changed(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                            tool_name.to_string(),
+                            deferred,
+                        );
+                    }
+                });
+            },
+        );
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mcp_server_tools_fetch_requested(move |server_name| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tools_fetch_requested(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                        );
+                    }
+                });
+            });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2261,6 +2779,18 @@ fn panel_rust_create_with_initial_identity(
                         &component,
                         agent_id.to_string(),
                     );
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_agent_website_clicked(move |website| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    panel.dispatch_agent_website_clicked(website.as_str());
                 }
             });
         });
@@ -3496,7 +4026,51 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
                     || thread.connection_status == "Connecting..."
             })
         };
-        let needs_paint = frame_changed || animating || busy_thread_animating;
+        // mcp_servers_spinner_repaint_gap: the Settings > MCP Servers row
+        // Spinners (Fetch tools / enable-toggle / Remove / Authenticate /
+        // Logout, mcp_servers_view.slint) use this same animation-tick()
+        // pattern but live entirely outside `model.threads` -- their busy
+        // state is `available_mcp_servers`/`mcp_operations_in_flight`,
+        // folded into per-row booleans by `models::to_mcp_server_option_
+        // rows`. Without this check they got one correct frame at
+        // click-time and then froze, same root cause as the
+        // `busy_thread_animating` case above just never extended to this
+        // model. Mirrors `to_mcp_server_option_rows`'s own `is_busy`
+        // check rather than re-deriving the Slint-side McpServerOption
+        // rows here.
+        let busy_mcp_server_animating = {
+            let model = panel.model.borrow();
+            let is_busy = |action: &str, name: &str| {
+                model
+                    .mcp_operations_in_flight
+                    .iter()
+                    .any(|key| key == &format!("{action}:{name}"))
+            };
+            model.available_mcp_servers.iter().any(|entry| {
+                is_busy("delete", &entry.name)
+                    || is_busy("enabled", &entry.name)
+                    || is_busy("authenticate", &entry.name)
+                    || is_busy("logout", &entry.name)
+                    || matches!(
+                        entry.tool_catalog,
+                        Some(crate::protocol_types::McpToolCatalog::Fetching)
+                    )
+                    || (entry.tool_catalog.is_none() && is_busy("tools_fetch", &entry.name))
+            })
+        };
+        // With zero durable threads, App mounts `legacy-chat-area` instead of
+        // a ChatViewStack delegate. That ChatArea still renders its
+        // connection-status spinner and topbar shimmer from the component-
+        // level default `connection-status == "Connecting..."`, but there is
+        // no ThreadModel for the predicate above to inspect. Include the
+        // component projection so the no-thread loading state keeps ticking
+        // without requiring mouse movement.
+        let component_connection_animating =
+            panel.component.get_connection_status().as_str() == "Connecting...";
+        let busy_animation = busy_thread_animating
+            || busy_mcp_server_animating
+            || component_connection_animating;
+        let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software
         // buffer. `MinimalSoftwareWindow::draw_if_needed` no-ops unless
         // Slint itself was told to redraw. `animation-tick()` bindings
@@ -3504,7 +4078,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // a busy loader froze: poll returned true, paint ran, but the
         // buffer was never re-rendered. Force the flag whenever we
         // need continuous tick-driven paint.
-        if needs_paint && (animating || busy_thread_animating) {
+        if needs_paint && (animating || busy_animation) {
             panel.window.window().request_redraw();
         }
         needs_paint

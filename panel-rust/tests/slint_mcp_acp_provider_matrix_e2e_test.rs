@@ -49,12 +49,23 @@ fn acpx_server_bin() -> PathBuf {
 /// Slint MCP server, this test only needs *a* compiled host, not a specific
 /// one. Override with `SHOTCUT_BIN` if neither default path matches.
 fn shotcut_bin() -> PathBuf {
-    if let Ok(over) = std::env::var("SHOTCUT_BIN") {
-        return PathBuf::from(over);
+    if let Ok(path) = std::env::var("SNAPFLOW_BIN_OVERRIDE") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return p;
+        }
     }
     let snapflow = repo_root().join("shotcut-rebrand/build-local/src/snapflow");
     if snapflow.exists() {
         return snapflow;
+    }
+    if let Ok(shared) = repo_root()
+        .join("../../shotcut-rebrand/build-local/src/snapflow")
+        .canonicalize()
+    {
+        if shared.exists() {
+            return shared;
+        }
     }
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
 }
