@@ -378,6 +378,17 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		"ACPX_MAX_SESSIONS_PER_TENANT=512",
 		"ACPX_MAX_SESSIONS_TOTAL=2048",
 	)
+	// acpx-server's tracing subscriber is EnvFilter-driven off RUST_LOG and
+	// writes to stderr, which this daemon already redirects into
+	// snapshotd_stdout.log. Without RUST_LOG it defaults to emitting
+	// nothing, so daemon-managed mode logged only lifecycle lines and no
+	// per-request tracing at all -- a real grok-build session/new failure
+	// was invisible on disk and only diagnosable by running acpx-server by
+	// hand outside the daemon. An inherited RUST_LOG still wins (Go keeps
+	// the last occurrence of a key).
+	if os.Getenv("RUST_LOG") == "" {
+		cmd.Env = append(cmd.Env, "RUST_LOG=info,acpx_core=debug,acpx_server=debug")
+	}
 	if cfg.DbPath != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DB_PATH="+cfg.DbPath)
 	}
