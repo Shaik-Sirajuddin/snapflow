@@ -10,8 +10,8 @@ use crate::gateway_actor::classify_raw_update;
 use crate::gateway_actor::session_opener::GatewaySessionOpener;
 use crate::protocol_types::AgentEvent;
 use crate::protocol_types::{
-    AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
-    TerminalCreatedEvent, TerminalOutputEvent,
+    AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
+    SessionModesEvent, TerminalCreatedEvent, TerminalOutputEvent,
 };
 use acpx_client::pool::{OpenSpec, PoolKey, ProjectSessionPool, SessionLease};
 use acpx_client::raw::ClientError;
@@ -983,10 +983,33 @@ async fn run_respond_worker(
 /// [`spawn_out_of_band_notification_forwarder`]'s job now (see that
 /// function's doc comment for why they were split out of this
 /// function).
+///
+/// `suppress_user_echo`: some ACP backends (observed live with
+/// `grok-build`) emit a `user_message_chunk` notification that simply
+/// echoes the prompt the client itself just sent as part of the very
+/// `session/prompt` turn currently in flight. `panel-rust/src/lib.rs`'s
+/// `start_send_prompt` already appends that exact text as a local
+/// `MessageKind::User` row (`AgentBridge::push_local`) *before* the
+/// `session/prompt` call goes out, so forwarding this echo too used to
+/// double the row up as a second, indistinguishable `AgentEvent::Message`
+/// (see `spawn_event_forwarder`'s unconditional push in
+/// `agent_bridge.rs` -- it has no way to tell "this is the same message
+/// I already have" from "this is new", especially since
+/// `classify_raw_update` never attaches an id to `user_message_chunk`
+/// entries). Callers draining updates that belong to the turn *this
+/// actor itself just started* (i.e. `Command::SendPrompt`'s own
+/// `session/prompt` round trip) pass `true` here to drop that echo at
+/// the source, since the local optimistic copy already covers it.
+/// Callers replaying a backend's own history independent of any local
+/// echo -- `session/load`/`session/resume` attachment and the idle
+/// out-of-turn `live_rx` listener -- pass `false`, so genuine past user
+/// turns replayed from the backend (which have no local counterpart at
+/// all) still render.
 fn forward_updates(
     updates: &[serde_json::Value],
     active_session_id: Option<&str>,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    suppress_user_echo: bool,
 ) {
     for update in updates {
         let Some(active_session_id) = active_session_id else {
@@ -1001,9 +1024,109 @@ fn forward_updates(
             continue;
         }
         if let Some(msg) = classify_raw_update(update) {
+            if suppress_user_echo && msg.kind == MessageKind::User {
+                continue;
+            }
             let _ = event_tx.send(AgentEvent::Message(msg));
         } else if let Some(event) = parse_capability_update(update) {
             let _ = event_tx.send(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod forward_updates_user_echo_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_message_chunk_update(session_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    fn agent_message_chunk_update(session_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    /// Reproduces the live grok-build bug: a backend echoing the user's
+    /// own prompt back as a `user_message_chunk` during the very
+    /// `session/prompt` turn the client just started must NOT become a
+    /// second rendered `AgentEvent::Message(User)` -- `lib.rs`'s
+    /// `start_send_prompt` already pushed a local optimistic copy before
+    /// this update ever arrives. Without `suppress_user_echo` (i.e. the
+    /// pre-fix `forward_updates(updates, session, event_tx)` two-arg
+    /// call this test would use), this update forwards unconditionally
+    /// and the send-a-message-once/see-it-twice bug reproduces.
+    #[test]
+    fn suppress_user_echo_drops_user_message_chunk_during_own_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![user_message_chunk_update("s1", "hello")];
+        forward_updates(&updates, Some("s1"), &tx, true);
+        drop(tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a user_message_chunk echo for the in-flight turn must be suppressed, \
+             not forwarded as a duplicate AgentEvent::Message"
+        );
+    }
+
+    /// Non-user updates (the real agent reply) must still forward
+    /// normally even with the echo suppressed -- this isn't a blanket
+    /// "ignore everything" flag, only the user-role echo is dropped.
+    #[test]
+    fn suppress_user_echo_still_forwards_agent_message_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![agent_message_chunk_update("s1", "hi there")];
+        forward_updates(&updates, Some("s1"), &tx, true);
+        drop(tx);
+        let event = rx.try_recv().expect("agent message should forward");
+        match event {
+            AgentEvent::Message(msg) => {
+                assert_eq!(msg.kind, MessageKind::Agent);
+                assert_eq!(msg.text, "hi there");
+            }
+            _ => panic!("expected AgentEvent::Message"),
+        }
+    }
+
+    /// Replayed history (`session/load`/`session/resume` attachment,
+    /// where there is no local optimistic echo at all -- the message
+    /// never went through this client's own `push_local`) must still
+    /// render: `suppress_user_echo: false` is the path those call sites
+    /// use, and a `user_message_chunk` there is genuine, unseen-before
+    /// content, not a duplicate of anything.
+    #[test]
+    fn suppress_user_echo_false_still_forwards_user_message_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![user_message_chunk_update("s1", "past turn")];
+        forward_updates(&updates, Some("s1"), &tx, false);
+        drop(tx);
+        let event = rx.try_recv().expect("replayed user message should forward");
+        match event {
+            AgentEvent::Message(msg) => {
+                assert_eq!(msg.kind, MessageKind::User);
+                assert_eq!(msg.text, "past turn");
+            }
+            _ => panic!("expected AgentEvent::Message"),
         }
     }
 }
@@ -1635,7 +1758,7 @@ async fn run_thread_actor(
     loop {
         let cmd = tokio::select! {
             Some(update) = live_rx.recv() => {
-                forward_updates(&[update], session_id.as_deref(), &event_tx);
+                forward_updates(&[update], session_id.as_deref(), &event_tx, false);
                 continue;
             }
             command = cmd_rx.recv() => match command {
@@ -1728,7 +1851,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, Some(&sid), &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx, false);
                             // A session/load replay is allowed to start
                             // before its RPC response, but a busy real
                             // host can schedule the WS reader just after
@@ -1741,10 +1864,10 @@ async fn run_thread_actor(
                             )
                             .await
                             {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, false);
                             }
                             while let Ok(update) = live_rx.try_recv() {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, false);
                             }
                             if let Some(notifications) = early_notifications.as_mut() {
                                 if let Ok(Ok(update)) = tokio::time::timeout(
@@ -1753,10 +1876,10 @@ async fn run_thread_actor(
                                 )
                                 .await
                                 {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                                 while let Ok(update) = notifications.try_recv() {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                             }
                             session_id = Some(sid.clone());
@@ -1808,7 +1931,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, Some(&sid), &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx, false);
                             if let Some(notifications) = early_notifications.as_mut() {
                                 if let Ok(Ok(update)) = tokio::time::timeout(
                                     std::time::Duration::from_millis(250),
@@ -1816,10 +1939,10 @@ async fn run_thread_actor(
                                 )
                                 .await
                                 {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                                 while let Ok(update) = notifications.try_recv() {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                             }
                             session_id = Some(sid.clone());
@@ -1903,7 +2026,7 @@ async fn run_thread_actor(
                             Ok((value, updates)) => {
                                 emit_capability_events(&value, &event_tx);
                                 attach_config_options_raw = value.get("configOptions").cloned();
-                                forward_updates(&updates, Some(&sid), &event_tx);
+                                forward_updates(&updates, Some(&sid), &event_tx, false);
                                 if let Some(notifications) = early_notifications.as_mut() {
                                     if let Ok(Ok(update)) = tokio::time::timeout(
                                         std::time::Duration::from_millis(250),
@@ -1911,10 +2034,10 @@ async fn run_thread_actor(
                                     )
                                     .await
                                     {
-                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                        forward_updates(&[update], Some(&sid), &event_tx, false);
                                     }
                                     while let Ok(update) = notifications.try_recv() {
-                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                        forward_updates(&[update], Some(&sid), &event_tx, false);
                                     }
                                 }
                                 Ok(())
@@ -2105,7 +2228,7 @@ async fn run_thread_actor(
                     tokio::select! {
                         update = live_rx.recv() => {
                             if let Some(update) = update {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, true);
                             }
                         }
                         result = &mut prompt => break result,
@@ -2113,7 +2236,7 @@ async fn run_thread_actor(
                 };
                 match outcome {
                     Ok((result, updates)) => {
-                        forward_updates(&updates, Some(&sid), &event_tx);
+                        forward_updates(&updates, Some(&sid), &event_tx, true);
                         // A resumed WS subscription can receive a burst of
                         // final notifications just after the prompt response.
                         // Keep draining until the stream is briefly quiet,
@@ -2127,7 +2250,7 @@ async fn run_thread_actor(
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
                                 Ok(Some(update)) => {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, true);
                                     wait = std::time::Duration::from_millis(75);
                                 }
                                 Ok(None) | Err(_) => break,
