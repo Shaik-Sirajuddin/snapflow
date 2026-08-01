@@ -4150,12 +4150,14 @@ impl AgentBridge {
                 continue;
             }
             let handle = slot.handle.clone();
-            if let Err(error) = self.runtime.block_on(handle.close_session(true)) {
-                eprintln!(
-                    "panel-rust: release_sessions_for_current_project close_session failed for thread {}: {error}",
-                    slot.thread_id
-                );
-            }
+            let thread_id = slot.thread_id.clone();
+            self.runtime.spawn(async move {
+                if let Err(error) = handle.close_session(true).await {
+                    eprintln!(
+                        "panel-rust: release_sessions_for_current_project close_session failed for thread {thread_id} (async): {error}"
+                    );
+                }
+            });
         }
     }
 
