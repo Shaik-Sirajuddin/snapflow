@@ -4524,6 +4524,16 @@ mod keyboard_shortcut_tests {
 
     impl TestPanel {
         fn new() -> Self {
+            Self::new_with_size(240, 260)
+        }
+
+        /// Same as `new()` but with a caller-chosen window size --
+        /// provider_trigger_full_width_click_sweep_opens_popup_wide uses
+        /// a width >= 320px so `chat_input_layout.slint`'s `row2-compact` is false
+        /// and the Provider trigger renders at its normal 72..140px
+        /// width (with the full "Provider \u{203a}" label) instead of
+        /// the 56px narrow-dock variant `new()`'s 240px window forces.
+        fn new_with_size(width: u32, height: u32) -> Self {
             let cache_dir = tempfile::tempdir().expect("cache dir");
             let previous_env = [
                 (
@@ -4544,8 +4554,8 @@ mod keyboard_shortcut_tests {
             let project_path = cache_dir.path().join("test-panel.mlt");
             let project_path = project_path.to_string_lossy().into_owned();
             let handle = panel_rust_create_with_identity(
-                240,
-                260,
+                width,
+                height,
                 project_path.as_ptr(),
                 project_path.len(),
                 false,
@@ -5052,6 +5062,179 @@ mod keyboard_shortcut_tests {
              e94f105a's label-scroll `clicked` handler has regressed (or the whole-trigger \
              fix was never actually complete)"
         );
+    }
+
+    /// Follow-up on fb5b8b57 (test(panel-rust): live-verify e94f105a's
+    /// whole-trigger dropdown click fix), which live-tested a single
+    /// point 30% across the trigger's width. A later report claimed
+    /// clicking directly on the rendered "Provider" glyphs (as opposed to
+    /// an arbitrary point inside the label region's bounding box) still
+    /// does not open the dropdown. Rather than guess at one more point,
+    /// this sweeps the ENTIRE trigger width in 4%-of-width steps (25
+    /// points) and asserts every single one opens the popup via the real
+    /// `panel_rust_input_click` FFI entry point -- the same one the
+    /// shipped Qt host calls on a genuine mouse click. This is the
+    /// 56px-wide `row2-compact` narrow-dock trigger variant (the default
+    /// `TestPanel::new()` window is 240px wide, well under
+    /// chat_input_layout.slint's 320px `row2-compact` threshold); see
+    /// `..._wide` below for the normal 72px+ variant with the full
+    /// "Provider \u{203a}" label.
+    ///
+    /// Result at this branch's tip: every sampled point across the full
+    /// width opens the popup -- no dead zone was found under the
+    /// rendered label glyphs specifically, or anywhere else on the
+    /// trigger. This reaffirms fb5b8b57's finding with much finer
+    /// resolution than its single sample point.
+    #[test]
+    fn provider_trigger_full_width_click_sweep_opens_popup() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "claude-acp".into(),
+                label: "claude-acp".into(),
+                value: "claude".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "codex-acp".into(),
+                label: "codex-acp".into(),
+                value: "codex".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_profile_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+        // profile-trigger-label empty => trigger-label falls back to
+        // "Provider \u{203a}" per chat_input_layout.slint line 187.
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "Provider \u{203a}")
+            .next()
+            .expect("profile-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+        eprintln!(
+            "DIAG trigger absolute_position=({}, {}) size=({}, {})",
+            position.x, position.y, size.width, size.height
+        );
+
+        let y = position.y + size.height / 2.0;
+        let mut frac = 0.02_f32;
+        while frac < 1.0 {
+            let x = position.x + size.width * frac;
+            let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(!opened_before, "popup must be closed before each sweep click");
+
+            let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            assert!(
+                ffi_ok,
+                "click at frac={frac} (rel_x={:.1}px) must reach the real input-click FFI",
+                x - position.x
+            );
+            let popup_opened = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                popup_opened,
+                "click at frac={frac} (rel_x={:.1}px) did not open the popup -- dead zone found \
+                 under the trigger at this x offset",
+                x - position.x
+            );
+
+            // Reset for next sample: click the exact same point again --
+            // toggle-popup() is symmetric, so this closes it back up
+            // without selecting a row (row-touch sits inside the popup
+            // at a totally different y, not at this trigger's y).
+            let closed_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            let still_open = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                closed_ok && !still_open,
+                "failed to re-close popup after sweep click at frac={frac}"
+            );
+            frac += 0.04;
+        }
+    }
+
+    /// Same sweep as `provider_trigger_full_width_click_sweep_opens_popup`
+    /// but at a window width >= 320px so `row2-compact` is false and the
+    /// trigger renders with the full "Provider \u{203a}" label at its
+    /// normal 72..140px width, not the 56px narrow-dock variant.
+    #[test]
+    fn provider_trigger_full_width_click_sweep_opens_popup_wide() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new_with_size(800, 400);
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "claude-acp".into(),
+                label: "claude-acp".into(),
+                value: "claude".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "codex-acp".into(),
+                label: "codex-acp".into(),
+                value: "codex".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_profile_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "Provider \u{203a}")
+            .next()
+            .expect("profile-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+
+        let y = position.y + size.height / 2.0;
+        let mut frac = 0.02_f32;
+        while frac < 1.0 {
+            let x = position.x + size.width * frac;
+            let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(!opened_before, "popup must be closed before each sweep click");
+
+            let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            assert!(
+                ffi_ok,
+                "click at frac={frac} (rel_x={:.1}px) must reach the real input-click FFI",
+                x - position.x
+            );
+            let popup_opened = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                popup_opened,
+                "click at frac={frac} (rel_x={:.1}px) did not open the popup -- dead zone found \
+                 under the trigger at this x offset",
+                x - position.x
+            );
+
+            let closed_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            let still_open = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                closed_ok && !still_open,
+                "failed to re-close popup after sweep click at frac={frac}"
+            );
+            frac += 0.04;
+        }
     }
 }
 
