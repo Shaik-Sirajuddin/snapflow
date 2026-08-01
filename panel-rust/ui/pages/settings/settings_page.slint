@@ -142,6 +142,7 @@ export component SettingsPage inherits Rectangle {
     callback profile-delete(string);
     callback agent-install-requested(string);
     callback agent-set-enabled(string, bool);
+    callback agent-website-clicked(string);
     callback recover-session-attach(string, string, string);
     callback skill-promote-to-global(string);
     callback dev-mode-toggled(bool);
@@ -308,6 +309,7 @@ export component SettingsPage inherits Rectangle {
                     profile-delete(name) => { root.profile-delete(name); }
                     agent-install-requested(id) => { root.agent-install-requested(id); }
                     agent-set-enabled(id, enabled) => { root.agent-set-enabled(id, enabled); }
+                    agent-website-clicked(website) => { root.agent-website-clicked(website); }
                     recover-session-attach(session-id, provider, title) => {
                         root.recover-session-attach(session-id, provider, title);
                     }

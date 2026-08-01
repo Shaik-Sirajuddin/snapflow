@@ -94,6 +94,7 @@ export component AgentsView inherits Rectangle {
     // connect/disconnect above -- routes through the admin plane
     // (AgentBridge::set_agent_enabled), not agents/connect.
     callback agent-set-enabled(string, bool);
+    callback agent-website-clicked(string);
 
     property <string> new-profile-name: "";
     property <string> new-profile-agent-id: "";
@@ -515,6 +516,7 @@ export component AgentsView inherits Rectangle {
                         agent-id: root.agent-catalog[first-agent-index].id;
                         agent-name: root.agent-catalog[first-agent-index].name != ""
                             ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
+                        website: root.agent-catalog[first-agent-index].website;
                         status: root.agent-catalog[first-agent-index].status;
                         card-width: cards-per-row == 1 ? root.width : 260px;
                         is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
@@ -527,6 +529,7 @@ export component AgentsView inherits Rectangle {
                         connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index].id); }
                         disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index].id); }
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index].id, new-enabled); }
+                        website-clicked => { root.agent-website-clicked(root.agent-catalog[first-agent-index].website); }
                     }
 
                     if second-visible : AgentCard {
@@ -534,6 +537,7 @@ export component AgentsView inherits Rectangle {
                         agent-id: root.agent-catalog[first-agent-index + 1].id;
                         agent-name: root.agent-catalog[first-agent-index + 1].name != ""
                             ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;
+                        website: root.agent-catalog[first-agent-index + 1].website;
                         status: root.agent-catalog[first-agent-index + 1].status;
                         card-width: 260px;
                         is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
@@ -546,6 +550,7 @@ export component AgentsView inherits Rectangle {
                         connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index + 1].id); }
                         disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index + 1].id); }
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index + 1].id, new-enabled); }
+                        website-clicked => { root.agent-website-clicked(root.agent-catalog[first-agent-index + 1].website); }
                     }
                 }
             }
