@@ -4291,6 +4291,85 @@ mod lifecycle_tests {
         assert_eq!(qt_cursor_shape_for_kind("some-future-kind"), 0);
     }
 
+    /// Regression test for a real, confirmed production crash: two
+    /// identical panics captured from a live `snapflow` process, both
+    /// `i-slint-renderer-software`'s "buffer ... too small to handle a
+    /// window of size ..." assert, firing inside `RustPanelItem::paint` ->
+    /// `panel_rust_render` across the non-unwinding Qt FFI boundary (an
+    /// abort, not a recoverable panic). Root cause: `RustPanelItem::
+    /// ensureHandle()` always calls `panel_rust_create` (which resizes the
+    /// buffer AND calls `window.set_size`, converting the new physical
+    /// size to Slint's internal *logical* window-item geometry using
+    /// whatever scale factor is live *at that moment*) strictly before
+    /// `panel_rust_apply_host_appearance` (which changes that scale
+    /// factor). `ScaleFactorChanged` alone never re-derives the window
+    /// item's logical geometry, so once density changes, the render-time
+    /// assert recomputes `stale logical geometry * new factor` -- a
+    /// physical pixel count that no longer matches the buffer, which was
+    /// sized directly from the raw physical width/height `panel_rust_create`
+    /// was actually given. This reproduces that exact sequence (resize at
+    /// the old density, then a density push) and asserts a render survives
+    /// it without panicking/aborting.
+    #[test]
+    fn render_survives_a_density_change_that_follows_a_resize() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = [
+            (
+                "RUI_ACPX_CODEX_URL",
+                std::env::var("RUI_ACPX_CODEX_URL").ok(),
+            ),
+            (
+                "RUI_ACPX_CLAUDE_URL",
+                std::env::var("RUI_ACPX_CLAUDE_URL").ok(),
+            ),
+            ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+        ];
+        std::env::set_var("RUI_ACPX_CODEX_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+        // Establish the panel at some size under the default (1.0) scale
+        // factor -- mirrors `ensureHandle()`'s `panel_rust_create(w, h)`
+        // call, where w/h are already physical pixels computed from
+        // whatever devicePixelRatio was live at that moment.
+        let handle = panel_rust_create(400, 400);
+        assert!(!handle.is_null());
+        assert!(panel_rust_render(handle), "initial render must succeed");
+
+        // Now the host reports a new density (e.g. the panel moved to a
+        // higher-DPI screen) -- mirrors `ensureHandle()`'s later
+        // `panel_rust_apply_host_appearance(...)` call, made strictly
+        // after `panel_rust_create` in the same tick. Before the fix, this
+        // alone (no further resize needed) leaves the buffer's physical
+        // size fixed at 400x400 while the next render demands 400*1.25 =
+        // 500x500 physical pixels -- exactly the "buffer too small"
+        // shape of the real crash.
+        assert!(panel_rust_apply_host_appearance(
+            handle,
+            1,
+            false,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            1.0,
+            1.25,
+        ));
+
+        // Must not panic/abort -- this is the actual regression check.
+        panel_rust_render(handle);
+
+        panel_rust_destroy(handle);
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[test]
     fn panel_create_destroy_create_reuses_slint_platform() {
         // Force the bridge into its documented display-only fallback so

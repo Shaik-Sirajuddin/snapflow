@@ -1688,6 +1688,42 @@ pub(crate) fn dispatch_apply_host_appearance(
             .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
                 scale_factor: appearance.density,
             });
+        // `ScaleFactorChanged` alone only updates the live scale factor --
+        // it does NOT retroactively recompute the Slint window item's
+        // stored *logical* geometry (see i-slint-core's window.rs
+        // `try_dispatch_event`: `ScaleFactorChanged` calls only
+        // `set_scale_factor`, while `Resized` is the only event that calls
+        // `set_window_item_geometry`). That logical geometry was last set
+        // by `panel_rust_create`'s `window.set_size(PhysicalSize::new(w,
+        // h))`, which converts physical -> logical using whatever scale
+        // factor was live *at that moment*. If density changes afterward
+        // (independently, or in the same host tick as a resize but applied
+        // second -- see `RustPanelItem::ensureHandle()`, which always calls
+        // `panel_rust_create` before `panel_rust_apply_host_appearance`),
+        // the stored logical geometry goes stale relative to the new
+        // factor. `i_slint_renderer_software::SoftwareRenderer::render`
+        // then recomputes the required physical size as `window_item.width
+        // ()/height() (stale logical) * current scale factor (new)` and
+        // asserts it fits the buffer -- which was sized directly from the
+        // physical pixels `panel_rust_create` was actually given, not from
+        // this recomputation. A stale-low logical size times a raised
+        // factor demands more pixels than the buffer holds, aborting the
+        // process on a non-unwinding panic across the Qt paint FFI
+        // boundary (confirmed via a live crash: buffer sized for a
+        // 697px-wide window, render demanded 871px -- a ~1.25x ratio,
+        // consistent with one live DPI step landing between a resize and
+        // its paired density push).
+        //
+        // Re-issuing `set_size` with the CURRENT physical size (the same
+        // `panel.width`/`panel.height` the buffer is actually sized for)
+        // right after the factor changes forces `window_item_geometry` to
+        // be recomputed under the factor that was just applied, so
+        // `logical_size * factor == physical_size` holds again by
+        // construction -- independent of call ordering on the C++ side or
+        // of which factor value gets applied.
+        panel
+            .window
+            .set_size(slint::PhysicalSize::new(panel.width, panel.height));
     }
     panel.window.window().request_redraw();
     true
