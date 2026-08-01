@@ -1770,6 +1770,13 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 ],
             )
         }
+        ChromeMsg::CompleteOnboarding => {
+            model.onboarding_completed = true;
+            if let Err(err) = crate::settings_file::SettingsPaths::from_env().set_onboarding_completed(true) {
+                eprintln!("panel-rust: failed to save onboarding_completed: {err}");
+            }
+            (vec![], vec![Dirty::Settings])
+        }
     }
 }
 
@@ -5003,6 +5010,7 @@ mod tests {
                     thread_states: vec![],
                     startup_warnings: vec![],
                     send_queues: vec![],
+                    onboarding_completed: false,
                 },
             ))),
         );
@@ -5050,6 +5058,7 @@ mod tests {
                         "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
                     ],
                     send_queues: vec![],
+                    onboarding_completed: false,
                 },
             ))),
         );

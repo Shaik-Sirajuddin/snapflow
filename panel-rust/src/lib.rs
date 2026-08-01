@@ -411,6 +411,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
         harness: None,
         dev_mode: None,
         snapflow_mcp_enabled: None,
+        onboarding_completed: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         let message = format!("failed to migrate panel defaults to JSON: {error}");
@@ -2306,12 +2307,17 @@ fn panel_rust_create_with_initial_identity(
                 })
             })
             .collect();
+        let onboarding_completed = settings_file::SettingsPaths::from_env()
+            .load_resolved()
+            .map(|r| r.onboarding_completed)
+            .unwrap_or(false);
         let initial = model::InitialState {
             threads: initial_specs.clone(),
             thread_ids: initial_thread_ids,
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
             send_queues: initial_send_queues,
+            onboarding_completed,
             thread_states: if bridge_available {
                 vec![ThreadState::Idle; initial_specs.len()]
             } else {
@@ -2567,6 +2573,21 @@ fn panel_rust_create_with_initial_identity(
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_settings_open(panel, &component);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_complete_onboarding(move || {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let _ = dispatch::update_persistent(
+                        panel,
+                        msg::Msg::Ui(msg::UiMsg::Chrome(msg::ChromeMsg::CompleteOnboarding)),
+                    );
                 }
             });
         });

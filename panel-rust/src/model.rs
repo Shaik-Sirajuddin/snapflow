@@ -67,6 +67,7 @@ pub struct InitialState {
     /// the same as `threads`/`thread_ids`; a missing/short entry falls
     /// back to an empty in-memory-only queue.
     pub send_queues: Vec<crate::send_queue::SendQueue>,
+    pub onboarding_completed: bool,
 }
 
 /// One thread's `Model`-side state -- the former parallel-array fields in
@@ -293,6 +294,7 @@ pub struct Model {
     pub background_default: bool,
     pub default_agent_id: String,
     pub dev_mode: bool,
+    pub onboarding_completed: bool,
     /// Feature-flag gate (env-var driven, see `PANEL_PROFILE_WIRING_ENABLED`
     /// in lib.rs) for the "default profile"/"permission profile" settings
     /// controls in `agents_view.slint`. Both are genuinely dual-tier
@@ -646,6 +648,7 @@ impl Model {
             threads,
             selected_thread,
             visible_indices: (0..thread_count).collect(),
+            onboarding_completed: initial.onboarding_completed,
             ..Self::default()
         };
         model.rebuild_thread_indices();
@@ -667,6 +670,7 @@ mod tests {
             thread_states: vec![],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -697,6 +701,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -728,6 +733,7 @@ mod tests {
             thread_states: vec![ThreadState::Error],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(
@@ -762,6 +768,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         });
 
         assert_eq!(model.thread_index_for_id("thread-second"), Some(1));

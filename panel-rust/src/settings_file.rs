@@ -80,6 +80,8 @@ pub struct SettingsDocument {
     // panel preference that gates client-side injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapflow_mcp_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_completed: Option<bool>,
 }
 
 fn schema_version_default() -> u32 {
@@ -95,6 +97,7 @@ pub struct ResolvedSettings {
     pub default_agent_id: Option<String>,
     pub show_global_skills: bool,
     pub harness: HarnessSettings,
+    pub onboarding_completed: bool,
 }
 
 impl Default for ResolvedSettings {
@@ -108,6 +111,7 @@ impl Default for ResolvedSettings {
             // default -- global skills show by default.
             show_global_skills: true,
             harness: HarnessSettings::default(),
+            onboarding_completed: false,
         }
     }
 }
@@ -149,6 +153,9 @@ pub fn merge_documents(layers: &[&SettingsDocument]) -> ResolvedSettings {
         }
         if let Some(ref h) = doc.harness {
             out.harness = h.clone();
+        }
+        if let Some(v) = doc.onboarding_completed {
+            out.onboarding_completed = v;
         }
     }
     out
@@ -314,6 +321,14 @@ impl SettingsPaths {
         doc.snapflow_mcp_enabled = Some(enabled);
         save_document(&self.global, &doc)
     }
+
+    /// Writes `onboarding_completed` into the Global document.
+    pub fn set_onboarding_completed(&self, completed: bool) -> Result<(), SettingsFileError> {
+        let mut doc = load_document(&self.global).unwrap_or_default();
+        doc.schema_version = 1;
+        doc.onboarding_completed = Some(completed);
+        save_document(&self.global, &doc)
+    }
 }
 
 fn dirs_fallback_config() -> PathBuf {
@@ -444,6 +459,7 @@ mod tests {
             harness: None,
             dev_mode: None,
             snapflow_mcp_enabled: None,
+            onboarding_completed: None,
         };
         let global = SettingsDocument {
             schema_version: 1,
@@ -455,6 +471,7 @@ mod tests {
             harness: None,
             dev_mode: None,
             snapflow_mcp_enabled: None,
+            onboarding_completed: None,
         };
         let project = SettingsDocument {
             schema_version: 1,
@@ -470,6 +487,7 @@ mod tests {
             }),
             dev_mode: None,
             snapflow_mcp_enabled: None,
+            onboarding_completed: None,
         };
         let r = merge_documents(&[&bundled, &global, &project]);
         assert_eq!(r.default_profile.as_deref(), Some("project-prof"));
@@ -499,6 +517,7 @@ mod tests {
             default_agent_id: Some("codex".to_owned()),
             show_global_skills: true,
             harness: HarnessSettings::default(),
+            onboarding_completed: false,
         };
         let defaults = resolved_to_panel_defaults(&poisoned, None);
         assert_eq!(defaults.profile_name, None);
@@ -551,6 +570,7 @@ mod tests {
             harness: Some(HarnessSettings::default()),
             dev_mode: None,
             snapflow_mcp_enabled: None,
+            onboarding_completed: None,
         };
         save_document(&path, &doc).unwrap();
         let loaded = load_document(&path).unwrap();
@@ -859,6 +879,30 @@ mod tests {
         assert!(
             paths_after.dev_mode(),
             "dev_mode written via set_dev_mode (Global tier) must take effect"
+        );
+    }
+
+    #[test]
+    fn onboarding_completed_defaults_to_false_and_persists_to_global_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("settings.global.json");
+        let paths = SettingsPaths {
+            global: global.clone(),
+            project: None,
+            bundled_default: None,
+        };
+
+        let resolved = paths.load_resolved().unwrap();
+        assert!(
+            !resolved.onboarding_completed,
+            "onboarding_completed must default to false on first install"
+        );
+
+        paths.set_onboarding_completed(true).unwrap();
+        let resolved_after = paths.load_resolved().unwrap();
+        assert!(
+            resolved_after.onboarding_completed,
+            "onboarding_completed must persist to settings config when completed"
         );
     }
 

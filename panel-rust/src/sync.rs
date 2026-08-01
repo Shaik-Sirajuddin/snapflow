@@ -249,6 +249,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_default(model.background_default);
             component.set_default_agent_id(model.default_agent_id.clone().into());
             component.set_dev_mode(model.dev_mode);
+            component.set_onboarding_completed(model.onboarding_completed);
             component.set_show_global_skills(model.show_global_skills);
             component.set_profile_wiring_enabled(model.profile_wiring_enabled);
             component.set_beta_mode_enabled(model.beta_mode_enabled);
@@ -1494,6 +1495,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
     component.set_open_terminal_tabs(slint::ModelRc::from(model.open_terminals_model.clone()));
+    component.set_onboarding_completed(model.onboarding_completed);
     reconcile_settings_models(model, component);
 }
 

@@ -58,6 +58,8 @@ export component ChatViewStack inherits Rectangle {
     in property <bool> rename-editing: false;
     in property <string> rename-focus-target: "";
     in-out property <string> rename-draft: "";
+    in-out property <bool> onboarding-completed: false;
+    callback complete-onboarding();
 
     // Commands are broadcast as generations; only the selected delegate
     // consumes them, so a hidden ChatArea cannot steal focus or approval.
@@ -155,6 +157,8 @@ export component ChatViewStack inherits Rectangle {
         pending-request: root.pending-request;
         terminals: root.terminals;
         local-terminal: root.local-terminal;
+        onboarding-completed <=> root.onboarding-completed;
+        complete-onboarding => { root.complete-onboarding(); }
         compose-text <=> root.compose-text;
         compose-text-changed(text) => { root.compose-draft-changed(text); }
         inputs-enabled: root.inputs-enabled;
@@ -260,6 +264,8 @@ export component ChatViewStack inherits Rectangle {
         pending-request: root.pending-request;
         terminals: root.terminals;
         local-terminal: root.local-terminal;
+        onboarding-completed <=> root.onboarding-completed;
+        complete-onboarding => { if (index == root.selected-index) { root.complete-onboarding(); } }
         // Each retained ChatArea owns its composer buffer. Do not bind this
         // to the stack-level fallback property: doing so makes hidden views
         // observe and overwrite the selected thread's draft.

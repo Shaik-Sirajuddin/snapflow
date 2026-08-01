@@ -307,6 +307,7 @@ pub enum ChromeMsg {
         text: String,
     },
     ErrorBannerDismissed,
+    CompleteOnboarding,
 }
 
 /// Direct C++ -> Rust FFI entry points that mutate panel state and are *not*
