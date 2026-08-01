@@ -179,10 +179,30 @@ export component AgentsView inherits Rectangle {
     // convention as every other elastic Flickable region in this
     // codebase), so the header -- and the search bar inside it -- stays
     // pinned above that scroll region instead of scrolling away with it.
+    //
+    // `alignment: start` -- both direct children below (the header
+    // `SettingsSection` and `agents-body-area`) set `vertical-stretch: 0`
+    // so neither wants to grow. But Slint's layout solver treats a
+    // group whose *total* stretch is 0 as an equal-share case rather
+    // than "give nobody the leftover space" (see
+    // i-slint-core::layout::stretch, `total_stretch <= 0` fallback) --
+    // without `alignment: start` here, this layout's default `stretch`
+    // redistributes any leftover vertical height (real once the parent
+    // is given real bounded height at fullscreen, per the call-site
+    // convention referenced above) equally between the two children
+    // anyway. `agents-body-area` is capped by its own `max-height:
+    // 420px`, but the header `SettingsSection` has no such cap, so it
+    // silently grew to absorb the rest -- rendering as a size-dependent
+    // gap below the pinned `agent-search-bar` (its last child, packed to
+    // the top via SettingsSection's own `alignment: start`) before
+    // `agents-body-area` began. Same class of bug, same fix, as
+    // `mcp_servers_view.slint`'s stdio-fields `VerticalLayout` (see its
+    // own doc comment) -- confirmed live there at a large window size.
     VerticalLayout {
         width: parent.width;
         height: parent.height;
         spacing: Metrics.space-6;
+        alignment: start;
 
         SettingsSection {
         width: parent.width;
