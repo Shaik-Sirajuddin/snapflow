@@ -124,8 +124,17 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             apply_thread_message_row_patch(model, thread_id, *index);
         }
         Dirty::Connection { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_connection_status(thread.connection_status.clone().into());
+            // Bug fix (same class as Dirty::PendingRequest, e30b6d2c): this
+            // used `thread_for_id` (any thread by id), so a *background*
+            // thread's connection-status change clobbered the singleton
+            // `connection_status` Slint property even though it's only
+            // ever read as "the displayed thread's connection status".
+            // Gate on `displayed_thread_for_id` like the other per-thread
+            // singleton-property syncs in this file.
+            if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_connection_status(thread.connection_status.clone().into());
+                }
             }
         }
         Dirty::Toast => {
@@ -272,7 +281,23 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::SkillEditor => sync_skill_editor_state(model, component),
         Dirty::Capabilities { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
+            // Bug fix (same class as Dirty::PendingRequest, e30b6d2c): this
+            // used `thread_for_id` (any thread by id), so a *background*
+            // thread's capability change (mode/reasoning/fast-mode options,
+            // profile/model dropdowns, plan entries, live session title,
+            // context-usage ring) clobbered these singleton `ChatPanel`
+            // properties even though every one of them is only ever read
+            // as "the displayed thread's" value -- e.g. viewing thread A,
+            // background thread B's config_options resolve or its plan
+            // updates, and this handler fired for B's `thread_id` and
+            // overwrote A's on-screen mode label / plan list / context
+            // ring / session title with B's state. Gate on
+            // `displayed_thread_for_id` like the other per-thread
+            // singleton-property syncs in this file.
+            if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                let Some(thread) = model.threads.get(idx) else {
+                    return;
+                };
                 component.set_mode_trigger_label(
                     crate::models::current_mode_name(&thread.session_modes).into(),
                 );

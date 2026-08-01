@@ -60,6 +60,20 @@ pub struct MessageEntry {
     pub row_index: usize,
     pub rendered_blocks: Option<ModelRc<crate::MarkdownBlock>>,
     pub rendered_lines: Option<ModelRc<crate::MarkdownLine>>,
+    /// Per-block incremental render cache (`(source_hash, MarkdownBlockData)`
+    /// per block, in block order) -- separate from `rendered_blocks`
+    /// (the already-`ModelRc`-wrapped whole-message result). This is what
+    /// lets `models::build_markdown_block_data_incremental` reuse an
+    /// unchanged block's already-styled `StyledText` even while the
+    /// message's *overall* content_hash keeps changing every tick during
+    /// live streaming (which is exactly when `rendered_blocks` above is
+    /// never a whole-message cache hit). Deliberately NOT wiped by
+    /// `record()` on a content change the way `rendered_blocks`/
+    /// `rendered_lines` are -- doing so would defeat the point: the caller
+    /// must read the previous tick's `block_cache` (via `block_cache_for`)
+    /// *before* calling `record()`, diff against it, then write the new
+    /// one back via `set_block_cache`.
+    pub block_cache: Vec<(u64, crate::models::MarkdownBlockData)>,
 }
 
 /// Per-thread key -> row bookkeeping. Rebuild wholesale only when the
@@ -188,8 +202,68 @@ impl ThreadMessageIndex {
                 row_index,
                 rendered_blocks: None,
                 rendered_lines: None,
+                // Deliberately NOT preserved from any prior entry here --
+                // see `block_cache_for`'s doc comment: a caller wanting
+                // incremental reuse across this content change must read
+                // the old entry's `block_cache` *before* this call (which
+                // replaces the entry wholesale) and write the freshly
+                // diffed result back via `set_block_cache` afterward.
+                block_cache: Vec::new(),
             },
         );
+    }
+
+    /// O(1) amortized: `key`'s currently-recorded per-block incremental
+    /// render cache, if any -- read this *before* calling `record`/
+    /// `rebuild` for a content change so the diff has something to
+    /// compare against (see `MessageEntry::block_cache`'s doc comment for
+    /// why this and `record`'s wipe-on-change behavior are deliberately
+    /// decoupled).
+    pub fn block_cache_for(&self, key: &str) -> Vec<(u64, crate::models::MarkdownBlockData)> {
+        self.by_key
+            .get(key)
+            .map(|e| e.block_cache.clone())
+            .unwrap_or_default()
+    }
+
+    /// O(1) amortized: overwrite `key`'s per-block incremental render
+    /// cache with a freshly-diffed one. No-op if `key` has no entry yet --
+    /// same "record first" rule as `set_rendered_blocks`.
+    pub fn set_block_cache(&mut self, key: &str, cache: Vec<(u64, crate::models::MarkdownBlockData)>) {
+        if let Some(entry) = self.by_key.get_mut(key) {
+            entry.block_cache = cache;
+        }
+    }
+
+    /// O(1) amortized, allocation-free when already empty: is `key`'s
+    /// per-block cache currently empty? Lets a caller on the hot "message
+    /// settled, whole-message cache hit" path skip the `clear_block_cache`
+    /// write entirely once there's nothing left to free, instead of
+    /// paying a `HashMap` write on every idle poll tick forever.
+    pub fn block_cache_is_empty(&self, key: &str) -> bool {
+        self.by_key.get(key).is_none_or(|e| e.block_cache.is_empty())
+    }
+
+    /// O(1) amortized: drop `key`'s per-block incremental cache.
+    ///
+    /// `block_cache` earns its keep only while a message's content is
+    /// still changing tick over tick (the live-streaming case) -- once a
+    /// message settles (its whole-message `content_hash` stops changing,
+    /// so every future call is satisfied by the `rendered_blocks_for`
+    /// fast path instead), `block_cache` is never read again but was
+    /// still sitting in memory as a second, `ModelRc`-free copy of the
+    /// same already-rendered content `rendered_blocks` already holds --
+    /// pure duplication with no future benefit. Callers should call this
+    /// exactly once, the first tick a message is observed settled (see
+    /// `block_cache_is_empty` for how to make that a no-op on every
+    /// subsequent idle tick rather than a repeated write), so a long
+    /// thread's memory footprint for this cache stays bounded to
+    /// whichever message(s) are actually still streaming, not every
+    /// historical agent message the thread has ever shown.
+    pub fn clear_block_cache(&mut self, key: &str) {
+        if let Some(entry) = self.by_key.get_mut(key) {
+            entry.block_cache = Vec::new();
+        }
     }
 
     /// O(1) amortized: attach a freshly-rendered `MarkdownBlock` model to
@@ -246,11 +320,26 @@ impl ThreadMessageIndex {
         let mut by_key = HashMap::with_capacity(keys.len());
         for (row_index, (key, text)) in keys.iter().zip(texts).enumerate() {
             let content_hash = hash_content(text);
-            let (rendered_blocks, rendered_lines) = match self.by_key.get(key) {
-                Some(prev) if prev.content_hash == content_hash => {
-                    (prev.rendered_blocks.clone(), prev.rendered_lines.clone())
-                }
-                _ => (None, None),
+            let (rendered_blocks, rendered_lines, block_cache) = match self.by_key.get(key) {
+                Some(prev) if prev.content_hash == content_hash => (
+                    prev.rendered_blocks.clone(),
+                    prev.rendered_lines.clone(),
+                    prev.block_cache.clone(),
+                ),
+                // Unlike `record()`, `rebuild` carries the previous
+                // `block_cache` over even when content_hash differs --
+                // matches `models::build_markdown_block_data_incremental`'s
+                // "diff against whatever prev had" contract; an actual
+                // content change just means most/all entries in that
+                // stale cache will hash-mismatch on the next diff and get
+                // rebuilt anyway, same as passing an empty cache would,
+                // but preserving it here means a caller that rebuilds
+                // instead of `record`s on this tick doesn't lose reuse
+                // opportunity for the (common) case where only the key's
+                // row_index moved and its block-level content is still
+                // largely a prefix match.
+                Some(prev) => (None, None, prev.block_cache.clone()),
+                None => (None, None, Vec::new()),
             };
             by_key.insert(
                 key.clone(),
@@ -260,6 +349,7 @@ impl ThreadMessageIndex {
                     row_index,
                     rendered_blocks,
                     rendered_lines,
+                    block_cache,
                 },
             );
         }

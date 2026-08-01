@@ -243,6 +243,76 @@ pub struct MarkdownBlockData {
     pub code_text: String,
 }
 
+/// Builds one [`MarkdownBlockData`] from a single already-segmented
+/// `span`, parsing/styling only that block's own source slice. Factored
+/// out of [`build_markdown_block_data`] so [`build_markdown_block_data_
+/// incremental`] (below) can call it per-block too -- rebuilding only
+/// the blocks that actually changed, instead of every block in the
+/// message.
+fn build_one_block_data(
+    text: &str,
+    span: markdown::MarkdownBlockSpan,
+    is_streaming_tail: bool,
+) -> MarkdownBlockData {
+    let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
+        // `segment_blocks`' byte ranges are pulldown-cmark's own
+        // verbatim block spans -- they legitimately include a
+        // trailing newline (block ranges) or table-cell padding
+        // whitespace around `|` delimiters, neither of which is
+        // real content (see markdown.rs's segment_blocks tests).
+        let raw = text[range].trim();
+        let candidate = if is_streaming_tail {
+            markdown::heal_open_markers(raw)
+        } else {
+            raw.to_string()
+        };
+        slint::StyledText::from_markdown(&candidate)
+            .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
+    };
+    match span.kind {
+        markdown::BlockSpanKind::Text => MarkdownBlockData {
+            kind: "text",
+            text: styled_text_for(span.source_range),
+            default_font_size: heading_font_size(span.heading_level),
+            indent: span.indent as i32,
+            table_cells: Vec::new(),
+            table_col_count: 0,
+            code_text: String::new(),
+        },
+        markdown::BlockSpanKind::Code(body) => MarkdownBlockData {
+            kind: "code",
+            text: slint::StyledText::default(),
+            default_font_size: 0.0_f32,
+            indent: span.indent as i32,
+            table_cells: Vec::new(),
+            table_col_count: 0,
+            code_text: body,
+        },
+        markdown::BlockSpanKind::Rule => MarkdownBlockData {
+            kind: "rule",
+            text: slint::StyledText::default(),
+            default_font_size: 0.0_f32,
+            indent: span.indent as i32,
+            table_cells: Vec::new(),
+            table_col_count: 0,
+            code_text: String::new(),
+        },
+        markdown::BlockSpanKind::Table { cells, col_count } => {
+            let cell_styled: Vec<slint::StyledText> =
+                cells.into_iter().map(styled_text_for).collect();
+            MarkdownBlockData {
+                kind: "table",
+                text: slint::StyledText::default(),
+                default_font_size: 0.0_f32,
+                indent: span.indent as i32,
+                table_cells: cell_styled,
+                table_col_count: col_count as i32,
+                code_text: String::new(),
+            }
+        }
+    }
+}
+
 /// Segments+styles `text` into [`MarkdownBlockData`] -- the `Send`-safe,
 /// `ModelRc`-free half of Architecture v2's per-block rendering. Pure
 /// function of `(text, is_streaming_tail)`, no caching, no Slint model
@@ -252,69 +322,114 @@ pub struct MarkdownBlockData {
 /// the worker calls it directly and does its own `ModelRc` wrapping in
 /// its UI-thread delivery closure.
 pub fn build_markdown_block_data(text: &str, is_streaming_tail: bool) -> Vec<MarkdownBlockData> {
-    let spans = markdown::segment_blocks(text);
-    spans
+    markdown::segment_blocks(text)
         .into_iter()
-        .map(|span| {
-            let styled_text_for = |range: std::ops::Range<usize>| -> slint::StyledText {
-                // `segment_blocks`' byte ranges are pulldown-cmark's own
-                // verbatim block spans -- they legitimately include a
-                // trailing newline (block ranges) or table-cell padding
-                // whitespace around `|` delimiters, neither of which is
-                // real content (see markdown.rs's segment_blocks tests).
-                let raw = text[range].trim();
-                let candidate = if is_streaming_tail {
-                    markdown::heal_open_markers(raw)
-                } else {
-                    raw.to_string()
-                };
-                slint::StyledText::from_markdown(&candidate)
-                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(raw))
-            };
-            match span.kind {
-                markdown::BlockSpanKind::Text => MarkdownBlockData {
-                    kind: "text",
-                    text: styled_text_for(span.source_range),
-                    default_font_size: heading_font_size(span.heading_level),
-                    indent: span.indent as i32,
-                    table_cells: Vec::new(),
-                    table_col_count: 0,
-                    code_text: String::new(),
-                },
-                markdown::BlockSpanKind::Code(body) => MarkdownBlockData {
-                    kind: "code",
-                    text: slint::StyledText::default(),
-                    default_font_size: 0.0_f32,
-                    indent: span.indent as i32,
-                    table_cells: Vec::new(),
-                    table_col_count: 0,
-                    code_text: body,
-                },
-                markdown::BlockSpanKind::Rule => MarkdownBlockData {
-                    kind: "rule",
-                    text: slint::StyledText::default(),
-                    default_font_size: 0.0_f32,
-                    indent: span.indent as i32,
-                    table_cells: Vec::new(),
-                    table_col_count: 0,
-                    code_text: String::new(),
-                },
-                markdown::BlockSpanKind::Table { cells, col_count } => {
-                    let cell_styled: Vec<slint::StyledText> =
-                        cells.into_iter().map(styled_text_for).collect();
-                    MarkdownBlockData {
-                        kind: "table",
-                        text: slint::StyledText::default(),
-                        default_font_size: 0.0_f32,
-                        indent: span.indent as i32,
-                        table_cells: cell_styled,
-                        table_col_count: col_count as i32,
-                        code_text: String::new(),
-                    }
+        .map(|span| build_one_block_data(text, span, is_streaming_tail))
+        .collect()
+}
+
+/// Same output as calling [`build_markdown_block_data`] fresh, but reuses
+/// `prev` (this same key's block list from the previous call, `(source_
+/// hash, MarkdownBlockData)` pairs in block order) for any block whose
+/// own source byte range is textually unchanged since then -- only
+/// genuinely new or changed blocks get (re-)parsed and (re-)styled.
+///
+/// **Why this exists** (the live-streaming freeze root cause): a
+/// streaming agent message calls into this module again on every new
+/// chunk with the *entire accumulated text so far*, not just the newly
+/// arrived tail. `build_markdown_block_data` (and, before this function
+/// existed, `markdown_blocks_for`'s only path) re-ran `segment_blocks`
+/// AND re-ran `StyledText::from_markdown` -- real inline parsing plus
+/// real pixel-width text layout -- for every block in the message on
+/// every single chunk, including every already-finalized heading/
+/// paragraph/code block from earlier in the same message that hadn't
+/// changed at all. That's O(already-rendered-length) work repeated on
+/// every incoming token, i.e. O(final-length^2) total over one streamed
+/// response, running synchronously on the UI thread (the background
+/// `markdown_worker.rs`/`RenderWorkerPool` pipeline is not wired into
+/// this live-dispatch call path -- see that module's own doc comment) --
+/// exactly the kind of per-chunk cost that stalls scrolling/repainting
+/// while a message is streaming.
+///
+/// `segment_blocks` itself must still run on the full text every call
+/// (block boundaries can only be found by parsing from the start), but
+/// that's cheap: block-level structural parsing, not the per-block
+/// inline-styling + real text-shaping/layout `StyledText::from_markdown`
+/// does. This function keeps paying that cheap part every call while
+/// skipping the expensive per-block styling for every block whose source
+/// slice (by content, not just position) matches what `prev` already has
+/// at the same index -- which, for the common streaming shape (new
+/// tokens appended at the end, only the last block still growing), is
+/// every block except the last one or two.
+///
+/// Falls back to a full rebuild of any block (including a positionally
+/// later block that happens to still hash-match) whenever `prev` doesn't
+/// have a same-index entry with a matching hash -- safe by construction:
+/// a hash mismatch or missing entry just means "rebuild it", never stale
+/// data reuse.
+pub fn build_markdown_block_data_incremental(
+    text: &str,
+    is_streaming_tail: bool,
+    prev: &[(u64, MarkdownBlockData)],
+) -> Vec<(u64, MarkdownBlockData)> {
+    markdown::segment_blocks(text)
+        .into_iter()
+        .enumerate()
+        .map(|(i, span)| {
+            let hash = block_span_content_hash(text, &span);
+            if let Some((prev_hash, prev_data)) = prev.get(i) {
+                if *prev_hash == hash {
+                    return (hash, prev_data.clone());
                 }
             }
+            (hash, build_one_block_data(text, span, is_streaming_tail))
         })
         .collect()
+}
+
+/// Fingerprint of a block span's *semantic* content -- what actually
+/// feeds `build_one_block_data`, not its raw `source_range` bytes.
+///
+/// Live-caught during this fix's own testing, not by static reasoning:
+/// `segment_blocks`' block ranges legitimately include a trailing
+/// newline only when another block follows (pulldown-cmark's own
+/// behavior -- a block at end-of-document has no trailing separator to
+/// include, one immediately followed by more content does). So the exact
+/// same paragraph's `source_range` byte slice differs by one trailing
+/// `\n` the moment a new block appears after it, even though the trimmed
+/// text `build_one_block_data` actually renders (`text[range].trim()`)
+/// is byte-identical -- hashing the untrimmed slice caused a spurious
+/// one-time cache miss on every block precisely when it stopped being
+/// the last block, which is the single most common transition during
+/// live streaming. Hashing the same normalized content the builder
+/// itself uses (trimmed text / already-extracted code body / cell texts)
+/// keeps the two in agreement.
+fn block_span_content_hash(text: &str, span: &markdown::MarkdownBlockSpan) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    span.indent.hash(&mut hasher);
+    match &span.kind {
+        markdown::BlockSpanKind::Text => {
+            0u8.hash(&mut hasher);
+            span.heading_level.hash(&mut hasher);
+            text[span.source_range.clone()].trim().hash(&mut hasher);
+        }
+        markdown::BlockSpanKind::Code(body) => {
+            1u8.hash(&mut hasher);
+            body.hash(&mut hasher);
+        }
+        markdown::BlockSpanKind::Rule => {
+            2u8.hash(&mut hasher);
+        }
+        markdown::BlockSpanKind::Table { cells, col_count } => {
+            3u8.hash(&mut hasher);
+            col_count.hash(&mut hasher);
+            for cell in cells {
+                text[cell.clone()].trim().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// Wraps `Vec<MarkdownBlockData>` into the `ModelRc<MarkdownBlock>` Slint
@@ -381,6 +496,22 @@ fn markdown_blocks_for(
         if let crate::thread_message_index::RowChange::Unchanged(_) = change {
             if let Some(cached) = render_index.rendered_blocks_for(key) {
                 crate::trace_host_input(format_args!("markdown cache hit key={key} kind=blocks"));
+                // This message has settled (unchanged since the last
+                // tick that already produced a whole-message cache hit)
+                // -- its per-block incremental cache (`block_cache`,
+                // below) is never consulted again from this point on
+                // (every future call for this key keeps hitting this
+                // same early return), so free it now rather than let it
+                // sit as a second, redundant copy of `cached`'s content
+                // for the rest of this message's lifetime in the
+                // thread's history. `block_cache_is_empty` makes this a
+                // no-op read on every subsequent idle tick instead of a
+                // repeated write, so a long-settled thread's idle-poll
+                // cost here does not regress versus before this
+                // block-level cache existed.
+                if !render_index.block_cache_is_empty(key) {
+                    render_index.clear_block_cache(key);
+                }
                 return cached;
             }
         }
@@ -400,11 +531,40 @@ fn markdown_blocks_for(
             }
         ));
     }
-    let built = markdown_block_data_to_model(build_markdown_block_data(text, is_streaming_tail));
+    // Block-level incremental reuse (see `build_markdown_block_data_
+    // incremental`'s doc comment for the full "why"): the whole-message
+    // cache-hit check above only helps when `text` is byte-identical to
+    // the last call -- never true while a message is actively streaming,
+    // since its content_hash changes on essentially every poll tick. But
+    // most *individual blocks* inside a growing `text` are still
+    // byte-identical to the previous call (only the actively-growing
+    // tail block, and occasionally a newly-started one, actually
+    // changed) -- reuse those instead of re-parsing and re-styling every
+    // already-finalized block on every single chunk. `block_cache_for`
+    // returns empty for a key with no entry yet (first render) or while
+    // `is_streaming_tail` (see below), which just means every block
+    // rebuilds this call, same as before this optimization existed.
+    let prev_blocks = render_index.block_cache_for(key);
+    let new_blocks = build_markdown_block_data_incremental(text, is_streaming_tail, &prev_blocks);
+    let built = markdown_block_data_to_model(new_blocks.iter().map(|(_, d)| d.clone()).collect());
     if !is_streaming_tail {
         render_index.record(key, row_index, text);
         render_index.set_rendered_blocks(key, built.clone());
+        // Must run after `record`, which (on a real content change)
+        // replaces the entry wholesale and would otherwise wipe this --
+        // `set_block_cache` is a no-op against a missing entry.
+        render_index.set_block_cache(key, new_blocks);
     }
+    // `is_streaming_tail == true`: matches this function's pre-existing
+    // "index never read or written for this key" contract (see this
+    // function's own doc comment) -- `set_block_cache` is skipped here
+    // too, not just `record`/`set_rendered_blocks`. Not currently
+    // production-reachable (every live call site still hardcodes
+    // `is_streaming_tail: false`, per `to_message_rows_from_transcript`'s
+    // comment), so this leaves no incremental-reuse benefit on that path
+    // today; a future caller wiring the real streaming-tail signal
+    // through would need `block_cache_for`/`set_block_cache` to work
+    // without a full `record()` first to get the same speedup there.
     built
 }
 
@@ -3623,6 +3783,165 @@ mod transcript_model_tests {
             render_index.check("k", "Hello <u>wor"),
             crate::thread_message_index::RowChange::New
         );
+    }
+
+    #[test]
+    fn build_markdown_block_data_incremental_reuses_matching_blocks_and_rebuilds_only_new_ones() {
+        // The core claim of the streaming-freeze fix: growing `text` by
+        // appending a new block must reuse the *unchanged* earlier
+        // blocks' already-built data rather than re-parsing/re-styling
+        // them from scratch on every call.
+        let first_text = "First paragraph.\n\nSecond paragraph.";
+        let first = build_markdown_block_data_incremental(first_text, false, &[]);
+        assert_eq!(first.len(), 2);
+
+        let grown_text = format!("{first_text}\n\nThird paragraph.");
+        let grown = build_markdown_block_data_incremental(&grown_text, false, &first);
+        assert_eq!(grown.len(), 3);
+        assert_eq!(grown[0].0, first[0].0, "unchanged block keeps the same source hash");
+        assert_eq!(grown[1].0, first[1].0, "unchanged block keeps the same source hash");
+
+        // Prove the *data itself* -- not just the hash -- was reused
+        // rather than recomputed: tamper with the cached entry's content
+        // in a way that a real rebuild would never independently
+        // reproduce, and confirm the tampered value survives into the
+        // diffed output for the unchanged block, but NOT for the
+        // genuinely new third block (which has no matching prior entry
+        // and so must actually be rebuilt).
+        let mut tampered = first.clone();
+        tampered[0].1.kind = "tampered-marker";
+        let diffed = build_markdown_block_data_incremental(&grown_text, false, &tampered);
+        assert_eq!(
+            diffed[0].1.kind, "tampered-marker",
+            "an unchanged block's data must come from the cache, not a fresh rebuild"
+        );
+        assert_ne!(
+            diffed[2].1.kind, "tampered-marker",
+            "a genuinely new block must be rebuilt, never mistaken for cached data"
+        );
+    }
+
+    #[test]
+    fn build_markdown_block_data_incremental_rebuilds_a_block_whose_content_actually_changed() {
+        // A prior entry at the same index with a *different* hash (the
+        // tail block growing mid-stream) must not be reused -- safety
+        // property of the diff: hash mismatch always means rebuild.
+        let step1 = build_markdown_block_data_incremental("Hel", false, &[]);
+        let step2 = build_markdown_block_data_incremental("Hello world", false, &step1);
+        assert_ne!(step1[0].0, step2[0].0, "growing text changes the block's source hash");
+        // Rebuilt data reflects the new, longer text, not the stale
+        // cached entry -- `StyledText` derives `PartialEq`, so comparing
+        // against a fresh direct build (bypassing the incremental path
+        // entirely) confirms step2 is a real rebuild, not a stale reuse.
+        let direct = build_markdown_block_data("Hello world", false);
+        assert_eq!(step2[0].1.text, direct[0].text);
+        assert_ne!(step2[0].1.text, step1[0].1.text);
+    }
+
+    #[test]
+    fn markdown_blocks_for_reuses_earlier_blocks_across_a_growing_streamed_message() {
+        // End-to-end through the actual production call path
+        // (`markdown_blocks_for`, `is_streaming_tail: false` -- matches
+        // `to_message_rows_from_transcript`'s real call site): as an
+        // agent message's accumulated text grows tick over tick, earlier
+        // blocks' cached entries must carry over unchanged instead of
+        // being rebuilt on every tick.
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let step1 = "First paragraph.\n\nSecond paragraph.";
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", step1, false);
+        let cache_after_step1 = render_index.block_cache_for("k");
+        assert_eq!(cache_after_step1.len(), 2);
+
+        let step2 = format!("{step1}\n\nThird paragraph.");
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", &step2, false);
+        let cache_after_step2 = render_index.block_cache_for("k");
+        assert_eq!(cache_after_step2.len(), 3);
+        assert_eq!(
+            cache_after_step2[0].0, cache_after_step1[0].0,
+            "first block's hash must be unchanged across the append"
+        );
+        assert_eq!(
+            cache_after_step2[1].0, cache_after_step1[1].0,
+            "second block's hash must be unchanged across the append"
+        );
+    }
+
+    #[test]
+    fn markdown_blocks_for_frees_the_per_block_cache_once_a_message_settles() {
+        // Memory-bound check for the block-level cache added by the
+        // live-streaming-freeze fix: `block_cache` exists only to help a
+        // message that's still actively changing tick over tick. Once a
+        // message stops changing (settles -- the normal end state for
+        // every historical message in a thread, not just the one
+        // currently streaming), it must not sit around forever as a
+        // second, `ModelRc`-free duplicate of what `rendered_blocks`
+        // already holds -- that would make a long thread's memory
+        // footprint scale with total historical message count instead of
+        // just however many messages are actually still streaming.
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let text = "First paragraph.\n\nSecond paragraph.";
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert!(
+            !render_index.block_cache_is_empty("k"),
+            "block cache is populated immediately after a real (first) build"
+        );
+
+        // Next tick: identical text (the message has stopped changing --
+        // matches a real turn-ended/settled message being re-projected on
+        // every subsequent idle poll tick).
+        let cached = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(cached.row_count(), 2, "still returns the correct rendered rows");
+        assert!(
+            render_index.block_cache_is_empty("k"),
+            "settling (a whole-message cache hit) must free the now-redundant per-block cache"
+        );
+
+        // A further idle tick with the same settled text must keep
+        // returning the correct content without ever re-populating
+        // block_cache (there's nothing left to diff against, and nothing
+        // in this message is changing) -- proves the free above isn't
+        // itself a one-tick fluke that silently rebuilds again right
+        // after.
+        let cached_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(cached_again.row_count(), 2);
+        assert!(render_index.block_cache_is_empty("k"));
+    }
+
+    #[test]
+    fn markdown_blocks_for_settled_message_does_no_block_level_work_on_repeat_ticks() {
+        // Companion to the memory-bound test above, from the CPU side:
+        // once settled, repeat calls with unchanged text must take the
+        // whole-message cache-hit fast path and never touch
+        // segment_blocks/StyledText::from_markdown again -- verified
+        // indirectly by asserting the returned ModelRc is the exact same
+        // Rc-backed instance every time (a fresh rebuild would allocate a
+        // brand new VecModel each call; `ModelRc`'s `PartialEq` in this
+        // crate's Slint version is pointer identity, matching the
+        // pre-existing `record_with_matching_hash_does_not_wipe_an_
+        // already_rendered_payload` regression test's own reasoning).
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        let text = "Some **markdown** paragraph.";
+        let first = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let second = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let third = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        assert_eq!(first, second, "settled repeat calls return the identical cached ModelRc");
+        assert_eq!(second, third, "settled repeat calls return the identical cached ModelRc");
+    }
+
+    #[test]
+    fn build_markdown_block_data_incremental_pays_no_more_hashing_than_segment_blocks_already_needs() {
+        // Cold-start / never-before-seen-message sanity check: with an
+        // empty `prev` cache (exactly the state for a message the thread
+        // is rendering for the very first time, e.g. cold hydration of a
+        // long thread history), the incremental path must produce
+        // byte-identical output to the plain, non-incremental builder --
+        // this fix must not change what cold-start renders, only what
+        // gets skipped on a *repeat* call for the same key.
+        let text = "# Heading\n\nA paragraph with `code` and **bold**.\n\n```\nfn main() {}\n```";
+        let direct = build_markdown_block_data(text, false);
+        let incremental: Vec<MarkdownBlockData> =
+            build_markdown_block_data_incremental(text, false, &[]).into_iter().map(|(_, d)| d).collect();
+        assert_eq!(direct, incremental, "cold start (empty prev cache) must match the non-incremental builder exactly");
     }
 
     #[test]
