@@ -3786,6 +3786,119 @@ mod transcript_model_tests {
     }
 
     #[test]
+    fn markdown_blocks_for_single_line_message_last_and_only_block_fully_present() {
+        // Coverage gap closed: the existing incremental-cache tests
+        // (added alongside this one by the streaming-freeze fix) assert
+        // block *counts* and prove *reuse*, but none of them assert that
+        // the tail line's actual rendered text reaches the true end of
+        // the source string -- the specific property a "last line looks
+        // cut off" bug report is about. A single short one-block message
+        // is the simplest case where "last block" and "only block" are
+        // the same thing; the multi-paragraph tests below cover the
+        // "several blocks, last one is short" shape too.
+        let text = "Just one short line, nothing else.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        // Streamed in growing partial calls, then settled (repeat call
+        // with unchanged text) -- matches a real short agent reply.
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", "Just one short", false);
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", "Just one short line, nothing", false);
+        let settled = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let settled_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+
+        let direct = markdown_block_data_to_model(build_markdown_block_data(text, false));
+        assert_eq!(settled.row_count(), 1);
+        assert_eq!(settled_again.row_count(), 1);
+        assert_eq!(
+            settled.row_data(0).unwrap().text,
+            direct.row_data(0).unwrap().text,
+            "settled single-line message's only block does not match ground truth"
+        );
+        assert_eq!(
+            settled_again.row_data(0).unwrap().text,
+            direct.row_data(0).unwrap().text,
+            "re-settled single-line message's only block does not match ground truth"
+        );
+    }
+
+    #[test]
+    fn markdown_blocks_for_streaming_char_by_char_last_line_matches_ground_truth_every_tick() {
+        // Simulates a message streaming in one character at a time -- the
+        // most granular real-world shape -- ending on a short final
+        // sentence after a longer paragraph, and at EVERY tick (not just
+        // the last one) compares `markdown_blocks_for`'s (the real
+        // production call path) last block's text against a from-scratch,
+        // non-incremental `build_markdown_block_data` build of the exact
+        // same text. Any tick where they diverge would mean the
+        // incremental cache is returning stale/incomplete content for the
+        // tail block -- the exact failure mode a "last line clipped"
+        // live bug report during active streaming would come from.
+        let full_text = "This is a longer first paragraph with quite a bit of content in it so it wraps across more than one visual line in the chat bubble.\n\nShort final line.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        for end in 1..=full_text.len() {
+            if !full_text.is_char_boundary(end) {
+                continue;
+            }
+            let partial = &full_text[..end];
+            let got = markdown_blocks_for(&mut render_index, "k", 0, "agent", partial, false);
+            let direct = markdown_block_data_to_model(build_markdown_block_data(partial, false));
+            assert_eq!(
+                got.row_count(),
+                direct.row_count(),
+                "block count diverged at len={end} partial={partial:?}"
+            );
+            for i in 0..got.row_count() {
+                assert_eq!(
+                    got.row_data(i).unwrap().text,
+                    direct.row_data(i).unwrap().text,
+                    "block {i} text diverged at len={end} partial={partial:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_blocks_for_settled_multi_paragraph_last_line_fully_present() {
+        // A message that has fully settled (streamed once, then stopped
+        // changing -- matches real "message turn ended" behavior) must
+        // render its LAST paragraph's full text, not a truncated prefix
+        // of it. Live-verified against the real `markdown_blocks_for`
+        // production entry point (not just the lower-level incremental
+        // builder) so this covers the actual whole-message settled
+        // cache-hit path too, not only the per-block diff.
+        let text = "First paragraph of the message.\n\nSecond paragraph, a bit longer than the first one to be realistic.\n\nFinal short line.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        // Tick 1: streaming arrives (simulated as a few growing calls).
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", "First paragraph of the message.", false);
+        markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "First paragraph of the message.\n\nSecond paragraph, a bit longer than the first one to be realistic.",
+            false,
+        );
+        let settled = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        // Tick 2+: message settled, text stops changing (real repeat-poll
+        // behavior after the turn ends).
+        let settled_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+
+        let direct = markdown_block_data_to_model(build_markdown_block_data(text, false));
+        assert_eq!(settled.row_count(), direct.row_count());
+        assert_eq!(settled_again.row_count(), direct.row_count());
+        let last = settled.row_count() - 1;
+        assert_eq!(
+            settled.row_data(last).unwrap().text,
+            direct.row_data(last).unwrap().text,
+            "settled message's LAST block text does not match ground truth"
+        );
+        assert_eq!(
+            settled_again.row_data(last).unwrap().text,
+            direct.row_data(last).unwrap().text,
+            "re-settled (repeat idle tick) message's LAST block text does not match ground truth"
+        );
+    }
+
+    #[test]
     fn build_markdown_block_data_incremental_reuses_matching_blocks_and_rebuilds_only_new_ones() {
         // The core claim of the streaming-freeze fix: growing `text` by
         // appending a new block must reuse the *unchanged* earlier
