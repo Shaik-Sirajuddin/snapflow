@@ -152,12 +152,13 @@ export component AgentCard inherits Rectangle {
             }
         }
 
-        if root.website != "" : Rectangle {
-            height: 16px;
+        if root.website != "" : VerticalLayout {
+            height: 14px + Metrics.space-1;
             width: parent.width;
+            padding-top: Metrics.space-1;
             LinkText {
                 text: "Official website";
-                font-size: 10px * Theme.font-scale;
+                font-size: 9px * Theme.font-scale;
                 clicked => { root.website-clicked(); }
             }
         }
