@@ -707,29 +707,6 @@ export component ChatArea inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
-                    if root.project-name != "" : HorizontalLayout {
-                        spacing: Metrics.space-1;
-                        horizontal-stretch: 0;
-                        cross-axis-alignment: center;
-                        accessible-role: text;
-                        accessible-label: "Project " + root.project-path
-                            + (root.project-mcp-live ? " (MCP connected)" : " (MCP disconnected)");
-                        Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: root.project-mcp-live ? #22c55e : #ef4444;
-                        }
-                        Text {
-                            text: root.project-name;
-                            color: Theme.text-muted;
-                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
-                            font-family: Theme.font-mono;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            max-width: compact ? 70px : 130px;
-                        }
-                    }
                     Text {
                         text: agent-badge;
                         color: Theme.text-primary;
