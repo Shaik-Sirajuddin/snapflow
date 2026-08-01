@@ -124,6 +124,26 @@ pub struct ThreadModel {
     pub message_ids: Vec<String>,
     pub transcript: Vec<TranscriptItem>,
     pub transcript_keys: Vec<String>,
+    /// `(send_queue, generation_in_flight)` captured the last time this
+    /// thread's message rows were actually rebuilt from `transcript` in
+    /// `update.rs`'s frame-poll fold. `None` until the first rebuild.
+    ///
+    /// The frame poll runs at 60-90fps and re-collects `snapshot.transcript`
+    /// every tick regardless of whether it changed (`ExternalSnapshotSource::
+    /// collect_thread_snapshot_for`'s doc comment). Before this field
+    /// existed, the fold unconditionally re-ran `message_rows_for_thread_
+    /// with_state` on every tick too -- re-cloning the whole transcript and
+    /// re-parsing every tool row's `raw_input` JSON (`to_message_rows_from_
+    /// transcript`'s `serde_json::from_str` call), even on an idle thread
+    /// whose transcript was byte-identical to the previous tick. Comparing
+    /// against this field (alongside `thread.transcript == snapshot.
+    /// transcript`) lets that tick instead reuse the already-installed rows
+    /// from `Model::thread_view_models` (cheap `Rc`-backed clones, no
+    /// re-parse) -- see the frame-poll fold in `update.rs` for the actual
+    /// gate. `send_queue`/`in_flight` are tracked too because either can
+    /// change the row projection (queued rows, the "sending" flag) even
+    /// while `transcript` itself stays the same.
+    pub rows_synced_with: Option<(SendQueue, bool)>,
     #[cfg(test)]
     /// Legacy projection fixture retained only by unit tests that exercise
     /// the pre-migration shared-list reducer. Production rows live in the
@@ -514,6 +534,7 @@ impl Default for ThreadModel {
             message_ids: Vec::new(),
             transcript: Vec::new(),
             transcript_keys: Vec::new(),
+            rows_synced_with: None,
             #[cfg(test)]
             message_rows: Vec::new(),
             markdown_render_index: RefCell::new(crate::thread_message_index::ThreadMessageIndex::default()),

@@ -884,6 +884,18 @@ impl<'a> ExternalSnapshotSource<'a> {
         selected.and_then(|real_idx| self.collect_thread_snapshot_for(real_idx))
     }
 
+    /// One `ThreadRecord` per bound thread that `update()`'s frame fold
+    /// hasn't already persisted (`model.traced_attachment_threads`, checked
+    /// via `HashSet::insert` in `update.rs`'s `for record in frame.
+    /// thread_record_snapshots` loop -- every already-traced thread's
+    /// record is built here just to be thrown away there). Filtering by the
+    /// same set here, rather than after collection, means a poll tick
+    /// (60-90fps) with N already-persisted open threads skips N thread_
+    /// binding/thread_provider bridge lookups and ~7 `String` clones per
+    /// thread (`display_name`, `profile_name`, `permission_profile`,
+    /// `thread_id`, `session_id`, `project_path`, ...) that would otherwise
+    /// be built and discarded on every single tick regardless of whether
+    /// any new thread ever attaches.
     pub(crate) fn collect_thread_record_snapshots(&self) -> Vec<crate::state_store::ThreadRecord> {
         let Some(bridge) = self.panel.bridge.as_ref() else {
             return Vec::new();
@@ -895,6 +907,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             .enumerate()
             .filter_map(|(idx, thread)| {
                 let binding = bridge.thread_binding(idx)?;
+                if model.traced_attachment_threads.contains(&binding.thread_id) {
+                    return None;
+                }
                 let provider = bridge.thread_provider(idx)?;
                 Some(crate::state_store::ThreadRecord {
                     thread_id: binding.thread_id,

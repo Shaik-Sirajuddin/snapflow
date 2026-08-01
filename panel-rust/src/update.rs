@@ -2868,21 +2868,59 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
-            let old_rows = model
-                .thread_view_models
-                .rows(&thread_id)
-                .unwrap_or_default();
             // Include send-queue rows (QueuedMessageBar) in the projection.
             let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
-            let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
-                snapshot.transcript.clone(),
-                &expanded,
-                &thread.send_queue,
-                in_flight,
-                &mut *thread.markdown_render_index.borrow_mut(),
-            );
-            // Preserve expand-by-key across re-project (live poll + switch).
-            merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
+            let queue_state = (thread.send_queue.clone(), in_flight);
+            // The frame poll runs at 60-90fps and collects `snapshot.
+            // transcript` every tick regardless of whether it changed (see
+            // `ExternalSnapshotSource::collect_thread_snapshot_for`'s doc
+            // comment). Rebuilding rows from scratch on every such tick re-
+            // clones the whole transcript and re-parses every tool row's
+            // `raw_input` JSON (`to_message_rows_from_transcript`'s
+            // `serde_json::from_str` call) even when nothing about this
+            // thread changed since the last tick. When the transcript AND
+            // the queue/in-flight state that also feed the projection are
+            // both unchanged since the rows currently installed in
+            // `thread_view_models` were built, reuse those rows (cheap
+            // `Rc`-backed clones) instead of re-projecting from scratch.
+            let rows_unchanged = !switched_thread
+                && thread.transcript == snapshot.transcript
+                && thread.rows_synced_with.as_ref() == Some(&queue_state);
+            let (rows, new_keys) = if rows_unchanged {
+                match model.thread_view_models.rows(&thread_id) {
+                    Some(cached_rows) if cached_rows.len() == old_keys.len() => {
+                        (cached_rows, old_keys.clone())
+                    }
+                    // Retained model and this thread's own key cache have
+                    // desynced (should not happen; defensive only, mirrors
+                    // `list_model::reconcile`'s own self-heal). Fall back to
+                    // a full rebuild rather than serving a mismatched row
+                    // list.
+                    _ => crate::models::message_rows_for_thread_with_state(
+                        snapshot.transcript.clone(),
+                        &expanded,
+                        &thread.send_queue,
+                        in_flight,
+                        &mut *thread.markdown_render_index.borrow_mut(),
+                    ),
+                }
+            } else {
+                let old_rows = model
+                    .thread_view_models
+                    .rows(&thread_id)
+                    .unwrap_or_default();
+                let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
+                    snapshot.transcript.clone(),
+                    &expanded,
+                    &thread.send_queue,
+                    in_flight,
+                    &mut *thread.markdown_render_index.borrow_mut(),
+                );
+                // Preserve expand-by-key across re-project (live poll + switch).
+                merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
+                (rows, new_keys)
+            };
+            thread.rows_synced_with = Some(queue_state);
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
             // A brand new thread's own cache is empty both before and
