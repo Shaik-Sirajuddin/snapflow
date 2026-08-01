@@ -904,10 +904,36 @@ export component ChatArea inherits Rectangle {
                 // `chat-scrollbar.dragging` state that scrollbar uses for
                 // its own side: instant while the thumb is being actively
                 // dragged (1:1 tracking, no lag-behind-cursor), eased for
-                // everything else (wheel ticks, click-to-jump).
+                // everything else (wheel ticks, click-to-jump, and the
+                // streaming auto-follow-to-bottom snap below).
+                //
+                // Duration bumped 90ms -> 180ms and easing switched
+                // ease-out -> ease-in-out: 90ms is this codebase's
+                // "instant feedback" tuning (hover/background fades all
+                // sit at 100ms elsewhere), not its "real movement" tuning
+                // (expandable_panel/collapse_expand/sidebar all animate
+                // height/width/x at 150-180ms with ease-in-out). At 90ms
+                // an eased jump across any real scroll distance reads as
+                // a snap, not a glide -- which is exactly the "sticks
+                // block-wise" complaint despite an animate block already
+                // being present. This also stops being visibly mismatched
+                // against raw mouse-wheel/touch flicking, which Slint's
+                // own Flickable animates natively via a separate built-in
+                // physics curve (i-slint-core's Flickable::process_wheel_event,
+                // WHEEL_SCROLL_DURATION = 180ms) that this .slint-level
+                // `animate` block cannot see or influence at all -- native
+                // wheel input calls the underlying Property's `set()`/
+                // `set_physic_animation_value()` directly, bypassing
+                // whatever PropertyAnimation a .slint file declares.
+                // Matching 180ms here means every OTHER viewport-y mover
+                // this file actually controls (click-to-jump on the
+                // track, the jump-to-latest button, and new-message
+                // auto-follow) now moves at the same speed the engine
+                // already uses for wheel scrolling, instead of visibly
+                // snapping twice as fast.
                 animate viewport-y {
-                    duration: chat-scrollbar.dragging ? 0ms : 90ms;
-                    easing: ease-out;
+                    duration: chat-scrollbar.dragging ? 0ms : 180ms;
+                    easing: ease-in-out;
                 }
                 // Was relying on Flickable's own auto-inference of
                 // viewport-height from its child, which -- per base/
