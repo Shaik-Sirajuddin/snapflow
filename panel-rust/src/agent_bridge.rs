@@ -4864,6 +4864,23 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
+    /// Just the last message of a thread's scrollback, if any -- O(1)
+    /// relative to that thread's history length, unlike `history()` which
+    /// clones the entire `Vec<ChatMessage>`. Used by per-frame snapshot
+    /// paths (e.g. the sidebar's one-line description) that only ever
+    /// look at the final message and must not scale with a thread's total
+    /// message count, since those paths run on every poll tick for every
+    /// thread regardless of which thread (if any) is actively sending.
+    pub fn last_message(&self, idx: usize) -> Option<ChatMessage> {
+        self.slots.get(idx).and_then(|s| {
+            s.history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
+        })
+    }
+
     /// The durable identity of an already-open thread, used by the panel's
     /// local SQLite state store after creation and after a resumed startup.
     pub fn thread_count(&self) -> usize {

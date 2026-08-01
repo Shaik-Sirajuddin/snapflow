@@ -1437,7 +1437,16 @@ pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> St
 /// result is truncated to `max_chars` with a trailing ellipsis so a long
 /// first line can't blow out the fixed-height thread card.
 pub fn describe_thread(msgs: &[ChatMessage], max_chars: usize) -> String {
-    let Some(last) = msgs.last() else {
+    describe_thread_from_last(msgs.last(), max_chars)
+}
+
+/// Same derivation as `describe_thread`, but taking just the candidate
+/// last message directly rather than a full slice -- lets callers that
+/// already have (or cheaply fetched) only the last message avoid cloning
+/// or holding an entire thread's scrollback just to read one line. See
+/// `AgentBridge::last_message`.
+pub fn describe_thread_from_last(last: Option<&ChatMessage>, max_chars: usize) -> String {
+    let Some(last) = last else {
         return String::new();
     };
     let flattened: String = last.text.split_whitespace().collect::<Vec<_>>().join(" ");

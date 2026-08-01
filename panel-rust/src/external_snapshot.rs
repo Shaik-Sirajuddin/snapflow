@@ -462,8 +462,8 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .bridge
                     .as_ref()
                     .map(|bridge| {
-                        models::describe_thread(
-                            &bridge.history(idx),
+                        models::describe_thread_from_last(
+                            bridge.last_message(idx).as_ref(),
                             crate::THREAD_DESCRIPTION_MAX_CHARS,
                         )
                     })
