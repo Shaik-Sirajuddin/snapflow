@@ -164,7 +164,7 @@ impl ServerConfig {
         // (matching ACPX_DEFAULT_AGENT_ID if it names a registry id, else
         // exactly one Installed launchable agent) over the hardcoded
         // codex-acp npx literal. Ambiguous/empty still falls back.
-        let default_acp_command = match std::env::var("ACPX_DEFAULT_ACP_COMMAND")
+        let mut default_acp_command = match std::env::var("ACPX_DEFAULT_ACP_COMMAND")
             .or_else(|_| std::env::var("ACPX_BACKEND_CMD"))
         {
             Ok(raw) => {
@@ -184,12 +184,10 @@ impl ServerConfig {
                     )
                 }),
         };
-        let program = default_acp_command.program.clone();
-        let args = default_acp_command.args.clone();
         let native_auth_method_id = std::env::var("ACPX_NATIVE_AUTH_METHOD_ID")
             .ok()
             .filter(|value| !value.is_empty())
-            .or_else(|| default_codex_native_auth_method(&program, &args));
+            .or_else(|| default_codex_native_auth_method(&mut default_acp_command));
         let http_bind_addr = match std::env::var("ACPX_HTTP_BIND") {
             Ok(raw) if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") => None,
             Ok(raw) => Some(raw.parse().unwrap_or_else(|err| {
@@ -542,9 +540,33 @@ fn registry_spawn_spec(agent: &acpx_registry::Agent) -> Option<SpawnSpec> {
 /// `tokens.access_token`) when `auth_mode` is missing or unrecognized,
 /// so `auth.json` shapes that predate this field (or come from a codex
 /// CLI version that doesn't set it) keep resolving exactly as before.
-fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<String> {
-    let is_codex_acp = program == "npx"
-        && args
+///
+/// **Scoping, cross-agent-leak fix.** The resolved key is written into
+/// `spec.env` -- `default_acp_command`'s own `SpawnSpec`, registered only
+/// under `default_agent_id` (see `main.rs`'s `router.register_agent`) --
+/// rather than into this *process's* environment via `std::env::set_var`.
+/// A process-global `set_var` would have been inherited by every backend
+/// this acpx-server instance ever spawns afterward
+/// (`acpx_conductor::SpawnSpec`'s child processes inherit the full
+/// ambient environment on top of their own explicit `env` map, with no
+/// `env_clear`), including unrelated non-codex agents (grok-build,
+/// claude-acp, any other auto-seeded profile) resolved and spawned later
+/// by the very same process -- the same "one agent's special-cased,
+/// env-derived default silently reaches every other agent" shape as the
+/// `native_auth_method_id`/`ACPX_NATIVE_AUTH_METHOD_ID` cross-
+/// contamination bug this file's `native_auth_method_id` fallback was
+/// fixed for (see `router.rs`'s `select_auth_method_id`), just leaking a
+/// secret into other agents' subprocess environments instead of an
+/// incompatible auth method id. Writing it into this one `SpawnSpec`'s
+/// own `env` map instead keeps it scoped to exactly the one agent id it
+/// was derived for, mirroring `acpx_core::launch`'s `provider_env` and
+/// panel-rust's `spawn_gateway_process`, both of which already set
+/// `CODEX_API_KEY` on a specific `Command`/profile rather than
+/// process-globally.
+fn default_codex_native_auth_method(spec: &mut SpawnSpec) -> Option<String> {
+    let is_codex_acp = spec.program == "npx"
+        && spec
+            .args
             .iter()
             .any(|arg| arg.starts_with("@agentclientprotocol/codex-acp"));
     if !is_codex_acp {
@@ -563,16 +585,9 @@ fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<St
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
-                if std::env::var_os("CODEX_API_KEY").is_none() {
-                    // SAFETY: single-threaded startup, before any backend is
-                    // spawned; `acpx_conductor::SpawnSpec`'s child processes
-                    // inherit the ambient environment on top of their own
-                    // explicit `env` map, so setting it here is enough for
-                    // every future spawn to see it.
-                    unsafe {
-                        std::env::set_var("CODEX_API_KEY", key);
-                    }
-                }
+                spec.env
+                    .entry("CODEX_API_KEY".to_string())
+                    .or_insert_with(|| key.to_string());
             }
         }
         return Some(mode.to_string());
@@ -583,15 +598,9 @@ fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<St
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        if std::env::var_os("CODEX_API_KEY").is_none() {
-            // SAFETY: single-threaded startup, before any backend is spawned;
-            // `acpx_conductor::SpawnSpec`'s child processes inherit the
-            // ambient environment on top of their own explicit `env` map, so
-            // setting it here is enough for every future spawn to see it.
-            unsafe {
-                std::env::set_var("CODEX_API_KEY", key);
-            }
-        }
+        spec.env
+            .entry("CODEX_API_KEY".to_string())
+            .or_insert_with(|| key.to_string());
         return Some("api-key".to_string());
     }
     let has_chatgpt_login = auth
@@ -767,6 +776,22 @@ mod tests {
         positive_usize("ACPX_STREAM_REPLAY_BUFFER_SIZE", 0);
     }
 
+    /// A bare codex-acp `SpawnSpec`, matching `default_acp_command`'s shape
+    /// at the point `default_codex_native_auth_method` is called on it in
+    /// `from_env`, with an empty `env` map so tests can assert exactly
+    /// what got inserted into it (never into process-global env -- see
+    /// `default_codex_native_auth_method`'s "Scoping, cross-agent-leak
+    /// fix" doc comment).
+    fn codex_acp_spec() -> SpawnSpec {
+        SpawnSpec::new(
+            "npx",
+            vec![
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
+            ],
+        )
+    }
+
     #[test]
     fn default_codex_native_auth_method_finds_a_real_key_and_sets_codex_api_key() {
         let dir = std::env::temp_dir().join(format!(
@@ -782,22 +807,23 @@ mod tests {
         std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-test-key"}"#)
             .expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
-            std::env::remove_var("CODEX_API_KEY");
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result.as_deref(), Some("api-key"));
-        assert_eq!(std::env::var("CODEX_API_KEY").as_deref(), Ok("sk-test-key"));
+        // Scoped into this one SpawnSpec's own env map, not process-global
+        // env -- a sibling agent's SpawnSpec, built independently, must
+        // never observe this.
+        assert_eq!(
+            spec.env.get("CODEX_API_KEY").map(String::as_str),
+            Some("sk-test-key")
+        );
+        assert!(std::env::var("CODEX_API_KEY").is_err());
     }
 
     #[test]
@@ -824,8 +850,10 @@ mod tests {
         // pin, or a test stand-in binary) must never be silently
         // reinterpreted as codex-acp just because a codex auth file
         // happens to exist on this machine.
-        let result = default_codex_native_auth_method("sh", &["./stand-in-agent.sh".to_string()]);
+        let mut spec = SpawnSpec::new("sh", vec!["./stand-in-agent.sh".to_string()]);
+        let result = default_codex_native_auth_method(&mut spec);
         assert_eq!(result, None);
+        assert!(spec.env.is_empty());
     }
 
     #[test]
@@ -852,25 +880,19 @@ mod tests {
         )
         .expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
-            std::env::remove_var("CODEX_API_KEY");
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result.as_deref(), Some("chat-gpt"));
         // No API key exists in this fixture, so nothing should be set --
         // unlike the API-key path, a ChatGPT login needs no env var, only
         // the resolved `auth_method_id` itself.
-        assert!(std::env::var("CODEX_API_KEY").is_err());
+        assert!(spec.env.get("CODEX_API_KEY").is_none());
     }
 
     #[test]
@@ -891,22 +913,19 @@ mod tests {
         )
         .expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
-            std::env::remove_var("CODEX_API_KEY");
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result.as_deref(), Some("api-key"));
-        assert_eq!(std::env::var("CODEX_API_KEY").as_deref(), Ok("sk-test-key"));
+        assert_eq!(
+            spec.env.get("CODEX_API_KEY").map(String::as_str),
+            Some("sk-test-key")
+        );
     }
 
     #[test]
@@ -935,24 +954,18 @@ mod tests {
         )
         .expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
-            std::env::remove_var("CODEX_API_KEY");
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result.as_deref(), Some("chat-gpt"));
         // The declared chat-gpt mode wins outright; the leftover key is
         // not forwarded since it's not the mode actually in use.
-        assert!(std::env::var("CODEX_API_KEY").is_err());
+        assert!(spec.env.get("CODEX_API_KEY").is_none());
     }
 
     #[test]
@@ -979,19 +992,13 @@ mod tests {
         )
         .expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
-            std::env::remove_var("CODEX_API_KEY");
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result.as_deref(), Some("chat-gpt"));
     }
@@ -1017,22 +1024,19 @@ mod tests {
         )
         .expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
-            std::env::remove_var("CODEX_API_KEY");
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result.as_deref(), Some("api-key"));
-        assert_eq!(std::env::var("CODEX_API_KEY").as_deref(), Ok("sk-test-key"));
+        assert_eq!(
+            spec.env.get("CODEX_API_KEY").map(String::as_str),
+            Some("sk-test-key")
+        );
     }
 
     #[test]
@@ -1049,20 +1053,67 @@ mod tests {
         let auth_file = dir.join("auth.json");
         std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": null}"#).expect("write temp auth file");
 
-        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
         }
 
-        let result = default_codex_native_auth_method(
-            "npx",
-            &[
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp@1.1.2".to_string(),
-            ],
-        );
+        let mut spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut spec);
 
         assert_eq!(result, None);
+    }
+
+    /// Regression test for the cross-agent env leak this file's
+    /// `default_codex_native_auth_method` used to have: it wrote the
+    /// resolved codex `CODEX_API_KEY` via process-global
+    /// `std::env::set_var`, which every backend this acpx-server process
+    /// spawns afterward inherits (`SpawnSpec`'s child processes keep the
+    /// full ambient environment, no `env_clear`) -- so a sibling agent's
+    /// own, independently-built `SpawnSpec` (e.g. grok-build's, resolved
+    /// via a completely separate profile path) would silently receive
+    /// codex's API key in its own child process environment too. Pins
+    /// that a second, unrelated `SpawnSpec` never observes it via process
+    /// env once codex's has been resolved.
+    #[test]
+    fn default_codex_native_auth_method_never_leaks_into_process_env_or_other_specs() {
+        let dir = std::env::temp_dir().join(format!(
+            "acpx-server-codex-auth-test-no-leak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("auth.json");
+        std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-should-stay-scoped"}"#)
+            .expect("write temp auth file");
+
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+        }
+
+        let mut codex_spec = codex_acp_spec();
+        let result = default_codex_native_auth_method(&mut codex_spec);
+        assert_eq!(result.as_deref(), Some("api-key"));
+        assert_eq!(
+            codex_spec.env.get("CODEX_API_KEY").map(String::as_str),
+            Some("sk-should-stay-scoped")
+        );
+
+        // Never touched this process's own environment.
+        assert!(std::env::var("CODEX_API_KEY").is_err());
+
+        // An unrelated, independently-built SpawnSpec for a different
+        // agent (e.g. grok-build) must never see it either -- there is no
+        // shared/global sink for it to leak through anymore.
+        let other_agent_spec = SpawnSpec::new(
+            "npx",
+            vec!["-y".to_string(), "@some/other-agent-acp".to_string()],
+        );
+        assert!(other_agent_spec.env.get("CODEX_API_KEY").is_none());
     }
 
     #[test]
