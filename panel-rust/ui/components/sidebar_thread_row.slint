@@ -169,7 +169,7 @@ export component SidebarThreadRow inherits HoverSurface {
                             width: 6px;
                             height: 6px;
                             border-radius: 3px;
-                            background: Theme.text-muted;
+                            background: thread.unread ? Theme.status-info : Theme.text-muted;
                         }
                     }
                     if expanded && rename-thread-index != index : Text {

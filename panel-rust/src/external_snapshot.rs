@@ -455,6 +455,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .map(|thread| thread.error.clone().unwrap_or_default())
             .collect();
+        // thread-unread-state: unlike archived/closed this lives on the TEA
+        // ThreadModel, not on an AgentBridge slot -- it is in-memory only
+        // (see ThreadModel::unread) and is folded by `update_frame`, so the
+        // model is its single source of truth.
+        let unread: Vec<bool> = model.threads.iter().map(|thread| thread.unread).collect();
         drop(model);
 
         let descriptions: Vec<String> = names
@@ -563,6 +568,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             &background_sessions,
             &closed,
             &archived,
+            &unread,
             &query,
         );
         // Plan phase 26: the chat view binds to the selected project --

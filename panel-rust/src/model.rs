@@ -118,6 +118,20 @@ pub struct ThreadModel {
     // presentation flag (see AgentBridge::archive_thread's doc comment) --
     // never sends an ACP request, unlike `closed`.
     pub archived: bool,
+    /// thread-unread-state: visible agent output arrived for this thread
+    /// while some OTHER thread was displayed, and the user has not opened
+    /// it since. Set in `update_frame`'s `AgentEvent::Message` arm (gated
+    /// on `model.displayed_thread != Some(this thread)`, so a thread
+    /// streaming its own reply in front of the user never flips), cleared
+    /// in `apply_thread_selection_switch`.
+    ///
+    /// Deliberately in-memory only, unlike `archived`: bridge events exist
+    /// only while this process runs the ACPX actor, so no content can be
+    /// delivered to a thread while the panel is closed. A restart therefore
+    /// has nothing the user could have missed, and hydrating every thread
+    /// as read is the correct -- not merely the cheap -- behaviour. That is
+    /// why this gets no `ThreadRuntimeSnapshot`/sqlite column.
+    pub unread: bool,
     /// Stable message identities currently known to the TEA model. Streaming
     /// effect results must resolve against this list, never a cached row
     /// index, before producing a `Dirty::MessageStreamingDelta`.
@@ -538,6 +552,7 @@ impl Default for ThreadModel {
             compose_draft: String::new(),
             closed: false,
             archived: false,
+            unread: false,
             message_ids: Vec::new(),
             transcript: Vec::new(),
             transcript_keys: Vec::new(),

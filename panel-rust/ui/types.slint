@@ -28,6 +28,13 @@ export struct ThreadItem {
     // flag -- archiving does not send any ACP request, it just hides the
     // Archive control and swaps the row's status label to "archived".
     archived: bool,
+    // thread-unread-state: true when visible agent output has arrived for
+    // this thread while it was NOT the displayed thread, and the user has
+    // not opened it since. Deliberately NOT durable (unlike `archived`):
+    // nothing can arrive while the panel process is down, so every restart
+    // legitimately starts with nothing unread -- see ThreadModel::unread.
+    // Only recolors the plain status dot; it never changes `status`.
+    unread: bool,
     // layout-redesign.md Phase 8: the thread's real provider (persisted
     // `AgentBridge::thread_provider`) and active model (the `"model"`
     // config option's current value, the same `configOptions[]` feed the

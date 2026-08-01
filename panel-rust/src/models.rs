@@ -1566,6 +1566,7 @@ pub fn build_thread_items<N: AsRef<str>>(
     background_sessions: &[bool],
     closed: &[bool],
     archived: &[bool],
+    unread: &[bool],
     query: &str,
 ) -> Vec<VisibleThreadItem> {
     let query_lower = query.trim().to_lowercase();
@@ -1610,6 +1611,7 @@ pub fn build_thread_items<N: AsRef<str>>(
                     .into(),
                 closed: closed.get(real_index).copied().unwrap_or(false),
                 archived: archived.get(real_index).copied().unwrap_or(false),
+                unread: unread.get(real_index).copied().unwrap_or(false),
                 // Provider/model are not part of the name/state slices this
                 // filter operates on -- `lib.rs` post-populates them by
                 // `real_index` after filtering, so they default empty here.
@@ -3050,6 +3052,7 @@ mod tests {
     const BACKGROUND: &[bool] = &[false, true, false, false];
     const NO_CLOSED: &[bool] = &[false, false, false, false];
     const NO_ARCHIVED: &[bool] = &[false, false, false, false];
+    const NO_UNREAD: &[bool] = &[false, false, false, false];
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
@@ -3060,6 +3063,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items.len(), 4);
@@ -3078,6 +3082,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "FADE",
         );
         assert_eq!(items.len(), 1);
@@ -3094,6 +3099,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "fade",
         );
         assert_eq!(items.len(), 1);
@@ -3112,6 +3118,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "x",
         );
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
@@ -3132,6 +3139,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "zzz-no-such-thread",
         );
         assert!(items.is_empty());
@@ -3146,6 +3154,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "   ",
         );
         assert_eq!(items.len(), 4);
@@ -3160,6 +3169,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items[1].item.status, "loading");
@@ -3180,6 +3190,7 @@ mod tests {
             BACKGROUND,
             closed,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items[1].item.status, "closed");
@@ -3204,6 +3215,7 @@ mod tests {
             BACKGROUND,
             closed,
             archived,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items[1].item.status, "archived");
@@ -3211,6 +3223,29 @@ mod tests {
         assert!(items[1].item.closed);
         assert_eq!(items[0].item.status, "idle");
         assert!(!items[0].item.archived);
+    }
+
+    #[test]
+    fn unread_is_carried_through_by_real_index_when_filtered() {
+        // thread-unread-state: filtering changes a thread's displayed
+        // position, so unread must be read by real_index like every other
+        // per-thread flag -- and it must not disturb `status`, which the
+        // sidebar keys the spinner/error branches off.
+        let unread: &[bool] = &[false, false, false, true];
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            unread,
+            "bug",
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].real_index, 3);
+        assert!(items[0].item.unread);
+        assert_eq!(items[0].item.status, STATE[3].as_str());
     }
 
     #[test]
@@ -3228,6 +3263,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "fade",
         );
         assert_eq!(items.len(), 1);
@@ -3243,6 +3279,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert!(items.iter().all(|i| i.item.description.is_empty()));
@@ -3257,6 +3294,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "fade",
         );
         assert!(items[0].item.background);

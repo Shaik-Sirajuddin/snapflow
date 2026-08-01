@@ -223,6 +223,7 @@ pub(crate) fn visible_thread_row(
             open: true,
             closed: thread.closed,
             archived: thread.archived,
+            unread: thread.unread,
             profile_name: thread.profile_name.clone().unwrap_or_default().into(),
             has_session: thread.session_id.is_some(),
             description: cached
@@ -318,6 +319,21 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
         // observable message model already contains B's rows, so switching
         // does not install/copy a list into a shared model.
         model.displayed_thread = real_idx;
+
+        // thread-unread-state: becoming the displayed thread IS being read.
+        // This app has no separate render-completion signal -- the retained
+        // ChatView's message model already holds this thread's rows, so the
+        // switch above is the moment its content is on screen. Clearing here
+        // (rather than in ThreadMsg::Selected) covers every selection path:
+        // sidebar click, keyboard NavigateDelta, and programmatic selection.
+        if let Some(idx) = real_idx {
+            if model.threads.get(idx).is_some_and(|thread| thread.unread) {
+                if let Some(thread) = model.threads.get_mut(idx) {
+                    thread.unread = false;
+                }
+                dirty.push(thread_row_dirty(model, idx));
+            }
+        }
 
         let target_id = real_idx
             .and_then(|idx| model.threads.get(idx))
@@ -2381,6 +2397,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
 fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect>, Vec<Dirty>) {
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
+    // Captured before the fold: no arm below changes which thread is
+    // displayed, and the mutable borrow of `model.threads` inside the loop
+    // rules out reading it there.
+    let displayed_thread = model.displayed_thread;
+    let mut unread_marked: Vec<usize> = Vec::new();
     for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
         let Some(target_index) = frame
             .bridge_event_thread_ids
@@ -2425,6 +2446,18 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 ) && !is_status_only
                 {
                     thread.agent_content_this_turn = true;
+                    // thread-unread-state: same "real visible agent output"
+                    // gate as above (thinking chunks and reconnect/status
+                    // spam are not content the user missed). A thread the
+                    // user is looking at is being read as it streams, so it
+                    // must never flip -- hence the displayed_thread guard.
+                    // This arm only ever sees live bridge deltas; restored
+                    // history is hydrated through thread snapshots, so
+                    // replay cannot manufacture an unread thread.
+                    if displayed_thread != Some(target_index) && !thread.unread {
+                        thread.unread = true;
+                        unread_marked.push(target_index);
+                    }
                 }
                 thread.last_activity_time = Some(std::time::Instant::now());
                 // Hard transport failures often arrive as ordinary agent
@@ -2570,6 +2603,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 });
             }
         }
+    }
+    // Repainting the sidebar dot needs a ThreadRow, which the Message arm
+    // does not emit (it only pushes MessageAppended, for the transcript).
+    // Deferred out of the loop because `thread_row_dirty` borrows the model
+    // immutably while the fold holds it mutably.
+    for real_index in unread_marked {
+        dirty.push(thread_row_dirty(model, real_index));
     }
     if frame.bridge_events_pending {
         dirty.push(Dirty::MessagesDiff {
@@ -4678,6 +4718,74 @@ mod tests {
             "paused queue must not auto-send after stop, got {effects2:?}"
         );
         assert_eq!(model.threads[0].send_queue.len(), 1);
+    }
+
+    /// thread-unread-state: one agent message delivered to `thread_index`,
+    /// carrying the durable id `update_frame` actually resolves against.
+    fn agent_message_frame(thread_index: usize, text: &str) -> FrameInput {
+        FrameInput {
+            bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                thread_index,
+                event: crate::protocol_types::AgentEvent::Message(
+                    crate::protocol_types::ChatMessage {
+                        kind: crate::protocol_types::MessageKind::Agent,
+                        text: text.to_owned(),
+                        status: None,
+                        id: Some(format!("msg-{thread_index}")),
+                        raw_input: None,
+                        raw_output: None,
+                    },
+                ),
+            }],
+            bridge_event_thread_ids: vec![format!("thread-{thread_index}")],
+            ..FrameInput::default()
+        }
+    }
+
+    #[test]
+    fn agent_content_marks_a_non_displayed_thread_unread() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        let (_effects, dirty) = update(&mut model, Msg::Frame(agent_message_frame(1, "reply")));
+        assert!(
+            model.threads[1].unread,
+            "content for a thread the user is not looking at must mark it unread"
+        );
+        assert!(!model.threads[0].unread);
+        assert!(
+            dirty.contains(&Dirty::ThreadRow {
+                thread_id: "thread-1".to_owned()
+            }),
+            "the sidebar row must be repainted so the dot turns blue, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn agent_content_never_marks_the_displayed_thread_unread() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        let _ = update(&mut model, Msg::Frame(agent_message_frame(0, "streaming")));
+        assert!(
+            !model.threads[0].unread,
+            "a thread streaming its reply in front of the user is being read, not missed"
+        );
+    }
+
+    #[test]
+    fn selecting_an_unread_thread_marks_it_read() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        let _ = update(&mut model, Msg::Frame(agent_message_frame(1, "reply")));
+        assert!(model.threads[1].unread);
+
+        let (_effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        assert!(
+            !model.threads[1].unread,
+            "displaying a thread is reading it -- the dot must go back to muted"
+        );
+        assert!(dirty.contains(&Dirty::ThreadRow {
+            thread_id: "thread-1".to_owned()
+        }));
     }
 
     #[test]

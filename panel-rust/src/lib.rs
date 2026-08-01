@@ -4657,6 +4657,7 @@ mod keyboard_shortcut_tests {
             description: "".into(),
             closed: false,
             archived: false,
+            unread: false,
             provider: "".into(),
             model: "".into(),
             project_name: "".into(),
