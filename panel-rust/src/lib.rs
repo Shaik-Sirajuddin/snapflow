@@ -4958,6 +4958,101 @@ mod keyboard_shortcut_tests {
              SpikePlatform::set_clipboard_text with exactly the selected text"
         );
     }
+
+    /// Regression test for `e94f105a` (fix(panel-rust): make full
+    /// ChatInputLayout selector trigger clickable). That fix added a
+    /// `clicked` handler to `SearchableDropdown`'s `label-scroll`
+    /// TouchArea (searchable_dropdown.slint), which sits on top of
+    /// `trigger-touch` for the label region of every compose-bar
+    /// dropdown trigger (mode/config/profile/reasoning). A TouchArea
+    /// absorbs the pointer event over its bounds regardless of which
+    /// callbacks it defines, so without a `clicked` handler there,
+    /// clicks over the label silently went nowhere -- only the small
+    /// arrow-icon sliver outside `label-scroll-host`'s bounds ever
+    /// reached `trigger-touch` underneath.
+    ///
+    /// e94f105a's own commit report says it was verified only via
+    /// `cargo check` -- never a live click -- which is exactly how a
+    /// second, unrelated regression could silently re-break the same
+    /// spot later without anyone noticing (`cargo check` can't catch a
+    /// dead click zone). This test closes that gap for good: it drives
+    /// a real click through `panel_rust_input_click` (the exact FFI
+    /// entry point the shipped Qt host calls on a genuine mouse click,
+    /// not a bypassed/direct WindowEvent dispatch) at a coordinate
+    /// specifically inside the trigger's LABEL region -- not the
+    /// trigger's bounding-box center, not the arrow -- and asserts the
+    /// popup actually opens.
+    #[test]
+    fn mode_dropdown_label_region_click_opens_the_popup() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "ask".into(),
+                label: "ask".into(),
+                value: "".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "code".into(),
+                label: "code".into(),
+                value: "".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_mode_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+        component.set_mode_trigger_label("ask".into());
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "ask")
+            .next()
+            .expect("mode-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+
+        // Sanity check this test actually exercises something: before any
+        // click, the popup's option rows are unmounted (invisible) and
+        // must not be found by accessible-label lookup (which skips
+        // invisible subtrees -- see ElementHandle::find_by_accessible_
+        // label's own doc comment / is_visible() gate).
+        assert!(
+            ElementHandle::find_by_accessible_label(&component, "code")
+                .next()
+                .is_none(),
+            "mode popup must start closed"
+        );
+
+        // Click well inside the LABEL region specifically: `label-scroll-
+        // host` starts at the trigger's left edge + Metrics.space-3
+        // (6px) and covers most of the trigger's width, leaving only a
+        // narrow left-padding strip and the right-side arrow/padding
+        // strip to `trigger-touch` alone (see searchable_dropdown.slint's
+        // HorizontalLayout: label-scroll-host is horizontal-stretch: 1,
+        // the arrow is horizontal-stretch: 0). 30% across the trigger's
+        // width lands solidly inside that label band across every width
+        // this trigger ever renders at (56px compact .. 140px max).
+        let x = position.x + size.width * 0.3;
+        let y = position.y + size.height / 2.0;
+        assert!(
+            panel_rust_input_click(panel.handle, x as c_uint, y as c_uint),
+            "click on the mode-dropdown trigger's label region must reach the real \
+             input-click FFI"
+        );
+
+        assert!(
+            ElementHandle::find_by_accessible_label(&component, "code")
+                .next()
+                .is_some(),
+            "clicking the trigger's label region must open the mode popup -- if this fails, \
+             e94f105a's label-scroll `clicked` handler has regressed (or the whole-trigger \
+             fix was never actually complete)"
+        );
+    }
 }
 
 /// Phase 17 (`markdown_highlight_and_real_links`): opens a Ctrl+Clicked
