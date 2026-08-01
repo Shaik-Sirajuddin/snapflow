@@ -1268,6 +1268,24 @@ fn sync_commands_model(model: &Model, thread: &crate::model::ThreadModel) {
     );
 }
 
+/// Filters the central-registry MCP server list down to the entries that
+/// still need their own settings row, excluding whichever one(s) match
+/// the built-in daemon's own name(s)
+/// (`agent_bridge::is_builtin_snapflow_mcp_name` -- `"snapflow"` or its
+/// wire alias `"snapshotd"`). Extracted as a pure, `ChatPanel`-free
+/// function so the dedup this exists for (see
+/// [`reconcile_settings_models`]'s call site comment) is unit-testable
+/// without a live Slint platform.
+fn registry_mcp_servers_excluding_builtin(
+    servers: &[crate::protocol_types::McpServerEntry],
+) -> Vec<crate::protocol_types::McpServerEntry> {
+    servers
+        .iter()
+        .filter(|server| !crate::agent_bridge::is_builtin_snapflow_mcp_name(&server.name))
+        .cloned()
+        .collect()
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -1293,16 +1311,29 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         mcp_keys.push(builtin.name.to_string());
         mcp_rows.push(builtin);
     }
+    // The background watcher (`agent_bridge::ensure_snapshotd_watcher_
+    // started` / `sync_snapshotd_registry_if_changed`) syncs a real
+    // `"snapflow"` row into the central registry so `mcp_servers/
+    // tools_fetch` has an actual target to query (see
+    // `agent_bridge::builtin_snapflow_registry_entry`'s doc comment).
+    // That means `model.available_mcp_servers` can now legitimately
+    // contain an entry under the built-in daemon's own name(s)
+    // (`agent_bridge::is_builtin_snapflow_mcp_name` -- `"snapflow"` or
+    // its wire alias `"snapshotd"`) once that sync lands, *in addition*
+    // to the synthetic row prepended above. Left unfiltered, both would
+    // render, showing two rows for the same daemon (found live: PUI-015
+    // mcp-servers-settings follow-up). The synthetic row stays the
+    // single source of truth for this row's display (it's always
+    // present, non-removable, and reflects the live toggle even before
+    // any registry sync succeeds); the registry row's only job is
+    // giving `tools_fetch`/other RPCs a real target, so it is excluded
+    // here rather than rendered a second time.
+    let extra_mcp_servers = registry_mcp_servers_excluding_builtin(&model.available_mcp_servers);
     mcp_rows.extend(crate::models::to_mcp_server_option_rows(
-        model.available_mcp_servers.clone(),
+        extra_mcp_servers.clone(),
         &model.mcp_operations_in_flight,
     ));
-    mcp_keys.extend(
-        model
-            .available_mcp_servers
-            .iter()
-            .map(|server| server.name.clone()),
-    );
+    mcp_keys.extend(extra_mcp_servers.iter().map(|server| server.name.clone()));
     crate::list_model::reconcile(
         &model.mcp_servers_model,
         &mut model.mcp_server_model_keys.borrow_mut(),
@@ -1524,6 +1555,58 @@ mod tests {
     use super::*;
     use crate::models::VisibleThreadItem;
     use std::rc::Rc;
+
+    /// Regression test for a real, live-found duplicate-row bug (PUI-015
+    /// mcp-servers-settings follow-up): `reconcile_settings_models`
+    /// always prepends a synthetic, non-removable `"snapflow"` row from
+    /// `models::builtin_snapshotd_option`, but the background watcher
+    /// (`agent_bridge::ensure_snapshotd_watcher_started`) separately
+    /// syncs a *real* `"snapflow"` row into the central registry so
+    /// `mcp_servers/tools_fetch` has a target to query. Once that sync
+    /// lands, `model.available_mcp_servers` legitimately contains an
+    /// entry under one of `agent_bridge::is_builtin_snapflow_mcp_name`'s
+    /// aliases too -- without filtering, Settings would render two rows
+    /// for the same built-in daemon. This pins
+    /// `registry_mcp_servers_excluding_builtin` (the fix) to actually
+    /// drop both aliased names, using the exact dual-name equivalence
+    /// `is_builtin_snapflow_mcp_name` already defines, while leaving
+    /// unrelated user-added servers untouched.
+    #[test]
+    fn registry_mcp_servers_excluding_builtin_drops_both_builtin_aliases_only() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
+
+        let http_entry = |name: &str| McpServerEntry {
+            name: name.to_string(),
+            enabled: true,
+            config: McpServerConfig::Http {
+                url: format!("http://127.0.0.1:1/{name}"),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+            auth_status: None,
+            tool_catalog: None,
+            extra: Default::default(),
+        };
+
+        let servers = vec![
+            http_entry("snapflow"),
+            http_entry("snapshotd"),
+            http_entry("my-custom-server"),
+        ];
+
+        let filtered = registry_mcp_servers_excluding_builtin(&servers);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["my-custom-server"],
+            "both built-in aliases must be excluded so the synthetic prepended row \
+             (models::builtin_snapshotd_option) is the only row rendered for the \
+             built-in daemon -- a real registry sync must never produce a second, \
+             visually-duplicate 'snapflow' row"
+        );
+    }
 
     #[test]
     fn thread_row_ops_apply_to_the_persistent_model_and_key_cache() {
