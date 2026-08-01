@@ -210,6 +210,9 @@ pub struct ThreadModel {
     pub config_options: Vec<ConfigOptionInfo>,
     /// PUI-003: the agent's built-in slash commands for the `/` menu.
     pub available_commands: Vec<AvailableCommandInfo>,
+    /// Per-thread slash-command filter. The source catalog remains
+    /// immutable; the Slint command model is a derived visible copy.
+    pub command_filter: String,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
     /// PROF-11: the agent's most recently pushed execution plan/todo
@@ -572,6 +575,7 @@ impl Default for ThreadModel {
             session_modes: None,
             config_options: Vec::new(),
             available_commands: Vec::new(),
+            command_filter: String::new(),
             usage: (0, 0),
             plan: Vec::new(),
             session_title: None,

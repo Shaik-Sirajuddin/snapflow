@@ -3399,6 +3399,64 @@ fn panel_rust_create_with_initial_identity(
                 });
             });
 
+        // Compose slash-command filtering is host-managed: keep the
+        // thread's advertised command catalog immutable and publish a
+        // separate filtered VecModel copy to Slint. `@` MCP suggestions do
+        // not filter; apostrophe is the explicit bypass marker for every
+        // picker filter chain.
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mention_filter_changed(move |prefix, query| {
+                if prefix != "/" {
+                    return;
+                }
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    let panel_cell = cell.borrow();
+                    let Some(panel) = panel_cell.as_ref() else {
+                        return;
+                    };
+                    let (commands, commands_model) = {
+                        let mut model = panel.model.borrow_mut();
+                        let real = model
+                            .visible_indices
+                            .get(model.selected_thread)
+                            .copied()
+                            .or_else(|| {
+                                (!model.visible_list_synced).then_some(model.selected_thread)
+                            });
+                        let source = real
+                            .and_then(|idx| model.threads.get_mut(idx))
+                            .map(|thread| {
+                                thread.command_filter = query.to_string();
+                                thread.available_commands.clone()
+                            })
+                            .unwrap_or_default();
+                        (source, model.commands_model.clone())
+                    };
+                    let needle = query.to_lowercase();
+                    let rows = commands
+                        .into_iter()
+                        .filter(|command| {
+                            needle.is_empty()
+                                || query == "'"
+                                || command.name.to_lowercase().contains(&needle)
+                                || command.description.to_lowercase().contains(&needle)
+                        })
+                        .map(|command| crate::SkillOption {
+                            name: command.name.into(),
+                            description: command.description.into(),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>();
+                    commands_model.set_vec(rows);
+                    component.set_available_commands(slint::ModelRc::from(commands_model));
+                });
+            });
+
         let component_weak = panel.component.as_weak();
         panel.component.on_toggle_expanded(move |index| {
             let Some(_component) = component_weak.upgrade() else {

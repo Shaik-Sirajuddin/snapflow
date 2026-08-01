@@ -136,6 +136,7 @@ export component ChatArea inherits Rectangle {
     in property <bool> inputs-enabled: true;
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
+    callback mention-filter-changed(string, string);
     // Phase 17: markdown Ctrl+Click link target, host opens it.
     callback md-link-activated(string);
     // Mode/model selector addition: the *currently displayed* thread's
@@ -1563,6 +1564,7 @@ export component ChatArea inherits Rectangle {
             inputs-enabled: root.inputs-enabled;
             mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
             mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
+            mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
             width: 100%;
             horizontal-stretch: 1;
             vertical-stretch: 0;

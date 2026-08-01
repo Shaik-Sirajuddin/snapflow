@@ -76,6 +76,7 @@ export component ChatViewStack inherits Rectangle {
     callback load-older-requested();
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
+    callback mention-filter-changed(string, string);
     callback md-link-activated(string);
     callback error-banner-dismissed();
     callback send-requested(string);
@@ -197,6 +198,7 @@ export component ChatViewStack inherits Rectangle {
         load-older-requested => { root.load-older-requested(); }
         mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
         mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
+        mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
         md-link-activated(target) => { root.md-link-activated(target); }
         error-banner-dismissed => { root.error-banner-dismissed(); }
         send-requested(text) => { root.send-requested(text); }
@@ -325,6 +327,7 @@ export component ChatViewStack inherits Rectangle {
         load-older-requested => { if (index == root.selected-index) { root.load-older-requested(); } }
         mcp-connect-requested(name) => { if (index == root.selected-index) { root.mcp-connect-requested(name); } }
         mcp-enabled-changed(name, enabled) => { if (index == root.selected-index) { root.mcp-enabled-changed(name, enabled); } }
+        mention-filter-changed(prefix, query) => { if (index == root.selected-index) { root.mention-filter-changed(prefix, query); } }
         md-link-activated(target) => { if (index == root.selected-index) { root.md-link-activated(target); } }
         error-banner-dismissed => { if (index == root.selected-index) { root.error-banner-dismissed(); } }
         send-requested(text) => { if (index == root.selected-index) { root.send-requested(text); } }
