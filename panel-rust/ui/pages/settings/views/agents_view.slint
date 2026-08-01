@@ -226,7 +226,12 @@ export component AgentsView inherits Rectangle {
         // manages the shared ProfileStore registry itself, not the
         // dual-tier default-profile *selection*, which the always-visible
         // TextField above already covers under both scopes.
-        if root.scope == "global" : Flickable {
+        // Additive BETA_MODE gate (see beta-mode-enabled's doc comment
+        // above): both root.scope == "global" AND root.beta-mode-enabled
+        // must hold for the profile chip row to show -- same additive
+        // pattern as the Profile SettingsField above, not a replacement of
+        // the existing scope gate.
+        if root.scope == "global" && root.beta-mode-enabled : Flickable {
             width: parent.width;
             height: root.available-profiles.length > 0 ? 30px : 0px;
             viewport-width: profile-chip-row.preferred-width;
