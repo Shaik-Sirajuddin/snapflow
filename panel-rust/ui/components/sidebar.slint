@@ -30,7 +30,7 @@ export component Sidebar inherits Rectangle {
     // sidebar collapse/reopen (root.expanded false->true) silently reset
     // this back to its `false` default, losing the user's collapse choice.
     // Hoisted here (always-present) so it survives.
-    property <bool> archived-collapsed: false;
+    property <bool> archived-collapsed: true;
     // Project identity is independent from the panel-level ACPX server
     // connection. A gateway-backed panel can create an unscoped first chat.
     in property <bool> project-open: false;

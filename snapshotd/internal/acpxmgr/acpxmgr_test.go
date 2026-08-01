@@ -1,10 +1,14 @@
 package acpxmgr
 
 import (
+	"context"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWriteConfig(t *testing.T) {
@@ -60,6 +64,98 @@ func TestEnsureAdminTokenIsStableAcrossCalls(t *testing.T) {
 	if strings.TrimSpace(string(raw)) != first {
 		t.Fatalf("token file content %q does not match generated token %q", raw, first)
 	}
+}
+
+// TestStartPortBumpIsDiscoverableViaBindFile is a regression test for the
+// real bug: when the requested ACPX_HTTP_BIND is already occupied,
+// acpxmgr.Start silently walks to the next free port (nextAvailableTCPBind)
+// and health-checks *that* address internally -- but until this fix,
+// nothing external could learn the resolved address, so a caller (like
+// vnc_worktree.sh) that hard-polls the originally-requested port spins
+// forever against a dead port and declares a perfectly healthy
+// daemon-managed acpx-server "never became healthy". This proves the new
+// acpx-http-bind discovery file reflects the real, resolved address.
+func TestStartPortBumpIsDiscoverableViaBindFile(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available to stand in for acpx-server")
+	}
+
+	// Occupy a real port first so Start is forced to bump off of it --
+	// this is the "stale process / another worktree's leaked child /
+	// concurrent-worktree race" scenario from production.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	requestedBind := occupied.Addr().String()
+
+	dir := t.TempDir()
+	fakeServer := writeFakeAcpxServer(t, dir)
+
+	cfg := Config{
+		BinPath:        fakeServer,
+		HttpBind:       requestedBind,
+		ConfigPath:     filepath.Join(dir, "snapshotd-home", "acpx-config.json"),
+		McpURL:         "http://127.0.0.1:1/mcp",
+		DefaultAgentID: "default",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mgr, err := Start(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	if mgr.HTTPBind() == requestedBind {
+		t.Fatalf("expected Start to bump off the occupied requested bind %q, got the same address back", requestedBind)
+	}
+
+	raw, err := os.ReadFile(httpBindFilePath(cfg))
+	if err != nil {
+		t.Fatalf("acpx-http-bind file was not written: %v", err)
+	}
+	fileBind := strings.TrimSpace(string(raw))
+	if fileBind != mgr.HTTPBind() {
+		t.Fatalf("acpx-http-bind file contains %q, want the actual resolved bind %q -- an external poller (vnc_worktree.sh) reading this file would still be looking at the wrong address", fileBind, mgr.HTTPBind())
+	}
+	if fileBind == requestedBind {
+		t.Fatalf("acpx-http-bind file still contains the originally-requested (occupied) bind %q; the whole point is that it must reflect the bump", fileBind)
+	}
+}
+
+// writeFakeAcpxServer writes a minimal executable script that binds
+// $ACPX_HTTP_BIND and answers any GET with 200, standing in for the real
+// acpx-server binary (which this test suite has no reason to build) --
+// good enough to exercise acpxmgr's spawn + bind-resolution + health-poll
+// path exactly the way the real binary would.
+func writeFakeAcpxServer(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-acpx-server.py")
+	script := `#!/usr/bin/env python3
+import http.server, os
+
+bind = os.environ["ACPX_HTTP_BIND"]
+host, port = bind.rsplit(":", 1)
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+http.server.HTTPServer((host, int(port)), H).serve_forever()
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestMcpHTTPURL(t *testing.T) {

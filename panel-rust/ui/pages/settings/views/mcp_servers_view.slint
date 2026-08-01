@@ -131,6 +131,12 @@ export component McpServersView inherits Rectangle {
         || root.stdio-fields-focused
         || root.http-fields-focused;
 
+    // Report the full form/list height to SettingsPage's shared Flickable.
+    // Without this intrinsic-height binding the outer Rectangle contributes
+    // no content height, so the lower Add/Edit fields can be clipped even
+    // though they are present in the SettingsSection.
+    preferred-height: content.preferred-height;
+
     property <bool> stdio-fields-focused: false;
     property <bool> http-fields-focused: false;
 
@@ -171,7 +177,7 @@ export component McpServersView inherits Rectangle {
 
     background: transparent;
 
-    SettingsSection {
+    content := SettingsSection {
         width: parent.width;
 
         SettingsSectionHeader {

@@ -339,6 +339,28 @@ PY
         sleep 0.1
     done
     [ -n "$server_pid" ] || die "daemon-managed acpx-server pid file was not created"
+
+    # acpxmgr.Start() walks to the next free TCP port when the requested
+    # SNAPSHOTD_ACPX_HTTP_BIND (0.0.0.0:$gateway_port, above) is already
+    # occupied -- e.g. a stale/leaked process from a prior run, or another
+    # concurrent worktree's instance -- and health-checks *that* address
+    # internally. Real regression this fixes: this script used to keep
+    # polling the originally-reserved $gateway_port regardless, so a
+    # silent port bump made a perfectly healthy daemon-managed acpx-server
+    # look permanently unhealthy from here and die. snapshotd now writes
+    # the address it actually bound to acpx-http-bind (sibling of
+    # acpx-server.pid) before spawning; trust that file over our own
+    # reservation when it disagrees.
+    local acpx_bind_file="$snapshotd_home/acpx-http-bind"
+    if [ -s "$acpx_bind_file" ]; then
+        local resolved_bind resolved_port
+        resolved_bind="$(tr -d '[:space:]' <"$acpx_bind_file")"
+        resolved_port="${resolved_bind##*:}"
+        if [[ "$resolved_port" =~ ^[0-9]+$ ]] && [ "$resolved_port" != "$gateway_port" ]; then
+            echo "    warn: daemon-managed acpx-server bound to $resolved_bind, not the reserved gateway port $gateway_port (requested port was occupied) -- using the actual bind"
+            gateway_port="$resolved_port"
+        fi
+    fi
     "$REG" update-pid "$gateway_port" "$server_pid" || true
 
     for _ in $(seq 1 100); do

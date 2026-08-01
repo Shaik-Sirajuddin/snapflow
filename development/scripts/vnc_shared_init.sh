@@ -203,8 +203,6 @@ root = d.screen().root
 client_list_atom = d.intern_atom("_NET_CLIENT_LIST")
 pid_atom = d.intern_atom("_NET_WM_PID")
 desktop_atom = d.intern_atom("_NET_WM_DESKTOP")
-target = None
-stable = 0
 # Prefer wmctrl for the actual move when present (Fluxbox honors it more
 # reliably than a raw ClientMessage), but always discover the window via
 # descendant pids so we do not require the window's _NET_WM_PID to equal
@@ -216,66 +214,138 @@ use_wmctrl = os.path.exists("/usr/bin/wmctrl") or any(
 )
 wmctrl_bin = "wmctrl"
 
-for _ in range(600):
-    pids = descendant_pids(target_pid)
-    if target is None:
-        prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
-        window_ids = [] if prop is None else prop.value
-        for window_id in window_ids:
-            window = d.create_resource_object("window", int(window_id))
-            try:
-                pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
-                if pid_prop is not None and int(pid_prop.value[0]) in pids:
-                    target = window
-                    target_xid = int(window_id)
-                    break
-            except Exception:
-                continue
-    if target is not None:
+
+def find_window(pids):
+    """Current top-level window (Xlib object, xid) whose _NET_WM_PID is in
+    pids, or (None, None). Re-run every tick -- see the real-bug note below
+    on why this cannot be a one-shot lookup."""
+    prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
+    window_ids = [] if prop is None else prop.value
+    for window_id in window_ids:
+        window = d.create_resource_object("window", int(window_id))
         try:
-            if use_wmctrl:
-                rc = os.system(f"{wmctrl_bin} -i -r {target_xid:#x} -t {target_desktop}")
-                if rc == 0:
-                    # Give Fluxbox a beat to apply, then accept: do not require
-                    # 10 consecutive _NET_WM_DESKTOP reads (that path flaked).
-                    time.sleep(0.2)
-                    desktop = target.get_full_property(desktop_atom, X.AnyPropertyType)
-                    if desktop is None or int(desktop.value[0]) == target_desktop:
-                        print(
-                            f"placed pid {target_pid} (window pid in {sorted(pids)}) "
-                            f"on workspace {target_desktop} via wmctrl"
-                        )
-                        raise SystemExit(0)
+            pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
+        except Exception:
+            continue
+        if pid_prop is not None and int(pid_prop.value[0]) in pids:
+            return window, int(window_id)
+    return None, None
+
+
+# Real bug found 2026-08-01, root-caused via live reproduction (registry
+# reserved workspace 1 for a worktree; this script logged "placed ... on
+# workspace 1"; wmctrl -lp/xprop showed the window actually on a different
+# desktop matching whatever was merely "currently active" in the shared
+# Fluxbox session):
+#
+# Snapflow's Qt/XCB startup replaces its own initial top-level window with a
+# second one -- a NEW X11 window id under the SAME pid -- roughly ~1s after
+# the first window is mapped (confirmed by polling wmctrl -lp/xprop every
+# second across a live launch: window 0x00400006 at t=5s, replaced by
+# 0x00400011 at t=6s, stable forever after at whatever desktop Fluxbox's own
+# default map-time placement picked for it -- never the reserved one,
+# because this script had already declared success on the first window and
+# exited half a second after finding it, long before the replacement
+# happened).
+#
+# The previous version of this loop only ever discovered a window ONCE (the
+# `if target is None:` scan ran a single time) and exited as soon as that
+# one window looked briefly correct. It never noticed the first window
+# being torn down and replaced, so the real, final window it never touched
+# fell back to Fluxbox's un-managed default. Fix: re-discover the live
+# window for these pids on every tick (not just once), detect id changes
+# (a torn-down/replaced window) and immediately re-apply placement to
+# whatever now exists, and only declare success after SETTLE_TICKS
+# consecutive ticks of "same window id, confirmed on the target desktop" --
+# long enough (with an intentional ~10x safety margin over the ~1s
+# replacement observed live) to span Snapflow's own startup window
+# recreation rather than being fooled by it again.
+SETTLE_TICKS = 100  # 100 * 0.1s = 10s of continuous confirmed placement
+MAX_TICKS = 600  # 60s overall budget (discovery + settle)
+
+current_xid = None
+current_window = None
+stable = 0
+found_once = False
+
+for _ in range(MAX_TICKS):
+    pids = descendant_pids(target_pid)
+    window, xid = find_window(pids)
+    if window is None:
+        # No live top-level window for this pid/descendant set right now --
+        # can happen transiently between the old window's teardown and the
+        # new one's creation. Keep polling; only the final timeout below is
+        # a real failure.
+        current_xid = None
+        current_window = None
+        stable = 0
+        time.sleep(0.1)
+        continue
+
+    found_once = True
+    if xid != current_xid:
+        # First sighting, or the window was torn down and replaced (new
+        # X11 id, same pid) -- reset stability and re-apply placement to
+        # the window that actually exists now instead of trusting a stale
+        # reference.
+        current_xid = xid
+        current_window = window
+        stable = 0
+
+    try:
+        if use_wmctrl:
+            os.system(f"{wmctrl_bin} -i -r {current_xid:#x} -t {target_desktop}")
+        else:
             root.send_event(
                 event.ClientMessage(
-                    window=target,
+                    window=current_window,
                     client_type=desktop_atom,
                     data=(32, [target_desktop, X.CurrentTime, 0, 0, 0]),
                 ),
                 event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
             )
-            d.sync()
-            desktop = target.get_full_property(desktop_atom, X.AnyPropertyType)
-            if desktop is not None and int(desktop.value[0]) == target_desktop:
-                stable += 1
-                if stable >= 5:
-                    print(
-                        f"placed pid {target_pid} (window pid in {sorted(pids)}) "
-                        f"on workspace {target_desktop}"
-                    )
-                    break
-            else:
-                stable = 0
-        except SystemExit:
-            raise
-        except Exception:
-            target = None
-            stable = 0
+        d.sync()
+        desktop = current_window.get_full_property(desktop_atom, X.AnyPropertyType)
+    except Exception:
+        # Window was very likely destroyed between find_window() and here
+        # (the exact startup-time recreation race this fix targets) --
+        # drop tracking and let the next tick's find_window() pick up
+        # whatever window (old or new) actually exists now.
+        current_xid = None
+        current_window = None
+        stable = 0
+        time.sleep(0.1)
+        continue
+
+    if desktop is None:
+        # Property not (yet) readable -- inconclusive, not a failure and
+        # not a success. A prior version of this check treated this as an
+        # immediate success, which is exactly how a not-yet-fully-mapped
+        # window's later re-placement by Fluxbox went unnoticed. Neither
+        # advance nor reset the stability counter; just keep re-issuing
+        # the move and try the read again next tick.
+        pass
+    elif int(desktop.value[0]) == target_desktop:
+        stable += 1
+        if stable >= SETTLE_TICKS:
+            print(
+                f"placed pid {target_pid} (window pid in {sorted(pids)}) "
+                f"on workspace {target_desktop}"
+                + (" via wmctrl" if use_wmctrl else "")
+            )
+            raise SystemExit(0)
+    else:
+        stable = 0
     time.sleep(0.1)
 else:
+    if found_once:
+        raise SystemExit(
+            f"window for pid {target_pid} (incl. descendants) kept "
+            f"drifting/getting replaced and never settled on workspace "
+            f"{target_desktop}"
+        )
     raise SystemExit(
-        f"window for pid {target_pid} (incl. descendants) did not settle "
-        f"on workspace {target_desktop}"
+        f"window for pid {target_pid} (incl. descendants) never appeared"
     )
 PY
       ;;

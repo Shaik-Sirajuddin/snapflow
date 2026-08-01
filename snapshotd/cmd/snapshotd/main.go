@@ -190,7 +190,10 @@ func cmdServe(cfg config.Config, args []string) error {
 				acpxMgr = mgr
 				logger.Info("bundled acpx-server started",
 					"bin", cfg.AcpxBinPath,
-					"bind", cfg.AcpxHttpBind,
+					// mgr.HTTPBind(), not cfg.AcpxHttpBind: acpxmgr.Start
+					// walks to the next free port when the requested one is
+					// already occupied, so the two can legitimately differ.
+					"bind", mgr.HTTPBind(),
 					"config", cfg.AcpxConfigPath,
 				)
 			}
