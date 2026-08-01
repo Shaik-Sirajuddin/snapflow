@@ -280,6 +280,7 @@ export component ChatPanel inherits Window {
     callback thread-archive-requested(int);
     callback thread-rename-requested(int, string);
     callback search-submitted(string, bool, bool);
+    callback mention-filter-changed(string, string);
     callback send-requested(string);
     callback compose-draft-changed(string);
     callback queue-fast-track-requested();
@@ -344,6 +345,16 @@ export component ChatPanel inherits Window {
     property <string> rename-thread-draft: "";
     property <string> rename-focus-target: "";
     property <bool> pending-compose-focus: false;
+    // Set immediately by a genuine user-initiated thread switch (sidebar
+    // click or Ctrl+Alt+Up/Down nav), *not* by begin-thread-rename's own
+    // `selected-thread` write (that's a side effect of starting a rename,
+    // not the user asking to read/type in a different thread -- stealing
+    // focus to compose there would fight the rename TextInput for it).
+    // Consumed by `changed selected-thread` below once Rust's dirty-sync
+    // round-trip (sync.rs ScalarField::SelectedThread) lands the switch,
+    // so it fires for both the sidebar's optimistic local update and the
+    // keyboard-nav path (which has no local update, only the round-trip).
+    property <bool> pending-thread-switch-focus: false;
 
     function start-new-thread() {
         root.active-pane = "chat";
@@ -415,6 +426,21 @@ export component ChatPanel inherits Window {
             chat-views.restore-compose-focus();
         } else {
             legacy-chat-area.restore-compose-focus();
+        }
+    }
+    // Auto-focus compose after a genuine user-initiated thread switch
+    // lands (see `pending-thread-switch-focus`'s doc comment), so the user
+    // can start typing immediately without clicking into the box first.
+    // Guarded the same way key dispatch already guards itself (lib.rs
+    // `panel_rust_has_text_focus`) -- don't yank focus away from an
+    // actively-focused rename field, sidebar/settings search box, mention
+    // filter, or terminal.
+    changed selected-thread => {
+        if (root.pending-thread-switch-focus) {
+            root.pending-thread-switch-focus = false;
+            if (!root.secondary-text-input-has-focus && !root.local-terminal-has-focus) {
+                root.restore-active-compose-focus();
+            }
         }
     }
     public function approve-active-pending() {
@@ -495,10 +521,12 @@ export component ChatPanel inherits Window {
             // collide with in-field text navigation and Shotcut's own
             // transport/navigation shortcuts (see the execution plan).
             if (event.modifiers.alt && event.text == Key.UpArrow) {
+                root.pending-thread-switch-focus = true;
                 root.thread-navigation-requested(-1);
                 return EventResult.accept;
             }
             if (event.modifiers.alt && event.text == Key.DownArrow) {
+                root.pending-thread-switch-focus = true;
                 root.thread-navigation-requested(1);
                 return EventResult.accept;
             }
@@ -546,6 +574,7 @@ export component ChatPanel inherits Window {
                 rename-thread-draft <=> root.rename-thread-draft;
                 rename-focus-target: root.rename-focus-target;
                 thread-selected(i) => {
+                    root.pending-thread-switch-focus = true;
                     selected-thread = i;
                     // Leave live skill editor when a thread is chosen —
                     // main surface returns to chat (active-pane switch).
@@ -621,6 +650,7 @@ export component ChatPanel inherits Window {
                     && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
+                mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
                 // Phase 16: project indicator from the selected thread's
                 // live fields (project_* post-populated from the bridge;
                 // connection-status is the live MCP/agent link state).
@@ -748,6 +778,7 @@ export component ChatPanel inherits Window {
                     && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
+                mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
                 // Phase 16: project indicator from the selected thread's
                 // live fields (project_* post-populated from the bridge;
                 // connection-status is the live MCP/agent link state).
