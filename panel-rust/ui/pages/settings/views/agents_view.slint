@@ -555,6 +555,7 @@ export component AgentsView inherits Rectangle {
                         agent-name: root.agent-catalog[first-agent-index].name != ""
                             ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
                         website: root.agent-catalog[first-agent-index].website;
+                        website-domain: root.agent-catalog[first-agent-index].website-domain;
                         status: root.agent-catalog[first-agent-index].status;
                         card-width: cards-per-row == 1 ? root.width : 260px;
                         is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
@@ -576,6 +577,7 @@ export component AgentsView inherits Rectangle {
                         agent-name: root.agent-catalog[first-agent-index + 1].name != ""
                             ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;
                         website: root.agent-catalog[first-agent-index + 1].website;
+                        website-domain: root.agent-catalog[first-agent-index + 1].website-domain;
                         status: root.agent-catalog[first-agent-index + 1].status;
                         card-width: 260px;
                         is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
