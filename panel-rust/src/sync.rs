@@ -249,8 +249,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_default(model.background_default);
             component.set_default_agent_id(model.default_agent_id.clone().into());
             component.set_dev_mode(model.dev_mode);
+            component.set_onboarding_completed(model.onboarding_completed);
             component.set_show_global_skills(model.show_global_skills);
             component.set_profile_wiring_enabled(model.profile_wiring_enabled);
+            component.set_beta_mode_enabled(model.beta_mode_enabled);
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);
@@ -421,6 +423,7 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
                 || existing.project_instance_live != row.item.project_instance_live
                 || existing.profile_name != row.item.profile_name
                 || existing.has_session != row.item.has_session
+                || existing.unread != row.item.unread
         })
         .unwrap_or(true);
     if needs_write {
@@ -1245,10 +1248,17 @@ fn sync_model_dropdown_for_provider(
 /// so the no-fallback behavior is unit-testable without constructing a
 /// live `ChatPanel` (see this module's tests for the regression pin).
 fn sync_commands_model(model: &Model, thread: &crate::model::ThreadModel) {
+    let needle = thread.command_filter.to_lowercase();
+    let bypass = needle.is_empty() || thread.command_filter == "'";
     model.commands_model.set_vec(
         thread
             .available_commands
             .iter()
+            .filter(|command| {
+                bypass
+                    || command.name.to_lowercase().contains(&needle)
+                    || command.description.to_lowercase().contains(&needle)
+            })
             .map(|command| crate::SkillOption {
                 name: command.name.clone().into(),
                 description: command.description.clone().into(),
@@ -1341,6 +1351,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let session_rows = crate::models::to_remote_session_option_rows(
         model.recoverable_sessions.clone(),
         &model.recovery_provider,
+        &model.recover_session_operations_in_flight,
     );
     let session_keys: Vec<String> = model
         .recoverable_sessions
@@ -1493,6 +1504,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
     component.set_open_terminal_tabs(slint::ModelRc::from(model.open_terminals_model.clone()));
+    component.set_onboarding_completed(model.onboarding_completed);
     reconcile_settings_models(model, component);
 }
 
@@ -1832,6 +1844,71 @@ mod tests {
             row.busy,
             "the sidebar spinner's busy flag must flip immediately, not on the \
                            next unrelated thread-list rebuild"
+        );
+    }
+
+    #[test]
+    fn thread_row_pushes_an_unread_to_read_transition_when_nothing_else_changed() {
+        // Regression: apply_thread_selection_switch (update.rs) clears
+        // ThreadModel.unread and returns Dirty::ThreadRow for the newly
+        // displayed thread, but apply_thread_row's `needs_write` comparison
+        // used to omit `unread` from the field list entirely. When opening
+        // a thread flips unread true -> false with every other display
+        // field identical (the common real case: no other content changed
+        // at the moment of selection), `needs_write` came back `false` and
+        // `set_row_data` was skipped -- the Slint-side ThreadItem.unread
+        // stayed `true` and the sidebar status dot never left its unread
+        // color, even though model.threads[idx].unread was correctly
+        // cleared on the Rust side. update.rs's own
+        // `selecting_an_unread_thread_marks_it_read` test only asserts the
+        // Rust-side flag and never calls apply_thread_row, so it could not
+        // catch this: the gap was entirely in sync.rs's projection step.
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-0".to_owned(),
+            display_name: "Fix timeline crash".to_owned(),
+            state: crate::models::ThreadState::Idle,
+            unread: true,
+            ..crate::model::ThreadModel::default()
+        });
+        model.thread_model.push(crate::ThreadItem {
+            name: "Fix timeline crash".into(),
+            status: "idle".into(),
+            // `open` is hardcoded to `true` by every real
+            // `visible_thread_row` call, so it must already be `true` here
+            // too -- otherwise the pre-existing `open` mismatch alone would
+            // force `needs_write`, masking whether the `unread` field is
+            // actually compared.
+            open: true,
+            unread: true,
+            ..crate::ThreadItem::default()
+        });
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned()];
+        model.visible_indices = vec![0];
+        model.thread_rows.push(VisibleThreadItem {
+            session_id: None,
+            agent_detected: None,
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            item: crate::ThreadItem {
+                name: "Fix timeline crash".into(),
+                status: "idle".into(),
+                open: true,
+                unread: true,
+                ..crate::ThreadItem::default()
+            },
+        });
+
+        // Same "becoming displayed clears unread" step apply_thread_selection_switch
+        // performs, in isolation.
+        model.threads[0].unread = false;
+        apply_thread_row(&model, 0);
+
+        let row = model.thread_model.row_data(0).unwrap();
+        assert!(
+            !row.unread,
+            "opening a thread must clear the Slint-side unread flag even when \
+             no other display field changed"
         );
     }
 

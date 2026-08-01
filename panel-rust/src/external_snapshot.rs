@@ -289,6 +289,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .as_ref()
                 .map(AgentBridge::mcp_operations_in_flight)
                 .unwrap_or_default(),
+            recover_session_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::recover_session_operations_in_flight)
+                .unwrap_or_default(),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold
             // the result, so the live skills view tracks filesystem/state
@@ -449,6 +455,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .map(|thread| thread.error.clone().unwrap_or_default())
             .collect();
+        // thread-unread-state: unlike archived/closed this lives on the TEA
+        // ThreadModel, not on an AgentBridge slot -- it is in-memory only
+        // (see ThreadModel::unread) and is folded by `update_frame`, so the
+        // model is its single source of truth.
+        let unread: Vec<bool> = model.threads.iter().map(|thread| thread.unread).collect();
         drop(model);
 
         let descriptions: Vec<String> = names
@@ -462,8 +473,8 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .bridge
                     .as_ref()
                     .map(|bridge| {
-                        models::describe_thread(
-                            &bridge.history(idx),
+                        models::describe_thread_from_last(
+                            bridge.last_message(idx).as_ref(),
                             crate::THREAD_DESCRIPTION_MAX_CHARS,
                         )
                     })
@@ -557,6 +568,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             &background_sessions,
             &closed,
             &archived,
+            &unread,
             &query,
         );
         // Plan phase 26: the chat view binds to the selected project --
@@ -884,6 +896,18 @@ impl<'a> ExternalSnapshotSource<'a> {
         selected.and_then(|real_idx| self.collect_thread_snapshot_for(real_idx))
     }
 
+    /// One `ThreadRecord` per bound thread that `update()`'s frame fold
+    /// hasn't already persisted (`model.traced_attachment_threads`, checked
+    /// via `HashSet::insert` in `update.rs`'s `for record in frame.
+    /// thread_record_snapshots` loop -- every already-traced thread's
+    /// record is built here just to be thrown away there). Filtering by the
+    /// same set here, rather than after collection, means a poll tick
+    /// (60-90fps) with N already-persisted open threads skips N thread_
+    /// binding/thread_provider bridge lookups and ~7 `String` clones per
+    /// thread (`display_name`, `profile_name`, `permission_profile`,
+    /// `thread_id`, `session_id`, `project_path`, ...) that would otherwise
+    /// be built and discarded on every single tick regardless of whether
+    /// any new thread ever attaches.
     pub(crate) fn collect_thread_record_snapshots(&self) -> Vec<crate::state_store::ThreadRecord> {
         let Some(bridge) = self.panel.bridge.as_ref() else {
             return Vec::new();
@@ -895,6 +919,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             .enumerate()
             .filter_map(|(idx, thread)| {
                 let binding = bridge.thread_binding(idx)?;
+                if model.traced_attachment_threads.contains(&binding.thread_id) {
+                    return None;
+                }
                 let provider = bridge.thread_provider(idx)?;
                 Some(crate::state_store::ThreadRecord {
                     thread_id: binding.thread_id,

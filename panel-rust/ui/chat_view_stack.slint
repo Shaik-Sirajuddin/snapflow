@@ -58,6 +58,8 @@ export component ChatViewStack inherits Rectangle {
     in property <bool> rename-editing: false;
     in property <string> rename-focus-target: "";
     in-out property <string> rename-draft: "";
+    in-out property <bool> onboarding-completed: false;
+    callback complete-onboarding();
 
     // Commands are broadcast as generations; only the selected delegate
     // consumes them, so a hidden ChatArea cannot steal focus or approval.
@@ -74,6 +76,7 @@ export component ChatViewStack inherits Rectangle {
     callback load-older-requested();
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
+    callback mention-filter-changed(string, string);
     callback md-link-activated(string);
     callback error-banner-dismissed();
     callback send-requested(string);
@@ -155,6 +158,8 @@ export component ChatViewStack inherits Rectangle {
         pending-request: root.pending-request;
         terminals: root.terminals;
         local-terminal: root.local-terminal;
+        onboarding-completed <=> root.onboarding-completed;
+        complete-onboarding => { root.complete-onboarding(); }
         compose-text <=> root.compose-text;
         compose-text-changed(text) => { root.compose-draft-changed(text); }
         inputs-enabled: root.inputs-enabled;
@@ -193,6 +198,7 @@ export component ChatViewStack inherits Rectangle {
         load-older-requested => { root.load-older-requested(); }
         mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
         mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
+        mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
         md-link-activated(target) => { root.md-link-activated(target); }
         error-banner-dismissed => { root.error-banner-dismissed(); }
         send-requested(text) => { root.send-requested(text); }
@@ -260,6 +266,8 @@ export component ChatViewStack inherits Rectangle {
         pending-request: root.pending-request;
         terminals: root.terminals;
         local-terminal: root.local-terminal;
+        onboarding-completed <=> root.onboarding-completed;
+        complete-onboarding => { if (index == root.selected-index) { root.complete-onboarding(); } }
         // Each retained ChatArea owns its composer buffer. Do not bind this
         // to the stack-level fallback property: doing so makes hidden views
         // observe and overwrite the selected thread's draft.
@@ -319,6 +327,7 @@ export component ChatViewStack inherits Rectangle {
         load-older-requested => { if (index == root.selected-index) { root.load-older-requested(); } }
         mcp-connect-requested(name) => { if (index == root.selected-index) { root.mcp-connect-requested(name); } }
         mcp-enabled-changed(name, enabled) => { if (index == root.selected-index) { root.mcp-enabled-changed(name, enabled); } }
+        mention-filter-changed(prefix, query) => { if (index == root.selected-index) { root.mention-filter-changed(prefix, query); } }
         md-link-activated(target) => { if (index == root.selected-index) { root.md-link-activated(target); } }
         error-banner-dismissed => { if (index == root.selected-index) { root.error-banner-dismissed(); } }
         send-requested(text) => { if (index == root.selected-index) { root.send-requested(text); } }

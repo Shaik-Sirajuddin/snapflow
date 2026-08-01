@@ -48,6 +48,14 @@ export component AgentsView inherits Rectangle {
     // profile-registry chip picker below (gated Global-only in
     // 6745aa0e), these two fields stay dual-tier once the flag is on.
     in property <bool> profile-wiring-enabled: false;
+    // Env-var feature-flag gate (BETA_MODE, read in lib.rs's
+    // beta_mode_enabled() and threaded down through settings_page.slint /
+    // app.slint). Additive on top of profile-wiring-enabled above -- gates
+    // ONLY the "Profile" SettingsField (default-profile) below; the
+    // adjacent "Permission profile" field is unaffected and stays governed
+    // solely by profile-wiring-enabled, same as before. Both flags must be
+    // true for the Profile field to show.
+    in property <bool> beta-mode-enabled: false;
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
@@ -66,6 +74,11 @@ export component AgentsView inherits Rectangle {
         if (!self.profile-wiring-enabled) {
             self.default-profile-focus-mirror = false;
             self.permission-profile-focus-mirror = false;
+        }
+    }
+    changed beta-mode-enabled => {
+        if (!self.beta-mode-enabled) {
+            self.default-profile-focus-mirror = false;
         }
     }
     // See FilterSearchBar.input-has-focus's doc comment. Also covers the
@@ -166,17 +179,37 @@ export component AgentsView inherits Rectangle {
     // convention as every other elastic Flickable region in this
     // codebase), so the header -- and the search bar inside it -- stays
     // pinned above that scroll region instead of scrolling away with it.
+    //
+    // `alignment: start` -- both direct children below (the header
+    // `SettingsSection` and `agents-body-area`) set `vertical-stretch: 0`
+    // so neither wants to grow. But Slint's layout solver treats a
+    // group whose *total* stretch is 0 as an equal-share case rather
+    // than "give nobody the leftover space" (see
+    // i-slint-core::layout::stretch, `total_stretch <= 0` fallback) --
+    // without `alignment: start` here, this layout's default `stretch`
+    // redistributes any leftover vertical height (real once the parent
+    // is given real bounded height at fullscreen, per the call-site
+    // convention referenced above) equally between the two children
+    // anyway. `agents-body-area` is capped by its own `max-height:
+    // 420px`, but the header `SettingsSection` has no such cap, so it
+    // silently grew to absorb the rest -- rendering as a size-dependent
+    // gap below the pinned `agent-search-bar` (its last child, packed to
+    // the top via SettingsSection's own `alignment: start`) before
+    // `agents-body-area` began. Same class of bug, same fix, as
+    // `mcp_servers_view.slint`'s stdio-fields `VerticalLayout` (see its
+    // own doc comment) -- confirmed live there at a large window size.
     VerticalLayout {
         width: parent.width;
         height: parent.height;
         spacing: Metrics.space-6;
+        alignment: start;
 
         SettingsSection {
         width: parent.width;
 
         SettingsSectionHeader { text: Strings.chat-defaults; }
 
-        if root.profile-wiring-enabled : SettingsField {
+        if root.profile-wiring-enabled && root.beta-mode-enabled : SettingsField {
             width: parent.width;
             label: Strings.profile;
             default-profile-field := TextField {
@@ -193,7 +226,12 @@ export component AgentsView inherits Rectangle {
         // manages the shared ProfileStore registry itself, not the
         // dual-tier default-profile *selection*, which the always-visible
         // TextField above already covers under both scopes.
-        if root.scope == "global" : Flickable {
+        // Additive BETA_MODE gate (see beta-mode-enabled's doc comment
+        // above): both root.scope == "global" AND root.beta-mode-enabled
+        // must hold for the profile chip row to show -- same additive
+        // pattern as the Profile SettingsField above, not a replacement of
+        // the existing scope gate.
+        if root.scope == "global" && root.beta-mode-enabled : Flickable {
             width: parent.width;
             height: root.available-profiles.length > 0 ? 30px : 0px;
             viewport-width: profile-chip-row.preferred-width;
@@ -587,6 +625,14 @@ export component AgentsView inherits Rectangle {
                 font-weight: 400;
                 bg: Theme.bg-card;
                 fg: Theme.text-secondary;
+                // recoverable-attach-fix: `session.busy` (`AgentBridge::
+                // recover_session_operations_in_flight`) is true for the
+                // whole `session/load` round trip -- Button's own `busy`
+                // prop swaps the label for a Spinner and ignores further
+                // clicks (see button.slint), so this can no longer be
+                // double-clicked into two attach attempts for the same
+                // session while the first is still in flight.
+                busy: session.busy;
                 clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
             }
         }

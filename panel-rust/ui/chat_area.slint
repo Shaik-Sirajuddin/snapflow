@@ -23,6 +23,7 @@ import { MentionPickRow } from "./base/mention_pick_row.slint";
 import { ThinScrollbar } from "./base/thin_scrollbar.slint";
 import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
 import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
+import { OnboardingGuideView } from "./chat-view/components/onboarding_guide_view.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -33,6 +34,8 @@ import { TerminalView } from "./chat-view/components/execution/terminal_view.sli
 // for why tool-call gets the richer timeline-style card instead of the
 // bubble layout's flat text dump.
 export component ChatArea inherits Rectangle {
+    in-out property <bool> onboarding-completed: false;
+    callback complete-onboarding();
     // Retained-view command generations. A stack host can address the
     // selected ChatArea without invoking methods on hidden delegates.
     in property <int> focus-command: 0;
@@ -133,6 +136,7 @@ export component ChatArea inherits Rectangle {
     in property <bool> inputs-enabled: true;
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
+    callback mention-filter-changed(string, string);
     // Phase 17: markdown Ctrl+Click link target, host opens it.
     callback md-link-activated(string);
     // Mode/model selector addition: the *currently displayed* thread's
@@ -1560,6 +1564,7 @@ export component ChatArea inherits Rectangle {
             inputs-enabled: root.inputs-enabled;
             mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
             mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
+            mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
             width: 100%;
             horizontal-stretch: 1;
             vertical-stretch: 0;
@@ -1661,4 +1666,13 @@ export component ChatArea inherits Rectangle {
         }
     }
     restore-compose-focus => { chat-input.focus-compose(); }
+
+    if !root.onboarding-completed : OnboardingGuideView {
+        width: 100%;
+        height: 100%;
+        z: 9000;
+        start-chat-clicked => {
+            root.complete-onboarding();
+        }
+    }
 }

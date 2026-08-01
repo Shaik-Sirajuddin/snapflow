@@ -67,6 +67,7 @@ pub struct InitialState {
     /// the same as `threads`/`thread_ids`; a missing/short entry falls
     /// back to an empty in-memory-only queue.
     pub send_queues: Vec<crate::send_queue::SendQueue>,
+    pub onboarding_completed: bool,
 }
 
 /// One thread's `Model`-side state -- the former parallel-array fields in
@@ -117,12 +118,46 @@ pub struct ThreadModel {
     // presentation flag (see AgentBridge::archive_thread's doc comment) --
     // never sends an ACP request, unlike `closed`.
     pub archived: bool,
+    /// thread-unread-state: visible agent output arrived for this thread
+    /// while some OTHER thread was displayed, and the user has not opened
+    /// it since. Set in `update_frame`'s `AgentEvent::Message` arm (gated
+    /// on `model.displayed_thread != Some(this thread)`, so a thread
+    /// streaming its own reply in front of the user never flips), cleared
+    /// in `apply_thread_selection_switch`.
+    ///
+    /// Deliberately in-memory only, unlike `archived`: bridge events exist
+    /// only while this process runs the ACPX actor, so no content can be
+    /// delivered to a thread while the panel is closed. A restart therefore
+    /// has nothing the user could have missed, and hydrating every thread
+    /// as read is the correct -- not merely the cheap -- behaviour. That is
+    /// why this gets no `ThreadRuntimeSnapshot`/sqlite column.
+    pub unread: bool,
     /// Stable message identities currently known to the TEA model. Streaming
     /// effect results must resolve against this list, never a cached row
     /// index, before producing a `Dirty::MessageStreamingDelta`.
     pub message_ids: Vec<String>,
     pub transcript: Vec<TranscriptItem>,
     pub transcript_keys: Vec<String>,
+    /// `(send_queue, generation_in_flight)` captured the last time this
+    /// thread's message rows were actually rebuilt from `transcript` in
+    /// `update.rs`'s frame-poll fold. `None` until the first rebuild.
+    ///
+    /// The frame poll runs at 60-90fps and re-collects `snapshot.transcript`
+    /// every tick regardless of whether it changed (`ExternalSnapshotSource::
+    /// collect_thread_snapshot_for`'s doc comment). Before this field
+    /// existed, the fold unconditionally re-ran `message_rows_for_thread_
+    /// with_state` on every tick too -- re-cloning the whole transcript and
+    /// re-parsing every tool row's `raw_input` JSON (`to_message_rows_from_
+    /// transcript`'s `serde_json::from_str` call), even on an idle thread
+    /// whose transcript was byte-identical to the previous tick. Comparing
+    /// against this field (alongside `thread.transcript == snapshot.
+    /// transcript`) lets that tick instead reuse the already-installed rows
+    /// from `Model::thread_view_models` (cheap `Rc`-backed clones, no
+    /// re-parse) -- see the frame-poll fold in `update.rs` for the actual
+    /// gate. `send_queue`/`in_flight` are tracked too because either can
+    /// change the row projection (queued rows, the "sending" flag) even
+    /// while `transcript` itself stays the same.
+    pub rows_synced_with: Option<(SendQueue, bool)>,
     #[cfg(test)]
     /// Legacy projection fixture retained only by unit tests that exercise
     /// the pre-migration shared-list reducer. Production rows live in the
@@ -175,6 +210,9 @@ pub struct ThreadModel {
     pub config_options: Vec<ConfigOptionInfo>,
     /// PUI-003: the agent's built-in slash commands for the `/` menu.
     pub available_commands: Vec<AvailableCommandInfo>,
+    /// Per-thread slash-command filter. The source catalog remains
+    /// immutable; the Slint command model is a derived visible copy.
+    pub command_filter: String,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
     /// PROF-11: the agent's most recently pushed execution plan/todo
@@ -293,6 +331,7 @@ pub struct Model {
     pub background_default: bool,
     pub default_agent_id: String,
     pub dev_mode: bool,
+    pub onboarding_completed: bool,
     /// Feature-flag gate (env-var driven, see `PANEL_PROFILE_WIRING_ENABLED`
     /// in lib.rs) for the "default profile"/"permission profile" settings
     /// controls in `agents_view.slint`. Both are genuinely dual-tier
@@ -301,6 +340,13 @@ pub struct Model {
     /// entirely, in both scopes, until this flag is turned on. Computed
     /// once at startup from the environment and never mutated afterward.
     pub profile_wiring_enabled: bool,
+    /// Feature-flag gate (env-var driven, see `beta_mode_enabled()` in
+    /// lib.rs, `BETA_MODE`) for in-development UI surfaces: the Chat
+    /// Defaults "Profile" field (`agents_view.slint`, additive on top of
+    /// `profile_wiring_enabled` above) and the whole Harness settings tab
+    /// (`left_tabs.slint` / `settings_page.slint`). Computed once at
+    /// startup from the environment and never mutated afterward.
+    pub beta_mode_enabled: bool,
     pub background_override_set: bool,
     pub background_override: bool,
     /// Skills settings view's "Show global skills" row
@@ -320,6 +366,13 @@ pub struct Model {
     /// rows`, driving the Spinner shown on whichever button's action is
     /// actually in flight.
     pub mcp_operations_in_flight: Vec<String>,
+    /// Same shape/lifecycle as `mcp_operations_in_flight` above, sourced
+    /// from `AgentBridge::recover_session_operations_in_flight`. Folded
+    /// into `RemoteSessionOption.busy` by `to_remote_session_option_
+    /// rows`, driving the Attach button's Spinner while a recoverable
+    /// session's `session/load` is in flight (symptom #2: this row
+    /// previously had no busy-state tracking at all).
+    pub recover_session_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot
@@ -502,9 +555,11 @@ impl Default for ThreadModel {
             compose_draft: String::new(),
             closed: false,
             archived: false,
+            unread: false,
             message_ids: Vec::new(),
             transcript: Vec::new(),
             transcript_keys: Vec::new(),
+            rows_synced_with: None,
             #[cfg(test)]
             message_rows: Vec::new(),
             markdown_render_index: RefCell::new(crate::thread_message_index::ThreadMessageIndex::default()),
@@ -520,6 +575,7 @@ impl Default for ThreadModel {
             session_modes: None,
             config_options: Vec::new(),
             available_commands: Vec::new(),
+            command_filter: String::new(),
             usage: (0, 0),
             plan: Vec::new(),
             session_title: None,
@@ -639,6 +695,7 @@ impl Model {
             threads,
             selected_thread,
             visible_indices: (0..thread_count).collect(),
+            onboarding_completed: initial.onboarding_completed,
             ..Self::default()
         };
         model.rebuild_thread_indices();
@@ -660,6 +717,7 @@ mod tests {
             thread_states: vec![],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -690,6 +748,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -721,6 +780,7 @@ mod tests {
             thread_states: vec![ThreadState::Error],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(
@@ -755,6 +815,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            onboarding_completed: false,
         });
 
         assert_eq!(model.thread_index_for_id("thread-second"), Some(1));

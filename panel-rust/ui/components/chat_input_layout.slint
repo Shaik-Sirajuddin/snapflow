@@ -101,6 +101,7 @@ export component ChatInputLayout inherits Rectangle {
     callback mcp-connect-requested(string);
     // Phase 15: inline enable/disable from the @ MCP popup row.
     callback mcp-enabled-changed(string, bool);
+    callback mention-filter-changed(string, string);
     // Panel chords (Ctrl+B/N/K/,, Escape, Ctrl+Enter approve) re-dispatched
     // while the composer owns focus — wired by ChatArea → ChatPanel.
     callback panel-shortcut(KeyEvent) -> EventResult;
@@ -233,6 +234,21 @@ export component ChatInputLayout inherits Rectangle {
         compose.has-focus
         && (token-prefix == "/" || token-prefix == "@" || token-prefix == "#");
     property <length> mention-popup-h: 220px;
+    // The popup list is a real Flickable, so keyboard selection must move
+    // its viewport as the highlighted row leaves the currently visible
+    // range. The selected row reports its content-space y/height below.
+    property <length> mention-scroll-y: 0px;
+
+    function scroll-to-mention(item-y: length, item-height: length) {
+        let viewport-top = mention-list.viewport-y;
+        let viewport-bottom = viewport-top + mention-list.height;
+        if (item-y < viewport-top) {
+            root.mention-scroll-y = item-y;
+        } else if (item-y + item-height > viewport-bottom) {
+            root.mention-scroll-y = Math.max(0px,
+                item-y + item-height - mention-list.height);
+        }
+    }
 
     // Keep mini-search + list filter in lockstep with the active token.
     changed token-query => {
@@ -249,6 +265,16 @@ export component ChatInputLayout inherits Rectangle {
     }
     changed mention-filter => {
         root.reselect-closest();
+        root.mention-filter-changed(root.token-prefix, root.mention-filter);
+    }
+    // Ctrl+A followed by Backspace/Delete can clear the whole compose text
+    // in one edit event. Close the local fallback state too; otherwise its
+    // remembered "/" prefix keeps the skill filter bar open on an empty
+    // composer.
+    changed compose-text => {
+        if (root.compose-text == "") {
+            root.close-local-mention();
+        }
     }
 
     function open-local-mention(prefix: string) {
@@ -280,20 +306,14 @@ export component ChatInputLayout inherits Rectangle {
         root.close-local-mention();
         compose.focus();
     }
-    // Hide rows that don't match the live filter (name or secondary text).
-    // Single contains-ci call — passing mention-filter twice into helpers
-    // trips a SharedString move bug in generated Rust.
+    // @ MCP suggestions intentionally do not filter. Slash-command rows are
+    // already supplied as a filtered copy by the host; the source catalog
+    // remains untouched in the per-thread model.
     function row-hidden(label: string, extra: string) -> bool {
-        if (root.mention-filter == "") {
-            return false;
-        }
-        if (TextUtil.contains-ci(label + "\n" + extra, root.mention-filter)) {
-            return false;
-        }
-        // Host/viewer with TextUtil: no match → hide.
-        // Pure slint-viewer (callback uninstalled): contains-ci always
-        // false — keep rows visible so the list is not blanked.
-        return TextUtil.filter-ready();
+        return (root.token-prefix == "/" || root.token-prefix == "#")
+            && root.mention-filter != ""
+            && root.mention-filter != "'"
+            && !TextUtil.matches-filter(label + "\n" + extra, root.mention-filter);
     }
 
     function catalog-len() -> int {
@@ -416,6 +436,7 @@ export component ChatInputLayout inherits Rectangle {
     }
     function reselect-closest() {
         // First visible under the current filter (default selection).
+        root.mention-scroll-y = 0px;
         root.mention-sel = root.next-visible(-1, 1);
     }
     function mention-move(dir: int) {
@@ -1237,11 +1258,17 @@ export component ChatInputLayout inherits Rectangle {
                     return root.mention-key(event);
                 }
             }
-            Flickable {
+            mention-list := Flickable {
                 vertical-stretch: 1;
                 preferred-height: 0px;
                 min-height: 40px;
+                // A filtered result with one (or otherwise short) visible
+                // row should not behave like a scrollable list. Hidden rows
+                // already collapse to zero height, so preferred-height is
+                // the actual rendered content height here.
+                interactive: mention-col.preferred-height > self.height;
                 viewport-height: mention-col.preferred-height;
+                viewport-y <=> root.mention-scroll-y;
                 mention-col := VerticalLayout {
                     spacing: Metrics.space-1;
 
@@ -1251,6 +1278,11 @@ export component ChatInputLayout inherits Rectangle {
                             property <bool> hidden: root.row-hidden(skill.name, skill.description);
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
+                            changed highlighted => {
+                                if (self.highlighted) {
+                                    root.scroll-to-mention(self.y, self.height);
+                                }
+                            }
                             show-icon: true;
                             icon-source: @image-url("../assets/icons/sparkles.svg");
                             title: skill.name;
@@ -1274,6 +1306,11 @@ export component ChatInputLayout inherits Rectangle {
                             property <bool> hidden: root.row-hidden(srv.name, srv.command);
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
+                            changed highlighted => {
+                                if (self.highlighted) {
+                                    root.scroll-to-mention(self.y, self.height);
+                                }
+                            }
                             show-icon: true;
                             icon-source: @image-url("../assets/icons/server.svg");
                             title: srv.name;
@@ -1311,6 +1348,11 @@ export component ChatInputLayout inherits Rectangle {
                             property <bool> hidden: root.row-hidden(f, "");
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
+                            changed highlighted => {
+                                if (self.highlighted) {
+                                    root.scroll-to-mention(self.y, self.height);
+                                }
+                            }
                             title: f;
                             title-font-family: Theme.font-mono;
                             clicked => {
@@ -1327,6 +1369,19 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
         }
+            // Make overflow discoverable: the list is keyboard-scrollable,
+            // but the scrollbar also gives a clear indication when more
+            // matching skills exist than fit in the popup. ThinScrollbar's
+            // own overflow check keeps it hidden for one short match.
+            mention-scrollbar := ThinScrollbar {
+                x: parent.width - self.width - 2px;
+                y: mention-search-bar.height + Metrics.gap-sm + 2px;
+                visible-height: mention-list.height - 4px;
+                viewport-height: mention-col.preferred-height;
+                viewport-y <=> root.mention-scroll-y;
+                thumb-width: 4px;
+                active: root.mention-open;
+            }
     }
 
     focus-compose => { compose.focus(); }

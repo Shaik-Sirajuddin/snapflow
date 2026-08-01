@@ -411,6 +411,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
         harness: None,
         dev_mode: None,
         snapflow_mcp_enabled: None,
+        onboarding_completed: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         let message = format!("failed to migrate panel defaults to JSON: {error}");
@@ -549,6 +550,21 @@ fn save_panel_prefs_to_json(
 /// env var => hidden) so an unset environment never surfaces them.
 fn profile_wiring_enabled() -> bool {
     std::env::var("PANEL_PROFILE_WIRING_ENABLED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// Feature-flag gate for in-development UI surfaces that aren't ready to
+/// ship broadly yet: the Chat Defaults "Profile" field (`agents_view.slint`,
+/// stacked additively on top of `profile_wiring_enabled` above -- both must
+/// be on for that field to show) and the whole Harness settings tab
+/// (`left_tabs.slint`'s nav item + `settings_page.slint`'s `HarnessView`
+/// mount). Named `BETA_MODE` (not `PANEL_`-prefixed like the sibling flag
+/// above) per explicit naming from the request that introduced it. Defaults
+/// OFF (unset env var => hidden) so an unset environment never surfaces
+/// either gated surface.
+fn beta_mode_enabled() -> bool {
+    std::env::var("BETA_MODE")
         .map(|value| value == "1")
         .unwrap_or(false)
 }
@@ -2291,12 +2307,17 @@ fn panel_rust_create_with_initial_identity(
                 })
             })
             .collect();
+        let onboarding_completed = settings_file::SettingsPaths::from_env()
+            .load_resolved()
+            .map(|r| r.onboarding_completed)
+            .unwrap_or(false);
         let initial = model::InitialState {
             threads: initial_specs.clone(),
             thread_ids: initial_thread_ids,
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
             send_queues: initial_send_queues,
+            onboarding_completed,
             thread_states: if bridge_available {
                 vec![ThreadState::Idle; initial_specs.len()]
             } else {
@@ -2306,6 +2327,7 @@ fn panel_rust_create_with_initial_identity(
         };
         let mut model = model::Model::default();
         model.profile_wiring_enabled = profile_wiring_enabled();
+        model.beta_mode_enabled = beta_mode_enabled();
         let thread_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();
@@ -2551,6 +2573,21 @@ fn panel_rust_create_with_initial_identity(
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_settings_open(panel, &component);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_complete_onboarding(move || {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let _ = dispatch::update_persistent(
+                        panel,
+                        msg::Msg::Ui(msg::UiMsg::Chrome(msg::ChromeMsg::CompleteOnboarding)),
+                    );
                 }
             });
         });
@@ -3362,6 +3399,64 @@ fn panel_rust_create_with_initial_identity(
                 });
             });
 
+        // Compose slash-command filtering is host-managed: keep the
+        // thread's advertised command catalog immutable and publish a
+        // separate filtered VecModel copy to Slint. `@` MCP suggestions do
+        // not filter; apostrophe is the explicit bypass marker for every
+        // picker filter chain.
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mention_filter_changed(move |prefix, query| {
+                if prefix != "/" {
+                    return;
+                }
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    let panel_cell = cell.borrow();
+                    let Some(panel) = panel_cell.as_ref() else {
+                        return;
+                    };
+                    let (commands, commands_model) = {
+                        let mut model = panel.model.borrow_mut();
+                        let real = model
+                            .visible_indices
+                            .get(model.selected_thread)
+                            .copied()
+                            .or_else(|| {
+                                (!model.visible_list_synced).then_some(model.selected_thread)
+                            });
+                        let source = real
+                            .and_then(|idx| model.threads.get_mut(idx))
+                            .map(|thread| {
+                                thread.command_filter = query.to_string();
+                                thread.available_commands.clone()
+                            })
+                            .unwrap_or_default();
+                        (source, model.commands_model.clone())
+                    };
+                    let needle = query.to_lowercase();
+                    let rows = commands
+                        .into_iter()
+                        .filter(|command| {
+                            needle.is_empty()
+                                || query == "'"
+                                || command.name.to_lowercase().contains(&needle)
+                                || command.description.to_lowercase().contains(&needle)
+                        })
+                        .map(|command| crate::SkillOption {
+                            name: command.name.into(),
+                            description: command.description.into(),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>();
+                    commands_model.set_vec(rows);
+                    component.set_available_commands(slint::ModelRc::from(commands_model));
+                });
+            });
+
         let component_weak = panel.component.as_weak();
         panel.component.on_toggle_expanded(move |index| {
             let Some(_component) = component_weak.upgrade() else {
@@ -4076,8 +4171,18 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // without requiring mouse movement.
         let component_connection_animating =
             panel.component.get_connection_status().as_str() == "Connecting...";
+        // recoverable-attach-fix: Settings > Agents "Attach" (symptom #2)
+        // -- same gap `busy_mcp_server_animating` above was added to
+        // close for the MCP-servers rows: `RemoteSessionOption.busy` is
+        // real per-row state now (`recover_session_operations_in_
+        // flight`), but without an explicit busy-thread reason here the
+        // Attach button's Spinner only got one correct frame at
+        // click-time and then froze until unrelated mouse movement.
+        let busy_recover_session_animating =
+            !panel.model.borrow().recover_session_operations_in_flight.is_empty();
         let busy_animation = busy_thread_animating
             || busy_mcp_server_animating
+            || busy_recover_session_animating
             || component_connection_animating;
         let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software
@@ -4477,6 +4582,16 @@ mod keyboard_shortcut_tests {
 
     impl TestPanel {
         fn new() -> Self {
+            Self::new_with_size(240, 260)
+        }
+
+        /// Same as `new()` but with a caller-chosen window size --
+        /// provider_trigger_full_width_click_sweep_opens_popup_wide uses
+        /// a width >= 320px so `chat_input_layout.slint`'s `row2-compact` is false
+        /// and the Provider trigger renders at its normal 72..140px
+        /// width (with the full "Provider \u{203a}" label) instead of
+        /// the 56px narrow-dock variant `new()`'s 240px window forces.
+        fn new_with_size(width: u32, height: u32) -> Self {
             let cache_dir = tempfile::tempdir().expect("cache dir");
             let previous_env = [
                 (
@@ -4497,8 +4612,8 @@ mod keyboard_shortcut_tests {
             let project_path = cache_dir.path().join("test-panel.mlt");
             let project_path = project_path.to_string_lossy().into_owned();
             let handle = panel_rust_create_with_identity(
-                240,
-                260,
+                width,
+                height,
                 project_path.as_ptr(),
                 project_path.len(),
                 false,
@@ -4610,6 +4725,7 @@ mod keyboard_shortcut_tests {
             description: "".into(),
             closed: false,
             archived: false,
+            unread: false,
             provider: "".into(),
             model: "".into(),
             project_name: "".into(),
@@ -4909,6 +5025,274 @@ mod keyboard_shortcut_tests {
             "a real Ctrl+A-then-Ctrl+C chord on the compose box's full selection must reach \
              SpikePlatform::set_clipboard_text with exactly the selected text"
         );
+    }
+
+    /// Regression test for `e94f105a` (fix(panel-rust): make full
+    /// ChatInputLayout selector trigger clickable). That fix added a
+    /// `clicked` handler to `SearchableDropdown`'s `label-scroll`
+    /// TouchArea (searchable_dropdown.slint), which sits on top of
+    /// `trigger-touch` for the label region of every compose-bar
+    /// dropdown trigger (mode/config/profile/reasoning). A TouchArea
+    /// absorbs the pointer event over its bounds regardless of which
+    /// callbacks it defines, so without a `clicked` handler there,
+    /// clicks over the label silently went nowhere -- only the small
+    /// arrow-icon sliver outside `label-scroll-host`'s bounds ever
+    /// reached `trigger-touch` underneath.
+    ///
+    /// e94f105a's own commit report says it was verified only via
+    /// `cargo check` -- never a live click -- which is exactly how a
+    /// second, unrelated regression could silently re-break the same
+    /// spot later without anyone noticing (`cargo check` can't catch a
+    /// dead click zone). This test closes that gap for good: it drives
+    /// a real click through `panel_rust_input_click` (the exact FFI
+    /// entry point the shipped Qt host calls on a genuine mouse click,
+    /// not a bypassed/direct WindowEvent dispatch) at a coordinate
+    /// specifically inside the trigger's LABEL region -- not the
+    /// trigger's bounding-box center, not the arrow -- and asserts the
+    /// popup actually opens.
+    #[test]
+    fn mode_dropdown_label_region_click_opens_the_popup() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "ask".into(),
+                label: "ask".into(),
+                value: "".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "code".into(),
+                label: "code".into(),
+                value: "".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_mode_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+        component.set_mode_trigger_label("ask".into());
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "ask")
+            .next()
+            .expect("mode-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+
+        // Sanity check this test actually exercises something: before any
+        // click, the popup's option rows are unmounted (invisible) and
+        // must not be found by accessible-label lookup (which skips
+        // invisible subtrees -- see ElementHandle::find_by_accessible_
+        // label's own doc comment / is_visible() gate).
+        assert!(
+            ElementHandle::find_by_accessible_label(&component, "code")
+                .next()
+                .is_none(),
+            "mode popup must start closed"
+        );
+
+        // Click well inside the LABEL region specifically: `label-scroll-
+        // host` starts at the trigger's left edge + Metrics.space-3
+        // (6px) and covers most of the trigger's width, leaving only a
+        // narrow left-padding strip and the right-side arrow/padding
+        // strip to `trigger-touch` alone (see searchable_dropdown.slint's
+        // HorizontalLayout: label-scroll-host is horizontal-stretch: 1,
+        // the arrow is horizontal-stretch: 0). 30% across the trigger's
+        // width lands solidly inside that label band across every width
+        // this trigger ever renders at (56px compact .. 140px max).
+        let x = position.x + size.width * 0.3;
+        let y = position.y + size.height / 2.0;
+        assert!(
+            panel_rust_input_click(panel.handle, x as c_uint, y as c_uint),
+            "click on the mode-dropdown trigger's label region must reach the real \
+             input-click FFI"
+        );
+
+        assert!(
+            ElementHandle::find_by_accessible_label(&component, "code")
+                .next()
+                .is_some(),
+            "clicking the trigger's label region must open the mode popup -- if this fails, \
+             e94f105a's label-scroll `clicked` handler has regressed (or the whole-trigger \
+             fix was never actually complete)"
+        );
+    }
+
+    /// Follow-up on fb5b8b57 (test(panel-rust): live-verify e94f105a's
+    /// whole-trigger dropdown click fix), which live-tested a single
+    /// point 30% across the trigger's width. A later report claimed
+    /// clicking directly on the rendered "Provider" glyphs (as opposed to
+    /// an arbitrary point inside the label region's bounding box) still
+    /// does not open the dropdown. Rather than guess at one more point,
+    /// this sweeps the ENTIRE trigger width in 4%-of-width steps (25
+    /// points) and asserts every single one opens the popup via the real
+    /// `panel_rust_input_click` FFI entry point -- the same one the
+    /// shipped Qt host calls on a genuine mouse click. This is the
+    /// 56px-wide `row2-compact` narrow-dock trigger variant (the default
+    /// `TestPanel::new()` window is 240px wide, well under
+    /// chat_input_layout.slint's 320px `row2-compact` threshold); see
+    /// `..._wide` below for the normal 72px+ variant with the full
+    /// "Provider \u{203a}" label.
+    ///
+    /// Result at this branch's tip: every sampled point across the full
+    /// width opens the popup -- no dead zone was found under the
+    /// rendered label glyphs specifically, or anywhere else on the
+    /// trigger. This reaffirms fb5b8b57's finding with much finer
+    /// resolution than its single sample point.
+    #[test]
+    fn provider_trigger_full_width_click_sweep_opens_popup() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "claude-acp".into(),
+                label: "claude-acp".into(),
+                value: "claude".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "codex-acp".into(),
+                label: "codex-acp".into(),
+                value: "codex".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_profile_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+        // profile-trigger-label empty => trigger-label falls back to
+        // "Provider \u{203a}" per chat_input_layout.slint line 187.
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "Provider \u{203a}")
+            .next()
+            .expect("profile-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+        eprintln!(
+            "DIAG trigger absolute_position=({}, {}) size=({}, {})",
+            position.x, position.y, size.width, size.height
+        );
+
+        let y = position.y + size.height / 2.0;
+        let mut frac = 0.02_f32;
+        while frac < 1.0 {
+            let x = position.x + size.width * frac;
+            let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(!opened_before, "popup must be closed before each sweep click");
+
+            let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            assert!(
+                ffi_ok,
+                "click at frac={frac} (rel_x={:.1}px) must reach the real input-click FFI",
+                x - position.x
+            );
+            let popup_opened = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                popup_opened,
+                "click at frac={frac} (rel_x={:.1}px) did not open the popup -- dead zone found \
+                 under the trigger at this x offset",
+                x - position.x
+            );
+
+            // Reset for next sample: click the exact same point again --
+            // toggle-popup() is symmetric, so this closes it back up
+            // without selecting a row (row-touch sits inside the popup
+            // at a totally different y, not at this trigger's y).
+            let closed_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            let still_open = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                closed_ok && !still_open,
+                "failed to re-close popup after sweep click at frac={frac}"
+            );
+            frac += 0.04;
+        }
+    }
+
+    /// Same sweep as `provider_trigger_full_width_click_sweep_opens_popup`
+    /// but at a window width >= 320px so `row2-compact` is false and the
+    /// trigger renders with the full "Provider \u{203a}" label at its
+    /// normal 72..140px width, not the 56px narrow-dock variant.
+    #[test]
+    fn provider_trigger_full_width_click_sweep_opens_popup_wide() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new_with_size(800, 400);
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "claude-acp".into(),
+                label: "claude-acp".into(),
+                value: "claude".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "codex-acp".into(),
+                label: "codex-acp".into(),
+                value: "codex".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_profile_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "Provider \u{203a}")
+            .next()
+            .expect("profile-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+
+        let y = position.y + size.height / 2.0;
+        let mut frac = 0.02_f32;
+        while frac < 1.0 {
+            let x = position.x + size.width * frac;
+            let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(!opened_before, "popup must be closed before each sweep click");
+
+            let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            assert!(
+                ffi_ok,
+                "click at frac={frac} (rel_x={:.1}px) must reach the real input-click FFI",
+                x - position.x
+            );
+            let popup_opened = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                popup_opened,
+                "click at frac={frac} (rel_x={:.1}px) did not open the popup -- dead zone found \
+                 under the trigger at this x offset",
+                x - position.x
+            );
+
+            let closed_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            let still_open = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                closed_ok && !still_open,
+                "failed to re-close popup after sweep click at frac={frac}"
+            );
+            frac += 0.04;
+        }
     }
 }
 

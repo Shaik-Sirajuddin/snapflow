@@ -34,6 +34,26 @@ export component TextField inherits Rectangle {
     // reaching Slint.
     out property <bool> has-focus: field-input.has-focus;
 
+    // Explicit fill-parent default -- this Rectangle's only children
+    // (the placeholder `Text` and `field-input`) are free-positioned via
+    // `x`/`y`, not laid out through an inner `*Layout`, so it has no
+    // intrinsic content size of its own for a layout parent to infer.
+    // Every call site that happens to also set its own `width:
+    // parent.width` (the tools-search field here, `SettingsSearchBar`
+    // elsewhere) renders fine; every call site that omits it (MCP
+    // server name/command/args/url/oauth/timeout, agent default-profile/
+    // permission-profile -- the majority of this component's actual
+    // uses) collapsed to a ~0px-wide box: no visible border (nothing to
+    // draw a 1px edge around) and no visible placeholder (its own width
+    // is `parent.width - 2 * pad`, i.e. also ~0). Confirmed live via the
+    // Slint debug MCP server: the MCP add-server form's fields were
+    // entirely absent from the window's element tree even though their
+    // `SettingsField` caption `Text` siblings rendered normally.
+    // Defaulting to full width here fixes every existing call site that
+    // forgot it and is a no-op for the ones that already set it
+    // explicitly (an instance-level binding always wins over this
+    // component-level default).
+    width: 100%;
     height: 26px;
     background: Theme.bg-sidebar;
     border-width: 1px;

@@ -60,8 +60,7 @@
 use crate::conversation::ConversationState;
 use crate::gateway_actor::{
     spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_delayed_gateway_and_pool,
-    spawn_acpx_thread_with_gateway, AcpxThreadGatewaySetter, AcpxThreadHandle,
-    GatewaySessionOpener, SharedSessionPool,
+    AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
     JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
@@ -501,6 +500,17 @@ pub struct AgentBridge {
     /// an agent id and an MCP server name can never collide on the same
     /// key by coincidence.
     mcp_operations: Arc<Mutex<HashSet<String>>>,
+    /// recoverable-attach-fix: remote session ids with a `recover-
+    /// session-attach` `session/load` currently in flight (Settings >
+    /// Agents "Attach" button, symptom #2 -- the row previously had no
+    /// busy-state tracking at all, unlike `agent_operations`/`mcp_
+    /// operations` above). Same shape/lifecycle: `begin_recover_session_
+    /// operation`/`recover_session_operations_in_flight` mirror `begin_
+    /// mcp_operation`/`mcp_operations_in_flight` exactly. Keyed by the
+    /// remote `acp_session_id`, not the local thread id -- a session
+    /// stays a candidate row (and therefore needs its own busy key) right
+    /// up until it disappears from `recoverable_sessions` once bound.
+    recover_session_operations: Arc<Mutex<HashSet<String>>>,
     // PROF-1: the same per-provider URL resolver the constructor used to
     // seed `gateway_urls` up front, kept around so a provider nobody
     // asked for at construction time (any real agent id, not just a
@@ -3806,6 +3816,7 @@ impl AgentBridge {
             gateway_catalog_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
             mcp_operations: Arc::new(Mutex::new(HashSet::new())),
+            recover_session_operations: Arc::new(Mutex::new(HashSet::new())),
             resolve_gateway,
             default_provider,
             store,
@@ -4658,6 +4669,38 @@ impl AgentBridge {
     /// [`Self::add_thread_with_profile`]'s own cached-session-resume
     /// branch already establishes for a different trigger (local jsonl
     /// cache instead of a picked remote session).
+    ///
+    /// recoverable-attach-fix: this used to resolve the gateway and run
+    /// `session/load` via two `self.runtime.block_on(..)` calls right
+    /// here, on whatever thread called this method -- the Slint "Attach"
+    /// button's click handler, i.e. the UI thread. That froze the whole
+    /// app for the full round trip (and up to a 10s gateway-wait on top).
+    /// Every other attach path in this file (`add_thread_deferred`'s
+    /// eventual `attach_deferred_thread`, `add_thread_with_profile_and_
+    /// provider`) claims its slot's index synchronously (cheap: name
+    /// dedup + a `HashMap` lookup) and then does the real network work on
+    /// `self.runtime` via `spawn_background_attachment`, in the
+    /// background. This method now follows the identical shape, using
+    /// the same delayed-gateway handle (`spawn_acpx_thread_with_delayed_
+    /// gateway`) `build_slot` uses for its own non-pool branch, so the
+    /// slot is pushed -- and this call returns -- before any RPC ever
+    /// starts. The slot starts with `AttachmentState::default()`
+    /// (`complete: false`), exactly like every other in-flight attach;
+    /// `external_snapshot.rs`'s existing "no binding yet, not deferred"
+    /// check already renders such a slot as a loading/"Starting new
+    /// thread..." row with zero additional wiring (see its own "eager/
+    /// recovered" comment, which already anticipated this path), and
+    /// `wait_for_attachment` already makes a `send_prompt` issued before
+    /// attachment completes wait for it in the background rather than
+    /// erroring or blocking the caller.
+    ///
+    /// Deliberately does NOT reuse `spawn_background_attachment` itself:
+    /// that function's `requested_session_id` branch falls back to a
+    /// brand-new `session/new` if `session/load` fails for a non-auth
+    /// reason, which would silently violate this method's own contract
+    /// ("never `session/new`") the moment a picked-from-`session/list`
+    /// session id turned out to be stale/gone -- exactly the case a
+    /// recovery flow most needs to fail loudly on, not paper over.
     pub fn add_thread_recovering_session(
         &mut self,
         name: &str,
@@ -4676,40 +4719,67 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let base_url =
-            self.gateway_urls.get(provider).cloned().ok_or_else(|| {
-                BridgeError::Gateway(format!("gateway URL missing for {provider}"))
-            })?;
-        let gateways = self.gateways.clone();
-        let gateway = self.runtime.block_on(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if let Some(gateway) = gateways
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&base_url)
-                    .cloned()
-                {
-                    return Ok(gateway);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(BridgeError::Gateway(format!(
-                        "gateway connection missing for {base_url}"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let base_url = match self.gateway_urls.get(provider).cloned() {
+            Some(base_url) => base_url,
+            None => {
+                return Err(BridgeError::Gateway(format!(
+                    "gateway URL missing for {provider}"
+                )))
             }
-        })?;
+        };
+        // Marked busy from this point on (a real attach is about to
+        // start) through the background task's completion below --
+        // covers both the success and error exits, symmetric with `end_
+        // recover_session_operation` at the bottom of the spawned task.
+        self.begin_recover_session_operation(session_id);
 
         // Deliberately does not consult the local jsonl cache for
         // `thread_id` -- this is a *new* local thread identity being
         // bound to a pre-existing *remote* session, not a reopen of a
         // thread this panel already knew about (that path is `add_
         // thread_with_profile`'s own `cached_session_id` branch).
-        let mut handle = {
+        //
+        // Same delayed-gateway construction `build_slot`'s non-pool
+        // branch uses: the handle is usable immediately (queues its
+        // first command until a gateway is set), so nothing here needs
+        // to wait -- synchronously if already connected, or via a
+        // background poll loop (identical to `build_slot`'s own) if the
+        // gateway's `Gateway::connect` task from the constructor hasn't
+        // resolved yet.
+        let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread_with_gateway(gateway)
+            spawn_acpx_thread_with_delayed_gateway()
         };
+        match self
+            .gateways
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&base_url)
+            .cloned()
+        {
+            Some(gateway) => gateway_setter.set_gateway(gateway),
+            None => {
+                let gateways = self.gateways.clone();
+                self.runtime.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Some(gateway) = gateways
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&base_url)
+                            .cloned()
+                        {
+                            gateway_setter.set_gateway(gateway);
+                            return;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+            }
+        }
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
         let project_path_for_slot = self
@@ -4739,10 +4809,14 @@ impl AgentBridge {
             available_commands: Mutex::new(Vec::new()),
             plan: Mutex::new(Vec::new()),
             session_title: Mutex::new(None),
-            attachment: Mutex::new(AttachmentState {
-                complete: true,
-                error: None,
-            }),
+            // Not yet attached: `session/load` hasn't even been sent
+            // yet, let alone completed. `wait_for_attachment` (used by
+            // `send_prompt`/`cancel_prompt`) blocks on this in the
+            // background until the task below calls `complete_
+            // attachment`, and `external_snapshot.rs`'s thread-list
+            // hydration already renders a slot in this state as a
+            // loading row.
+            attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(false),
@@ -4750,62 +4824,116 @@ impl AgentBridge {
             deferred: false,
             background: Mutex::new(false),
         });
+        self.slots.push(slot.clone());
 
-        // `slot.project_path` (not `self.session_cwd_override` directly) so
-        // this cwd -- and the MCP `--project-dir` below -- can never
-        // disagree with what was just recorded on the slot a few lines
-        // above (PISO-4): both trace back to the same `project_path_for_
-        // slot` snapshot taken before construction, not an independent
-        // re-read of the global that could have moved since.
-        let slot_project_path = slot.project_path_snapshot();
-        let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
-        let project_dir =
-            thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), provider);
-        self.runtime
-            .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
-            .map_err(|error| BridgeError::Gateway(error.to_string()))?;
-        *slot
-            .acp_session_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
-        persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
+        let session_id = session_id.to_string();
+        let store = self.store.clone();
+        let session_cwd_override = self.session_cwd_override.clone();
+        let events_out = self.events.clone();
+        let recover_session_operations = self.recover_session_operations.clone();
+        self.runtime.spawn(async move {
+            // `slot.project_path` (not `session_cwd_override` directly) so
+            // this cwd -- and the MCP `--project-dir` below -- can never
+            // disagree with what was just recorded on the slot above
+            // (PISO-4): both trace back to the same snapshot, not an
+            // independent re-read of the global that could have moved
+            // since.
+            let slot_project_path = slot.project_path_snapshot();
+            let cwd = cwd_for_session(slot_project_path.as_deref(), &session_cwd_override);
+            let project_dir =
+                thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
+            let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), &slot.provider);
+            match handle
+                .resume_session(session_id.clone(), cwd, mcp_servers)
+                .await
+            {
+                Ok(()) => {
+                    *slot
+                        .acp_session_id
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
+                    persist_thread_snapshot(store.as_ref(), &slot, now_token());
 
-        // `resume_session`'s own replayed `session/update` history has
-        // already fully arrived on `events_rx` by the time the call
-        // above returns (it drains to a real ACP response before
-        // `AcpxThreadHandle::resume_session` resolves -- see that
-        // method's own actor-loop implementation) -- drain it now into
-        // this brand-new slot's `history`, same `try_recv` sweep
-        // `add_thread_with_profile`'s own cached-resume branch uses,
-        // before handing the receiver off to the continuous forwarder
-        // for anything that arrives afterward.
-        let mut replayed_any = false;
-        while let Ok(event) = events_rx.try_recv() {
-            if let AgentEvent::Message(message) = event {
-                slot.history
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(message.clone());
-                replayed_any = true;
-                if let Some(store) = &self.store {
-                    let _ = store.append(&slot.thread_id, &message);
+                    // `resume_session`'s own replayed `session/update`
+                    // history -- AND the capability events (`session/
+                    // load`'s own `configOptions`/`modes`, emitted via
+                    // `emit_capability_events` before the RPC resolves --
+                    // see `Command::ResumeSession`'s handler) -- have
+                    // already fully arrived on `events_rx` by the time
+                    // the call above returns. Drain both into this
+                    // brand-new slot's state now, before handing the
+                    // receiver off to the continuous forwarder for
+                    // anything that arrives afterward. Previously this
+                    // drain only matched `AgentEvent::Message`, silently
+                    // dropping every `ConfigOptions`/`SessionModes`/etc.
+                    // event already queued here -- the recovered
+                    // thread's compose bar never got a provider/model
+                    // dropdown because the one and only capability event
+                    // `session/load` ever emits for it was thrown away
+                    // right here, before the forwarder task (which DOES
+                    // handle those variants via `store_capability_event`)
+                    // ever got a chance to see it.
+                    let mut replayed_any = false;
+                    while let Ok(event) = events_rx.try_recv() {
+                        match &event {
+                            AgentEvent::Message(message) => {
+                                slot.history
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(message.clone());
+                                replayed_any = true;
+                                if let Some(store) = &store {
+                                    let _ = store.append(&slot.thread_id, message);
+                                }
+                            }
+                            AgentEvent::SessionModes(_)
+                            | AgentEvent::CurrentModeChanged(_)
+                            | AgentEvent::ConfigOptions(_)
+                            | AgentEvent::AvailableCommands(_)
+                            | AgentEvent::PlanUpdate(_)
+                            | AgentEvent::SessionInfoUpdate { .. } => {
+                                store_capability_event(&slot, &event);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if replayed_any {
+                        refresh_transcript(&slot);
+                    }
+                    complete_attachment(&slot, None);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "session/load failed for recovered session {session_id:?}: {error}"
+                    );
+                    complete_attachment(&slot, Some(message.clone()));
+                    events_out
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(message),
+                        });
                 }
             }
-        }
-        if replayed_any {
-            refresh_transcript(&slot);
-        }
-
-        spawn_event_forwarder(
-            &self.runtime.handle().clone(),
-            events_rx,
-            self.events.clone(),
-            self.store.clone(),
-            slot.clone(),
-            idx,
-        );
-        self.slots.push(slot);
+            // Symmetric with `begin_recover_session_operation` above --
+            // covers both the `Ok` and `Err` arms, so the Settings >
+            // Agents row's spinner (`RemoteSessionOption.busy`, sourced
+            // from `recover_session_operations_in_flight`) clears the
+            // instant this attach settles, success or failure alike.
+            recover_session_operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&session_id);
+            spawn_event_forwarder(
+                &tokio::runtime::Handle::current(),
+                events_rx,
+                events_out,
+                store,
+                slot,
+                idx,
+            );
+        });
         Ok(idx)
     }
 
@@ -4862,6 +4990,23 @@ impl AgentBridge {
             .get(idx)
             .map(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .unwrap_or_default()
+    }
+
+    /// Just the last message of a thread's scrollback, if any -- O(1)
+    /// relative to that thread's history length, unlike `history()` which
+    /// clones the entire `Vec<ChatMessage>`. Used by per-frame snapshot
+    /// paths (e.g. the sidebar's one-line description) that only ever
+    /// look at the final message and must not scale with a thread's total
+    /// message count, since those paths run on every poll tick for every
+    /// thread regardless of which thread (if any) is actively sending.
+    pub fn last_message(&self, idx: usize) -> Option<ChatMessage> {
+        self.slots.get(idx).and_then(|s| {
+            s.history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
+        })
     }
 
     /// The durable identity of an already-open thread, used by the panel's
@@ -5786,6 +5931,31 @@ impl AgentBridge {
     /// key ending in `:<name>`.
     pub fn mcp_operations_in_flight(&self) -> Vec<String> {
         self.mcp_operations
+            .try_lock()
+            .map(|operations| operations.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// recoverable-attach-fix: marks `session_id` busy for the duration
+    /// of its `recover-session-attach` `session/load`. Mirrors `begin_
+    /// mcp_operation`'s own contract; the key is removed again once the
+    /// background attach task completes (success or error) -- inlined
+    /// there directly (via a cloned `Arc`) rather than through a `&self`
+    /// method, since that task runs detached from any `AgentBridge`
+    /// borrow.
+    fn begin_recover_session_operation(&self, session_id: &str) {
+        self.recover_session_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_owned());
+    }
+
+    /// Non-blocking read, safe to call every frame poll -- same contract
+    /// as [`Self::mcp_operations_in_flight`]. Keys are bare remote
+    /// `acp_session_id`s (never composite like the MCP/agent sets above,
+    /// since a session id alone is already unique).
+    pub fn recover_session_operations_in_flight(&self) -> Vec<String> {
+        self.recover_session_operations
             .try_lock()
             .map(|operations| operations.iter().cloned().collect())
             .unwrap_or_default()
@@ -8697,8 +8867,20 @@ mod tests {
         let recovered_idx = bridge
             .add_thread_recovering_session("Recovered Thread", "codex", &orphan_session_id)
             .expect("add_thread_recovering_session");
+        // recoverable-attach-fix: the attach itself (gateway resolution +
+        // `session/load`) now runs on the background runtime instead of
+        // blocking this call, so the binding is not necessarily present
+        // the instant `add_thread_recovering_session` returns -- poll for
+        // it with a deadline, same convention every other event-driven
+        // assertion in this module already follows.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut binding = bridge.thread_binding(recovered_idx);
+        while std::time::Instant::now() < deadline && binding.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            binding = bridge.thread_binding(recovered_idx);
+        }
         assert_eq!(
-            bridge.thread_binding(recovered_idx).map(|b| b.session_id),
+            binding.map(|b| b.session_id),
             Some(orphan_session_id.clone()),
             "the recovered thread must bind to the orphan's own session id, not a new one"
         );

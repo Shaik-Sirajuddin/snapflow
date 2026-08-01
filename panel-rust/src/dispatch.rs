@@ -62,6 +62,24 @@ fn execute_thread_lifecycle_effect(
             }
             None
         }
+        // recoverable-attach-fix: `add_thread_recovering_session` used to
+        // run `session/load` synchronously (via `self.runtime.block_on`)
+        // before returning, so a binding was always present by the time
+        // control came back here -- a missing one meant a real error.
+        // Now the attach happens in the background (same shape as
+        // `NewThreadDeferred`'s own eventual attach), so `thread_binding`
+        // is expected to still be `None` immediately after a *successful*
+        // call: that's the normal "attach in flight" state, not a
+        // failure. Mirror `NewThreadDeferred`'s own `None` return here --
+        // there is no `SessionAttached` result to fold yet. The row
+        // renders as a loading placeholder (external_snapshot.rs's
+        // existing "no binding yet, not deferred" check already covers
+        // this), and `hydrate_thread_ids_from_bridge` picks up the real
+        // session id every frame once the background task completes. A
+        // failed attach still surfaces promptly: `complete_attachment`'s
+        // error queues a real `AgentEvent::Error` that the next frame's
+        // `bridge.poll()` turns into the thread's error state the same
+        // way any other agent-originated failure does.
         crate::effect::Effect::RecoverSessionAttach {
             real_index,
             session_id,
@@ -77,42 +95,17 @@ fn execute_thread_lifecycle_effect(
                         .add_thread_recovering_session(&title, &provider, &session_id)
                         .map_err(|error| crate::effect::EffectError::new(error.to_string()))
                 });
-            let (thread_id, actual_provider, result) = match result {
-                Ok(real_idx) => {
-                    let binding = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_binding(real_idx));
-                    let actual_provider = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_provider(real_idx));
-                    match binding {
-                        Some(binding) => (
-                            Some(binding.thread_id),
-                            actual_provider,
-                            Ok(binding.session_id),
-                        ),
-                        None => (
-                            None,
-                            actual_provider,
-                            Err(crate::effect::EffectError::new(
-                                "bridge created a recovery slot without a session binding",
-                            )),
-                        ),
-                    }
-                }
-                Err(error) => (None, None, Err(error)),
-            };
-            let result = result.map_err(|error| {
-                crate::effect::EffectError::new(format!("recovery thread {real_index}: {error}"))
-            });
-            Some(crate::effect::EffectResultMsg::SessionAttached {
-                real_index,
-                thread_id,
-                provider: actual_provider,
-                result,
-            })
+            match result {
+                Ok(_real_idx) => None,
+                Err(error) => Some(crate::effect::EffectResultMsg::SessionAttached {
+                    real_index,
+                    thread_id: None,
+                    provider: None,
+                    result: Err(crate::effect::EffectError::new(format!(
+                        "recovery thread {real_index}: {error}"
+                    ))),
+                }),
+            }
         }
         other => panic!("unexpected lifecycle effect: {other:?}"),
     }

@@ -223,6 +223,7 @@ pub(crate) fn visible_thread_row(
             open: true,
             closed: thread.closed,
             archived: thread.archived,
+            unread: thread.unread,
             profile_name: thread.profile_name.clone().unwrap_or_default().into(),
             has_session: thread.session_id.is_some(),
             description: cached
@@ -318,6 +319,21 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
         // observable message model already contains B's rows, so switching
         // does not install/copy a list into a shared model.
         model.displayed_thread = real_idx;
+
+        // thread-unread-state: becoming the displayed thread IS being read.
+        // This app has no separate render-completion signal -- the retained
+        // ChatView's message model already holds this thread's rows, so the
+        // switch above is the moment its content is on screen. Clearing here
+        // (rather than in ThreadMsg::Selected) covers every selection path:
+        // sidebar click, keyboard NavigateDelta, and programmatic selection.
+        if let Some(idx) = real_idx {
+            if model.threads.get(idx).is_some_and(|thread| thread.unread) {
+                if let Some(thread) = model.threads.get_mut(idx) {
+                    thread.unread = false;
+                }
+                dirty.push(thread_row_dirty(model, idx));
+            }
+        }
 
         let target_id = real_idx
             .and_then(|idx| model.threads.get(idx))
@@ -1770,6 +1786,13 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 ],
             )
         }
+        ChromeMsg::CompleteOnboarding => {
+            model.onboarding_completed = true;
+            if let Err(err) = crate::settings_file::SettingsPaths::from_env().set_onboarding_completed(true) {
+                eprintln!("panel-rust: failed to save onboarding_completed: {err}");
+            }
+            (vec![], vec![Dirty::Settings])
+        }
     }
 }
 
@@ -2374,6 +2397,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
 fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect>, Vec<Dirty>) {
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
+    // Captured before the fold: no arm below changes which thread is
+    // displayed, and the mutable borrow of `model.threads` inside the loop
+    // rules out reading it there.
+    let displayed_thread = model.displayed_thread;
+    let mut unread_marked: Vec<usize> = Vec::new();
     for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
         let Some(target_index) = frame
             .bridge_event_thread_ids
@@ -2418,6 +2446,18 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 ) && !is_status_only
                 {
                     thread.agent_content_this_turn = true;
+                    // thread-unread-state: same "real visible agent output"
+                    // gate as above (thinking chunks and reconnect/status
+                    // spam are not content the user missed). A thread the
+                    // user is looking at is being read as it streams, so it
+                    // must never flip -- hence the displayed_thread guard.
+                    // This arm only ever sees live bridge deltas; restored
+                    // history is hydrated through thread snapshots, so
+                    // replay cannot manufacture an unread thread.
+                    if displayed_thread != Some(target_index) && !thread.unread {
+                        thread.unread = true;
+                        unread_marked.push(target_index);
+                    }
                 }
                 thread.last_activity_time = Some(std::time::Instant::now());
                 // Hard transport failures often arrive as ordinary agent
@@ -2563,6 +2603,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 });
             }
         }
+    }
+    // Repainting the sidebar dot needs a ThreadRow, which the Message arm
+    // does not emit (it only pushes MessageAppended, for the transcript).
+    // Deferred out of the loop because `thread_row_dirty` borrows the model
+    // immutably while the fold holds it mutably.
+    for real_index in unread_marked {
+        dirty.push(thread_row_dirty(model, real_index));
     }
     if frame.bridge_events_pending {
         dirty.push(Dirty::MessagesDiff {
@@ -2752,6 +2799,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         model.mcp_operations_in_flight = frame.mcp_operations_in_flight;
         dirty.push(Dirty::Settings);
     }
+    if model.recover_session_operations_in_flight != frame.recover_session_operations_in_flight {
+        model.recover_session_operations_in_flight = frame.recover_session_operations_in_flight;
+        dirty.push(Dirty::Settings);
+    }
     if let Some(snapshot) = frame.settings_preferences_snapshot {
         let changed = model.settings_scope != snapshot.scope
             || model.default_profile != snapshot.default_profile
@@ -2861,21 +2912,59 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
-            let old_rows = model
-                .thread_view_models
-                .rows(&thread_id)
-                .unwrap_or_default();
             // Include send-queue rows (QueuedMessageBar) in the projection.
             let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
-            let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
-                snapshot.transcript.clone(),
-                &expanded,
-                &thread.send_queue,
-                in_flight,
-                &mut *thread.markdown_render_index.borrow_mut(),
-            );
-            // Preserve expand-by-key across re-project (live poll + switch).
-            merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
+            let queue_state = (thread.send_queue.clone(), in_flight);
+            // The frame poll runs at 60-90fps and collects `snapshot.
+            // transcript` every tick regardless of whether it changed (see
+            // `ExternalSnapshotSource::collect_thread_snapshot_for`'s doc
+            // comment). Rebuilding rows from scratch on every such tick re-
+            // clones the whole transcript and re-parses every tool row's
+            // `raw_input` JSON (`to_message_rows_from_transcript`'s
+            // `serde_json::from_str` call) even when nothing about this
+            // thread changed since the last tick. When the transcript AND
+            // the queue/in-flight state that also feed the projection are
+            // both unchanged since the rows currently installed in
+            // `thread_view_models` were built, reuse those rows (cheap
+            // `Rc`-backed clones) instead of re-projecting from scratch.
+            let rows_unchanged = !switched_thread
+                && thread.transcript == snapshot.transcript
+                && thread.rows_synced_with.as_ref() == Some(&queue_state);
+            let (rows, new_keys) = if rows_unchanged {
+                match model.thread_view_models.rows(&thread_id) {
+                    Some(cached_rows) if cached_rows.len() == old_keys.len() => {
+                        (cached_rows, old_keys.clone())
+                    }
+                    // Retained model and this thread's own key cache have
+                    // desynced (should not happen; defensive only, mirrors
+                    // `list_model::reconcile`'s own self-heal). Fall back to
+                    // a full rebuild rather than serving a mismatched row
+                    // list.
+                    _ => crate::models::message_rows_for_thread_with_state(
+                        snapshot.transcript.clone(),
+                        &expanded,
+                        &thread.send_queue,
+                        in_flight,
+                        &mut *thread.markdown_render_index.borrow_mut(),
+                    ),
+                }
+            } else {
+                let old_rows = model
+                    .thread_view_models
+                    .rows(&thread_id)
+                    .unwrap_or_default();
+                let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
+                    snapshot.transcript.clone(),
+                    &expanded,
+                    &thread.send_queue,
+                    in_flight,
+                    &mut *thread.markdown_render_index.borrow_mut(),
+                );
+                // Preserve expand-by-key across re-project (live poll + switch).
+                merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
+                (rows, new_keys)
+            };
+            thread.rows_synced_with = Some(queue_state);
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
             // A brand new thread's own cache is empty both before and
@@ -4631,6 +4720,74 @@ mod tests {
         assert_eq!(model.threads[0].send_queue.len(), 1);
     }
 
+    /// thread-unread-state: one agent message delivered to `thread_index`,
+    /// carrying the durable id `update_frame` actually resolves against.
+    fn agent_message_frame(thread_index: usize, text: &str) -> FrameInput {
+        FrameInput {
+            bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                thread_index,
+                event: crate::protocol_types::AgentEvent::Message(
+                    crate::protocol_types::ChatMessage {
+                        kind: crate::protocol_types::MessageKind::Agent,
+                        text: text.to_owned(),
+                        status: None,
+                        id: Some(format!("msg-{thread_index}")),
+                        raw_input: None,
+                        raw_output: None,
+                    },
+                ),
+            }],
+            bridge_event_thread_ids: vec![format!("thread-{thread_index}")],
+            ..FrameInput::default()
+        }
+    }
+
+    #[test]
+    fn agent_content_marks_a_non_displayed_thread_unread() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        let (_effects, dirty) = update(&mut model, Msg::Frame(agent_message_frame(1, "reply")));
+        assert!(
+            model.threads[1].unread,
+            "content for a thread the user is not looking at must mark it unread"
+        );
+        assert!(!model.threads[0].unread);
+        assert!(
+            dirty.contains(&Dirty::ThreadRow {
+                thread_id: "thread-1".to_owned()
+            }),
+            "the sidebar row must be repainted so the dot turns blue, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn agent_content_never_marks_the_displayed_thread_unread() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        let _ = update(&mut model, Msg::Frame(agent_message_frame(0, "streaming")));
+        assert!(
+            !model.threads[0].unread,
+            "a thread streaming its reply in front of the user is being read, not missed"
+        );
+    }
+
+    #[test]
+    fn selecting_an_unread_thread_marks_it_read() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.displayed_thread = Some(0);
+        let _ = update(&mut model, Msg::Frame(agent_message_frame(1, "reply")));
+        assert!(model.threads[1].unread);
+
+        let (_effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        assert!(
+            !model.threads[1].unread,
+            "displaying a thread is reading it -- the dot must go back to muted"
+        );
+        assert!(dirty.contains(&Dirty::ThreadRow {
+            thread_id: "thread-1".to_owned()
+        }));
+    }
+
     #[test]
     fn cancelled_empty_turn_never_fires_the_empty_turn_notice() {
         // Interaction between setup-followups' queue-stop semantics and
@@ -5003,6 +5160,7 @@ mod tests {
                     thread_states: vec![],
                     startup_warnings: vec![],
                     send_queues: vec![],
+                    onboarding_completed: false,
                 },
             ))),
         );
@@ -5050,6 +5208,7 @@ mod tests {
                         "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
                     ],
                     send_queues: vec![],
+                    onboarding_completed: false,
                 },
             ))),
         );
@@ -5281,6 +5440,7 @@ mod tests {
                 settings_preferences_snapshot: None,
                 agent_operations_in_flight: Vec::new(),
                 mcp_operations_in_flight: Vec::new(),
+                recover_session_operations_in_flight: Vec::new(),
                 skills_snapshot: None,
                 daemon_projects_refresh_due: false,
             }),
