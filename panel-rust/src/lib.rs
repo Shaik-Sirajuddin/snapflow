@@ -3677,6 +3677,30 @@ pub extern "C" fn panel_rust_input_hover_exit(_handle: *mut PanelHandle) -> bool
     true
 }
 
+/// Forwards the host OS window's activation state (`QQuickWindow::
+/// activeChanged`, wired from `RustPanelItem`) into Slint via the real
+/// `WindowEvent::WindowActiveChanged` the platform API defines for exactly
+/// this -- see `i-slint-core`'s `Window::dispatch_event` match arm, which
+/// forwards straight to `WindowInner::set_active`. Candidate fix for a
+/// reported real-desktop bug (source-level investigation only, unconfirmed
+/// on a real machine): Slint's own internal "window active" notion never
+/// received a single update outside of VNC/fluxbox's auto-focus-on-map
+/// behavior papering over it, which may be why most input silently never
+/// reached this panel until an unrelated OS-level window-activate cycle
+/// (alt-tab away and back) "fixed" it. Mirrors `panel_rust_input_hover`'s
+/// PANEL-lookup shape exactly.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_window_active(_handle: *mut PanelHandle, active: bool) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(active));
+    true
+}
+
 /// Forwards a Qt wheel/touchpad gesture in logical pixels. Slint's nested
 /// Flickables consume only the scroll they can apply and automatically bubble
 /// any boundary remainder to their parent surface.
