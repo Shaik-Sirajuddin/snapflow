@@ -144,54 +144,139 @@ cmd_workspace() {
       ;;
     place)
       local pid="${3:?window pid required}" workspace="${4:?workspace number required}"
-      if command -v wmctrl >/dev/null 2>&1; then
-        local window_id=""
-        for _ in $(seq 1 50); do
-          window_id="$(wmctrl -lp 2>/dev/null | awk -v pid="$pid" '$3 == pid { print $1; exit }')"
-          [ -n "$window_id" ] && break
-          sleep 0.1
-        done
-        [ -n "$window_id" ] || die "could not locate window for pid $pid"
-        wmctrl -i -r "$window_id" -t "$workspace"
-        return 0
-      fi
+      # Snapflow/Qt often maps the top-level window to a *child* of the
+      # launcher pid we tracked from setsid/nohup -- exact-pid match misses
+      # it and either never finds the window (wmctrl) or never settles
+      # (python). Match the whole descendant tree of $pid.
+      #
+      # main independently added a wmctrl fast-path here that matches the
+      # launcher pid exactly (`wmctrl -lp | awk '$3 == pid'`) and hard-dies
+      # if it never finds a match within 60s. Deliberately NOT adopted on
+      # reconcile: it reintroduces exactly the exact-pid-match failure mode
+      # documented above, and this branch's own descendant-aware python
+      # matcher (below) already does a wmctrl move as its preferred path
+      # once it has found the real window via descendant pids -- so main's
+      # idea is subsumed correctly rather than dropped.
       command -v python3 >/dev/null 2>&1 || die "python3 is required for X11 workspace placement"
       TARGET_PID="$pid" TARGET_DESKTOP="$workspace" python3 - <<'PY'
 import os
+import time
 from Xlib import X, display
 from Xlib.protocol import event
 
 target_pid = int(os.environ["TARGET_PID"])
 target_desktop = int(os.environ["TARGET_DESKTOP"])
+
+
+def descendant_pids(root_pid: int) -> set[int]:
+    """root_pid plus all currently-running descendants via /proc ppid links."""
+    children: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "r", encoding="utf-8") as fh:
+                # comm can contain spaces/parens; ppid is the field after the
+                # closing paren of comm.
+                data = fh.read()
+            close = data.rfind(")")
+            if close < 0:
+                continue
+            fields = data[close + 2 :].split()
+            ppid = int(fields[1])  # state, ppid, ...
+            children.setdefault(ppid, []).append(int(entry))
+        except (OSError, ValueError, IndexError):
+            continue
+    out = {root_pid}
+    stack = [root_pid]
+    while stack:
+        cur = stack.pop()
+        for child in children.get(cur, []):
+            if child not in out:
+                out.add(child)
+                stack.append(child)
+    return out
+
+
 d = display.Display()
 root = d.screen().root
 client_list_atom = d.intern_atom("_NET_CLIENT_LIST")
 pid_atom = d.intern_atom("_NET_WM_PID")
 desktop_atom = d.intern_atom("_NET_WM_DESKTOP")
-prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
-window_ids = [] if prop is None else prop.value
 target = None
-for window_id in window_ids:
-    window = d.create_resource_object("window", int(window_id))
-    try:
-        pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
-        if pid_prop is not None and int(pid_prop.value[0]) == target_pid:
-            target = window
-            break
-    except Exception:
-        continue
-if target is None:
-    raise SystemExit(f"could not locate X11 window for pid {target_pid}")
-root.send_event(
-    event.ClientMessage(
-        window=target,
-        client_type=desktop_atom,
-        data=(32, [target_desktop, X.CurrentTime, 0, 0, 0]),
-    ),
-    event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+stable = 0
+# Prefer wmctrl for the actual move when present (Fluxbox honors it more
+# reliably than a raw ClientMessage), but always discover the window via
+# descendant pids so we do not require the window's _NET_WM_PID to equal
+# the launcher pid.
+use_wmctrl = os.path.exists("/usr/bin/wmctrl") or any(
+    os.access(os.path.join(p, "wmctrl"), os.X_OK)
+    for p in os.environ.get("PATH", "").split(":")
+    if p
 )
-d.sync()
-print(f"placed pid {target_pid} on workspace {target_desktop}")
+wmctrl_bin = "wmctrl"
+
+for _ in range(600):
+    pids = descendant_pids(target_pid)
+    if target is None:
+        prop = root.get_full_property(client_list_atom, X.AnyPropertyType)
+        window_ids = [] if prop is None else prop.value
+        for window_id in window_ids:
+            window = d.create_resource_object("window", int(window_id))
+            try:
+                pid_prop = window.get_full_property(pid_atom, X.AnyPropertyType)
+                if pid_prop is not None and int(pid_prop.value[0]) in pids:
+                    target = window
+                    target_xid = int(window_id)
+                    break
+            except Exception:
+                continue
+    if target is not None:
+        try:
+            if use_wmctrl:
+                rc = os.system(f"{wmctrl_bin} -i -r {target_xid:#x} -t {target_desktop}")
+                if rc == 0:
+                    # Give Fluxbox a beat to apply, then accept: do not require
+                    # 10 consecutive _NET_WM_DESKTOP reads (that path flaked).
+                    time.sleep(0.2)
+                    desktop = target.get_full_property(desktop_atom, X.AnyPropertyType)
+                    if desktop is None or int(desktop.value[0]) == target_desktop:
+                        print(
+                            f"placed pid {target_pid} (window pid in {sorted(pids)}) "
+                            f"on workspace {target_desktop} via wmctrl"
+                        )
+                        raise SystemExit(0)
+            root.send_event(
+                event.ClientMessage(
+                    window=target,
+                    client_type=desktop_atom,
+                    data=(32, [target_desktop, X.CurrentTime, 0, 0, 0]),
+                ),
+                event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+            )
+            d.sync()
+            desktop = target.get_full_property(desktop_atom, X.AnyPropertyType)
+            if desktop is not None and int(desktop.value[0]) == target_desktop:
+                stable += 1
+                if stable >= 5:
+                    print(
+                        f"placed pid {target_pid} (window pid in {sorted(pids)}) "
+                        f"on workspace {target_desktop}"
+                    )
+                    break
+            else:
+                stable = 0
+        except SystemExit:
+            raise
+        except Exception:
+            target = None
+            stable = 0
+    time.sleep(0.1)
+else:
+    raise SystemExit(
+        f"window for pid {target_pid} (incl. descendants) did not settle "
+        f"on workspace {target_desktop}"
+    )
 PY
       ;;
     *) die "unknown workspace action: $action" ;;

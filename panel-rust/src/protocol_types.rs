@@ -287,42 +287,17 @@ pub struct AgentRequestEvent {
 }
 
 /// One centrally-registered MCP server, as returned by `mcp_servers/
-/// list` -- typed narrowly to the two fields a settings-gear list view
-/// actually renders (`McpServerOption` in `panel-rust::models`), per
-/// Phase 2 step 3's "no Slint-adjacent code sees raw JSON" goal.
-/// `extra` retains the full original entry (env/args/url/whatever else
-/// a real MCP server entry carries) as an opaque JSON object for a
-/// future settings-sheet edit dialog that needs the complete payload --
-/// `acpx-core::McpServerStore` itself never interprets more than
-/// `"name"`, so this crate has no more reason to hand-type every field
-/// than the server does.
-#[derive(Debug, Clone, PartialEq)]
-pub struct McpServerEntry {
-    pub name: String,
-    pub command: Option<String>,
-    pub extra: serde_json::Value,
-}
-
-impl McpServerEntry {
-    /// Parses one `mcp_servers/list` array entry. `None` only for an
-    /// entry missing the required `"name"` field -- `acpx-core::
-    /// McpServerStore::create`/`update` both reject such an entry
-    /// server-side, so a well-behaved gateway never actually returns
-    /// one, but this stays tolerant (skip, don't panic) rather than
-    /// assuming that invariant holds forever.
-    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
-        let name = value.get("name")?.as_str()?.to_string();
-        let command = value
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(str::to_string);
-        Some(Self {
-            name,
-            command,
-            extra: value.clone(),
-        })
-    }
-}
+/// list`. Re-exported directly from `acpx-client` (not re-typed here)
+/// since `panel-rust` already depends on that crate for every other
+/// gateway call -- see `acpx_client::mcp`'s own module doc comment for
+/// why the full `command`/`args`/`env`/`url`/`headers`/`timeout`/`oauth`
+/// shape lives there rather than being narrowed down to the two fields a
+/// settings-gear list view happens to render today, which is what this
+/// type used to do (and is exactly the "incomplete data" this replaced).
+pub use acpx_client::mcp::{
+    McpAuthStatus, McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo,
+    OAuthClientConfig,
+};
 
 /// Registry-reported install/detection status for one agent catalog
 /// entry (`agents/list`/`agents/status`) -- mirrors `acpx_proto::
@@ -429,22 +404,24 @@ mod parsing_tests {
 
     #[test]
     fn mcp_server_entry_parses_name_and_command() {
-        let value = json!({"name": "central-fs", "command": "mcp-central-fs"});
-        let entry = McpServerEntry::from_json(&value).expect("entry");
+        let value = json!({"name": "central-fs", "type": "stdio", "command": "mcp-central-fs"});
+        let entry: McpServerEntry = serde_json::from_value(value).expect("entry");
         assert_eq!(entry.name, "central-fs");
-        assert_eq!(entry.command.as_deref(), Some("mcp-central-fs"));
+        assert_eq!(entry.command(), Some("mcp-central-fs"));
     }
 
     #[test]
-    fn mcp_server_entry_none_without_command_is_still_valid() {
-        let value = json!({"name": "url-only"});
-        let entry = McpServerEntry::from_json(&value).expect("entry");
-        assert_eq!(entry.command, None);
+    fn mcp_server_entry_parses_url_only_http_entry() {
+        let value = json!({"name": "url-only", "type": "http", "url": "https://example.com/mcp"});
+        let entry: McpServerEntry = serde_json::from_value(value).expect("entry");
+        assert_eq!(entry.command(), None);
+        assert_eq!(entry.url(), Some("https://example.com/mcp"));
     }
 
     #[test]
-    fn mcp_server_entry_is_none_without_a_name() {
-        assert!(McpServerEntry::from_json(&json!({"command": "x"})).is_none());
+    fn mcp_server_entry_is_err_without_a_name() {
+        let value = json!({"type": "stdio", "command": "x"});
+        assert!(serde_json::from_value::<McpServerEntry>(value).is_err());
     }
 
     #[test]

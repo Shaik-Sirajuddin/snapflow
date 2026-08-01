@@ -11,9 +11,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -29,11 +29,9 @@ import (
 	"snapshotd/internal/acpnode"
 )
 
-// AdminBind is the fixed loopback address acpx-server's admin plane binds
-// to when acpxmgr enables it -- fixed (not per-run-reserved) because
-// acpxmgr only ever spawns exactly one acpx-server instance at a time
-// (unlike panel-rust's own per-provider dev-fallback spawn path, which
-// does need a fresh port per instance).
+// AdminBind is the default loopback address acpx-server's admin plane binds
+// to when acpxmgr enables it. Callers that can run multiple daemon instances
+// (for example the per-worktree VNC harness) may provide Config.AdminBind.
 const AdminBind = "127.0.0.1:8791"
 
 const maxPortBumpAttempts = 100
@@ -55,6 +53,10 @@ type Config struct {
 	DefaultAcpCommand string
 	// DefaultAgentID is optional ACPX_DEFAULT_AGENT_ID (default "default").
 	DefaultAgentID string
+	// AdminBind is the loopback address for acpx-server's admin plane. Empty
+	// uses AdminBind; daemon test/worktree instances should reserve a unique
+	// port and provide it here.
+	AdminBind string
 	// ExtraEnv is merged into the child environment.
 	ExtraEnv []string
 	// Log is optional; if nil, slog.Default is used.
@@ -351,9 +353,13 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_AGENT_ID="+agentID)
 	}
 	if adminToken != "" {
+		adminBind := cfg.AdminBind
+		if adminBind == "" {
+			adminBind = AdminBind
+		}
 		cmd.Env = append(cmd.Env,
 			"ACPX_ADMIN_TOKEN="+adminToken,
-			"ACPX_ADMIN_BIND="+AdminBind,
+			"ACPX_ADMIN_BIND="+adminBind,
 		)
 	}
 	cmd.Env = append(cmd.Env, cfg.ExtraEnv...)

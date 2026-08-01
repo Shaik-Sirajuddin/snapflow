@@ -391,6 +391,81 @@ struct GatewayCatalogCache {
     last_refresh: Option<std::time::Instant>,
 }
 
+/// Identity of the central MCP registry for poll-diff purposes.
+/// Ignores ephemeral `tool_catalog` (recomputed every list) so a tools
+/// fetch cannot look like a registry mutation that should evict pools.
+/// Sorted by name so list order from the gateway does not matter.
+fn mcp_registry_identity(
+    servers: &[crate::protocol_types::McpServerEntry],
+) -> Vec<(
+    String,
+    bool,
+    crate::protocol_types::McpServerConfig,
+    Option<crate::protocol_types::McpAuthStatus>,
+)> {
+    let mut rows: Vec<_> = servers
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                s.enabled,
+                s.config.clone(),
+                s.auth_status,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// Merge a fresh `mcp_servers/list` payload with the UI-side optimistic
+/// cache so concurrent list polls cannot wipe an in-flight tools_fetch
+/// spinner or enable-toggle StatusDot before the matching RPC lands.
+///
+/// Rules (per server name present on the wire):
+/// - `tools_fetch:<name>` in flight + wire `tool_catalog == None` and
+///   local was `Fetching` → keep `Fetching`
+/// - `enabled:<name>` in flight → keep local `enabled` (toggle already
+///   flipped in the UI; list may still show the pre-update value)
+/// - wire `tool_catalog == None` + local `Error` → keep the last fetch error
+///   until the next fetch explicitly replaces it with `Fetching`
+/// Wire-side Ready/Error always wins over local Fetching.
+fn merge_mcp_list_with_optimistic(
+    wire: Vec<crate::protocol_types::McpServerEntry>,
+    previous: &[crate::protocol_types::McpServerEntry],
+    ops: &HashSet<String>,
+) -> Vec<crate::protocol_types::McpServerEntry> {
+    use crate::protocol_types::McpToolCatalog;
+    wire.into_iter()
+        .map(|mut entry| {
+            let prev = previous.iter().find(|p| p.name == entry.name);
+            if ops.contains(&format!("tools_fetch:{}", entry.name))
+                && entry.tool_catalog.is_none()
+                && matches!(
+                    prev.and_then(|p| p.tool_catalog.as_ref()),
+                    Some(McpToolCatalog::Fetching)
+                )
+            {
+                entry.tool_catalog = Some(McpToolCatalog::Fetching);
+            }
+            if entry.tool_catalog.is_none()
+                && matches!(
+                    prev.and_then(|p| p.tool_catalog.as_ref()),
+                    Some(McpToolCatalog::Error { .. })
+                )
+            {
+                entry.tool_catalog = prev.and_then(|p| p.tool_catalog.clone());
+            }
+            if ops.contains(&format!("enabled:{}", entry.name)) {
+                if let Some(prev) = prev {
+                    entry.enabled = prev.enabled;
+                }
+            }
+            entry
+        })
+        .collect()
+}
+
 /// Owns the background runtime, the per-thread agent connections, the
 /// jsonl cache, and the event queue the UI thread drains via `poll`.
 pub struct AgentBridge {
@@ -427,6 +502,15 @@ pub struct AgentBridge {
     /// Agent ids with an install or enablement RPC currently in flight.
     /// Access is short-lived and read with `try_lock` from frame polling.
     agent_operations: Arc<Mutex<HashSet<String>>>,
+    /// MCP server settings actions currently in flight, keyed
+    /// `"<action>:<server-name>"` (e.g. `"create:filesystem"`,
+    /// `"authenticate:github"`) -- same shape/lifecycle as `agent_
+    /// operations` above (`begin_mcp_operation`/`mcp_operations_in_flight`
+    /// mirror `begin_agent_operation`/`agent_operations_in_flight`
+    /// exactly), kept as a separate field rather than sharing one set so
+    /// an agent id and an MCP server name can never collide on the same
+    /// key by coincidence.
+    mcp_operations: Arc<Mutex<HashSet<String>>>,
     // PROF-1: the same per-provider URL resolver the constructor used to
     // seed `gateway_urls` up front, kept around so a provider nobody
     // asked for at construction time (any real agent id, not just a
@@ -1038,20 +1122,74 @@ pub struct DaemonProjectInstance {
 /// daemon's control socket the CLI dials, per `config.Default`'s own doc
 /// comment) flows through exactly as a test or production launch already
 /// has it set -- this function never touches `SNAPSHOTD_HOME` itself.
+const SNAPSHOTD_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn run_snapshotd_subcommand(bin: &Path, subcommand: &str) -> Result<String, String> {
-    let output = std::process::Command::new(bin)
+    // Do not use Command::output here: a wedged daemon control socket would
+    // otherwise leave the background inventory thread blocked forever. Files
+    // keep stdout/stderr drainable even if a broken daemon emits a large
+    // diagnostic before the timeout expires.
+    let unique = format!(
+        "snapflow-snapshotd-{}-{}-{}",
+        std::process::id(),
+        subcommand,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let stdout_path = std::env::temp_dir().join(format!("{unique}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("{unique}.stderr"));
+    let stdout_file = File::create(&stdout_path)
+        .map_err(|error| format!("creating snapshotd {subcommand} stdout capture: {error}"))?;
+    let stderr_file = File::create(&stderr_path)
+        .map_err(|error| format!("creating snapshotd {subcommand} stderr capture: {error}"))?;
+    let mut child = std::process::Command::new(bin)
         .arg(subcommand)
-        .output()
-        .map_err(|error| format!("spawning `snapshotd {subcommand}`: {error}"))?;
-    if !output.status.success() {
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .map_err(|error| format!("spawning snapshotd {subcommand}: {error}"))?;
+    let deadline = std::time::Instant::now() + SNAPSHOTD_CLI_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!(
+                    "snapshotd {subcommand} timed out after {}s",
+                    SNAPSHOTD_CLI_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!("waiting for snapshotd {subcommand}: {error}"));
+            }
+        }
+    };
+    let stdout = std::fs::read(&stdout_path)
+        .map_err(|error| format!("reading snapshotd {subcommand} stdout capture: {error}"))?;
+    let stderr = std::fs::read(&stderr_path)
+        .map_err(|error| format!("reading snapshotd {subcommand} stderr capture: {error}"))?;
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    if !status.success() {
         return Err(format!(
-            "`snapshotd {subcommand}` exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            "snapshotd {subcommand} exited {status}: {}",
+            String::from_utf8_lossy(&stderr)
         ));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("`snapshotd {subcommand}` produced non-UTF8 stdout: {error}"))
+    String::from_utf8(stdout)
+        .map_err(|error| format!("snapshotd {subcommand} produced non-UTF8 stdout: {error}"))
 }
 
 /// Parses `snapshotd list`'s JSONL stdout (one `registry.ProcessInstance`
@@ -1169,7 +1307,6 @@ pub fn fetch_daemon_project_instances() -> Result<Vec<DaemonProjectInstance>, St
 fn snapflowd_mcp_servers_entry(
     project_dir: Option<&std::path::Path>,
     provider: &str,
-    context_token: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     // Whether MCP-free, filesystem-only skill delivery is safe for
@@ -1198,7 +1335,7 @@ fn snapflowd_mcp_servers_entry(
             "env": [],
         }));
     }
-    entries.extend(snapshotd_mcp_server_entry(provider, context_token));
+    entries.extend(snapshotd_mcp_server_entry(provider));
     entries
 }
 
@@ -1239,6 +1376,113 @@ fn snapflowd_mcp_servers_entry(
 static SNAPSHOTD_MCP_STATUS: Mutex<Option<String>> = Mutex::new(None);
 static SNAPSHOTD_WATCHER_STARTED: std::sync::Once = std::sync::Once::new();
 
+/// Last address the watcher successfully pushed into every known acpx
+/// central `McpServerStore` registry via [`sync_snapshotd_registry_if_
+/// changed`] -- separate from `SNAPSHOTD_MCP_STATUS`, which is the last
+/// *observed* address regardless of whether a registry push happened.
+/// `None` means either no push has ever succeeded, or a bridge just
+/// registered a new sync target ([`register_snapshotd_registry_sync_
+/// target`] resets this so the next tick re-syncs unconditionally, since
+/// a freshly-registered gateway has never seen a push even if the
+/// address itself hasn't changed).
+static SNAPSHOTD_MCP_SYNCED: Mutex<Option<String>> = Mutex::new(None);
+
+/// One `AgentBridge`'s worth of gateways this process's snapshotd watcher
+/// can push the synthetic `"snapflow"` registry row into, plus the tokio
+/// `Handle` to actually run that async push on (the watcher itself is a
+/// plain OS thread with no runtime of its own). `Weak` so a bridge that
+/// has since been dropped (e.g. a test's own short-lived `AgentBridge`)
+/// is silently pruned on the next tick instead of leaking.
+struct SnapshotdSyncTarget {
+    gateways: std::sync::Weak<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    runtime: tokio::runtime::Handle,
+}
+
+/// Every live `AgentBridge`'s gateway map the watcher should keep synced.
+/// Registered once per bridge construction (see [`register_snapshotd_
+/// registry_sync_target`]); almost always holds exactly one entry in
+/// production (one panel process, one `AgentBridge`), but nothing here
+/// assumes that -- each independent gateway/router process reachable from
+/// this panel needs its own registry row, since `McpServerStore` is
+/// per-router state, not shared.
+static SNAPSHOTD_SYNC_TARGETS: Mutex<Vec<SnapshotdSyncTarget>> = Mutex::new(Vec::new());
+
+/// Registers `gateways` (an `AgentBridge`'s own gateway-connection cache,
+/// keyed by base URL) as a target the background snapshotd watcher
+/// (`ensure_snapshotd_watcher_started`) should push the synthetic
+/// `"snapflow"` MCP server row into whenever the daemon's live MCP
+/// address changes. Resets [`SNAPSHOTD_MCP_SYNCED`] so the very next
+/// watcher tick pushes to this (and every other still-live) target even
+/// if the address happens to already match the last-synced value --
+/// otherwise a bridge constructed after the address stabilized would
+/// never receive an initial sync.
+fn register_snapshotd_registry_sync_target(
+    gateways: Arc<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    runtime: tokio::runtime::Handle,
+) {
+    SNAPSHOTD_SYNC_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(SnapshotdSyncTarget {
+            gateways: Arc::downgrade(&gateways),
+            runtime,
+        });
+    *SNAPSHOTD_MCP_SYNCED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Forces the process-wide watcher to revisit the current daemon address on
+/// its next tick. A bridge can gain a gateway after construction (lazy agent
+/// provisioning), and each gateway owns an independent MCP registry.
+fn invalidate_snapshotd_registry_sync() {
+    *SNAPSHOTD_MCP_SYNCED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Live gate for the built-in snapflow (snapshotd) MCP client injection.
+/// Settings UI name is `"snapflow"`; wire `mcpServers` name is
+/// `"snapshotd"`. This flag alone still governs the always-correct
+/// per-session `mcpServers` injection path (toggle must flip it and
+/// rewrite pool openers directly -- see
+/// [`AgentBridge::set_builtin_snapflow_mcp_enabled`]); it is *not*
+/// gating the central-registry sync below. As of the `mcp-servers-
+/// settings` fix, the watcher (`ensure_snapshotd_watcher_started`) also
+/// pushes a real `"snapflow"` row into every known acpx central
+/// `McpServerStore` registry (`sync_snapshotd_registry_if_changed`) via
+/// `mcp_servers/create`/`update`, so Settings' "Fetch tools" action --
+/// which calls `mcp_servers/tools_fetch` against whatever name the row
+/// displays -- has a real registry entry to query instead of failing
+/// with "no mcp server named snapflow". That registry sync is additive:
+/// the per-session client-injection mechanism below is unchanged.
+static SNAPFLOW_MCP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Serializes flag write + multi-step test assertions (and production
+/// toggle + pool rewrite) so parallel unit tests cannot race the gate.
+static SNAPFLOW_MCP_GATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Whether new/pooled sessions inject the built-in snapflow MCP.
+pub fn snapflow_mcp_enabled() -> bool {
+    SNAPFLOW_MCP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Seed or update the process-wide snapflow injection gate (e.g. from
+/// Settings on panel start). Does not touch pools — use
+/// [`AgentBridge::set_builtin_snapflow_mcp_enabled`] for a live toggle.
+pub fn set_snapflow_mcp_enabled_flag(enabled: bool) {
+    let _guard = SNAPFLOW_MCP_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    SNAPFLOW_MCP_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Settings UI / registry aliases for the built-in daemon MCP.
+pub fn is_builtin_snapflow_mcp_name(name: &str) -> bool {
+    name == "snapflow" || name == "snapshotd"
+}
+
 const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn snapshotd_control_socket_path() -> PathBuf {
@@ -1250,46 +1494,61 @@ fn snapshotd_control_socket_path() -> PathBuf {
 /// from session creation or the UI thread.
 #[cfg(unix)]
 fn query_snapshotd_mcp_addr_at(path: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
 
-    // UnixStream has no stable connect_timeout API. This connect runs only on
-    // the dedicated watcher thread; all subsequent socket I/O is bounded.
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream
-        .set_read_timeout(Some(SNAPSHOTD_CONTROL_TIMEOUT))
+    // std::os::unix::net::UnixStream has no connect timeout. Use a tiny
+    // current-thread runtime on the already-background watcher thread so a
+    // dead/stuck control socket cannot stop all future five-second probes.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
         .ok()?;
-    stream
-        .set_write_timeout(Some(SNAPSHOTD_CONTROL_TIMEOUT))
+    runtime.block_on(async {
+        let stream = tokio::time::timeout(SNAPSHOTD_CONTROL_TIMEOUT, UnixStream::connect(path))
+            .await
+            .ok()?
+            .ok()?;
+        let (read_half, mut write_half) = stream.into_split();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "daemon.mcpStatus",
+            "params": {}
+        });
+        let mut line = serde_json::to_vec(&request).ok()?;
+        line.push(b'\n');
+        tokio::time::timeout(SNAPSHOTD_CONTROL_TIMEOUT, write_half.write_all(&line))
+            .await
+            .ok()?
+            .ok()?;
+        let mut response_line = String::new();
+        let mut reader = BufReader::new(read_half);
+        let count = tokio::time::timeout(
+            SNAPSHOTD_CONTROL_TIMEOUT,
+            reader.read_line(&mut response_line),
+        )
+        .await
+        .ok()?
         .ok()?;
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "daemon.mcpStatus",
-        "params": {}
-    });
-    let mut line = serde_json::to_vec(&request).ok()?;
-    line.push(b'\n');
-    stream.write_all(&line).ok()?;
-
-    let mut response_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response_line)
-        .ok()
-        .filter(|count| *count > 0)?;
-    let response: serde_json::Value = serde_json::from_str(&response_line).ok()?;
-    if response.get("error").is_some() {
-        return None;
-    }
-    let result = response.get("result")?;
-    if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
-        return None;
-    }
-    result
-        .get("addr")
-        .and_then(|value| value.as_str())
-        .filter(|addr| !addr.is_empty())
-        .map(str::to_owned)
+        if count == 0 {
+            return None;
+        }
+        let response: serde_json::Value = serde_json::from_str(&response_line).ok()?;
+        if response.get("error").is_some() {
+            return None;
+        }
+        let result = response.get("result")?;
+        if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+        result
+            .get("addr")
+            .and_then(|value| value.as_str())
+            .filter(|addr| !addr.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 #[cfg(unix)]
@@ -1312,10 +1571,161 @@ fn ensure_snapshotd_watcher_started() {
             let addr = query_snapshotd_mcp_addr();
             *SNAPSHOTD_MCP_STATUS
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addr;
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addr.clone();
+            sync_snapshotd_registry_if_changed(addr);
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
     });
+}
+
+/// Pushes the just-observed `addr` into every live [`SNAPSHOTD_SYNC_
+/// TARGETS`] registry, but only when it differs from the last address
+/// this watcher successfully synced ([`SNAPSHOTD_MCP_SYNCED`]) -- so a
+/// steady-state daemon (the overwhelmingly common case) costs one string
+/// comparison per 5s tick, not a `mcp_servers/create`/`update` round trip
+/// to every known gateway. Called from the watcher's own OS thread, which
+/// has no tokio runtime of its own; the actual async RPCs are handed off
+/// to each target's own `Handle::spawn` and this function returns without
+/// waiting for them (best-effort -- a failed push is retried whenever the
+/// address next changes, or a new target registers).
+fn sync_snapshotd_registry_if_changed(addr: Option<String>) {
+    let changed = {
+        let mut last_synced = SNAPSHOTD_MCP_SYNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_synced.as_deref() == addr.as_deref() {
+            false
+        } else {
+            *last_synced = addr.clone();
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+    // A `None` tick (daemon down / control socket unreachable) still
+    // updates `SNAPSHOTD_MCP_SYNCED` above so a later real address is
+    // recognized as a change, but there is nothing to push yet.
+    let Some(addr) = addr else {
+        return;
+    };
+    let Some(entry) = builtin_snapflow_registry_entry(&addr) else {
+        return;
+    };
+    // Prune dead (dropped-bridge) targets while collecting live ones, so
+    // this list stays bounded across e.g. many short-lived test bridges
+    // within one process.
+    let mut targets = SNAPSHOTD_SYNC_TARGETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    targets.retain(|target| target.gateways.strong_count() > 0);
+    let mut scheduled = false;
+    for target in targets.iter() {
+        let Some(gateways) = target.gateways.upgrade() else {
+            continue;
+        };
+        if gateways
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            continue;
+        }
+        scheduled = true;
+        let entry = entry.clone();
+        target.runtime.spawn(async move {
+            if !sync_snapflow_registry_entry(&gateways, &entry).await {
+                // A gateway can appear after the watcher observes the
+                // daemon address, or can temporarily reject the upsert while
+                // it is still starting. Leave the address unsynced so the
+                // next five-second watcher tick retries it.
+                *SNAPSHOTD_MCP_SYNCED
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+        });
+    }
+    if !scheduled {
+        // Do not consume the address-change edge before a gateway exists.
+        // Otherwise the first gateway created after this tick would never
+        // receive the snapflow registry row until the daemon address changed.
+        *SNAPSHOTD_MCP_SYNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Builds the central-registry `McpServerEntry` for the built-in snapflow
+/// server at `addr`, reusing [`snapshotd_mcp_server_entry_for_addr`] for
+/// the URL shape (the same `http://{addr}/mcp` this crate already injects
+/// per-session) rather than recomputing it a second way. That helper's
+/// wire shape targets ACP's own per-session `mcpServers` array (`"name":
+/// "snapshotd"`, array-of-pairs `headers`) and is also gated on the live
+/// [`snapflow_mcp_enabled`] toggle, neither of which apply to the central
+/// registry row: the Settings UI's row (and therefore what "Fetch tools"
+/// queries) is named `"snapflow"`, uses `McpServerConfig`'s object-shaped
+/// `headers`, and the registry row is what still needs to exist even
+/// while the toggle is off (else re-enabling it would race a fresh watch
+/// tick). Only the `url` field is actually reused across the two shapes.
+fn builtin_snapflow_registry_entry(addr: &str) -> Option<crate::protocol_types::McpServerEntry> {
+    let built = snapshotd_mcp_server_entry_for_addr(Some(addr));
+    let url = built.first()?.get("url")?.as_str()?.to_string();
+    Some(crate::protocol_types::McpServerEntry::new(
+        "snapflow",
+        crate::protocol_types::McpServerConfig::Http {
+            url,
+            headers: std::collections::HashMap::new(),
+            timeout: None,
+            oauth: None,
+        },
+    ))
+}
+
+/// Upserts `entry` into every gateway currently known in `gateways`
+/// (one push per distinct connected acpx-server this panel talks to --
+/// each owns an independent `McpServerStore`). Try-create-then-update-on-
+/// AlreadyExists, the same pattern `acpx-server/src/provisioning.rs`'s
+/// `apply` uses for its own declarative-reapply case, ported to the
+/// client-side `ClientError::Rpc` shape `Gateway::create_mcp_server`
+/// actually returns (the server-side `RouterError::McpServer(McpServer
+/// StoreError::AlreadyExists(_))` `apply` matches on never crosses the
+/// wire as a typed variant -- it collapses to a JSON-RPC error whose
+/// `message` is `McpServerStoreError::AlreadyExists`'s `Display` text,
+/// "mcp server store: mcp server {name} already exists", wrapped by
+/// `RouterError::McpServer`'s own `"mcp server store: {0}"` -- so this
+/// matches on that substring the same way `ClientError::is_transient`
+/// already does for its own message-sniffing cases).
+async fn sync_snapflow_registry_entry(
+    gateways: &Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>,
+    entry: &crate::protocol_types::McpServerEntry,
+) -> bool {
+    let live_gateways: Vec<Arc<acpx_client::Gateway>> = gateways
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    if live_gateways.is_empty() {
+        return false;
+    }
+    let mut all_succeeded = true;
+    for gateway in live_gateways {
+        if let Err(err) = gateway.create_mcp_server(entry).await {
+            let already_exists = matches!(
+                &err,
+                acpx_client::raw::ClientError::Rpc { message, .. }
+                    if message.to_ascii_lowercase().contains("already exists")
+            );
+            if already_exists {
+                if gateway.update_mcp_server(entry).await.is_err() {
+                    all_succeeded = false;
+                }
+            } else {
+                all_succeeded = false;
+            }
+        }
+    }
+    all_succeeded
 }
 
 /// Non-blocking read of the watcher cache. Starting the watcher is one-time
@@ -1332,10 +1742,9 @@ pub fn snapshotd_mcp_addr() -> Option<String> {
 #[allow(dead_code)]
 fn snapshotd_mcp_server_entry(
     provider: &str,
-    context_token: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
-    snapshotd_mcp_server_entry_for_addr(snapshotd_mcp_addr().as_deref(), context_token)
+    snapshotd_mcp_server_entry_for_addr(snapshotd_mcp_addr().as_deref())
 }
 
 #[allow(dead_code)]
@@ -1345,28 +1754,57 @@ fn snapshotd_mcp_server_entry(
 // `session/new` time, before any specific consuming thread (and its own
 // token) is known; see GatewaySessionOpener's mcp_servers refresh path for
 // how project/provider-level MCP config changes now propagate instead.
-fn snapshotd_mcp_server_entry_for_addr(
-    addr: Option<&str>,
-    context_token: Option<&str>,
-) -> Vec<serde_json::Value> {
+fn snapshotd_mcp_server_entry_for_addr(addr: Option<&str>) -> Vec<serde_json::Value> {
+    if !snapflow_mcp_enabled() {
+        return Vec::new();
+    }
     let Some(addr) = addr.filter(|addr| !addr.is_empty()) else {
         return Vec::new();
     };
-    let headers = context_token
-        .filter(|token| !token.is_empty())
-        .map(|token| {
-            vec![serde_json::json!({
-                "name": "X-Snapshotd-Context-Token",
-                "value": token,
-            })]
-        })
-        .unwrap_or_default();
     vec![serde_json::json!({
         "type": "http",
         "name": "snapshotd",
         "url": format!("http://{addr}/mcp"),
-        "headers": headers,
+        "headers": [],
     })]
+}
+
+/// Drop or re-add the built-in snapflow (`snapshotd`) entry on a pool's
+/// client `mcpServers` list without recomputing skills (which depend on
+/// project-dir resolution that is not stored on the pool key alone).
+///
+/// When enabling, `inject_addr` is the daemon MCP bind address to put
+/// back (live watcher value in production). Tests pass an explicit addr.
+fn apply_snapflow_to_client_mcp_list(
+    mcp_servers: &[serde_json::Value],
+    enabled: bool,
+    inject_addr: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut next: Vec<serde_json::Value> = mcp_servers
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| !is_builtin_snapflow_mcp_name(n))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    if enabled {
+        // Bypass the process-wide flag here: the caller already decided
+        // `enabled` and may still be holding the gate lock while the
+        // atomic is mid-update. Force-inject from `inject_addr` only.
+        if let Some(addr) = inject_addr.filter(|a| !a.is_empty()) {
+            next.push(serde_json::json!({
+                "type": "http",
+                "name": "snapshotd",
+                "url": format!("http://{addr}/mcp"),
+                "headers": [],
+            }));
+        }
+    }
+    next
 }
 
 // PROF-3 (`profile-only-backend-selection` plan): `resolve_backend_agent_
@@ -1462,6 +1900,82 @@ fn codex_auth_file_has_chatgpt_login() -> bool {
         .and_then(|tokens| tokens.get("access_token"))
         .and_then(|token| token.as_str())
         .is_some_and(|token| !token.is_empty())
+}
+
+/// Normalizes the free-form `auth_mode` string real `codex` CLI builds
+/// write into `auth.json` into the exact ACP `native_auth_method_id`
+/// value codex-acp expects. Case/hyphen/underscore-insensitive since
+/// only `"chatgpt"` has been directly confirmed on a live system (see
+/// `resolve_codex_native_auth_method_id`'s doc comment) -- other codex
+/// CLI versions may plausibly spell either mode differently
+/// (`"chat-gpt"`, `"ChatGPT"`, `"api-key"`, `"apiKey"`, ...), so this
+/// normalizes defensively rather than matching a single literal.
+/// Returns `None` for anything unrecognized so the caller can fall back
+/// to today's presence-based detection instead of guessing.
+fn normalize_codex_auth_mode(raw: &str) -> Option<&'static str> {
+    let normalized: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    match normalized.as_str() {
+        "chatgpt" => Some("chat-gpt"),
+        "apikey" => Some("api-key"),
+        _ => None,
+    }
+}
+
+/// Reads and normalizes `auth.json`'s own `auth_mode` field (see
+/// `codex_home_dir` for path resolution). `None` covers every "we don't
+/// have a trustworthy declared mode" case alike -- missing file,
+/// unparseable JSON, missing field, or an unrecognized value -- so
+/// callers have one signal to check before falling back.
+fn read_codex_auth_mode_from_file() -> Option<&'static str> {
+    let path = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    value
+        .get("auth_mode")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_codex_auth_mode)
+}
+
+/// Resolves the ACP `native_auth_method_id` this system's real Codex CLI
+/// login implies, mirroring acpx-server's own
+/// `default_codex_native_auth_method` (`acpx-server/src/config.rs`) --
+/// kept as a deliberately separate, hand-mirrored implementation per
+/// that function's own doc comment, not a shared crate, so keep any
+/// future change to this priority order in sync in both places.
+///
+/// **auth_mode-first, live bug this fixes.** Before this function
+/// existed, `spawn_gateway_process` inlined field-presence-only
+/// detection (API key first, then `tokens.access_token`) that completely
+/// ignored `auth.json`'s own `auth_mode` field. Live-confirmed against
+/// this exact system: its real `~/.codex/auth.json` has
+/// `"auth_mode": "chatgpt"` (a real, completed ChatGPT-plan login) *and*
+/// a stale, leftover non-empty `OPENAI_API_KEY` field left over from an
+/// earlier/different login -- so presence-only detection always picked
+/// "api-key" for it, silently contradicting what the file's own
+/// `auth_mode` field declared, and shadowing a real working login with a
+/// wrong one. This now checks `auth_mode` first via
+/// `read_codex_auth_mode_from_file`, and only falls back to the old
+/// presence-based priority (api-key field presence, then
+/// `tokens.access_token`) when `auth_mode` is missing or unrecognized,
+/// so `auth.json` shapes that predate this field (or come from a codex
+/// CLI version that doesn't set it) keep resolving exactly as before.
+fn resolve_codex_native_auth_method_id() -> Option<&'static str> {
+    if let Some(mode) = read_codex_auth_mode_from_file() {
+        return Some(mode);
+    }
+    if read_codex_api_key_from_auth_file().is_some() {
+        return Some("api-key");
+    }
+    if codex_auth_file_has_chatgpt_login() {
+        return Some("chat-gpt");
+    }
+    None
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -2014,14 +2528,33 @@ fn spawn_gateway_process(
         // (`config.rs`'s `default_codex_native_auth_method`): api-key
         // when a real key is found, else chat-gpt when a real ChatGPT
         // OAuth login is found, else leave it unset.
+        //
+        // auth-mode-first fix: the above (field-presence-only) priority
+        // had its own live bug -- this system's real `~/.codex/auth.json`
+        // has `"auth_mode": "chatgpt"` (a real, completed ChatGPT-plan
+        // login) *and* a stale, leftover non-empty `OPENAI_API_KEY` field.
+        // Presence-only detection always resolved that combination to
+        // "api-key", silently discarding the user's actual declared
+        // login mode. `resolve_codex_native_auth_method_id` now checks
+        // the file's own `auth_mode` field first (normalized
+        // case/hyphen-insensitively) and only falls back to this
+        // presence-based priority when `auth_mode` is missing or
+        // unrecognized, so older `auth.json` shapes without the field
+        // keep behaving exactly as before.
         if std::env::var_os("ACPX_NATIVE_AUTH_METHOD_ID").is_none() {
-            if let Some(key) = read_codex_api_key_from_auth_file() {
-                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
-                if std::env::var_os("CODEX_API_KEY").is_none() {
-                    cmd.env("CODEX_API_KEY", key);
+            match resolve_codex_native_auth_method_id() {
+                Some("api-key") => {
+                    cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+                    if std::env::var_os("CODEX_API_KEY").is_none() {
+                        if let Some(key) = read_codex_api_key_from_auth_file() {
+                            cmd.env("CODEX_API_KEY", key);
+                        }
+                    }
                 }
-            } else if codex_auth_file_has_chatgpt_login() {
-                cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+                Some("chat-gpt") => {
+                    cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+                }
+                _ => {}
             }
         } else if std::env::var_os("CODEX_API_KEY").is_none() {
             if let Some(key) = read_codex_api_key_from_auth_file() {
@@ -2685,7 +3218,6 @@ fn spawn_background_attachment(
     let mcp_servers = snapflowd_mcp_servers_entry(
         thread_project_dir.as_deref(),
         &slot.provider,
-        Some(&slot.mcp_context_token),
     );
 
     // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
@@ -2769,6 +3301,12 @@ fn spawn_background_attachment(
                 )
                 .await
             {
+                // `attached.resumed_from_saved` deliberately unread here --
+                // see `AttachedSession`'s own doc comment: capability
+                // events are already emitted uniformly for both the
+                // resumed and freshly-created cases by
+                // `Command::AcquireAndAttach`'s handler, so no fallback
+                // decision needs it at this layer.
                 Ok(attached) => Ok(attached.session_id),
                 Err(error) => Err(error),
             }
@@ -2783,15 +3321,11 @@ fn spawn_background_attachment(
                 &session_id,
                 remote_sessions.as_deref(),
             );
-            let context_header_present = mcp_servers.iter().any(|entry| {
-                entry.get("name").and_then(serde_json::Value::as_str) == Some("snapshotd")
-                    && entry
-                        .get("headers")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|headers| !headers.is_empty())
-            });
-            let resume_result = if has_cached_transcript && !cache_is_stale && !context_header_present {
-                match handle.reattach_session(session_id.clone(), cwd.clone()).await {
+            let resume_result = if has_cached_transcript && !cache_is_stale {
+                match handle
+                    .reattach_session(session_id.clone(), cwd.clone(), mcp_servers.clone())
+                    .await
+                {
                     Ok(()) => Ok(()),
                     Err(reattach_error) => {
                         eprintln!(
@@ -3307,6 +3841,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway.clone());
+                invalidate_snapshotd_registry_sync();
                 for setter in setters {
                     setter.set_gateway(gateway.clone());
                 }
@@ -3321,12 +3856,23 @@ impl AgentBridge {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(url, gateway.clone());
+                    invalidate_snapshotd_registry_sync();
                     for setter in setters {
                         setter.set_gateway(gateway.clone());
                     }
                 });
             }
         }
+
+        // mcp-servers-settings: this bridge's gateway map is a target the
+        // process-wide snapshotd watcher should keep the central-registry
+        // "snapflow" row synced into (see `register_snapshotd_registry_
+        // sync_target`'s doc comment). Registered here, once per bridge,
+        // rather than only from `snapshotd_mcp_addr()`'s first caller --
+        // that call site has no `Arc<Mutex<HashMap<..., Arc<Gateway>>>>` or
+        // runtime handle to offer, and may run long before any bridge
+        // (and its gateways) exist at all.
+        register_snapshotd_registry_sync_target(gateways.clone(), runtime.handle().clone());
 
         Ok(AgentBridge {
             runtime,
@@ -3338,6 +3884,7 @@ impl AgentBridge {
             gateway_catalog: Arc::new(Mutex::new(GatewayCatalogCache::default())),
             gateway_catalog_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
+            mcp_operations: Arc::new(Mutex::new(HashSet::new())),
             resolve_gateway,
             default_provider,
             store,
@@ -3388,6 +3935,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway);
+                invalidate_snapshotd_registry_sync();
                 return Ok(());
             }
             let _guard = self.runtime.enter();
@@ -3401,6 +3949,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway);
+                invalidate_snapshotd_registry_sync();
             });
         }
         Ok(())
@@ -3458,6 +4007,127 @@ impl AgentBridge {
         }
     }
 
+    /// Retires every pool owned by a project whose identity changed. Idle
+    /// sessions are removed immediately; active leases become stale and are
+    /// removed by their owner after the current turn finishes.
+    fn refresh_pools_for_project_dir(&self, project_dir: &Path) {
+        let prefix = format!("{}|", project_dir.to_string_lossy());
+        let pools = {
+            let pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Starts bounded warmup for the resolved default agent when its gateway
+    /// is already available. It activates the pool without taking a thread
+    /// lease and never waits for `session/new` on the caller thread.
+    pub fn prewarm_default_agent(&self, agent_id: &str, profile_name: Option<&str>) {
+        let Some(project_dir) = self
+            .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(agent_id).cloned() else {
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), agent_id);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            return;
+        };
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            agent_id,
+            crate::gateway_actor::provider_profile_key(profile_name),
+        );
+        self.runtime.spawn(async move {
+            pool.prewarm(key).await;
+        });
+    }
+
+    /// Async counterpart to [`Self::refresh_pools_for_gateway`] for use
+    /// inside already-spawned MCP-settings futures that only hold a
+    /// pre-captured `project_pools` Arc (no `&self`).
+    async fn refresh_captured_pools(
+        project_pools: &Mutex<
+            std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>,
+        >,
+        base_url: Option<&str>,
+    ) {
+        let Some(url) = base_url else {
+            return;
+        };
+        let pools = {
+            let pools = project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.rsplit_once('|').is_some_and(|(_, u)| u == url))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            pool.refresh_all().await;
+        }
+    }
+
+    /// Toggle the built-in snapflow (snapshotd) MCP for **live** pool
+    /// openers and future `session/new` client `mcpServers`.
+    ///
+    /// Unlike registry enable (`mcp_servers/update`), this is not a
+    /// central-store row — Settings shows it as a non-removable "snapflow"
+    /// row while injection uses wire name `"snapshotd"`. Flipping the
+    /// gate alone would leave already-pooled sessions with the old list
+    /// forever; this rewrites every pool's opener mcp list and
+    /// `refresh_all` so idle leases drop and the next acquire omits (or
+    /// re-adds) snapflow. Currently-leased sessions stay until release
+    /// (same generation semantics as registry refresh).
+    pub fn set_builtin_snapflow_mcp_enabled(&self, enabled: bool) {
+        set_snapflow_mcp_enabled_flag(enabled);
+        let inject_addr = if enabled {
+            snapshotd_mcp_addr()
+        } else {
+            None
+        };
+        let pools_to_refresh = {
+            let mut pools = self
+                .project_pools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut to_refresh = Vec::new();
+            for (_key, (pool, last_mcp)) in pools.iter_mut() {
+                let next = apply_snapflow_to_client_mcp_list(
+                    last_mcp,
+                    enabled,
+                    inject_addr.as_deref(),
+                );
+                if next.as_slice() != last_mcp.as_slice() {
+                    pool.opener()
+                        .set_mcp_servers(serde_json::Value::Array(next.clone()));
+                    *last_mcp = next;
+                    to_refresh.push(pool.clone());
+                }
+            }
+            to_refresh
+        };
+        for pool in pools_to_refresh {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
     /// Immediate signal from Settings after a successful MCP registry
     /// mutation. The settings gateway is represented by a bridge slot, so
     /// resolve its base URL and refresh all project pools sharing that
@@ -3492,12 +4162,87 @@ impl AgentBridge {
         self.set_active_project_identity(&identity);
     }
 
+    /// project-close-session-teardown: soft-releases every open thread's
+    /// live session that is still bound to the CURRENTLY active project
+    /// (i.e. the one about to stop being active), scoped by each
+    /// [`ThreadSlot`]'s own recorded `project_path` (the same value
+    /// `thread_project_path`/`retain_items_for_project` use to scope the
+    /// sidebar). Must be called BEFORE [`Self::set_active_project_
+    /// identity`] overwrites `session_project_path_override`, since that
+    /// is exactly the "currently active project" this method reads.
+    ///
+    /// Root cause this closes: before this method existed, a project
+    /// switch or close only ever updated `session_cwd_override`/
+    /// `session_project_path_override` (so *future* `session/new` calls
+    /// picked up the new project) and, via `refresh_pools_for_project_dir`,
+    /// bumped the previous project's pool generation -- which only evicts
+    /// currently-IDLE pool entries and marks a currently-LEASED one stale
+    /// for later. A thread's [`gateway_actor::thread_actor`] actor holds
+    /// its lease for the thread's entire life (see that module's
+    /// `current_lease`), released only on an explicit close/delete or the
+    /// next `SendPrompt` -- neither of which a thread belonging to a
+    /// project the user just switched away from (or closed) will ever see
+    /// again while that project stays inactive. The live ACPX session and
+    /// its pooled connection therefore stayed open/leased indefinitely,
+    /// exactly the "threads keep running in the background instead of
+    /// being torn down" bug this fixes.
+    ///
+    /// Uses `close_session(true)` (background=true) rather than a hard
+    /// close/delete: per `Command::CloseSession`'s `background` branch in
+    /// `gateway_actor/thread_actor.rs`, a background close still releases
+    /// this panel's client-side pool lease back to Idle -- freeing the
+    /// pooled connection slot, this bug's actual complaint -- while asking
+    /// acpx-core for a resumable soft close on the backend side, so
+    /// switching back to this project later resumes the conversation
+    /// instead of losing it. Deliberately does NOT set `slot.closed` --
+    /// that flag is the user-facing, permanent "Close" button state
+    /// ([`Self::close_thread`]); this is an automatic lifecycle teardown,
+    /// not an explicit user action, and must not make an untouched thread
+    /// look explicitly closed in the sidebar.
+    ///
+    /// Errors are logged and otherwise ignored, same posture as this
+    /// file's other best-effort teardown paths (e.g. `Drop for
+    /// AgentBridge`) -- a failed release here should not block the
+    /// project switch itself.
+    pub fn release_sessions_for_current_project(&self) {
+        let Some(project_path) = self
+            .session_project_path_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        for slot in &self.slots {
+            if slot.project_path_snapshot().as_deref() != Some(project_path.as_path()) {
+                continue;
+            }
+            let handle = slot.handle.clone();
+            if let Err(error) = self.runtime.block_on(handle.close_session(true)) {
+                eprintln!(
+                    "panel-rust: release_sessions_for_current_project close_session failed for thread {}: {error}",
+                    slot.thread_id
+                );
+            }
+        }
+    }
+
     /// Apply the complete lifecycle identity, including an untitled UUID.
     /// An untitled project has no raw MLT path to publish to snapshotd, but it
     /// still owns a staging store and therefore must provide a real ACP cwd.
     pub fn set_active_project_identity(&self, identity: &crate::model::ProjectIdentity) {
+        let previous_store_path = self
+            .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let store_path = crate::project_store::project_store_dir(identity, &resolve_cache_dir());
         let raw_path = identity.saved_path().map(PathBuf::from);
+        if previous_store_path != store_path {
+            if let Some(previous_store_path) = previous_store_path {
+                self.refresh_pools_for_project_dir(&previous_store_path);
+            }
+        }
         *self
             .session_cwd_override
             .lock()
@@ -3644,7 +4389,6 @@ impl AgentBridge {
             thread_project_dir(project_path_for_slot.as_deref(), &self.session_cwd_override)
                 .as_deref(),
             provider,
-            Some(&mcp_context_token),
         );
         let pool = self.pool_for(&pool_cwd.to_string_lossy(), &base_url, &mcp_servers);
         let uses_pool = pool.is_some();
@@ -4102,7 +4846,6 @@ impl AgentBridge {
         let mcp_servers = snapflowd_mcp_servers_entry(
             project_dir.as_deref(),
             provider,
-            Some(&slot.mcp_context_token),
         );
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
@@ -4405,6 +5148,66 @@ impl AgentBridge {
             .is_ok()
     }
 
+    /// Non-blocking profile create for Settings. The synchronous wrapper is
+    /// retained for compatibility tests, but UI effects must use this
+    /// runtime-owned path so a slow gateway cannot stall Slint.
+    pub fn create_profile_async(
+        &self,
+        idx: usize,
+        entry: serde_json::Value,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let handle = slot.handle.clone();
+        let cache = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .create_profile(entry)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                if let Ok(mut cache) = cache.try_lock() {
+                    cache.last_refresh = None;
+                }
+            }
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking profile delete for Settings; see
+    /// [`Self::create_profile_async`] for the threading contract.
+    pub fn delete_profile_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let handle = slot.handle.clone();
+        let cache = self.gateway_catalog.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_profile(name)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                if let Ok(mut cache) = cache.try_lock() {
+                    cache.last_refresh = None;
+                }
+            }
+            on_complete(result);
+        });
+    }
+
     /// Explicit, opt-in-only `session/close` on thread `idx` -- see
     /// `AcpxThreadHandle::close_session`'s doc comment: this is never
     /// sent implicitly by window/process teardown, only by a real UI
@@ -4515,57 +5318,590 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
-    /// `mcp_servers/create`. Returns `true` on success -- the caller
-    /// (`lib.rs`'s settings-sheet save handler) is expected to re-call
-    /// [`Self::list_mcp_servers`] afterward to refresh the UI list from
-    /// the gateway's own state, same "don't optimistically mutate
-    /// client-side state" posture the mode/config selector uses.
-    pub fn create_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+    /// `mcp_servers/create`. Returns the real gateway/transport error
+    /// text on failure (e.g. a duplicate-name rejection from
+    /// `acpx_core::mcp_servers::McpServerStore::create`, surfaced through
+    /// `AcpxThreadError`'s `Display`) instead of collapsing it to a bare
+    /// `bool` -- `lib.rs`'s settings dispatch methods show this verbatim
+    /// in the action-feedback toast, so a generic "failed" message no
+    /// longer hides *why*. On success, the caller (`lib.rs`'s settings
+    /// dispatch methods) is expected to re-call [`Self::
+    /// list_mcp_servers`] afterward to refresh the UI list from the
+    /// gateway's own state, same "don't optimistically mutate client-side
+    /// state" posture the mode/config selector uses.
+    pub fn create_mcp_server(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        let success = self
+        let result = self
             .runtime
             .block_on(handle.create_mcp_server(entry))
-            .is_ok();
-        if success {
+            .map_err(|err| err.to_string());
+        // Main's live-pool refresh: registry mutations must bump pool
+        // generations so already-open sessions pick up the change on next
+        // reacquire (see notify_mcp_settings_changed).
+        if result.is_ok() {
             self.notify_mcp_settings_changed(idx);
         }
-        success
+        result
     }
 
-    /// `mcp_servers/update` -- same payload shape as [`Self::
-    /// create_mcp_server`].
-    pub fn update_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+    /// `mcp_servers/update` -- same payload shape and error-surfacing
+    /// contract as [`Self::create_mcp_server`].
+    pub fn update_mcp_server(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        let success = self
+        let result = self
             .runtime
             .block_on(handle.update_mcp_server(entry))
-            .is_ok();
-        if success {
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
             self.notify_mcp_settings_changed(idx);
         }
-        success
+        result
     }
 
     /// `mcp_servers/delete`.
-    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> bool {
+    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        let success = self
+        let result = self
             .runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
-            .is_ok();
-        if success {
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
             self.notify_mcp_settings_changed(idx);
         }
-        success
+        result
+    }
+
+    /// `mcp_servers/authenticate`. Returns the authorization URL to open
+    /// in a browser on success, the real error text on failure (server
+    /// not found, stdio transport, discovery failure, etc.) instead of
+    /// collapsing it to `None`.
+    pub fn authenticate_mcp_server(&self, idx: usize, name: &str) -> Result<String, String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.authenticate_mcp_server(name.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// `mcp_servers/logout`.
+    pub fn logout_mcp_server(&self, idx: usize, name: &str) -> Result<(), String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.logout_mcp_server(name.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe. See `AcpxThreadHandle::fetch_mcp_server_tools`'s
+    /// doc comment: the real tool list arrives on a later
+    /// [`Self::list_mcp_servers`] call, not this one.
+    pub fn fetch_mcp_server_tools(&self, idx: usize, name: &str) -> Result<(), String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.fetch_mcp_server_tools(name.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// Non-blocking counterparts to the six `*_mcp_server` methods above --
+    /// same rationale as `install_agent_async`/`set_agent_enabled_async`
+    /// (PUI-013): every one of those synchronous methods does `self.
+    /// runtime.block_on(...)` directly on the calling thread, which for
+    /// every MCP settings action is the Slint UI callback thread, freezing
+    /// the whole panel for the RPC's full duration (the reported "jittery
+    /// lag while toggling the switch" -- a real block, not just visual
+    /// jank). These run the same RPC on `self.runtime` via `spawn` instead,
+    /// deduped through `mcp_operations` exactly like `agent_operations`
+    /// dedupes agent installs, and hand the real `Result` to `on_complete`
+    /// -- invoked on the runtime thread, never the UI thread, so callers
+    /// (`lib.rs`'s `dispatch_mcp_server_*_async` methods) must re-enter the
+    /// event loop themselves (`slint::invoke_from_event_loop`) before
+    /// touching any Slint/`PanelSingleton` state, same as every other
+    /// background-thread completion in this codebase (`effect_executor.rs`'s
+    /// skill-effect handlers, `report_mcp_server_result`).
+    ///
+    /// On successful create/update/delete/enabled, also fires
+    /// [`Self::notify_mcp_settings_changed`] so pooled sessions refresh
+    /// (same contract as the synchronous methods above -- critical because
+    /// the Settings UI exclusively uses these async paths).
+    pub fn create_mcp_server_async(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("create:{}", entry.name);
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        // Cannot call &self methods from the spawn future; capture base_url
+        // + project_pools the same way notify_mcp_settings_changed resolves
+        // them so a successful mutation still refreshes pools off the UI
+        // thread (Settings uses only these async paths).
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .create_mcp_server(entry)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn update_mcp_server_async(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("update:{}", entry.name);
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .update_mcp_server(entry)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn delete_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("delete:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking enabled-toggle. Mirrors `lib.rs`'s synchronous
+    /// `dispatch_mcp_server_enabled_changed` (fetch the current entry,
+    /// flip `enabled`, `mcp_servers/update` it back) but runs the whole
+    /// fetch-mutate-update sequence on `self.runtime` instead of blocking
+    /// the caller -- there is no dedicated `mcp_servers/set_enabled` RPC,
+    /// so this composes the same two real calls [`Self::list_mcp_servers`]/
+    /// [`Self::update_mcp_server`] use, just via their `handle.*.await`
+    /// counterparts instead of `self.runtime.block_on`.
+    pub fn set_mcp_server_enabled_async(
+        &self,
+        idx: usize,
+        name: &str,
+        enabled: bool,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        // Built-in snapflow is client-injected, not a central registry
+        // entry — route off the registry update path entirely.
+        if is_builtin_snapflow_mcp_name(name) {
+            self.set_builtin_snapflow_mcp_enabled(enabled);
+            on_complete(Ok(()));
+            return;
+        }
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("enabled:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        // Optimistic local flip so StatusDot / status-line re-derive from
+        // the new enabled state this frame (list poll will confirm).
+        if let Ok(mut cache) = self.gateway_catalog.try_lock() {
+            if let Some(entry) = cache
+                .mcp_servers
+                .iter_mut()
+                .find(|entry| entry.name == name)
+            {
+                entry.enabled = enabled;
+            }
+            cache.last_refresh = None;
+        }
+        let catalog = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut entry = handle
+                    .list_mcp_servers()
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| {
+                        format!("MCP server \"{name}\" disappeared before its enabled state could update")
+                    })?;
+                entry.enabled = enabled;
+                handle
+                    .update_mcp_server(entry)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            .await;
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            // Confirm StatusDot from wire without waiting out the 2s debounce.
+            if let Ok(mut cache) = catalog.try_lock() {
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`]. Returns the authorization URL
+    /// on success, same contract as the synchronous [`Self::
+    /// authenticate_mcp_server`].
+    pub fn authenticate_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<String, String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("authenticate:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .authenticate_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn logout_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("logout:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .logout_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`]. Kicks off the same real
+    /// `mcp_servers/tools_fetch` probe as the synchronous [`Self::
+    /// fetch_mcp_server_tools`], just off the calling thread -- the
+    /// fetched catalog itself still only ever arrives via a later
+    /// [`Self::list_mcp_servers`] poll, so this has no new "busy" UI of
+    /// its own to drive: the existing `tool_fetch_status == "fetching"`
+    /// state (already polled from that same catalog) is what the Fetch/
+    /// Refresh button's spinner is sourced from, not `mcp_operations_in_
+    /// flight` -- the kickoff round-trip this dedupes is typically much
+    /// shorter than the probe itself.
+    pub fn fetch_mcp_server_tools_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("tools_fetch:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        // Optimistic Fetching: the kickoff RPC is short, the real probe
+        // is not -- stamp the local catalog cache immediately so the
+        // Fetch button spinner and "fetching" status show this frame,
+        // not only after the next mcp_servers/list round-trip.
+        if let Ok(mut cache) = self.gateway_catalog.try_lock() {
+            if let Some(entry) = cache
+                .mcp_servers
+                .iter_mut()
+                .find(|entry| entry.name == name)
+            {
+                entry.tool_catalog =
+                    Some(crate::protocol_types::McpToolCatalog::Fetching);
+            }
+            cache.last_refresh = None;
+        }
+        let catalog = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .fetch_mcp_server_tools(name.clone())
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            // Kickoff returned: server has stamped Fetching (or failed).
+            // Drop debounce so the next frame's list poll can pick up
+            // Fetching → Ready without waiting the default 2s.
+            if let Err(error) = &result {
+                // Keep the real RPC failure visible on the row after the
+                // short-lived toast disappears. This is also emitted by
+                // the panel process so async errors can be correlated
+                // with acpx/daemon logs.
+                eprintln!(
+                    "panel-rust: mcp_servers/tools_fetch failed for {name}: {error}"
+                );
+            }
+            if let Ok(mut cache) = catalog.try_lock() {
+                if let Err(error) = &result {
+                    if let Some(entry) = cache
+                        .mcp_servers
+                        .iter_mut()
+                        .find(|entry| entry.name == name)
+                    {
+                        entry.tool_catalog = Some(
+                            crate::protocol_types::McpToolCatalog::Error {
+                                message: error.clone(),
+                            },
+                        );
+                    }
+                }
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking update of one discovered MCP tool preference. The
+    /// read/modify/write sequence stays together on the bridge runtime so a
+    /// UI effect never performs either registry RPC synchronously.
+    pub fn update_mcp_tool_preference_async(
+        &self,
+        idx: usize,
+        server_name: &str,
+        tool_name: &str,
+        field: &str,
+        value: bool,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("tool:{server_name}:{tool_name}:{field}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let catalog = self.gateway_catalog.clone();
+        let project_pools = self.project_pools.clone();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let field = field.to_string();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut entry = handle
+                    .list_mcp_servers()
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.name == server_name)
+                    .ok_or_else(|| {
+                        format!(
+                            "MCP server \"{server_name}\" disappeared before tool preference update"
+                        )
+                    })?;
+                let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
+                if let Some(tools) = tools {
+                    if let Some(tool) = tools.iter_mut().find(|tool| {
+                        tool.get("name").and_then(|name| name.as_str()) == Some(tool_name.as_str())
+                    }) {
+                        if let Some(object) = tool.as_object_mut() {
+                            object.insert(field.clone(), serde_json::Value::Bool(value));
+                        }
+                    } else {
+                        let mut object = serde_json::Map::new();
+                        object.insert("name".to_string(), serde_json::Value::String(tool_name.clone()));
+                        object.insert(field.clone(), serde_json::Value::Bool(value));
+                        tools.push(serde_json::Value::Object(object));
+                    }
+                } else {
+                    let mut object = serde_json::Map::new();
+                    object.insert("name".to_string(), serde_json::Value::String(tool_name.clone()));
+                    object.insert(field.clone(), serde_json::Value::Bool(value));
+                    entry.extra.insert(
+                        "tools".to_string(),
+                        serde_json::Value::Array(vec![serde_json::Value::Object(object)]),
+                    );
+                }
+                handle
+                    .update_mcp_server(entry)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            .await;
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            if let Ok(mut cache) = catalog.try_lock() {
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    fn begin_mcp_operation(&self, key: &str) -> bool {
+        self.mcp_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned())
+    }
+
+    /// Non-blocking read, safe to call every frame poll -- same contract
+    /// as [`Self::agent_operations_in_flight`]. Keys are `"<action>:
+    /// <server-name>"` (see `mcp_operations`'s own doc comment); callers
+    /// that only need "is *this* server busy at all" should check for any
+    /// key ending in `:<name>`.
+    pub fn mcp_operations_in_flight(&self) -> Vec<String> {
+        self.mcp_operations
+            .try_lock()
+            .map(|operations| operations.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// `agents/list` against thread `idx`'s bound gateway -- the
@@ -4741,22 +6077,59 @@ impl AgentBridge {
             .is_none_or(|cache| cache.gen == 0)
     }
 
+    /// Drop the catalog's last-refresh stamp so the next
+    /// [`Self::request_gateway_catalog_refresh`] actually hits the gateway
+    /// instead of being absorbed by the 2s debounce. Used after MCP
+    /// mutations (tools_fetch kickoff, enable toggle, create/update/
+    /// delete) so Settings sees Fetching/Ready and enabled state live.
+    pub fn invalidate_gateway_catalog(&self) {
+        if let Ok(mut cache) = self.gateway_catalog.try_lock() {
+            cache.last_refresh = None;
+        }
+    }
+
     /// Fire-and-forget background refresh of profiles / MCP / agents /
     /// recoverable sessions. Safe to call every frame: single-flight via
     /// `gateway_catalog_refreshing`, and skips if a fresh fill landed within
     /// `min_interval`. Installation does not need a special case because the
     /// frame path never waits for these RPCs.
     ///
+    /// While any MCP server's `toolCatalog` is `Fetching` (or a
+    /// `tools_fetch:<name>` op is still in flight), the debounce shrinks
+    /// to 200ms so the Fetch-tools spinner and expanded tool list update
+    /// as soon as the background probe finishes (the 2s default otherwise
+    /// made "Fetch tools" look dead).
+    ///
     /// **Must not** be awaited on the UI thread — all RPC work runs on the
     /// bridge tokio runtime (canonical push pattern; same as `poll` drain).
     pub fn request_gateway_catalog_refresh(&self, idx: usize) {
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const FETCHING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
         {
             let Ok(cache) = self.gateway_catalog.try_lock() else {
                 return;
             };
+            let ops = self
+                .mcp_operations
+                .try_lock()
+                .ok();
+            let any_tools_fetch_op = ops
+                .as_ref()
+                .is_some_and(|set| set.iter().any(|k| k.starts_with("tools_fetch:")));
+            let any_tools_fetching = any_tools_fetch_op
+                || cache.mcp_servers.iter().any(|entry| {
+                    matches!(
+                        entry.tool_catalog,
+                        Some(crate::protocol_types::McpToolCatalog::Fetching)
+                    )
+                });
+            let min_interval = if any_tools_fetching {
+                FETCHING_INTERVAL
+            } else {
+                MIN_INTERVAL
+            };
             if let Some(at) = cache.last_refresh {
-                if cache.gen > 0 && at.elapsed() < MIN_INTERVAL {
+                if cache.gen > 0 && at.elapsed() < min_interval {
                     return;
                 }
             }
@@ -4782,12 +6155,27 @@ impl AgentBridge {
             })
             .collect();
         let cache = self.gateway_catalog.clone();
+        let operations = self.mcp_operations.clone();
         let refreshing = self.gateway_catalog_refreshing.clone();
         let admin_creds = resolve_admin_creds();
+        // mcp-registry-live-propagation: on a real central-registry diff
+        // (not the cold first fill), refresh every project pool bound to
+        // this gateway so idle sessions drop and leased ones stamp stale.
+        let base_url = self.gateway_urls.get(&provider).cloned();
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
-            let profiles = handle.list_profiles().await.unwrap_or_default();
-            let mcp_servers = handle.list_mcp_servers().await.unwrap_or_default();
-            let mut agents = handle.list_agents().await.unwrap_or_default();
+            // These four RPCs are independent of each other (only the admin-enablement
+            // merge below depends on `agents` having resolved), so run them concurrently
+            // via `tokio::join!` instead of paying for N sequential round-trips.
+            let (profiles, mcp_servers, agents_result, sessions_result) = tokio::join!(
+                handle.list_profiles(),
+                handle.list_mcp_servers(),
+                handle.list_agents(),
+                handle.list_sessions_for_agent(provider.clone())
+            );
+            let profiles = profiles.unwrap_or_default();
+            let mcp_servers = mcp_servers.unwrap_or_default();
+            let mut agents = agents_result.unwrap_or_default();
             if let Some((admin_url, admin_token)) = admin_creds {
                 let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
                 if let Ok(entries) = client.list_agents().await {
@@ -4802,23 +6190,40 @@ impl AgentBridge {
                     }
                 }
             }
-            let recoverable_sessions = handle
-                .list_sessions_for_agent(provider.clone())
-                .await
+            let recoverable_sessions = sessions_result
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|session| !bound.contains(&session.acp_session_id))
                 .collect();
-            {
+            let registry_changed = {
                 if let Ok(mut c) = cache.try_lock() {
+                    let had_prior_fill = c.gen > 0;
+                    let ops = operations
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let merged = merge_mcp_list_with_optimistic(
+                        mcp_servers,
+                        &c.mcp_servers,
+                        &ops,
+                    );
+                    let changed = had_prior_fill
+                        && mcp_registry_identity(&c.mcp_servers)
+                            != mcp_registry_identity(&merged);
                     c.profiles = profiles;
-                    c.mcp_servers = mcp_servers;
+                    c.mcp_servers = merged;
                     c.agents = agents;
                     c.recoverable_sessions = recoverable_sessions;
                     c.recovery_provider = provider;
                     c.gen = c.gen.saturating_add(1).max(1);
                     c.last_refresh = Some(std::time::Instant::now());
+                    changed
+                } else {
+                    false
                 }
+            };
+            if registry_changed {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
             }
             refreshing.store(false, Ordering::SeqCst);
         });
@@ -5397,7 +6802,7 @@ impl AgentBridge {
             });
             return;
         };
-        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider, None);
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
         let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
         else {
             let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
@@ -5925,7 +7330,7 @@ mod tests {
             Some(PathBuf::from("/projects/a/.snapflow/timeline"))
         );
 
-        let entries = snapflowd_mcp_servers_entry(resolved.as_deref(), "claude", None);
+        let entries = snapflowd_mcp_servers_entry(resolved.as_deref(), "claude");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -6037,6 +7442,70 @@ mod tests {
             None,
             "an unscoped thread must never be retro-bound via an empty `old`"
         );
+    }
+
+    /// project-close-session-teardown: releasing sessions for the
+    /// currently active project must not touch threads recorded against a
+    /// DIFFERENT project (or an unscoped thread) -- mirrors `rebind_
+    /// project_path_moves_only_the_renamed_projects_threads`'s "only the
+    /// matching project's threads move" shape, but for teardown instead of
+    /// rename. None of these threads ever opened a real session (an
+    /// unreachable gateway URL, same as every other bridge-construction
+    /// test in this module), so `close_session` resolves to an immediate
+    /// no-op success on each -- this test's real assertion is that the
+    /// call is safe (no panic) for every slot regardless of project, and
+    /// that it never sets the permanent user-facing `closed` state, which
+    /// only the explicit close/delete UI actions may do.
+    #[test]
+    fn release_sessions_for_current_project_never_marks_threads_permanently_closed() {
+        let specs = vec![
+            ThreadSpec {
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "on-b".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/b/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        // No active project recorded yet -- must be a safe no-op.
+        bridge.release_sessions_for_current_project();
+        for idx in 0..3 {
+            assert!(!bridge.thread_closed(idx));
+        }
+
+        // Now project A becomes active; releasing must leave every thread
+        // (A's own, B's, and the unscoped one) not permanently closed.
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/a/timeline.mlt".to_owned(),
+        ));
+        bridge.release_sessions_for_current_project();
+        for idx in 0..3 {
+            assert!(
+                !bridge.thread_closed(idx),
+                "release must never flip the permanent closed flag"
+            );
+        }
     }
 
     #[test]
@@ -6202,6 +7671,103 @@ mod tests {
 
         assert_eq!(missing_file_result, None);
         assert_eq!(empty_key_result, None);
+    }
+
+    /// Writes `contents` to a disposable temp `auth.json`, points
+    /// `ACPX_CODEX_AUTH_FILE` at it, and returns a guard whose drop
+    /// restores the prior env var and removes the temp dir -- shared
+    /// setup for `resolve_codex_native_auth_method_id`'s regression
+    /// tests below, which each need a fresh file of a specific shape.
+    struct TempCodexAuthFile {
+        dir: PathBuf,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl TempCodexAuthFile {
+        fn write(contents: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rui-codex-auth-mode-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let auth_file = dir.join("auth.json");
+            std::fs::write(&auth_file, contents).expect("write temp auth file");
+            let prior = std::env::var_os("ACPX_CODEX_AUTH_FILE");
+            unsafe {
+                std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+            }
+            Self { dir, prior }
+        }
+    }
+
+    impl Drop for TempCodexAuthFile {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => unsafe { std::env::set_var("ACPX_CODEX_AUTH_FILE", value) },
+                None => unsafe { std::env::remove_var("ACPX_CODEX_AUTH_FILE") },
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Regression test for the actual live bug this plan fixes: this
+    /// developer's real `~/.codex/auth.json` had `"auth_mode": "chatgpt"`
+    /// (a real, completed ChatGPT-plan login) *and* a stale, leftover
+    /// non-empty `OPENAI_API_KEY` field, and the old field-presence-only
+    /// detection always picked "api-key" for that combination, silently
+    /// contradicting the file's own declared mode. `auth_mode` must now
+    /// win regardless of the leftover key's presence.
+    #[test]
+    fn resolve_codex_native_auth_method_id_prefers_declared_chatgpt_over_leftover_api_key() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(
+            r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": "sk-stale-leftover-key", "tokens": {"access_token": "at-real-login"}}"#,
+        );
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
+    }
+
+    /// `auth_mode` absent entirely (an `auth.json` shape from before this
+    /// field existed) must still fall back to the old presence-based
+    /// priority: a real `OPENAI_API_KEY` resolves to "api-key".
+    #[test]
+    fn resolve_codex_native_auth_method_id_falls_back_to_api_key_presence_without_auth_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(r#"{"OPENAI_API_KEY": "sk-test-key"}"#);
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("api-key"));
+    }
+
+    /// `auth_mode: "chatgpt"` must be trusted on its own -- with
+    /// `OPENAI_API_KEY` explicitly `null` and no `tokens` object at all
+    /// (no recognized token evidence whatsoever) -- since acpx's
+    /// `authenticate` call only ever sends `{"methodId": "chat-gpt"}`
+    /// with no credential payload; codex-acp itself re-reads the same
+    /// auth.json natively to actually consume the login.
+    #[test]
+    fn resolve_codex_native_auth_method_id_trusts_declared_chatgpt_with_no_token_evidence() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth =
+            TempCodexAuthFile::write(r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": null}"#);
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
+    }
+
+    /// An unrecognized `auth_mode` value must be ignored (not trusted as
+    /// either mode) and fall back to presence-based detection, same as a
+    /// missing field.
+    #[test]
+    fn resolve_codex_native_auth_method_id_falls_back_on_unrecognized_auth_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(
+            r#"{"auth_mode": "some-future-mode", "OPENAI_API_KEY": "sk-test-key"}"#,
+        );
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("api-key"));
     }
 
     /// read_codex_model_provider_from_config derives the .codex directory
@@ -6447,15 +8013,37 @@ mod tests {
             persona: &str,
             db_path: Option<&std::path::Path>,
         ) -> Self {
+            // `acpx-server` now defaults `ACPX_DB_PATH` to a fixed
+            // `~/.acpx/acpx.db` when unset (durable-persistence-by-
+            // default, see `main.rs::default_db_path`'s doc comment) --
+            // every test spawn that used to rely on "no ACPX_DB_PATH ==
+            // no persistence, fully isolated in-memory state" would
+            // otherwise silently share and lock-contend on that one real
+            // file across every parallel test process. When the caller
+            // doesn't ask for a specific `db_path`, mint a fresh one-off
+            // sqlite file per spawn instead (leaked via `into_path`, not
+            // cleaned up -- same tradeoff any throwaway test tempfile
+            // makes; a locked/shared default file across dozens of
+            // concurrent `cargo test` processes is the far worse
+            // failure mode this avoids).
+            let owned_db_path;
+            let db_path = match db_path {
+                Some(path) => path,
+                None => {
+                    owned_db_path = tempfile::tempdir()
+                        .expect("tempdir for isolated test ACPX_DB_PATH")
+                        .into_path()
+                        .join("acpx-test.db");
+                    owned_db_path.as_path()
+                }
+            };
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
                 test_only_set_backend_cmd_env(command, backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
-                    .env("RUST_LOG", "error");
-                if let Some(db_path) = db_path {
-                    command.env("ACPX_DB_PATH", db_path);
-                }
+                    .env("RUST_LOG", "error")
+                    .env("ACPX_DB_PATH", db_path);
             });
             TestGateway { child, base_url }
         }
@@ -9638,23 +11226,44 @@ done
             bridge.list_mcp_servers(0).is_empty(),
             "expected no MCP servers on a fresh gateway"
         );
-        assert!(bridge.create_mcp_server(
-            0,
-            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs" })
-        ));
+        let stdio_entry = |command: &str| {
+            crate::protocol_types::McpServerEntry::new(
+                "bridge-fs",
+                crate::protocol_types::McpServerConfig::Stdio {
+                    command: command.to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    timeout: None,
+                },
+            )
+        };
+        assert!(bridge.create_mcp_server(0, stdio_entry("mcp-bridge-fs")).is_ok());
         let after_create = bridge.list_mcp_servers(0);
         assert_eq!(after_create.len(), 1);
         assert_eq!(after_create[0].name, "bridge-fs");
 
-        assert!(bridge.update_mcp_server(
-            0,
-            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs-v2" })
-        ));
+        // The real failure-text contract this test exists to prove:
+        // create_mcp_server/etc. used to collapse every failure into a
+        // bare `bool`/`Option`, discarding the actual reason. A duplicate
+        // create against the real gateway is rejected server-side
+        // (`acpx_core::mcp_servers::McpServerStore::create`'s
+        // `AlreadyExists` error) -- confirm that real message reaches the
+        // caller, not a generic "failed" string with no context.
+        let duplicate_create_err = bridge
+            .create_mcp_server(0, stdio_entry("mcp-bridge-fs"))
+            .expect_err("creating the same name twice must fail");
+        assert!(
+            duplicate_create_err.contains("bridge-fs") || duplicate_create_err.contains("already"),
+            "expected the real gateway rejection reason (naming the duplicate server or \
+             \"already exists\"), got: {duplicate_create_err:?}"
+        );
+
+        assert!(bridge.update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2")).is_ok());
         let after_update = bridge.list_mcp_servers(0);
         assert_eq!(after_update.len(), 1);
-        assert_eq!(after_update[0].command.as_deref(), Some("mcp-bridge-fs-v2"));
+        assert_eq!(after_update[0].command(), Some("mcp-bridge-fs-v2"));
 
-        assert!(bridge.delete_mcp_server(0, "bridge-fs"));
+        assert!(bridge.delete_mcp_server(0, "bridge-fs").is_ok());
         assert!(
             bridge.list_mcp_servers(0).is_empty(),
             "expected the server to be gone after delete"
@@ -9670,6 +11279,84 @@ done
         assert!(
             !bridge.install_agent(0, "definitely-not-a-real-agent-id"),
             "install_agent against an unknown id should fail against the real registry, not succeed"
+        );
+    }
+
+    /// Real end-to-end proof of `AgentBridge::fetch_mcp_server_tools` --
+    /// proven at the layer `lib.rs` actually calls from Slint (the
+    /// sibling `gateway_actor_mcp_agents_e2e_test.rs` tests only prove
+    /// this one level lower, through `AcpxThreadHandle` directly).
+    /// Real `snapflowd-mcp` subprocess, real `mcp_servers/tools_fetch`
+    /// RPC, real background probe, polled through the real gateway.
+    #[test]
+    fn fetch_mcp_server_tools_reaches_a_real_backend_through_the_bridge() {
+        let gateway = TestGateway::spawn();
+        let names = ["Tools Fetch Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        let global_dir = tempfile::tempdir().expect("global dir tempdir");
+        std::fs::create_dir_all(global_dir.path().join("release")).expect("skill dir");
+        std::fs::write(
+            global_dir.path().join("release").join("SKILL.md"),
+            "---\nname: release\ndescription: release process\n---\n",
+        )
+        .expect("write SKILL.md");
+
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "bridge-tools-preview",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: resolve_snapflowd_mcp_bin().to_string_lossy().into_owned(),
+                args: vec![
+                    "--global-dir".to_string(),
+                    global_dir.path().to_string_lossy().into_owned(),
+                ],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        assert!(bridge.create_mcp_server(0, entry).is_ok());
+
+        let before_fetch = bridge
+            .list_mcp_servers(0)
+            .into_iter()
+            .find(|e| e.name == "bridge-tools-preview")
+            .expect("just-created entry should be listed");
+        assert_eq!(before_fetch.tool_catalog, None);
+
+        assert!(
+            bridge.fetch_mcp_server_tools(0, "bridge-tools-preview").is_ok(),
+            "fetch_mcp_server_tools kickoff should reach the real gateway"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ready_tools = None;
+        while std::time::Instant::now() < deadline {
+            let entry = bridge
+                .list_mcp_servers(0)
+                .into_iter()
+                .find(|e| e.name == "bridge-tools-preview")
+                .expect("entry should still be listed while polling");
+            match entry.tool_catalog {
+                Some(crate::protocol_types::McpToolCatalog::Ready { tools }) => {
+                    ready_tools = Some(tools);
+                    break;
+                }
+                Some(crate::protocol_types::McpToolCatalog::Error { message }) => {
+                    panic!("real tools/list probe through the bridge failed: {message}");
+                }
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let tool_names: Vec<String> = ready_tools
+            .expect("expected a ready real tool catalog within the timeout")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            tool_names.contains(&"list_skills".to_string()),
+            "expected the real snapflowd-mcp tool catalog to include list_skills, got {tool_names:?}"
         );
     }
 
@@ -9963,7 +11650,7 @@ done
         // entry (see that function's own doc comment) regardless of
         // provider -- this test only cares that "skills" is present,
         // first, and correctly shaped, for a provider still on MCP.
-        let entries = snapflowd_mcp_servers_entry(None, "claude", None);
+        let entries = snapflowd_mcp_servers_entry(None, "claude");
         assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
@@ -9978,6 +11665,45 @@ done
         );
     }
 
+    #[test]
+    fn snapshotd_mcp_entry_omitted_when_snapflow_disabled() {
+        let _gate = SNAPFLOW_MCP_GATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = SNAPFLOW_MCP_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        SNAPFLOW_MCP_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let without = snapshotd_mcp_server_entry_for_addr(Some("127.0.0.1:9"));
+        assert!(
+            without.is_empty(),
+            "disabled snapflow must not inject snapshotd into mcpServers"
+        );
+        SNAPFLOW_MCP_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let with = snapshotd_mcp_server_entry_for_addr(Some("127.0.0.1:9"));
+        assert_eq!(with.len(), 1);
+        assert_eq!(with[0]["name"], "snapshotd");
+        SNAPFLOW_MCP_ENABLED.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn apply_snapflow_to_client_mcp_list_removes_and_restores() {
+        let base = vec![
+            serde_json::json!({"name": "skills", "command": "x", "env": []}),
+            serde_json::json!({"type": "http", "name": "snapshotd", "url": "http://1/mcp", "headers": []}),
+        ];
+        let off = apply_snapflow_to_client_mcp_list(&base, false, None);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0]["name"], "skills");
+        let on = apply_snapflow_to_client_mcp_list(&off, true, Some("127.0.0.1:9"));
+        assert!(
+            on.iter()
+                .any(|e| e.get("name").and_then(|n| n.as_str()) == Some("snapshotd")),
+            "re-enable with an inject addr must put snapshotd back"
+        );
+        assert!(on
+            .iter()
+            .any(|e| e.get("name").and_then(|n| n.as_str()) == Some("skills")));
+    }
+
     /// **Regression test for the real, live-found silent-drop bug**
     /// (`video-generation-e2e-harness` plan's `custom_mcp_and_skills_
     /// support` phase, 2026-07-23): real `codex-acp`'s own request
@@ -9990,7 +11716,7 @@ done
     /// silently dropped by every real codex-acp session.
     #[test]
     fn snapflowd_mcp_servers_entry_skills_server_includes_the_required_env_field() {
-        let entries = snapflowd_mcp_servers_entry(None, "claude", None);
+        let entries = snapflowd_mcp_servers_entry(None, "claude");
         assert_eq!(entries[0]["name"], "skills");
         assert!(
             entries[0]["env"].is_array(),
@@ -10003,7 +11729,7 @@ done
     #[test]
     fn snapflowd_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_dir = std::path::Path::new("/tmp/my-project/.snapflow/timeline");
-        let entries = snapflowd_mcp_servers_entry(Some(project_dir), "claude", None);
+        let entries = snapflowd_mcp_servers_entry(Some(project_dir), "claude");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -10029,7 +11755,7 @@ done
     fn snapflowd_mcp_servers_entry_omits_the_skills_server_for_live_verified_filesystem_providers()
     {
         for provider in ["codex", "codex-acp"] {
-            let entries = snapflowd_mcp_servers_entry(None, provider, None);
+            let entries = snapflowd_mcp_servers_entry(None, provider);
             assert!(
                 entries.iter().all(|e| e["name"] != "skills"),
                 "provider {provider:?} passed the live filesystem-discovery gate (phase 7) -- \
@@ -10045,7 +11771,7 @@ done
     /// regardless of which provider string is passed in.
     #[test]
     fn snapshotd_mcp_server_entry_is_absent_without_cached_daemon_status() {
-        assert!(snapshotd_mcp_server_entry_for_addr(None, None).is_empty());
+        assert!(snapshotd_mcp_server_entry_for_addr(None).is_empty());
     }
 
     /// **Regression test for the real, live-found MCP transport bug**
@@ -10062,7 +11788,7 @@ done
         // The authoritative address is supplied by daemon.mcpStatus; this
         // pure helper verifies the generated entry without a per-call dial.
         let addr = "127.0.0.1:43210";
-        let entries = snapshotd_mcp_server_entry_for_addr(Some(addr), Some("ctx-token"));
+        let entries = snapshotd_mcp_server_entry_for_addr(Some(addr));
 
         assert_eq!(
             entries.len(),
@@ -10075,13 +11801,7 @@ done
             "must point at the Streamable HTTP endpoint (/mcp), not the legacy SSE one (/sse) -- \
              codex-acp's real MCP client requires this exact shape, confirmed live"
         );
-        assert_eq!(
-            entries[0]["headers"][0],
-            serde_json::json!({
-                "name": "X-Snapshotd-Context-Token",
-                "value": "ctx-token"
-            })
-        );
+        assert!(entries[0]["headers"].as_array().is_some_and(|headers| headers.is_empty()));
     }
 
     /// Exercises the real control-socket request/response path used by the
@@ -10175,6 +11895,122 @@ done
             !live[0].headless,
             "a project the user has open headful (PISO-9's headful-wins reuse) must not be \
              misreported as headless"
+        );
+    }
+
+    /// Broad coverage for registry poll-diff identity: name/enabled/config
+    /// changes count; tool_catalog (ephemeral fetch state) does not; order
+    /// is irrelevant.
+    #[test]
+    fn mcp_registry_identity_ignores_tool_catalog_and_detects_real_diffs() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog};
+
+        let a = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let mut a_with_tools = a.clone();
+        a_with_tools.tool_catalog = Some(McpToolCatalog::Fetching);
+        assert_eq!(
+            mcp_registry_identity(std::slice::from_ref(&a)),
+            mcp_registry_identity(std::slice::from_ref(&a_with_tools)),
+            "tool catalog must not look like a registry mutation"
+        );
+
+        let mut disabled = a.clone();
+        disabled.enabled = false;
+        assert_ne!(
+            mcp_registry_identity(std::slice::from_ref(&a)),
+            mcp_registry_identity(std::slice::from_ref(&disabled)),
+            "enabled flip is a real registry change"
+        );
+
+        let b = McpServerEntry::new(
+            "git",
+            McpServerConfig::Stdio {
+                command: "mcp-git".into(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let ordered = mcp_registry_identity(&[b.clone(), a.clone()]);
+        let reversed = mcp_registry_identity(&[a, b]);
+        assert_eq!(ordered, reversed, "list order must not matter");
+    }
+
+    #[test]
+    fn merge_mcp_list_keeps_fetching_and_enabled_while_ops_in_flight() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog};
+        use std::collections::HashSet;
+
+        let mut local = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "npx".into(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        local.enabled = false;
+        local.tool_catalog = Some(McpToolCatalog::Fetching);
+
+        // Wire still shows pre-toggle enabled=true and no catalog yet.
+        let mut wire = local.clone();
+        wire.enabled = true;
+        wire.tool_catalog = None;
+
+        let mut ops = HashSet::new();
+        ops.insert("tools_fetch:fs".to_owned());
+        ops.insert("enabled:fs".to_owned());
+
+        let merged = merge_mcp_list_with_optimistic(vec![wire], std::slice::from_ref(&local), &ops);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            !merged[0].enabled,
+            "in-flight enable toggle must keep optimistic enabled"
+        );
+        assert_eq!(
+            merged[0].tool_catalog,
+            Some(McpToolCatalog::Fetching),
+            "in-flight tools_fetch must keep optimistic Fetching over empty list"
+        );
+
+        // Wire Ready wins even while tools_fetch key is still present.
+        let mut ready = local.clone();
+        ready.tool_catalog = Some(McpToolCatalog::Ready { tools: vec![] });
+        let merged_ready =
+            merge_mcp_list_with_optimistic(vec![ready], std::slice::from_ref(&local), &ops);
+        assert!(matches!(
+            merged_ready[0].tool_catalog,
+            Some(McpToolCatalog::Ready { .. })
+        ));
+
+        // An immediate RPC failure must survive the next empty list poll so
+        // the row remains useful after the shared toast expires.
+        let error_message = "300002: no mcp server named snapflow".to_owned();
+        let mut failed = local.clone();
+        failed.tool_catalog = Some(McpToolCatalog::Error {
+            message: error_message.clone(),
+        });
+        let mut empty_catalog = failed.clone();
+        empty_catalog.tool_catalog = None;
+        let merged_error = merge_mcp_list_with_optimistic(
+            vec![empty_catalog],
+            std::slice::from_ref(&failed),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            merged_error[0].tool_catalog,
+            Some(McpToolCatalog::Error {
+                message: error_message,
+            })
         );
     }
 

@@ -385,6 +385,38 @@ fn merge_expanded_by_key(
     }
 }
 
+/// Frame-poll fold merges a fresh `config_options` snapshot (from
+/// `AgentBridge::config_options_for_provider`, which never carries a
+/// `current_value`) over the thread's existing options. A blind overwrite
+/// would silently discard a user's just-made `SettingsMsg::
+/// ConfigOptionSelected` pick on a deferred thread the very next frame,
+/// before they had a chance to send. Carry the old `current_value` forward
+/// onto the matching new option only when it's still a valid choice in the
+/// new option's `options[].value` list; otherwise leave the fresh
+/// snapshot's `current_value` as-is (never fabricate a value that isn't
+/// actually offered anymore).
+fn merge_config_options_preserving_current_value(
+    old: &[crate::protocol_types::ConfigOptionInfo],
+    new: Vec<crate::protocol_types::ConfigOptionInfo>,
+) -> Vec<crate::protocol_types::ConfigOptionInfo> {
+    new.into_iter()
+        .map(|mut option| {
+            if let Some(old_option) = old.iter().find(|candidate| candidate.id == option.id) {
+                if let Some(value) = old_option.current_value.as_ref() {
+                    if option
+                        .options
+                        .iter()
+                        .any(|candidate| &candidate.value == value)
+                    {
+                        option.current_value = Some(value.clone());
+                    }
+                }
+            }
+            option
+        })
+        .collect()
+}
+
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
         ThreadMsg::New => {
@@ -1253,6 +1285,7 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.default_agent_id = input.default_agent_id.clone();
             model.background_override_set = input.background_override_set;
             model.background_override = input.background_override;
+            model.show_global_skills = input.show_global_skills;
             model.settings_open = false;
             (
                 vec![Effect::SaveSettings { input }],
@@ -1385,7 +1418,7 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
         // orthogonal to whether the ACP AGENT itself is reachable/
         // authenticated, and blocking it here would trap a user trying to
         // fix the MCP side first).
-        SettingsMsg::McpServerCreate { name, command } => {
+        SettingsMsg::McpServerCreate { entry } => {
             let Some(idx) = selected_real_index(model) else {
                 return (vec![], vec![]);
             };
@@ -1400,8 +1433,19 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             (
                 vec![Effect::McpServerCreate {
                     real_index: idx,
-                    name,
-                    command,
+                    entry,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerUpdate { entry } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerUpdate {
+                    real_index: idx,
+                    entry,
                 }],
                 vec![Dirty::Settings],
             )
@@ -1452,6 +1496,18 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 vec![Dirty::Settings],
             )
         }
+        SettingsMsg::McpServerLogout { name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerLogout {
+                    real_index: idx,
+                    name,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerToolEnabledChanged {
             server_name,
             tool_name,
@@ -1474,6 +1530,36 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                     server_name,
                     tool_name,
                     enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerToolDeferredChanged {
+            server_name,
+            tool_name,
+            deferred,
+        } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerToolDeferredChanged {
+                    real_index: idx,
+                    server_name,
+                    tool_name,
+                    deferred,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
+        SettingsMsg::McpServerToolsFetchRequested { server_name } => {
+            let Some(idx) = selected_real_index(model) else {
+                return (vec![], vec![]);
+            };
+            (
+                vec![Effect::McpServerToolsFetchRequested {
+                    real_index: idx,
+                    server_name,
                 }],
                 vec![Dirty::Settings],
             )
@@ -2241,6 +2327,14 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 ],
             )
         }
+        EffectResultMsg::McpServerOperationCompleted(Ok(message)) => {
+            let toast = show_toast(model, "status", message);
+            (vec![], vec![toast])
+        }
+        EffectResultMsg::McpServerOperationCompleted(Err(err)) => {
+            let toast = show_toast(model, "error", err.message);
+            (vec![], vec![toast])
+        }
         EffectResultMsg::GatewayCallCompleted { real_index, result } => match result {
             Ok(()) => (
                 vec![],
@@ -2743,6 +2837,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         model.agent_operations_in_flight = frame.agent_operations_in_flight;
         dirty.push(Dirty::Settings);
     }
+    if model.mcp_operations_in_flight != frame.mcp_operations_in_flight {
+        model.mcp_operations_in_flight = frame.mcp_operations_in_flight;
+        dirty.push(Dirty::Settings);
+    }
     if let Some(snapshot) = frame.settings_preferences_snapshot {
         let changed = model.settings_scope != snapshot.scope
             || model.default_profile != snapshot.default_profile
@@ -2751,7 +2849,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             || model.default_agent_id != snapshot.default_agent_id
             || model.dev_mode != snapshot.dev_mode
             || model.background_override_set != snapshot.background_override_set
-            || model.background_override != snapshot.background_override;
+            || model.background_override != snapshot.background_override
+            || model.show_global_skills != snapshot.show_global_skills;
         if changed {
             model.settings_scope = snapshot.scope;
             model.default_profile = snapshot.default_profile;
@@ -2761,6 +2860,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.dev_mode = snapshot.dev_mode;
             model.background_override_set = snapshot.background_override_set;
             model.background_override = snapshot.background_override;
+            model.show_global_skills = snapshot.show_global_skills;
             dirty.push(Dirty::Settings);
         }
     }
@@ -2947,7 +3047,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.local_terminal = snapshot.local_terminal;
             thread.connection_status = snapshot.connection_status;
             thread.session_modes = snapshot.session_modes;
-            thread.config_options = snapshot.config_options;
+            let old_config_options = std::mem::take(&mut thread.config_options);
+            thread.config_options = merge_config_options_preserving_current_value(
+                &old_config_options,
+                snapshot.config_options,
+            );
             thread.available_commands = snapshot.available_commands;
             thread.usage = snapshot.usage;
             thread.plan = snapshot.plan;
@@ -4181,6 +4285,7 @@ mod tests {
             selected_thread_id: None,
             background_override_set: false,
             background_override: false,
+            show_global_skills: true,
         };
 
         update(
@@ -5368,6 +5473,7 @@ mod tests {
                 settings_gateway_snapshot: None,
                 settings_preferences_snapshot: None,
                 agent_operations_in_flight: Vec::new(),
+                mcp_operations_in_flight: Vec::new(),
                 skills_snapshot: None,
                 daemon_projects_refresh_due: false,
             }),
@@ -5705,6 +5811,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/review"),
             scope: crate::skills_state::SkillScope::Global,
             started_from: None,
+            is_dev_only: false,
         };
         let (_, dirty) = update(
             &mut model,
@@ -5921,8 +6028,15 @@ mod tests {
             let (effects, dirty) = update(
                 &mut model,
                 Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
-                    name: "srv".to_owned(),
-                    command: "cmd".to_owned(),
+                    entry: crate::protocol_types::McpServerEntry::new(
+                        "srv",
+                        crate::protocol_types::McpServerConfig::Stdio {
+                            command: "cmd".to_owned(),
+                            args: Vec::new(),
+                            env: Default::default(),
+                            timeout: None,
+                        },
+                    ),
                 })),
             );
             assert!(
@@ -5974,8 +6088,15 @@ mod tests {
         let (effects, _) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
-                name: "srv".to_owned(),
-                command: "cmd".to_owned(),
+                entry: crate::protocol_types::McpServerEntry::new(
+                    "srv",
+                    crate::protocol_types::McpServerConfig::Stdio {
+                        command: "cmd".to_owned(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                        timeout: None,
+                    },
+                ),
             })),
         );
         assert!(matches!(
@@ -6350,6 +6471,78 @@ mod tests {
         );
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
         assert_eq!(model.toast_kind, "info");
+    }
+
+    #[test]
+    fn mcp_server_operation_result_arms_the_shared_feedback_toast() {
+        // Every `dispatch_mcp_server_*` in lib.rs used to only `eprintln!`
+        // on failure, with nothing shown in the UI at all. Now routed
+        // through the same shared toast every other Settings action-result
+        // already uses (see `action_results_arm_the_shared_feedback_toast`
+        // just above).
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::McpServerOperationCompleted(Err(
+                crate::effect::EffectError::new("Failed to create MCP server \"fs\""),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "error");
+        assert_eq!(model.toast_message, "Failed to create MCP server \"fs\"");
+        let seq_after_error = model.toast_seq;
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::McpServerOperationCompleted(Ok(
+                "MCP server \"fs\" created".to_string(),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "status");
+        assert_eq!(model.toast_message, "MCP server \"fs\" created");
+        assert_ne!(model.toast_seq, seq_after_error, "seq bumps every show");
+    }
+
+    #[test]
+    fn mcp_server_tool_deferred_changed_produces_a_matching_effect() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
+                server_name: "fs".to_string(),
+                tool_name: "read_file".to_string(),
+                deferred: true,
+            })),
+        );
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::McpServerToolDeferredChanged {
+                server_name,
+                tool_name,
+                deferred: true,
+                ..
+            } if server_name == "fs" && tool_name == "read_file"
+        ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
+    }
+
+    #[test]
+    fn mcp_server_tools_fetch_requested_produces_a_matching_effect() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
+                server_name: "fs".to_string(),
+            })),
+        );
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::McpServerToolsFetchRequested { server_name, .. } if server_name == "fs"
+        ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
     }
 
     #[test]
@@ -6808,5 +7001,47 @@ mod tests {
         assert!(dirty
             .iter()
             .any(|d| matches!(d, Dirty::MessageRowPatch { index: 0, .. })));
+    }
+
+    fn config_option(
+        id: &str,
+        current_value: Option<&str>,
+        values: &[&str],
+    ) -> crate::protocol_types::ConfigOptionInfo {
+        crate::protocol_types::ConfigOptionInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            description: None,
+            category: None,
+            kind: "select".into(),
+            current_value: current_value.map(str::to_owned),
+            options: values
+                .iter()
+                .map(|value| crate::protocol_types::ConfigOptionValue {
+                    value: (*value).to_owned(),
+                    name: (*value).to_owned(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn config_option_merge_keeps_current_value_when_still_a_valid_choice() {
+        let old = vec![config_option("model", Some("opus"), &["sonnet", "opus"])];
+        let new = vec![config_option("model", None, &["sonnet", "opus", "haiku"])];
+        let merged = merge_config_options_preserving_current_value(&old, new);
+        assert_eq!(merged[0].current_value.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn config_option_merge_drops_current_value_once_it_is_no_longer_offered() {
+        let old = vec![config_option("model", Some("opus"), &["sonnet", "opus"])];
+        let new = vec![config_option("model", None, &["sonnet", "haiku"])];
+        let merged = merge_config_options_preserving_current_value(&old, new);
+        assert_eq!(
+            merged[0].current_value, None,
+            "must not fabricate a value that isn't a real choice in the fresh snapshot"
+        );
     }
 }

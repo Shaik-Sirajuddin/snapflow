@@ -294,3 +294,89 @@ async fn session_new_profile_with_no_mcp_servers_leaves_params_untouched() {
     assert_eq!(response["result"]["sawCentralFs"], false);
     assert_eq!(response["result"]["sawClientGit"], false);
 }
+
+/// Broad coverage for mcp-registry-live-propagation server merge:
+/// resume merges central+client, load merges central when client omits
+/// the list, malformed client mcpServers is rejected (not silently emptied).
+#[tokio::test]
+async fn session_resume_and_load_merge_central_mcp_and_reject_malformed() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", observing_backend_spec());
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "mcp_servers/create",
+            "params": {"name": "central-fs", "command": "mcp-central-fs"}
+        }))
+        .await
+        .expect("mcp_servers/create");
+
+    let mut profile = sample_profile("with-mcp", "stand-in-agent");
+    profile.mcp_servers = vec!["central-fs".to_string()];
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "profiles/create",
+            "params": profile
+        }))
+        .await
+        .expect("profiles/create");
+
+    let opened = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "mcpServers": [],
+                "_acpx": {"profile": "with-mcp"}
+            }
+        }))
+        .await
+        .expect("session/new");
+    let session_id = opened["result"]["sessionId"]
+        .as_str()
+        .expect("gateway session id")
+        .to_string();
+
+    let resume = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "session/resume",
+            "params": {
+                "sessionId": session_id,
+                "cwd": "/tmp",
+                "mcpServers": [{"name": "client-git", "command": "mcp-git", "args": [], "env": []}]
+            }
+        }))
+        .await
+        .expect("session/resume");
+    assert_eq!(resume["result"]["sawCentralFs"], true);
+    assert_eq!(resume["result"]["sawClientGit"], true);
+
+    let load = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 5, "method": "session/load",
+            "params": {"sessionId": session_id, "cwd": "/tmp"}
+        }))
+        .await
+        .expect("session/load");
+    assert_eq!(
+        load["result"]["sawCentralFs"], true,
+        "load must still merge central when client omits mcpServers"
+    );
+
+    let err = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 6, "method": "session/resume",
+            "params": {
+                "sessionId": session_id,
+                "cwd": "/tmp",
+                "mcpServers": [{"name": "broken", "notARealField": true}]
+            }
+        }))
+        .await
+        .expect_err("malformed mcpServers must be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("mcpServers") || message.contains("McpServer") || message.contains("invalid"),
+        "error should name the bad field: {message}"
+    );
+}

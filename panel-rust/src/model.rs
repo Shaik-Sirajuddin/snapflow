@@ -296,12 +296,33 @@ pub struct Model {
     pub background_default: bool,
     pub default_agent_id: String,
     pub dev_mode: bool,
+    /// Feature-flag gate (env-var driven, see `PANEL_PROFILE_WIRING_ENABLED`
+    /// in lib.rs) for the "default profile"/"permission profile" settings
+    /// controls in `agents_view.slint`. Both are genuinely dual-tier
+    /// (visible/working under Project and Global scope alike, unlike the
+    /// six categories gated Global-only in 6745aa0e) but are hidden
+    /// entirely, in both scopes, until this flag is turned on. Computed
+    /// once at startup from the environment and never mutated afterward.
+    pub profile_wiring_enabled: bool,
     pub background_override_set: bool,
     pub background_override: bool,
+    /// Skills settings view's "Show global skills" row
+    /// (`skills_view.slint`). Genuinely dual-tier, same
+    /// Project-overrides-Global mechanism as `background_default` --
+    /// see `settings_file::SettingsDocument::show_global_skills`'s doc
+    /// comment.
+    pub show_global_skills: bool,
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
     pub agent_operations_in_flight: Vec<String>,
+    /// Same shape/lifecycle as `agent_operations_in_flight` above, sourced
+    /// from `AgentBridge::mcp_operations_in_flight` -- keys are `"<action>:
+    /// <server-name>"` (see that method's own doc comment). Folded into
+    /// `McpServerOption`'s per-row busy booleans by `to_mcp_server_option_
+    /// rows`, driving the Spinner shown on whichever button's action is
+    /// actually in flight.
+    pub mcp_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot

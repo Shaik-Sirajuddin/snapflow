@@ -6,13 +6,13 @@
 //! the project-scoped MCP/SAP connection.
 
 use serde_json::{json, Value};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex, OnceLock,
-};
+use std::sync::{atomic::{AtomicU64, Ordering}, Mutex, OnceLock};
+#[cfg(unix)]
 use std::time::Duration;
 
 static OPEN_PROJECT: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
@@ -28,6 +28,7 @@ fn client_id() -> String {
         .unwrap_or_else(|_| format!("panel-gui-{}", std::process::id()))
 }
 
+#[cfg(unix)]
 fn socket_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SNAPSHOTD_CONTROL_SOCKET") {
         if !path.is_empty() {
@@ -40,6 +41,7 @@ fn socket_path() -> Option<PathBuf> {
         .map(|s| PathBuf::from(s).join("control.sock"))
 }
 
+#[cfg(unix)]
 fn call(method: &str, params: Value) -> Result<Value, String> {
     let path =
         socket_path().ok_or_else(|| "snapshotd control socket is not configured".to_owned())?;
@@ -60,6 +62,15 @@ fn call(method: &str, params: Value) -> Result<Value, String> {
         return Err(error.to_string());
     }
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+// Rust's std doesn't expose a Windows unix-domain-socket client, so the SDP
+// control-socket bridge is unix-only for now; GUI lifecycle notifications
+// are a best-effort side channel and every caller already treats errors as
+// non-fatal, so a stubbed Err here is a safe no-op on Windows.
+#[cfg(not(unix))]
+fn call(_method: &str, _params: Value) -> Result<Value, String> {
+    Err("snapshotd control socket bridge is not supported on this platform".to_owned())
 }
 
 pub(crate) fn project_changed(path: Option<String>) {

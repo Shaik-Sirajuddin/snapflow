@@ -581,10 +581,44 @@ fn parse_one_block(events: &[(Event, Range<usize>)], i: usize) -> (BlockAst, usi
                                     k += 1;
                                     break;
                                 }
-                                _ => {
+                                Event::Start(Tag::Paragraph)
+                                | Event::Start(Tag::Heading { .. })
+                                | Event::Start(Tag::CodeBlock(_))
+                                | Event::Start(Tag::BlockQuote(_))
+                                | Event::Start(Tag::List(_))
+                                | Event::Start(Tag::Table(_))
+                                | Event::Rule => {
                                     let (ast, next_k, _) = parse_one_block(events, k);
                                     item_blocks.push(ast);
                                     k = next_k;
+                                }
+                                _ => {
+                                    // "Tight" list items (the common case --
+                                    // any list without a blank line between
+                                    // items) have their content emitted as
+                                    // bare inline events (Text, Code,
+                                    // Strong/Emphasis/Link start+end,
+                                    // SoftBreak, ...) with no `Tag::Paragraph`
+                                    // wrapper -- CommonMark drops the <p> for
+                                    // tight lists. Falling through to
+                                    // `parse_one_block` per individual event
+                                    // hit its generic leaf fallback, which
+                                    // treated the Link's Start/Text/End as
+                                    // three separate one-run "paragraphs":
+                                    // the Start/End produced empty-text
+                                    // lines (the "dual/triple line" bug) and
+                                    // the Text event lost `link_stack`
+                                    // context entirely (the "no href inside
+                                    // bullets" bug), since only
+                                    // `collect_inline_runs` tracks that
+                                    // stack. Collect the whole inline run as
+                                    // one paragraph instead, exactly like a
+                                    // top-level paragraph does.
+                                    let (runs, next_k, _) =
+                                        collect_inline_runs(events, k, TagEnd::Item);
+                                    item_blocks.push(BlockAst::Paragraph(runs));
+                                    k = next_k;
+                                    break;
                                 }
                             }
                         }
@@ -1099,6 +1133,31 @@ mod tests {
     }
 
     #[test]
+    fn tight_list_item_with_link_stays_one_line_and_keeps_href() {
+        // Regression test: tight (no-blank-line) list items have their
+        // content emitted by pulldown-cmark as bare inline events with no
+        // `Tag::Paragraph` wrapper. Before the fix, the per-event fallback
+        // in the list-item parser split a link item into three lines
+        // (empty / text-without-link / empty) instead of one `ListItem`
+        // line carrying the href.
+        let lines = render_document("- [click me](https://example.com/x)\n", DEFAULT_WRAP_COLS);
+        assert_eq!(lines.len(), 1, "expected a single line, got {:?}", lines);
+        assert_eq!(lines[0].kind, LineKind::ListItem);
+        assert_eq!(lines[0].runs.len(), 1);
+        assert_eq!(lines[0].runs[0].text, "click me");
+        assert_eq!(lines[0].runs[0].link, "https://example.com/x");
+    }
+
+    #[test]
+    fn tight_list_item_with_bold_stays_one_line() {
+        let lines = render_document("- **bold** and plain\n", DEFAULT_WRAP_COLS);
+        assert_eq!(lines.len(), 1, "expected a single line, got {:?}", lines);
+        assert_eq!(lines[0].kind, LineKind::ListItem);
+        assert!(lines[0].runs.iter().any(|r| r.bold && r.text == "bold"));
+        assert_eq!(texts(&lines), vec!["bold and plain"]);
+    }
+
+    #[test]
     fn ordered_list_ordinals() {
         let lines = render_document("1. first\n2. second\n", DEFAULT_WRAP_COLS);
         assert_eq!(lines[0].ordinal, 1);
@@ -1185,6 +1244,80 @@ mod tests {
     #[test]
     fn empty_source_renders_nothing() {
         assert!(render_document("", DEFAULT_WRAP_COLS).is_empty());
+    }
+
+    #[test]
+    fn built_by_sentence_with_inline_code_parses_as_normal_runs() {
+        // Regression test for a reported "one character per line" render
+        // bug in this exact sentence (parentheses, an inline code span,
+        // commas, a period). Root cause was NOT here: `collect_inline_runs`
+        // and `wrap_runs` already coalesce this text into a small number
+        // of normal, multi-character runs/lines -- confirmed both for a
+        // one-shot `render_document` call and for the same text streamed
+        // in one character at a time through `StreamingMarkdownRenderer`
+        // (which re-parses on every push). The actual bug was a
+        // `markdown_view.slint` layout issue (see
+        // `slint_component_e2e_test::
+        // agent_markdown_run_does_not_collapse_to_one_char_per_line`):
+        // the per-run `Text` cluster's `alignment: start` sized non-
+        // stretch children to their *minimum* width, and `wrap:
+        // word-wrap` let that minimum collapse toward a single glyph for
+        // every run once it was added, not just oversized ones. This test
+        // guards the parsing/wrapping side so a future regression here
+        // (e.g. `Event::Code` handling corrupting run-collection state)
+        // would still be caught even though it wasn't the culprit this
+        // time.
+        let text = "I'm Claude Sonnet 5 (model ID `claude-sonnet-5`), built by Anthropic, running here as your Claude Code agent.";
+
+        let lines = render_document(text, DEFAULT_WRAP_COLS);
+        assert!(
+            lines.len() <= 3,
+            "expected a small number of wrapped lines, not one-per-character: {:?}",
+            lines
+        );
+        for line in &lines {
+            assert!(
+                line.runs.len() <= 4,
+                "expected each line to hold a handful of coalesced runs, not \
+                 one-run-per-character: {:?}",
+                line
+            );
+            for run in &line.runs {
+                assert!(
+                    run.text.chars().count() > 1 || run.text.trim().is_empty(),
+                    "found a suspicious single-character run (would indicate the \
+                     parser itself split text into one-run-per-character): {:?}",
+                    run
+                );
+            }
+        }
+        // The inline code span survives as its own single coalesced run,
+        // not split into individual characters.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .any(|r| r.code && r.text.contains("claude-sonnet-5")),
+            "expected the inline code span to survive as one run: {:?}",
+            lines
+        );
+
+        // Same assertions hold when the identical text arrives streamed in
+        // one character at a time (the real agent-chat delivery path).
+        let mut renderer = StreamingMarkdownRenderer::new(DEFAULT_WRAP_COLS);
+        for ch in text.chars() {
+            renderer.push(&ch.to_string());
+            let streamed = renderer.render();
+            for line in &streamed {
+                assert!(
+                    line.runs.len() <= 4,
+                    "streaming produced a one-run-per-character line mid-stream: {:?}",
+                    line
+                );
+            }
+        }
+        let finished = renderer.finish();
+        assert_eq!(texts(&finished), texts(&lines));
     }
 
     // -- segment_blocks (Architecture v2 block segmentation) --
@@ -1365,3 +1498,4 @@ mod tests {
         assert_eq!(heal_open_markers("just plain text"), "just plain text");
     }
 }
+

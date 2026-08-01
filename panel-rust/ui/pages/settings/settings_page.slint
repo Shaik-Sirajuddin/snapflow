@@ -9,11 +9,22 @@
 // `agent-catalog`, `recoverable-sessions`) `settings_sheet.slint` did, via
 // the same round-trip callbacks (`lib.rs` still owns re-populating those
 // lists after any create/update/delete/install call -- nothing here
-// optimistically mutates them). `scope` has no behavioral effect yet
-// (both Project and Global render the same live data) -- a real
-// per-scope `SettingsDocument` is a later phase (see the plan's
-// `settings_store.rs` phases), once the file-backed store exists to
-// actually differ between the two.
+// optimistically mutates them).
+//
+// settings_scope_visibility_gate: `scope` now DOES have a real behavioral
+// effect -- it gates visibility of every settings category that is
+// unconditionally global (no per-project dimension exists on the backend
+// at all, regardless of which tab is showing it): the MCP Servers section
+// (whole `McpServerStore` registry, gated by hiding its left-tab nav item
+// entirely -- see left_tabs.slint), agent enable/disable and the
+// install action (`AgentCard`'s own `scope` prop, gated inside
+// agent_card.slint), the profile registry browse/create/delete row
+// (agents_view.slint), and the Dev mode toggle (skills_view.slint).
+// Everything genuinely dual-tier -- default profile, permission profile,
+// default agent id, background-session-default -- has a real Project-file
+// value that overrides/falls back to Global (`settings_file.rs`'s
+// `SettingsDocument` merge) and stays visible/editable under both tabs
+// unchanged.
 import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Button } from "../../base/button.slint";
@@ -22,16 +33,33 @@ import { IconButton } from "../../base/icon_button.slint";
 import { SettingsTopTabs } from "components/top_tabs.slint";
 import { SettingsLeftTabs } from "components/left_tabs.slint";
 import { SettingsSearchBar } from "components/search_bar.slint";
+import { ThinScrollbar } from "../../base/thin_scrollbar.slint";
 import { McpServersView } from "views/mcp_servers_view.slint";
 import { AgentsView } from "views/agents_view.slint";
 import { HarnessView } from "views/harness_view.slint";
 import { SkillsView } from "views/skills_view.slint";
-import { ProfileOption, McpServerOption, AgentCatalogEntry, RemoteSessionOption, SkillOption } from "../../types.slint";
+import { ProfileOption, McpServerOption, McpServerFormData, AgentCatalogEntry, RemoteSessionOption, SkillOption } from "../../types.slint";
 
 export component SettingsPage inherits Rectangle {
     // New shell-only state (settings-pane-redesign plan, phase 1).
-    in-out property <string> scope: "project"; // "project" | "global"
-    in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
+    // "project" | "global". MUST stay identical to app.slint's own
+    // `settings-scope` default: the two are joined by a `<=>` two-way
+    // alias (`scope <=> root.settings-scope`), and Slint resolves that
+    // alias to the OUTER property's default with no diagnostic at all, so
+    // a mismatch here is silently dead code that only shows up when this
+    // component is rendered standalone (ui-dev-viewer, component tests).
+    // The live app never observes either literal -- lib.rs computes the
+    // real scope from SettingsPaths and pushes it synchronously during
+    // panel construction, before the window is shown.
+    in-out property <string> scope: "global";
+    // Default must be a section valid under BOTH scopes -- "mcp_servers"
+    // is Global-only (see settings_scope_visibility_gate below), and the
+    // `changed scope` redirect that guards against landing on it doesn't
+    // fire on initial mount (Rust's model.settings_scope sync is also
+    // "project" by default, so no actual change event occurs), which used
+    // to leave the page opening to a blank pane. "agents" renders under
+    // both scopes.
+    in-out property <string> active-section: "agents"; // "mcp_servers" | "agents" | "harness" | "skills"
     in-out property <string> search-query: "";
     in-out property <bool> sections-expanded: true;
     // See FilterSearchBar.input-has-focus's doc comment. The AgentsView
@@ -61,6 +89,15 @@ export component SettingsPage inherits Rectangle {
             self.skills-search-focus-mirror = false;
         }
     }
+    // settings_scope_visibility_gate: MCP Servers' left-tab nav item only
+    // exists under Global scope (see left_tabs.slint) -- if the user was
+    // sitting on that section and flips to Project, redirect off it so
+    // the content pane isn't left mounted on a now-nonexistent tab.
+    changed scope => {
+        if (self.scope == "project" && self.active-section == "mcp_servers") {
+            self.active-section = "agents";
+        }
+    }
     out property <bool> search-has-focus:
         top-search-bar.input-has-focus || agents-search-focus-mirror
         || mcp-servers-focus-mirror || skills-search-focus-mirror;
@@ -69,12 +106,22 @@ export component SettingsPage inherits Rectangle {
     // call site only needs its component name + import swapped.
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
+    // Env-var feature-flag gate (PANEL_PROFILE_WIRING_ENABLED) for the
+    // default-profile/permission-profile controls above -- see
+    // app.slint's own doc comment for this same property.
+    in property <bool> profile-wiring-enabled: false;
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
+    // Genuinely dual-tier like `background-default` -- see
+    // `settings_file::SettingsDocument::show_global_skills`'s doc comment.
+    // Forwarded to `SkillsView` below via `<=>` the same way.
+    in-out property <bool> show-global-skills: true;
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <[ProfileOption]> available-profiles: [];
     in property <[McpServerOption]> available-mcp-servers: [];
+    in property <int> mcp-tools-total-count: 0;
+    in property <bool> mcp-server-submit-busy: false;
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     in property <[SkillOption]> available-skills: [];
@@ -83,11 +130,14 @@ export component SettingsPage inherits Rectangle {
     callback save();
     callback close();
     callback scope-changed(string);
-    callback mcp-server-create(string, string);
+    callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
     callback mcp-server-authenticate(string);
+    callback mcp-server-logout(string);
     callback mcp-server-tool-enabled-changed(string, string, bool);
+    callback mcp-server-tool-deferred-changed(string, string, bool);
+    callback mcp-server-tools-fetch-requested(string);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -210,6 +260,7 @@ export component SettingsPage inherits Rectangle {
             left-tabs := SettingsLeftTabs {
                 active-section: root.active-section;
                 expanded: root.sections-expanded;
+                scope: root.scope;
                 section-selected(new-section) => { root.active-section = new-section; }
                 collapse-requested => { root.sections-expanded = false; }
             }
@@ -222,101 +273,188 @@ export component SettingsPage inherits Rectangle {
                 vertical-stretch: 1;
                 spacing: Metrics.space-4;
 
-                // The one elastic region in this column -- same
-                // `vertical-stretch: 1` + `preferred-height: 0px` +
-                // `min-height: 0px` convention `chat_area.slint`'s own
-                // message-scroll Flickable uses, rather than binding
-                // `height: parent.height` (that only resolves once the
-                // layout has already assigned this Flickable a height,
-                // which a plain binding can't rely on inside a
-                // `VerticalLayout`).
-                Flickable {
+                // settings_agents_search_sticky: the Agents section owns
+                // its own bounded scroll region (see agents_view.slint's
+                // own internal Flickable/ThinScrollbar) so its
+                // "search agents" bar can stay pinned above the scrolling
+                // agent grid/recoverable-sessions body -- pinning it would
+                // not be possible if AgentsView shared the single generic
+                // Flickable below with the other sections, since that
+                // Flickable scrolls its whole mounted child (search bar
+                // included) as one unit. Same `vertical-stretch: 1` +
+                // `preferred-height: 0px` + `min-height: 0px` convention
+                // used everywhere else in this file to hand a Flickable
+                // (or, here, a self-scrolling component) real bounded
+                // height inside a VerticalLayout.
+                if root.active-section == "agents" : AgentsView {
                     width: parent.width;
                     vertical-stretch: 1;
                     preferred-height: 0px;
                     min-height: 0px;
-                    // Was missing entirely (the actual reported "scroll
-                    // issues" bug) -- a bare Flickable doesn't reliably
-                    // report its own preferred-height from arbitrary child
-                    // content (it's a scroll viewport, not a layout), so
-                    // without this the Flickable had no real idea how tall
-                    // its content actually was and couldn't scroll far
-                    // enough (or at all) to reach content past the visible
-                    // area. Every other Flickable in this codebase already
-                    // binds this explicitly (confirmed by grepping every
-                    // Flickable site); this was the one exception. Same
-                    // fix `base/expandable_panel.slint`'s own Flickable
-                    // documents for the identical symptom.
-                    viewport-height: content.preferred-height;
-                    content := VerticalLayout {
+                    scope: root.scope;
+                    default-profile <=> root.default-profile;
+                    permission-profile <=> root.permission-profile;
+                    profile-wiring-enabled: root.profile-wiring-enabled;
+                    default-agent-id <=> root.default-agent-id;
+                    available-profiles: root.available-profiles;
+                    agent-catalog: root.agent-catalog;
+                    page-search-query: root.search-query;
+                    recoverable-sessions: root.recoverable-sessions;
+                    profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
+                        root.profile-create(name, agent-id, terminal-enabled, fs-enabled);
+                    }
+                    profile-delete(name) => { root.profile-delete(name); }
+                    agent-install-requested(id) => { root.agent-install-requested(id); }
+                    agent-set-enabled(id, enabled) => { root.agent-set-enabled(id, enabled); }
+                    recover-session-attach(session-id, provider, title) => {
+                        root.recover-session-attach(session-id, provider, title);
+                    }
+                    changed search-has-focus => {
+                        root.agents-search-focus-mirror = self.search-has-focus;
+                    }
+                }
+
+                // The other three sections have no pinned-header need, so
+                // they keep sharing one generic scrolling viewport.
+                if root.active-section != "agents" : Rectangle {
+                    // The one elastic region in this column -- same
+                    // `vertical-stretch: 1` + `preferred-height: 0px` +
+                    // `min-height: 0px` convention `chat_area.slint`'s own
+                    // message-scroll Flickable uses, rather than binding
+                    // `height: parent.height` (that only resolves once the
+                    // layout has already assigned this Flickable a height,
+                    // which a plain binding can't rely on inside a
+                    // `VerticalLayout`). Wrapped in a plain (non-layout)
+                    // Rectangle, same as chat_area.slint's `message-area`,
+                    // so the ThinScrollbar sibling below can be positioned
+                    // as a free-floating overlay instead of being packed
+                    // into the vertical flow by a layout parent.
+                    vertical-stretch: 1;
+                    preferred-height: 0px;
+                    min-height: 0px;
+
+                    // settings_scrollbar_discoverability: the ThinScrollbar
+                    // below has no `active` binding, so -- same as every
+                    // other bare-hover ThinScrollbar in this codebase before
+                    // it got one (see chat_input_layout.slint's row2 strip
+                    // and searchable_dropdown.slint) -- it only fades in
+                    // while the pointer sits exactly over its ~10px hit
+                    // zone at the far edge, not while the user is actually
+                    // scrolling the content by wheel or drag. Flickable has
+                    // no `pressed` property to mirror the `row2-scroll.
+                    // pressed` pattern those two use (only a TouchArea
+                    // exposes that), so this tracks "recently scrolled" via
+                    // `changed viewport-y` + a short idle timer instead --
+                    // the scrollbar lights up the instant a real scroll
+                    // happens (wheel included) and fades a beat after it
+                    // stops, rather than requiring a pixel-perfect hover.
+                    property <bool> scroll-recently-active: false;
+                    scroll-idle-timer := Timer {
+                        interval: 900ms;
+                        running: false;
+                        triggered => {
+                            scroll-recently-active = false;
+                            self.running = false;
+                        }
+                    }
+
+                    other-sections-scroll := Flickable {
                         width: parent.width;
-                        if root.active-section == "mcp_servers" : McpServersView {
+                        height: parent.height;
+                        // Was missing entirely (the actual reported "scroll
+                        // issues" bug) -- a bare Flickable doesn't reliably
+                        // report its own preferred-height from arbitrary child
+                        // content (it's a scroll viewport, not a layout), so
+                        // without this the Flickable had no real idea how tall
+                        // its content actually was and couldn't scroll far
+                        // enough (or at all) to reach content past the visible
+                        // area. Every other Flickable in this codebase already
+                        // binds this explicitly (confirmed by grepping every
+                        // Flickable site); this was the one exception. Same
+                        // fix `base/expandable_panel.slint`'s own Flickable
+                        // documents for the identical symptom.
+                        viewport-height: content.preferred-height;
+                        changed viewport-y => {
+                            scroll-recently-active = true;
+                            scroll-idle-timer.running = false;
+                            scroll-idle-timer.running = true;
+                        }
+                        content := VerticalLayout {
                             width: parent.width;
-                            servers: root.available-mcp-servers;
-                            page-search-query: root.search-query;
-                            mcp-server-create(name, command) => { root.mcp-server-create(name, command); }
-                            mcp-server-delete(name) => { root.mcp-server-delete(name); }
-                            mcp-server-enabled-changed(name, enabled) => {
-                                root.mcp-server-enabled-changed(name, enabled);
+                            if root.active-section == "mcp_servers" && root.scope == "global" : McpServersView {
+                                width: parent.width;
+                                servers: root.available-mcp-servers;
+                                total-tools-count: root.mcp-tools-total-count;
+                                submit-busy: root.mcp-server-submit-busy;
+                                page-search-query: root.search-query;
+                                mcp-server-submit(data) => { root.mcp-server-submit(data); }
+                                mcp-server-delete(name) => { root.mcp-server-delete(name); }
+                                mcp-server-enabled-changed(name, enabled) => {
+                                    root.mcp-server-enabled-changed(name, enabled);
+                                }
+                                mcp-server-authenticate(name) => {
+                                    root.mcp-server-authenticate(name);
+                                }
+                                mcp-server-logout(name) => {
+                                    root.mcp-server-logout(name);
+                                }
+                                mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
+                                    root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
+                                }
+                                mcp-server-tool-deferred-changed(server-name, tool-name, deferred) => {
+                                    root.mcp-server-tool-deferred-changed(server-name, tool-name, deferred);
+                                }
+                                mcp-server-tools-fetch-requested(server-name) => {
+                                    root.mcp-server-tools-fetch-requested(server-name);
+                                }
+                                changed search-has-focus => {
+                                    root.mcp-servers-focus-mirror = self.search-has-focus;
+                                }
                             }
-                            mcp-server-authenticate(name) => {
-                                root.mcp-server-authenticate(name);
+                            if root.active-section == "harness" : HarnessView {
+                                width: parent.width;
+                                background-default <=> root.background-default;
+                                background-override-set <=> root.background-override-set;
+                                background-override <=> root.background-override;
                             }
-                            mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
-                                root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
-                            }
-                            changed search-has-focus => {
-                                root.mcp-servers-focus-mirror = self.search-has-focus;
+                            if root.active-section == "skills" : SkillsView {
+                                width: parent.width;
+                                scope: root.scope;
+                                skills: root.available-skills;
+                                dev-mode: root.dev-mode;
+                                show-global-skills <=> root.show-global-skills;
+                                // page-search-query/search-has-focus wiring:
+                                // was previously missing entirely on this
+                                // branch, leaving `skills-search-focus-mirror`
+                                // (declared above) dead and the Skills tab's
+                                // search bar non-functional -- SkillsView's
+                                // own `matches-search` filtering already
+                                // depends on `page-search-query` being fed a
+                                // real value (see skills_view.slint).
+                                page-search-query <=> root.search-query;
+                                skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
+                                dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
+                                changed search-has-focus => {
+                                    root.skills-search-focus-mirror = self.search-has-focus;
+                                }
                             }
                         }
-                        // Stays `if` (unlike the other visible:-conversion
-                        // fixes elsewhere for this same issue) -- this sits
-                        // alongside 3 other mutually-exclusive sections in
-                        // a VerticalLayout, so an unconditionally-mounted
-                        // AgentsView would reserve its height even while
-                        // hidden, pushing the other sections down whenever
-                        // this tab isn't active. Mirrors its own
-                        // search-has-focus into a plain root property
-                        // instead (see agents-search-focus-mirror below).
-                        if root.active-section == "agents" : AgentsView {
-                            width: parent.width;
-                            default-profile <=> root.default-profile;
-                            permission-profile <=> root.permission-profile;
-                            default-agent-id <=> root.default-agent-id;
-                            available-profiles: root.available-profiles;
-                            agent-catalog: root.agent-catalog;
-                            page-search-query: root.search-query;
-                            recoverable-sessions: root.recoverable-sessions;
-                            profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
-                                root.profile-create(name, agent-id, terminal-enabled, fs-enabled);
-                            }
-                            profile-delete(name) => { root.profile-delete(name); }
-                            agent-install-requested(id) => { root.agent-install-requested(id); }
-                            agent-set-enabled(id, enabled) => { root.agent-set-enabled(id, enabled); }
-                            recover-session-attach(session-id, provider, title) => {
-                                root.recover-session-attach(session-id, provider, title);
-                            }
-                            changed search-has-focus => {
-                                root.agents-search-focus-mirror = self.search-has-focus;
-                            }
-                        }
-                        if root.active-section == "harness" : HarnessView {
-                            width: parent.width;
-                            background-default <=> root.background-default;
-                            background-override-set <=> root.background-override-set;
-                            background-override <=> root.background-override;
-                        }
-                        if root.active-section == "skills" : SkillsView {
-                            width: parent.width;
-                            skills: root.available-skills;
-                            page-search-query <=> root.search-query;
-                            dev-mode: root.dev-mode;
-                            skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
-                            dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
-                            changed search-has-focus => {
-                                root.skills-search-focus-mirror = self.search-has-focus;
-                            }
-                        }
+                    }
+
+                    // settings_page_scrollbar: was previously a bare
+                    // Flickable with scroll mechanics but no visible
+                    // scrollbar -- same class of gap the compose-bar
+                    // horizontal-scroll row had (chat_input_layout.slint)
+                    // before it got its own ThinScrollbar. Reuses that same
+                    // component/pattern chat_area.slint's message list uses.
+                    ThinScrollbar {
+                        x: parent.width - self.width - 2px;
+                        y: 4px;
+                        visible-height: parent.height - 8px;
+                        viewport-height: content.preferred-height;
+                        viewport-y <=> other-sections-scroll.viewport-y;
+                        thumb-width: 4px;
+                        active: scroll-recently-active;
                     }
                 }
             }

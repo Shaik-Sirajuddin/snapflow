@@ -72,7 +72,14 @@ async fn session_new_proceeds_normally_when_backend_advertises_no_auth_methods()
 while IFS= read -r line; do
   id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
   if echo "$line" | grep -q '"method":"initialize"'; then
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+    # ACP v1 declares terminal support as a boolean, not a map of
+    # individual terminal methods. This strict stand-in catches accidental
+    # schema drift that permissive adapters would otherwise hide.
+    if echo "$line" | grep -q '"terminal":false'; then
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+    else
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"terminal capability must be boolean"}}\n' "$id"
+    fi
   elif echo "$line" | grep -q '"method":"session/new"'; then
     printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
   else
@@ -101,6 +108,48 @@ done
     // succeeded rather than acpx's new authenticate branch (a no-op
     // here) blocking or erroring it.
     assert!(response["result"]["sessionId"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn session_new_surfaces_the_backends_initialize_error_without_marking_handshake_done() {
+    // The backend must reject initialize before it ever sees session/new.
+    // If acpx marks the handshake complete from the error response, this
+    // stand-in's session/new response would hide the real initialize error.
+    let script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"backend rejected initialize"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"must-not-be-created"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+    let mut router = Router::new("initialize-error-agent");
+    router.register_agent(
+        "initialize-error-agent",
+        SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()]),
+    );
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        router.dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        })),
+    )
+    .await
+    .expect("must not hang when initialize is rejected");
+
+    match result {
+        Err(RouterError::BackendInitializationError(error)) => {
+            assert_eq!(error["code"], json!(-32001));
+            assert_eq!(error["message"], json!("backend rejected initialize"));
+        }
+        other => panic!("expected BackendInitializationError, got {other:?}"),
+    }
 }
 
 #[tokio::test]

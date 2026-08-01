@@ -4,6 +4,7 @@ import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
 import { ThreadItem } from "../types.slint";
+import { Spinner } from "../base/spinner.slint";
 
 // One sidebar thread row -- shared by the active list and the bottom
 // Archived section so both share one implementation.
@@ -124,7 +125,7 @@ export component SidebarThreadRow inherits HoverSurface {
                     property <bool> row-busy:
                         thread.status == "loading" || thread.status == "cancelling";
                     property <angle> load-spin: row-busy
-                        ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                        ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                         : 0deg;
                     // Phase 25 (thread_row_loading_indicator_fix): two
                     // live defects here. (1) The spinner/hand were drawn
@@ -136,16 +137,22 @@ export component SidebarThreadRow inherits HoverSurface {
                     // (fixed-height children sit at the cross-axis start),
                     // so the loader rode high against the first-row title;
                     // each state icon now lives in a height-stretching
-                    // cell whose inner fixed-size child self-centers
-                    // (default x/y center an element in its parent).
+                    // cell whose explicit center layout keeps the native
+                    // spinner centered in collapsed rows as well.
                     if row-busy : Rectangle {
                         width: 14px;
-                        Icon {
-                            source: @image-url("../assets/icons/loader-circle.svg");
-                            size: 14px;
-                            color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
-                            transform-rotation: load-spin;
-                            transform-origin: { x: self.width / 2, y: self.height / 2 };
+                        VerticalLayout {
+                            width: 100%;
+                            height: 100%;
+                            alignment: center;
+                            HorizontalLayout {
+                                alignment: center;
+                                Spinner {
+                                    size: 14px;
+                                    stroke: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
+                                    stroke-width: 2px;
+                                }
+                            }
                         }
                     }
                     if thread.status == "error" : Rectangle {
@@ -319,7 +326,6 @@ export component SidebarThreadRow inherits HoverSurface {
                     // without a pointer hover.
                     property <bool> row-hovered: root.has-hover
                         || rename-btn.has-hover
-                        || close-btn.has-hover
                         || delete-btn.has-hover
                         || resume-btn.has-hover
                         || archive-btn.has-hover;
@@ -366,59 +372,15 @@ export component SidebarThreadRow inherits HoverSurface {
                                 }
                             }
                         }
-                        close-btn := IconButton {
-                            // Only offered for a thread that's still live
-                            // (never closed, never archived) -- once closed,
-                            // `delete-btn` below takes over. This is the
-                            // per-thread counterpart to `AgentBridge::
-                            // close_thread`/`Effect::CloseThread`, which had
-                            // no UI trigger at all until now: `close-
-                            // requested()` was declared and wired up through
-                            // `sidebar.slint` but never actually invoked by
-                            // any button in this file.
-                            visible: expanded && rename-thread-index != index
-                                && !thread.closed && !thread.archived
-                                && pending-close-index != index && (row-hovered || index == selected-thread);
-                            btn-width: 18px;
-                            btn-height: 18px;
-                            button-accessible-label: "Close thread " + thread.name;
-                            clicked => { pending-close-index = index; }
-                            Icon {
-                                source: @image-url("../assets/icons/power.svg");
-                                size: 13px;
-                                color: Theme.text-muted;
-                            }
-                        }
-                        if expanded && rename-thread-index != index
-                            && !thread.closed && !thread.archived
-                            && pending-close-index == index : HorizontalLayout {
-                            spacing: 2px;
-                            IconButton {
-                                btn-width: 18px;
-                                btn-height: 18px;
-                                button-accessible-label: "Confirm close thread " + thread.name;
-                                clicked => {
-                                    pending-close-index = -1;
-                                    close-requested();
-                                }
-                                Icon {
-                                    source: @image-url("../assets/icons/circle-check.svg");
-                                    size: Metrics.icon-sm;
-                                    color: Theme.bg-primary;
-                                }
-                            }
-                            IconButton {
-                                btn-width: 18px;
-                                btn-height: 18px;
-                                button-accessible-label: "Cancel close thread " + thread.name;
-                                clicked => { pending-close-index = -1; }
-                                Icon {
-                                    source: @image-url("../assets/icons/x.svg");
-                                    size: 13px;
-                                    color: Theme.text-secondary;
-                                }
-                            }
-                        }
+                        // The "close thread" power-button affordance (armed/
+                        // confirm two-step, mirroring delete-btn below) that
+                        // used to live here was explicitly removed at the
+                        // user's request. `close-requested()` and
+                        // `pending-close-index` are deliberately left wired
+                        // (see their declarations above) for a future UI
+                        // trigger -- only the button itself is gone; nothing
+                        // in this file references them anymore, so no
+                        // control currently fires `close-requested()`.
                         delete-btn := IconButton {
                             visible: expanded && rename-thread-index != index
                                 && thread.closed && pending-delete-index != index && (row-hovered || index == selected-thread);
@@ -490,7 +452,12 @@ export component SidebarThreadRow inherits HoverSurface {
                     }
                 }
                 // Phase 8: active model (provider · model when known).
-                if expanded && thread.model != "" : Text {
+                // Gated on has-session (a real attached ACP session), not
+                // just a non-empty model string -- a fresh/draft thread can
+                // already carry a pre-selected default provider/model
+                // before the user ever sends anything, and showing that
+                // here read as if the conversation had already started.
+                if expanded && thread.has-session && thread.model != "" : Text {
                     text: thread.provider != "" ? thread.provider + " \u{00B7} " + thread.model : thread.model;
                     color: Theme.text-muted;
                     font-size: 9px * Theme.font-scale;
