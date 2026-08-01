@@ -147,9 +147,8 @@ cmd_workspace() {
       if command -v wmctrl >/dev/null 2>&1; then
         local window_id=""
         # Qt can take several seconds to create the top-level window while
-        # loading filters and initializing the embedded Rust panel.  The
-        # launcher used to give up after 5 seconds, leaving a live process
-        # registered to a workspace but visibly stuck on the current desktop.
+        # loading filters and initializing the embedded Rust panel. Give the
+        # launcher enough time to place a live process reliably.
         for _ in $(seq 1 600); do
           window_id="$(wmctrl -lp 2>/dev/null | awk -v pid="$pid" '$3 == pid { print $1; exit }')"
           [ -n "$window_id" ] && break
