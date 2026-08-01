@@ -159,10 +159,31 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::PendingRequest { thread_id } => {
             // Empty id = transition clear on thread switch (leak_audit §2.3).
+            //
+            // Bug fix: this used `thread_for_id` (any thread by id), so a
+            // *background* thread's pending-request change -- e.g. its
+            // request resolving while a different thread is displayed --
+            // clobbered the singleton `pending_request` Slint property even
+            // though that property is only ever read as "the displayed
+            // thread's pending request" (see `shown-pending`/`status-
+            // needs-attention` in chat_area.slint). Concretely: viewing
+            // thread A with a live approval card up, thread B (background)
+            // resolves its own unrelated request, and this handler fired
+            // for B's `thread_id`, finding no match against A only by
+            // accident of iteration order -- or worse, matching and
+            // overwriting A's real pending state with B's (now-cleared)
+            // one, silently dropping A's approval indicator. Gate on
+            // `displayed_thread_for_id` like every other per-thread
+            // singleton-property sync in this file (see
+            // `sync_has_older_messages`, `Dirty::Error`'s `for_displayed`)
+            // so only the currently-displayed thread's pending request can
+            // ever reach the component.
             if thread_id.is_empty() {
                 component.set_pending_request(crate::PendingRequestItem::default());
-            } else if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_pending_request(thread.pending_request.clone());
+            } else if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_pending_request(thread.pending_request.clone());
+                }
             }
         }
         Dirty::Terminal { .. } => {

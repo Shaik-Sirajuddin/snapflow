@@ -16,6 +16,26 @@ export component PermissionCard inherits Rectangle {
 
     vertical-stretch: 0;
     horizontal-stretch: 1;
+    // Root-cause fix (docked-band full-height bug): this card is placed
+    // inside a `HorizontalLayout` in chat_area.slint (the approval band
+    // row). A `HorizontalLayout`'s cross axis (height, since its main
+    // axis is horizontal) stretches children to fill the row's resolved
+    // height by default -- unlike `vertical-stretch`, which only opts a
+    // child out of *its own* leftover-space share along a VerticalLayout's
+    // main axis, there's no equivalent per-child opt-out for cross-axis
+    // fill on a plain `Rectangle` (confirmed: `vertical-alignment` isn't a
+    // property Rectangle exposes -- that's Text/Image content alignment,
+    // not layout cross-axis control). So whenever the row ends up
+    // resolving to a height taller than this card's own content actually
+    // needs, the card silently stretched to fill the leftover space
+    // instead of hugging its content -- the "sometimes full height" bug.
+    // Explicitly binding `height` to `self.preferred-height` (itself
+    // auto-computed bottom-up from the VerticalLayout below, which is the
+    // one true source of this card's content height) makes the layout
+    // solver treat this as an explicit height rather than a
+    // stretch-to-fill target, so the card always hugs its real content
+    // height regardless of what the enclosing row computes.
+    height: self.preferred-height;
     // Distinct approval fill — not bg-card.
     background: Theme.bg-approval;
     border-color: Theme.border-approval;
