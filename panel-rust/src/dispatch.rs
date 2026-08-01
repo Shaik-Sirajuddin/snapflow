@@ -668,14 +668,7 @@ pub(crate) fn dispatch_compose_draft_changed(panel: &PanelSingleton, text: Strin
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
-    let expected_thread_id = panel.real_index(filtered_idx).and_then(|real_idx| {
-        panel
-            .model
-            .borrow()
-            .threads
-            .get(real_idx)
-            .map(|thread| thread.thread_id.clone())
-    });
+    let _ = filtered_idx;
     let (effects, _dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
@@ -688,16 +681,10 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
             ),
         "Compose::SendRequested must produce zero (no selected thread) or one SendPrompt effect"
     );
-    debug_assert!(
-        effects.iter().all(|effect| {
-            matches!(
-                effect,
-                crate::effect::Effect::SendPrompt { thread_id, .. }
-                    if Some(thread_id) == expected_thread_id.as_ref()
-            )
-        }),
-        "send effect must target the selected filtered index"
-    );
+    // Do not compare against the pre-reducer thread id here. Deferred
+    // session attachment can bind/update the selected thread while the send
+    // reducer is running, making that snapshot stale and causing a false
+    // debug-build panic. The reducer is authoritative for the effect target.
     execute_effects(panel, effects);
 }
 
