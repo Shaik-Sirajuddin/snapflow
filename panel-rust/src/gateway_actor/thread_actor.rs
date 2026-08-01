@@ -1412,6 +1412,148 @@ fn parse_model_catalog(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
     }]
 }
 
+/// grok-build's real vendor extension to `session/new`'s result: no
+/// top-level `configOptions`/`modes` key at all (verified against the
+/// real `grok agent stdio` binary -- its `session/new` result has
+/// exactly three top-level keys: `sessionId`, `models`, `_meta`).
+/// Instead the model catalog lives at `models: {currentModelId,
+/// availableModels: [{modelId, name, description?, _meta: {
+/// supportsReasoningEffort, reasoningEffort, reasoningEfforts: [{id,
+/// value, label, description?, default}]}}]}`. This maps that shape into
+/// this crate's `ConfigOptionInfo` vocabulary exactly like
+/// `parse_model_catalog` does for its own vendor shape: one `{id:
+/// "model", category: "model"}` entry (picked up by
+/// `to_config_dropdown_entries`/`model_name_from_config`/the sidebar's
+/// provider·model label, all keyed on that `id`), plus -- when any
+/// model reports reasoning-effort choices -- one `{id: "reasoning_
+/// effort", category: "reasoning"}` entry (picked up by the existing
+/// `to_reasoning_dropdown_entries`/`is_reasoning_option_id`, which
+/// already accepts that id). Without this, grok's real model/reasoning
+/// data was silently dropped: `parse_config_options` only ever looks at
+/// `configOptions`, which grok never sends.
+fn parse_grok_model_config(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let models = value.get("models");
+    let current_model_id = models
+        .and_then(|m| m.get("currentModelId"))
+        .and_then(|v| v.as_str());
+    let Some(available) = models
+        .and_then(|m| m.get("availableModels"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let model_options: Vec<ConfigOptionValue> = available
+        .iter()
+        .filter_map(|model| {
+            Some(ConfigOptionValue {
+                value: model.get("modelId")?.as_str()?.to_owned(),
+                name: model
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: model
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    if model_options.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = vec![ConfigOptionInfo {
+        id: "model".to_owned(),
+        name: "Model".to_owned(),
+        description: None,
+        category: Some("model".to_owned()),
+        kind: "select".to_owned(),
+        current_value: current_model_id.map(str::to_owned),
+        options: model_options,
+    }];
+
+    // Reasoning effort lives per-model (`_meta.reasoningEfforts`), keyed
+    // to whichever model is currently selected -- fall back to the first
+    // model that advertises any efforts at all if `currentModelId` is
+    // absent or doesn't match (still better than silently dropping the
+    // reasoning-effort picker).
+    let reasoning_model = current_model_id
+        .and_then(|id| {
+            available
+                .iter()
+                .find(|m| m.get("modelId").and_then(|v| v.as_str()) == Some(id))
+        })
+        .or_else(|| available.first());
+    if let Some(model) = reasoning_model {
+        let meta = model.get("_meta");
+        let reasoning_options: Vec<ConfigOptionValue> = meta
+            .and_then(|m| m.get("reasoningEfforts"))
+            .and_then(|v| v.as_array())
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(|effort| {
+                        let value = effort
+                            .get("value")
+                            .or_else(|| effort.get("id"))
+                            .and_then(|v| v.as_str())?
+                            .to_owned();
+                        Some(ConfigOptionValue {
+                            value,
+                            name: effort
+                                .get("label")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            description: effort
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .map(str::to_owned),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !reasoning_options.is_empty() {
+            entries.push(ConfigOptionInfo {
+                id: "reasoning_effort".to_owned(),
+                name: "Reasoning Effort".to_owned(),
+                description: None,
+                category: Some("reasoning".to_owned()),
+                kind: "select".to_owned(),
+                current_value: meta
+                    .and_then(|m| m.get("reasoningEffort"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                options: reasoning_options,
+            });
+        }
+    }
+
+    entries
+}
+
+/// Extracts a `session/new`/`session/load`/`session/resume` response's
+/// selectable config options, tolerating both the standard ACP
+/// `configOptions[]` shape and grok-build's real vendor extension (see
+/// [`parse_grok_model_config`]'s doc comment) -- grok's real response has
+/// no top-level `configOptions` at all, so the standard parse always
+/// comes back empty for it and this falls back to the vendor shape
+/// instead of leaving the compose bar's Model dropdown and the sidebar's
+/// model label empty for every grok-build thread.
+fn extract_config_options(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let standard = value
+        .get("configOptions")
+        .and_then(parse_config_options)
+        .unwrap_or_default();
+    if !standard.is_empty() {
+        return standard;
+    }
+    parse_grok_model_config(value)
+}
+
 /// Emits [`AgentEvent::SessionModes`]/[`AgentEvent::ConfigOptions`] for
 /// whichever of a `session/new`/`session/load`/`session/resume`
 /// response's `modes`/`configOptions` fields are actually present --
@@ -1422,7 +1564,8 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
     if let Some(modes) = value.get("modes").and_then(parse_session_modes) {
         let _ = event_tx.send(AgentEvent::SessionModes(modes));
     }
-    if let Some(options) = value.get("configOptions").and_then(parse_config_options) {
+    let options = extract_config_options(value);
+    if !options.is_empty() {
         let _ = event_tx.send(AgentEvent::ConfigOptions(options));
     }
 }
@@ -2025,7 +2168,7 @@ async fn run_thread_actor(
                         {
                             Ok((value, updates)) => {
                                 emit_capability_events(&value, &event_tx);
-                                attach_config_options_raw = value.get("configOptions").cloned();
+                                attach_config_options_raw = Some(value.clone());
                                 forward_updates(&updates, Some(&sid), &event_tx, false);
                                 if let Some(notifications) = early_notifications.as_mut() {
                                     if let Ok(Ok(update)) = tokio::time::timeout(
@@ -2081,7 +2224,7 @@ async fn run_thread_actor(
                     // the opener genuinely didn't report a response.
                     if let Some(value) = lease.capabilities.as_ref() {
                         emit_capability_events(value, &event_tx);
-                        attach_config_options_raw = value.get("configOptions").cloned();
+                        attach_config_options_raw = Some(value.clone());
                     }
                     client.register_session_replay(
                         &sid,
@@ -2106,7 +2249,7 @@ async fn run_thread_actor(
                         current_lease = Some(lease);
                         baseline_config_options = attach_config_options_raw
                             .as_ref()
-                            .and_then(parse_config_options)
+                            .map(extract_config_options)
                             .unwrap_or_default();
                         config_overrides.clear();
                     }
@@ -2158,10 +2301,7 @@ async fn run_thread_actor(
                                     let new_sid = new_lease.session_id.clone();
                                     if let Some(value) = new_lease.capabilities.as_ref() {
                                         emit_capability_events(value, &event_tx);
-                                        baseline_config_options = value
-                                            .get("configOptions")
-                                            .and_then(parse_config_options)
-                                            .unwrap_or_default();
+                                        baseline_config_options = extract_config_options(value);
                                         config_overrides.clear();
                                     }
                                     client.register_session_replay(
@@ -2713,6 +2853,102 @@ mod capability_parsing_tests {
         assert_eq!(parsed[0].current_value.as_deref(), Some("gpt-5"));
         assert_eq!(parsed[0].options.len(), 2);
         assert_eq!(parsed[0].options[1].description.as_deref(), Some("Cheaper"));
+    }
+
+    /// Real `session/new` result shape captured from a live
+    /// `grok agent stdio` (`~/.grok/bin/grok`) subprocess -- grok has no
+    /// top-level `configOptions`/`modes` at all; this is exactly what
+    /// `parse_grok_model_config`/`extract_config_options` must handle.
+    fn real_grok_session_new_result() -> serde_json::Value {
+        json!({
+            "sessionId": "019fbc0e-55b2-7f42-97eb-0a59bed5f63b",
+            "models": {
+                "currentModelId": "grok-4.5",
+                "availableModels": [{
+                    "modelId": "grok-4.5",
+                    "name": "Grok 4.5",
+                    "description": "SpaceXAI's new frontier model",
+                    "_meta": {
+                        "totalContextTokens": 500000,
+                        "agentType": "grok-build-plan",
+                        "supportsReasoningEffort": true,
+                        "reasoningEffort": "medium",
+                        "reasoningEfforts": [
+                            {"id": "high", "value": "high", "label": "High Effort", "default": true},
+                            {"id": "medium", "value": "medium", "label": "Medium Effort", "default": false},
+                            {"id": "low", "value": "low", "label": "Low Effort", "default": false}
+                        ]
+                    }
+                }]
+            },
+            "_meta": {
+                "x.ai/sessionConfig": {
+                    "options": [
+                        {"id": "grok-4.5", "category": "model", "label": "Grok 4.5", "selected": true},
+                        {"id": "high", "category": "mode", "label": "High Effort", "selected": false},
+                        {"id": "medium", "category": "mode", "label": "Medium Effort", "selected": true},
+                        {"id": "low", "category": "mode", "label": "Low Effort", "selected": false}
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn extract_config_options_is_empty_for_grok_with_only_the_standard_acp_parse() {
+        // Regression guard: confirms the bug this fix addresses actually
+        // exists in the standard-shape-only parse -- grok's real
+        // response genuinely has no top-level `configOptions`, so the
+        // plain ACP parse must come back empty (this is what left the
+        // compose bar's Model dropdown and sidebar model label blank for
+        // grok-build before `parse_grok_model_config` existed).
+        let value = real_grok_session_new_result();
+        assert!(value.get("configOptions").and_then(parse_config_options).is_none());
+    }
+
+    #[test]
+    fn parse_grok_model_config_reads_real_grok_model_and_reasoning_shape() {
+        let value = real_grok_session_new_result();
+        let parsed = parse_grok_model_config(&value);
+        assert_eq!(parsed.len(), 2, "expected a model entry and a reasoning_effort entry");
+
+        let model = parsed.iter().find(|o| o.id == "model").expect("model entry");
+        assert_eq!(model.category.as_deref(), Some("model"));
+        assert_eq!(model.current_value.as_deref(), Some("grok-4.5"));
+        assert_eq!(model.options.len(), 1);
+        assert_eq!(model.options[0].value, "grok-4.5");
+        assert_eq!(model.options[0].name, "Grok 4.5");
+
+        let reasoning = parsed
+            .iter()
+            .find(|o| o.id == "reasoning_effort")
+            .expect("reasoning_effort entry");
+        assert_eq!(reasoning.current_value.as_deref(), Some("medium"));
+        assert_eq!(reasoning.options.len(), 3);
+        assert!(reasoning.options.iter().any(|o| o.value == "high" && o.name == "High Effort"));
+    }
+
+    #[test]
+    fn extract_config_options_falls_back_to_grok_shape_when_configoptions_is_absent() {
+        let value = real_grok_session_new_result();
+        let extracted = extract_config_options(&value);
+        assert!(
+            extracted.iter().any(|o| o.id == "model" && o.current_value.as_deref() == Some("grok-4.5")),
+            "extract_config_options must recover grok's real model catalog via the vendor-shape fallback, got {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn extract_config_options_prefers_the_standard_shape_when_both_are_present() {
+        let mut value = real_grok_session_new_result();
+        value["configOptions"] = json!([{
+            "id": "model",
+            "currentValue": "standard-shape-model",
+            "options": [{"value": "standard-shape-model", "name": "Standard"}]
+        }]);
+        let extracted = extract_config_options(&value);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].current_value.as_deref(), Some("standard-shape-model"));
     }
 
     #[test]
