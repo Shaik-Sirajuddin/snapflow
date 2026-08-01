@@ -210,6 +210,10 @@ export component SkillEditorView inherits Rectangle {
                 font-size: 11px * Theme.font-scale;
                 wrap: word-wrap;
                 single-line: false;
+                // Explicit accessible-label -- without one, MCP/UI-test
+                // element lookups (find-by-label) have no reliable way to
+                // address the skill content editor at all.
+                accessible-label: "Skill content editor";
                 text <=> root.skill-content;
                 edited => { root.content-edited(self.text); }
                 changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
