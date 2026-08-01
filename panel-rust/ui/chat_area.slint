@@ -582,8 +582,37 @@ export component ChatArea inherits Rectangle {
                             size: Metrics.icon-md;
                             color: Theme.bg-primary;
                         }
+                        // gateway-fail-state: `connection-status` reads
+                        // "Unavailable" whenever `AgentBridge::transport_
+                        // status` finds no gateway URL recorded for this
+                        // thread's provider -- exactly the state left behind
+                        // by a failed `provision_gateway`/`spawn_gateway_
+                        // process` call (see that function's real production
+                        // failure log, `system_launch.yaml`, "Permission
+                        // denied (os error 13)"). Before this branch existed
+                        // that state fell straight through to the plain
+                        // neutral dot below, indistinguishable from "idle,
+                        // nothing to report" -- a real, silent failure looked
+                        // identical to nothing happening. A plain dash, not a
+                        // colored icon: matches this project's established
+                        // monochrome-only status language (see
+                        // `agent_card.slint`'s doc comment) rather than
+                        // introducing a red/error-colored treatment here.
                         if !(root.sending || connection-status == "Connecting...")
-                            && !root.status-needs-attention : Rectangle {
+                            && !root.status-needs-attention
+                            && connection-status == "Unavailable" : Text {
+                            text: "-";
+                            color: Theme.text-secondary;
+                            font-size: Metrics.icon-md * 0.9;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+                        if !(root.sending || connection-status == "Connecting...")
+                            && !root.status-needs-attention
+                            && connection-status != "Unavailable" : Rectangle {
                             width: 6px;
                             height: 6px;
                             border-radius: 3px;
@@ -707,29 +736,6 @@ export component ChatArea inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
-                    if root.project-name != "" : HorizontalLayout {
-                        spacing: Metrics.space-1;
-                        horizontal-stretch: 0;
-                        cross-axis-alignment: center;
-                        accessible-role: text;
-                        accessible-label: "Project " + root.project-path
-                            + (root.project-mcp-live ? " (MCP connected)" : " (MCP disconnected)");
-                        Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: root.project-mcp-live ? #22c55e : #ef4444;
-                        }
-                        Text {
-                            text: root.project-name;
-                            color: Theme.text-muted;
-                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
-                            font-family: Theme.font-mono;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            max-width: compact ? 70px : 130px;
-                        }
-                    }
                     Text {
                         text: agent-badge;
                         color: Theme.text-primary;

@@ -2,7 +2,6 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Strings } from "../tokens/strings.slint";
 import { Icon } from "../base/icon.slint";
-import { Spinner } from "../base/spinner.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
@@ -748,40 +747,17 @@ export component ChatInputLayout inherits Rectangle {
                     animate background { duration: 100ms; }
                     border-radius: Theme.radius-md;
                     opacity: (root.sending || compose.text != "") ? 1.0 : 0.7;
-                    // setup-followups plan, in_flight_turn_loading_indicator:
-                    // the composer previously gave zero animated feedback
-                    // during an in-flight turn -- the button just went
-                    // static-stop-icon and sat there. Same spinning-ring
-                    // motif as sidebar.slint's own load-spin (thread.status
-                    // == "loading"), so a user watching only the composer
-                    // (not the sidebar) can still see the turn is actively
-                    // in progress.
-                    //
-                    // audit-fixes animation_tick_loaders: continuous spin
-                    // via animation-tick (no dynamic iteration-count).
-                    property <angle> load-spin: root.sending
-                        ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
-                        : 0deg;
-                    if root.sending : VerticalLayout {
-                        // Without this wrapper the ring rendered pinned to
-                        // this Rectangle's top-left corner (a plain child
-                        // Item with no layout defaults to (0,0)), not
-                        // centered behind the stop icon -- unlike the stop/
-                        // send Icon just below, which already has this same
-                        // centering wrapper.
-                        alignment: center;
-                        HorizontalLayout {
-                            alignment: center;
-                            Spinner {
-                                // Larger than the stop icon (icon-sm, 12px)
-                                // so it reads as a ring around it, not an
-                                // overlapping duplicate at the same size.
-                                size: 26px;
-                                stroke: Theme.text-secondary.with-alpha(0.55);
-                                stroke-width: 2px;
-                            }
-                        }
-                    }
+                    // chat_input_send_box_double_busy_indicator: this used to
+                    // also render a spinning ring behind the stop icon while
+                    // `root.sending` was true (setup-followups plan,
+                    // in_flight_turn_loading_indicator), but that meant the
+                    // busy compose box showed a spinner AND the stop button
+                    // at once. Per explicit direction, the stop button alone
+                    // is the in-progress/queued signal here now; the ring is
+                    // removed. Repaint-gate note: `panel_rust_poll`'s
+                    // `busy_thread_animating` check (lib.rs) still applies --
+                    // it also drives chat_area.slint's header Spinner and
+                    // sidebar row spinners, so it stays as-is.
                     send-stop-button := TouchArea {
                         mouse-cursor: pointer;
                         accessible-role: button;
@@ -801,9 +777,9 @@ export component ChatInputLayout inherits Rectangle {
                         alignment: center;
                         HorizontalLayout {
                             alignment: center;
-                            // Stop icon still renders on top so click-to-
-                            // stop stays visually obvious; the spinning
-                            // ring behind it is the new in-progress signal.
+                            // Stop icon is the sole in-progress/busy signal
+                            // in this button now (no spinner behind it --
+                            // see chat_input_send_box_double_busy_indicator).
                             Icon {
                                 source: root.sending
                                     ? @image-url("../assets/icons/square.svg")

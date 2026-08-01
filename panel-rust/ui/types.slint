@@ -605,6 +605,13 @@ export struct AgentCatalogEntry {
     name: string,
     version: string,
     website: string,
+    // Display-ready host portion of `website` (e.g. "openai.com" for
+    // "https://openai.com/codex"), computed Rust-side in
+    // `models::website_domain` -- Slint has no string-split primitive,
+    // so this rides alongside the raw `website` field (still used
+    // verbatim for the actual click-to-open URL) rather than being
+    // sliced in `agent_card.slint`.
+    website-domain: string,
     status: string,
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: current admin-plane enablement, merged in client-side (see

@@ -1036,6 +1036,54 @@ fn resolve_acpx_server_bin() -> PathBuf {
     )
 }
 
+/// Best-effort self-heal for a real, recurring production failure: real
+/// installs (2026-08-01 `system_launch.yaml` log, "failed to spawn
+/// acpx-server for codex on port ...: Permission denied (os error 13)",
+/// twice in one session) hit `Command::spawn`'s own `EACCES` -- confirmed
+/// by tracing `spawn_gateway_process` below, where `cmd.spawn()` is the
+/// *only* syscall in this whole function whose error is wrapped into the
+/// "failed to spawn" message (the other candidate EACCES source, the
+/// per-provider stderr log `File::create` a few lines down, has its own
+/// separate error handling that falls back to `Stdio::null()` instead of
+/// failing the spawn at all -- so it can never produce this message).
+///
+/// `EACCES` from `execve` on a path that *does* resolve to a real file
+/// (as opposed to `ENOENT`, which `resolve_acpx_server_bin_from`'s own
+/// fallback chain can also produce, but that surfaces as a distinctly
+/// different os error 2) means the file exists but lacks the execute
+/// bit for this process's effective uid/gid -- exactly what a plain
+/// `cp`/archive-extract/artifact-download step that does not preserve
+/// POSIX permission bits produces (this project's own Linux packaging
+/// pipeline, `shotcut/scripts/build-snapflow.sh`'s `install_snapflow_linux`,
+/// assembles the bundle with a long sequence of manual `cp`/`install`
+/// calls rather than exclusively CMake's `install(PROGRAMS ...)`, which
+/// is the one step that would otherwise always normalize this). Rather
+/// than hard-failing the whole gateway (and every thread on this
+/// provider) over a one-bit permission defect this process is fully
+/// entitled to fix on a file it already resolved by path, attempt to add
+/// the owner/group/world execute bits before spawning. Best-effort and
+/// silent on failure (e.g. a read-only install root) -- `cmd.spawn()`'s
+/// own error still surfaces normally if this doesn't help.
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mut perms = metadata.permissions();
+    let mode = perms.mode();
+    // 0o111 = owner+group+world execute. Only touched when at least one
+    // of those bits is missing, so an already-correct file's mtime/ctime
+    // is left alone.
+    if mode & 0o111 != 0o111 {
+        perms.set_mode(mode | 0o111);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}
+
 /// Resolves the `snapflowd-mcp` binary path (`skill_injection_
 /// verification` phase): `RUI_SNAPFLOWD_MCP_BIN` env override, else a
 /// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
@@ -2638,10 +2686,29 @@ fn spawn_gateway_process(
         // TOCTOU-safe convention `reserve_ephemeral_port`'s own caller
         // (the main HTTP port, `lock` above) already uses.
     }
+    // See `ensure_executable`'s doc comment: a real, recurring production
+    // failure (`system_launch.yaml`, "Permission denied (os error 13)")
+    // traced to this exact `cmd.spawn()` call losing the resolved
+    // binary's execute bit somewhere in packaging/transfer. Self-heal
+    // before attempting the exec so a stripped permission bit does not
+    // fail every thread on this provider.
+    let acpx_server_bin = resolve_acpx_server_bin();
+    ensure_executable(&acpx_server_bin);
     let mut child = cmd.spawn().map_err(|e| {
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
-        format!("failed to spawn acpx-server for {provider} on port {port}: {e}")
+        // Distinguish "never resolved a real binary" (EACCES self-heal
+        // above cannot help, and a bare `ENOENT`/os error 2 from Command
+        // is easy to misread as a permissions problem) from "resolved a
+        // real file that still failed to exec" -- surfaces the exact
+        // path this process tried, which the bare `io::Error` alone does
+        // not include, so an operator does not have to reconstruct
+        // `resolve_acpx_server_bin_from`'s own fallback chain by hand.
+        let exists = acpx_server_bin.is_file();
+        format!(
+            "failed to spawn acpx-server for {provider} on port {port} \
+             (resolved path {acpx_server_bin:?}, exists={exists}): {e}"
+        )
     })?;
     for _ in 0..50 {
         if probe_acpx_gateway_for_agent(port, Some(provider)) {
@@ -4103,6 +4170,23 @@ impl AgentBridge {
     /// identity`] overwrites `session_project_path_override`, since that
     /// is exactly the "currently active project" this method reads.
     ///
+    /// Unscoped threads (`project_path: None`) are ALSO released here, on
+    /// every switch, regardless of what (if anything) was previously
+    /// active. Unlike scoped threads, an unscoped thread's `project_path`
+    /// is never bound to whatever project happens to be active -- it stays
+    /// `None` for the thread's whole life (barring an explicit rebind, see
+    /// `rebind_unscoped_project_path`) -- so there is no "switching away
+    /// from it" moment to key off of the way there is for a scoped thread.
+    /// Without this, an unscoped thread's live session/pool lease would
+    /// never be released by ANY project switch, accumulating indefinitely
+    /// no matter how many times the user changes projects. This does not
+    /// affect sidebar visibility: `retain_items_for_project` unconditionally
+    /// keeps unscoped threads listed (they were never tied to a project),
+    /// and releasing here never sets the permanent `closed` flag, so a
+    /// released unscoped thread reappears exactly like a released
+    /// scoped-foreign-project thread does today -- listed, session-less,
+    /// reopenable on next send.
+    ///
     /// Root cause this closes: before this method existed, a project
     /// switch or close only ever updated `session_cwd_override`/
     /// `session_project_path_override` (so *future* `session/new` calls
@@ -4137,25 +4221,37 @@ impl AgentBridge {
     /// AgentBridge`) -- a failed release here should not block the
     /// project switch itself.
     pub fn release_sessions_for_current_project(&self) {
-        let Some(project_path) = self
+        let leaving_project_path = self
             .session_project_path_override
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        else {
-            return;
-        };
+            .clone();
         for slot in &self.slots {
-            if slot.project_path_snapshot().as_deref() != Some(project_path.as_path()) {
+            let slot_project_path = slot.project_path_snapshot();
+            // Unscoped threads (`project_path: None`) are never tied to any
+            // one project, so they never match `leaving_project_path` by
+            // equality -- release them on EVERY switch, regardless of what
+            // (if anything) was previously active, otherwise their live
+            // session accumulates forever across arbitrarily many project
+            // switches. Scoped threads keep the original behavior: release
+            // only when they match the project actually being left.
+            let should_release = match (&slot_project_path, &leaving_project_path) {
+                (None, _) => true,
+                (Some(slot_path), Some(leaving_path)) => slot_path == leaving_path,
+                (Some(_), None) => false,
+            };
+            if !should_release {
                 continue;
             }
             let handle = slot.handle.clone();
-            if let Err(error) = self.runtime.block_on(handle.close_session(true)) {
-                eprintln!(
-                    "panel-rust: release_sessions_for_current_project close_session failed for thread {}: {error}",
-                    slot.thread_id
-                );
-            }
+            let thread_id = slot.thread_id.clone();
+            self.runtime.spawn(async move {
+                if let Err(error) = handle.close_session(true).await {
+                    eprintln!(
+                        "panel-rust: release_sessions_for_current_project close_session failed for thread {thread_id} (async): {error}"
+                    );
+                }
+            });
         }
     }
 
@@ -7503,10 +7599,12 @@ mod tests {
 
     /// project-close-session-teardown: releasing sessions for the
     /// currently active project must not touch threads recorded against a
-    /// DIFFERENT project (or an unscoped thread) -- mirrors `rebind_
-    /// project_path_moves_only_the_renamed_projects_threads`'s "only the
-    /// matching project's threads move" shape, but for teardown instead of
-    /// rename. None of these threads ever opened a real session (an
+    /// DIFFERENT project -- mirrors `rebind_project_path_moves_only_the_
+    /// renamed_projects_threads`'s "only the matching project's threads
+    /// move" shape, but for teardown instead of rename. Unscoped threads
+    /// are deliberately NOT exempt here (see the sibling test below for
+    /// that behavior) -- this test only pins down the scoped-vs-scoped
+    /// isolation. None of these threads ever opened a real session (an
     /// unreachable gateway URL, same as every other bridge-construction
     /// test in this module), so `close_session` resolves to an immediate
     /// no-op success on each -- this test's real assertion is that the
@@ -7545,7 +7643,10 @@ mod tests {
         )
         .expect("bridge construction does not require a reachable gateway");
 
-        // No active project recorded yet -- must be a safe no-op.
+        // No active project recorded yet -- releasing is still safe (and,
+        // per the new unscoped behavior, actively releases the unscoped
+        // thread's session) but must never touch the permanent `closed`
+        // flag on any thread.
         bridge.release_sessions_for_current_project();
         for idx in 0..3 {
             assert!(!bridge.thread_closed(idx));
@@ -7561,6 +7662,65 @@ mod tests {
             assert!(
                 !bridge.thread_closed(idx),
                 "release must never flip the permanent closed flag"
+            );
+        }
+    }
+
+    /// New behavior: unscoped threads' live sessions must be released on
+    /// EVERY project switch, not just when a scoped thread's own project is
+    /// being left -- otherwise an unscoped thread's session/pool lease
+    /// would never be released by any switch and accumulate indefinitely.
+    /// Verifies this holds both for a "no-project -> project A" switch and
+    /// a "project A -> project B" switch, and that the unscoped thread
+    /// stays visible/reopenable (never permanently `closed`) afterward,
+    /// matching how a released scoped-foreign-project thread already
+    /// behaves.
+    #[test]
+    fn release_sessions_for_current_project_releases_unscoped_threads_on_every_switch() {
+        let specs = vec![
+            ThreadSpec {
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        // "no project -> project A": previously no project was active at
+        // all, yet the unscoped thread's session must still be released.
+        bridge.release_sessions_for_current_project();
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/a/timeline.mlt".to_owned(),
+        ));
+
+        // "project A -> project B": the unscoped thread is released again,
+        // same as A's own thread is released for leaving A.
+        bridge.release_sessions_for_current_project();
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/b/timeline.mlt".to_owned(),
+        ));
+
+        // Neither release call may ever flip the permanent `closed` flag --
+        // both threads must remain visible/reopenable, just session-less.
+        for idx in 0..2 {
+            assert!(
+                !bridge.thread_closed(idx),
+                "releasing a session must never permanently close the thread \
+                 (slot {idx} must remain visible and reopenable)"
             );
         }
     }

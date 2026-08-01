@@ -2403,6 +2403,29 @@ fn agent_status_sort_priority(status: &crate::protocol_types::AgentStatus) -> u8
     }
 }
 
+/// Display-ready host portion of a `website` URL for `agent_card.slint`'s
+/// website row (e.g. "openai.com" for "https://openai.com/codex") --
+/// Slint has no string-split primitive, so this is computed Rust-side
+/// and threaded through as `AgentCatalogEntry.website-domain`, kept
+/// alongside the raw `website` field (still used verbatim for the
+/// actual click-to-open URL, see `lib.rs::dispatch_agent_website_
+/// clicked`'s http(s)-only guard). Strips a `http(s)://` scheme, any
+/// path/query/fragment after the host, and a leading `www.`. Never
+/// panics: an empty or schemeless/malformed input just falls through to
+/// whatever's left of the string (possibly empty).
+fn website_domain(website: &str) -> String {
+    let trimmed = website.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    host.strip_prefix("www.").unwrap_or(host).to_string()
+}
+
 pub fn to_agent_catalog_entry_rows(
     mut agents: Vec<crate::protocol_types::AgentCatalogEntry>,
     loading_ids: &[String],
@@ -2416,6 +2439,7 @@ pub fn to_agent_catalog_entry_rows(
                 id: id.clone().into(),
                 name: entry.name.into(),
                 version: entry.version.into(),
+                website_domain: website_domain(&entry.website).into(),
                 website: entry.website.into(),
                 status: entry.status.as_wire_str().into(),
                 enabled: entry.enabled,
@@ -2502,6 +2526,37 @@ pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use slint::Model;
+
+    #[test]
+    fn website_domain_strips_scheme_and_path() {
+        assert_eq!(website_domain("https://openai.com/codex"), "openai.com");
+        assert_eq!(website_domain("http://openai.com/codex"), "openai.com");
+    }
+
+    #[test]
+    fn website_domain_handles_bare_host() {
+        assert_eq!(website_domain("openai.com"), "openai.com");
+    }
+
+    #[test]
+    fn website_domain_strips_leading_www() {
+        assert_eq!(website_domain("https://www.openai.com/codex"), "openai.com");
+        assert_eq!(website_domain("www.openai.com"), "openai.com");
+    }
+
+    #[test]
+    fn website_domain_strips_query_and_fragment() {
+        assert_eq!(
+            website_domain("https://openai.com?ref=x#section"),
+            "openai.com"
+        );
+    }
+
+    #[test]
+    fn website_domain_empty_input_is_empty() {
+        assert_eq!(website_domain(""), "");
+        assert_eq!(website_domain("   "), "");
+    }
 
     // PROF-7: agent_detected_for_profile is the pure decision function the
     // real per-thread Stale state is built on -- exercised directly here so

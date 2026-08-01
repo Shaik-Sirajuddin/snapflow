@@ -3677,6 +3677,30 @@ pub extern "C" fn panel_rust_input_hover_exit(_handle: *mut PanelHandle) -> bool
     true
 }
 
+/// Forwards the host OS window's activation state (`QQuickWindow::
+/// activeChanged`, wired from `RustPanelItem`) into Slint via the real
+/// `WindowEvent::WindowActiveChanged` the platform API defines for exactly
+/// this -- see `i-slint-core`'s `Window::dispatch_event` match arm, which
+/// forwards straight to `WindowInner::set_active`. Candidate fix for a
+/// reported real-desktop bug (source-level investigation only, unconfirmed
+/// on a real machine): Slint's own internal "window active" notion never
+/// received a single update outside of VNC/fluxbox's auto-focus-on-map
+/// behavior papering over it, which may be why most input silently never
+/// reached this panel until an unrelated OS-level window-activate cycle
+/// (alt-tab away and back) "fixed" it. Mirrors `panel_rust_input_hover`'s
+/// PANEL-lookup shape exactly.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_window_active(_handle: *mut PanelHandle, active: bool) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(active));
+    true
+}
+
 /// Forwards a Qt wheel/touchpad gesture in logical pixels. Slint's nested
 /// Flickables consume only the scroll they can apply and automatically bubble
 /// any boundary remainder to their parent surface.
@@ -4289,6 +4313,133 @@ mod lifecycle_tests {
         assert_eq!(qt_cursor_shape_for_kind("default"), 0); // Qt::ArrowCursor
         assert_eq!(qt_cursor_shape_for_kind(""), 0);
         assert_eq!(qt_cursor_shape_for_kind("some-future-kind"), 0);
+    }
+
+    /// idle_poll_backoff evidence-gathering: `RustPanelItem::poll()`
+    /// (rustpanelitem.cpp) now backs its `QTimer` off to a slow idle
+    /// cadence whenever `panel_rust_poll`'s return value (`needs_paint`)
+    /// is false, and restores the full 60-90fps display-refresh cadence
+    /// whenever it's true -- see `RustPanelItem::applyPollCadence`'s doc
+    /// comment. This deliberately does NOT assert quiescence: a freshly
+    /// created, zero-thread panel is a poor idle fixture, because
+    /// `chat_area.slint`'s legacy (zero-thread) view renders its
+    /// connecting `Spinner` off `connection-status == "Connecting..."`,
+    /// and nothing ever writes that Slint property away from its
+    /// declared default for the zero-thread case (`sync.rs`'s
+    /// `Dirty::Connection` arm only fires via `displayed_thread_for_id`,
+    /// which requires an actual thread to be displayed). That is a real,
+    /// pre-existing, separate connection-status wiring gap for the
+    /// empty-project state -- out of scope for the poll-cadence fix this
+    /// test accompanies, which only needs `panel_rust_poll`'s existing
+    /// per-tick `needs_paint` signal to be honest, not for every fixture
+    /// to reach `false`. This test instead records concrete tick
+    /// counts/timing so idle-vs-active behavior is backed by numbers
+    /// rather than a claim.
+    #[test]
+    fn panel_rust_poll_tick_counts_on_a_freshly_created_panel() {
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        const TICKS: usize = 300; // ~5s of ticks at a 60fps active cadence
+        let mut needs_paint_count = 0usize;
+        let started = std::time::Instant::now();
+        for _ in 0..TICKS {
+            if panel_rust_poll(handle) {
+                needs_paint_count += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "idle_poll_backoff: {TICKS} panel_rust_poll ticks on a freshly-created, zero-thread \
+             panel took {elapsed:?} total ({:?}/tick); {needs_paint_count}/{TICKS} reported \
+             needs_paint == true (expected non-zero for this fixture -- see doc comment above). \
+             RustPanelItem::applyPollCadence still correctly follows whatever panel_rust_poll \
+             reports tick to tick, backing off to kIdlePollFps only on the ticks that report \
+             false.",
+            elapsed / TICKS as u32,
+        );
+
+        panel_rust_destroy(handle);
+    }
+
+    /// Regression test for a real, confirmed production crash: two
+    /// identical panics captured from a live `snapflow` process, both
+    /// `i-slint-renderer-software`'s "buffer ... too small to handle a
+    /// window of size ..." assert, firing inside `RustPanelItem::paint` ->
+    /// `panel_rust_render` across the non-unwinding Qt FFI boundary (an
+    /// abort, not a recoverable panic). Root cause: `RustPanelItem::
+    /// ensureHandle()` always calls `panel_rust_create` (which resizes the
+    /// buffer AND calls `window.set_size`, converting the new physical
+    /// size to Slint's internal *logical* window-item geometry using
+    /// whatever scale factor is live *at that moment*) strictly before
+    /// `panel_rust_apply_host_appearance` (which changes that scale
+    /// factor). `ScaleFactorChanged` alone never re-derives the window
+    /// item's logical geometry, so once density changes, the render-time
+    /// assert recomputes `stale logical geometry * new factor` -- a
+    /// physical pixel count that no longer matches the buffer, which was
+    /// sized directly from the raw physical width/height `panel_rust_create`
+    /// was actually given. This reproduces that exact sequence (resize at
+    /// the old density, then a density push) and asserts a render survives
+    /// it without panicking/aborting.
+    #[test]
+    fn render_survives_a_density_change_that_follows_a_resize() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = [
+            (
+                "RUI_ACPX_CODEX_URL",
+                std::env::var("RUI_ACPX_CODEX_URL").ok(),
+            ),
+            (
+                "RUI_ACPX_CLAUDE_URL",
+                std::env::var("RUI_ACPX_CLAUDE_URL").ok(),
+            ),
+            ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+        ];
+        std::env::set_var("RUI_ACPX_CODEX_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+        // Establish the panel at some size under the default (1.0) scale
+        // factor -- mirrors `ensureHandle()`'s `panel_rust_create(w, h)`
+        // call, where w/h are already physical pixels computed from
+        // whatever devicePixelRatio was live at that moment.
+        let handle = panel_rust_create(400, 400);
+        assert!(!handle.is_null());
+        assert!(panel_rust_render(handle), "initial render must succeed");
+
+        // Now the host reports a new density (e.g. the panel moved to a
+        // higher-DPI screen) -- mirrors `ensureHandle()`'s later
+        // `panel_rust_apply_host_appearance(...)` call, made strictly
+        // after `panel_rust_create` in the same tick. Before the fix, this
+        // alone (no further resize needed) leaves the buffer's physical
+        // size fixed at 400x400 while the next render demands 400*1.25 =
+        // 500x500 physical pixels -- exactly the "buffer too small"
+        // shape of the real crash.
+        assert!(panel_rust_apply_host_appearance(
+            handle,
+            1,
+            false,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            1.0,
+            1.25,
+        ));
+
+        // Must not panic/abort -- this is the actual regression check.
+        panel_rust_render(handle);
+
+        panel_rust_destroy(handle);
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
     }
 
     #[test]

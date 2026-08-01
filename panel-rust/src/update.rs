@@ -5510,6 +5510,86 @@ mod tests {
         )));
     }
 
+    /// render-loop-idle-pause: `panel_rust_poll` (lib.rs) treats
+    /// `dispatch_frame_poll`'s "did anything change" result (this
+    /// reducer's own `!dirty.is_empty()`) as one of the signals that
+    /// force a repaint tick -- so `RustPanelItem::applyPollCadence`
+    /// (rustpanelitem.cpp)'s new idle backoff is only safe if a *settled*
+    /// thread (one whose connection has resolved and isn't
+    /// Loading/Cancelling/streaming -- the ordinary "user has a project
+    /// open, nothing is happening right now" case, unlike the zero-thread
+    /// fixture `panel_rust_poll_tick_counts_on_a_freshly_created_panel`
+    /// documents as a separate pre-existing gap) actually stops producing
+    /// non-empty `dirty` once repeatedly fed the exact same snapshot.
+    /// Confirms that repeated `Msg::Frame` on unchanging input is
+    /// idempotent (`dirty` empty from the second identical frame
+    /// onward), which is the reducer-level guarantee the C++ poll-cadence
+    /// backoff actually depends on for the mainstream idle case.
+    #[test]
+    fn a_settled_threads_repeated_identical_frame_snapshot_produces_no_further_dirty() {
+        let mut model = model_with_threads(&["thread"]);
+        model.threads[0].session_id = Some("thread-1".to_owned());
+        model.displayed_thread = Some(0);
+        let snapshot = crate::msg::ThreadFrameSnapshot {
+            thread_id: "thread-1".to_owned(),
+            real_index: 0,
+            transcript: vec![crate::conversation::TranscriptItem::Assistant {
+                message_id: "message-1".to_owned(),
+                text: "hello".to_owned(),
+                streaming: false,
+            }],
+            has_older_messages: false,
+            pending_request: crate::PendingRequestItem::default(),
+            terminals: vec![],
+            expanded_terminal: None,
+            open_terminals: vec![],
+            local_terminal: crate::LocalTerminalItem::default(),
+            connection_status: "Live connection".to_owned(),
+            session_modes: None,
+            config_options: vec![],
+            available_commands: vec![],
+            plan: vec![],
+            session_title: None,
+            usage: (0, 0),
+        };
+
+        let (_, first_dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(snapshot.clone()),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            !first_dirty.is_empty(),
+            "first frame establishing the settled thread should dirty something"
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert_eq!(model.threads[0].connection_status, "Live connection");
+
+        // Poll again several times with the exact same snapshot -- this is
+        // what an idle `panel_rust_poll` tick looks like once nothing is
+        // actually happening: no new tokens, no state change, identical
+        // input every tick.
+        for tick in 0..5 {
+            let (_, dirty) = update(
+                &mut model,
+                Msg::Frame(FrameInput {
+                    selected_thread_snapshot: Some(snapshot.clone()),
+                    ..FrameInput::default()
+                }),
+            );
+            assert!(
+                dirty.is_empty(),
+                "tick {tick}: a settled thread fed an unchanged snapshot must not keep \
+                 producing dirty -- if this fails, panel_rust_poll's `frame_changed` signal \
+                 would stay true forever even with nothing actually happening, defeating \
+                 RustPanelItem::applyPollCadence's idle backoff for the mainstream \
+                 (non-zero-thread) idle case"
+            );
+        }
+    }
+
     #[test]
     fn cold_starts_first_displayed_thread_snapshot_never_clears_a_global_error_banner() {
         // SCNA-01 regression: model.displayed_thread starts None before
