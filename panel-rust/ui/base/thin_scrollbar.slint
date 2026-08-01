@@ -32,8 +32,8 @@ export component ThinScrollbar inherits Rectangle {
     // itself, which isn't a guarantee worth depending on silently.
     out property <bool> dragging: touch.pressed;
 
-    // A flat 90ms ease on every `viewport-y` change smoothed click-to-jump
-    // and wheel-scroll nicely, but broke active dragging: the value is
+    // A flat ease on every `viewport-y` change smoothed click-to-jump and
+    // wheel-scroll nicely, but broke active dragging: the value is
     // re-targeted on every pointer-move while the thumb is held, so the
     // eased position perpetually chased a moving target and never caught
     // up to the cursor until the drag stopped -- reading as "hold and
@@ -42,7 +42,20 @@ export component ThinScrollbar inherits Rectangle {
     // indirect cases (a wheel tick, a click-to-jump) should ease. `touch`
     // is declared below but forward-referencing it here is fine (Slint
     // bindings form one graph, not sequential statements).
-    animate viewport-y { duration: touch.pressed ? 0ms : 90ms; easing: ease-out; }
+    //
+    // Duration/easing kept in lockstep with chat_area.slint's own
+    // `message-scroll` animate on the two-way-bound `viewport-y` (both
+    // sides declare it independently rather than relying on one side's
+    // animate propagating across the `<=>` binding -- see the comment on
+    // `dragging` above). 90ms ease-out read as an instant snap for any
+    // real scroll distance; 180ms ease-in-out matches this codebase's
+    // established "real movement" convention (expandable_panel/
+    // collapse_expand/sidebar height/width/x all animate at 150-180ms
+    // ease-in-out, not the 90-100ms used for hover/background feedback)
+    // and matches Slint's own built-in wheel-flick physics duration
+    // (i-slint-core Flickable::WHEEL_SCROLL_DURATION = 180ms), which this
+    // declaration can't see or influence but should visually agree with.
+    animate viewport-y { duration: touch.pressed ? 0ms : 180ms; easing: ease-in-out; }
 
     property <length> extent: root.horizontal ? root.viewport-width : root.viewport-height;
     property <length> visible-extent: root.horizontal ? root.visible-width : root.visible-height;
