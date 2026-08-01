@@ -66,19 +66,33 @@ export component SidebarThreadRow inherits HoverSurface {
             // the icon group (alignment:center was the gap).
             alignment: stretch;
             spacing: 0px;
-            Rectangle {
+            // Only reserve in-layout width for the stick when expanded,
+            // where its 3px indent is needed so row text/controls don't
+            // start flush at x=0. Collapsed: the stick must NOT consume
+            // HorizontalLayout width -- 5b3cd157 fixed the (much larger)
+            // ~78px residual from the trailing action-button cluster,
+            // but left this 3px stick still subtracted from the region
+            // the status icon centers within. That leaves the icon
+            // centered in the *post-stick* 45px remainder (center
+            // x=25.5 on a 48px rail) instead of the rail's true center
+            // (x=24) -- a real, reproducible +1.5px (half the stick's
+            // own width) rightward bias, confirmed live via a headless
+            // `i_slint_backend_testing::ElementHandle` geometry
+            // measurement even with 5b3cd157's fix fully intact. Gating
+            // this stick on `if expanded` (dropping it from layout
+            // entirely when collapsed) and repainting it as a plain
+            // root-level overlay below removes that bias: the status
+            // icon then centers over the full 48px rail.
+            if expanded : Rectangle {
                 width: 3px;
                 horizontal-stretch: 0;
                 // Full row height, flush to the rail's left end.
                 height: 100%;
-                // Collapsed: per-thread accent (rose/orange/…).
-                // Expanded: white selection bar (bg-primary) on
-                // the selected row only; transparent otherwise.
-                // Phase 29: archived rows carry NO accent glow in the
-                // collapsed rail -- only live threads get their color.
-                background: expanded
-                    ? (index == selected-thread ? Theme.bg-primary : transparent)
-                    : (thread.archived ? transparent : accent-color);
+                // White selection bar (bg-primary) on the selected row
+                // only; transparent otherwise. (Collapsed's per-thread
+                // accent color is now painted by the overlay Rectangle
+                // below instead of this in-layout copy.)
+                background: index == selected-thread ? Theme.bg-primary : transparent;
             }
             VerticalLayout {
                 horizontal-stretch: 1;
@@ -497,5 +511,19 @@ export component SidebarThreadRow inherits HoverSurface {
                     min-width: 0px;
                 }
             }
+        }
+        // Collapsed-rail accent stick, painted as a root-level overlay
+        // (a sibling of the HorizontalLayout above, not a child inside
+        // it) so it never contributes to that layout's width math -- see
+        // the `if expanded` gate on the in-layout copy above for why.
+        // Same flush-left placement/color logic as before: per-thread
+        // accent (rose/orange/…), except archived rows carry no glow
+        // (Phase 29).
+        if !expanded : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 3px;
+            height: 100%;
+            background: thread.archived ? transparent : accent-color;
         }
 }
