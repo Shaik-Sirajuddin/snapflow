@@ -4825,6 +4825,7 @@ impl Router {
                         "id": agent.id,
                         "name": agent.name,
                         "version": agent.version,
+                        "website": agent.website,
                         "status": crate::detect::detect(&agent.id, &agent.distribution),
                         "enabled": enabled,
                         "source": AgentSource::Registry,
@@ -4840,6 +4841,7 @@ impl Router {
                             "id": agent.id,
                             "name": agent.name,
                             "version": "custom",
+                            "website": serde_json::Value::Null,
                             "status": AgentStatus::Configured,
                             "enabled": enabled,
                             "source": AgentSource::Custom,
@@ -5395,6 +5397,72 @@ async fn write_cancel_notification_best_effort(
     }
 }
 
+/// Picks the `methodId` to send in `authenticate`, constrained to what the
+/// backend actually advertised in its own `initialize` result.
+///
+/// **The live bug this closes.** `Router::call_policy` falls back to the
+/// process-global `native_auth_method_id` (`ACPX_NATIVE_AUTH_METHOD_ID`,
+/// auto-derived from `~/.codex/auth.json` for the *default* agent, see
+/// `acpx-server`'s `default_codex_native_auth_method`) for every profile
+/// that doesn't carry one of its own. Auto-seeded registry profiles never
+/// carry one, so every non-codex agent inherited codex's method id and
+/// acpx sent a `methodId` the agent had never advertised. Confirmed live
+/// against a real daemon-managed instance: `session/new` with
+/// `_acpx.profile = "grok-build"` failed instantly with
+/// `backend rejected authenticate: {"code":-32602,"message":"Invalid
+/// params","data":"unsupported auth method: chat-gpt"}` -- grok advertises
+/// `["cached_token", "grok.com"]` and never `chat-gpt`, so grok-build
+/// could never open a session at all and no session row was ever
+/// persisted for it.
+///
+/// Resolution order:
+/// 1. the configured id, but **only if the backend advertises it** (keeps
+///    codex-acp's real `chat-gpt` behavior byte-for-byte);
+/// 2. the backend's own `_meta.defaultAuthMethodId`, when it advertises
+///    one (grok reports `"cached_token"` here -- the same method the
+///    manual raw-ACP handshake used successfully). This is the agent
+///    explicitly nominating a method, not acpx guessing one;
+/// 3. `None`, leaving the caller to surface
+///    `BackendRequiresAuthentication` with the real advertised list.
+///    Deliberately *not* "auto-pick the only advertised method" -- acpx
+///    refusing to silently invent an auth method the operator never
+///    configured is an existing tested contract (`authenticate_test.rs`'s
+///    `session_new_is_refused_with_a_clear_error_when_backend_requires_
+///    auth_and_none_is_configured`).
+fn select_auth_method_id(
+    configured: Option<&str>,
+    auth_methods: &[serde_json::Value],
+    initialize_result: Option<&serde_json::Value>,
+) -> Option<String> {
+    let advertises = |id: &str| {
+        auth_methods
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .any(|advertised| advertised == id)
+    };
+
+    if let Some(id) = configured.filter(|id| advertises(id)) {
+        return Some(id.to_string());
+    }
+    if configured.is_some() {
+        tracing::warn!(
+            configured,
+            "configured auth method id is not advertised by this backend; falling back to the \
+             backend's own advertised methods (a process-global \
+             ACPX_NATIVE_AUTH_METHOD_ID applies to every agent, not just the one it was \
+             derived from)"
+        );
+    }
+
+    let default_id = initialize_result
+        .and_then(|r| r.get("_meta"))
+        .and_then(|m| m.get("defaultAuthMethodId"))
+        .and_then(|v| v.as_str());
+    default_id
+        .filter(|id| advertises(id))
+        .map(str::to_string)
+}
+
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
     call_policy: BackendCallPolicy,
@@ -5516,11 +5584,25 @@ async fn ensure_backend_initialized_with_handshake_timeout(
             .cloned()
             .unwrap_or_default();
         if !auth_methods.is_empty() {
-            let Some(method_id) = call_policy.auth_method_id.as_deref() else {
+            let Some(method_id) = select_auth_method_id(
+                call_policy.auth_method_id.as_deref(),
+                &auth_methods,
+                proc.agent_capabilities.as_ref(),
+            ) else {
                 return Err(RouterError::BackendRequiresAuthentication(
                     serde_json::Value::Array(auth_methods),
                 ));
             };
+            let method_id = method_id.as_str();
+            tracing::debug!(
+                method_id,
+                configured = ?call_policy.auth_method_id,
+                advertised = ?auth_methods
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>(),
+                "authenticating backend"
+            );
             let request = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": AUTHENTICATE_REQUEST_ID,
@@ -8545,6 +8627,16 @@ async fn dispatch_session_new_shared(
         }
 
         let admission = r.admit_session(tenant_id)?;
+        // The only per-request visibility into which agent a `session/new`
+        // actually resolved to and what it spawns for it. Without this the
+        // whole stretch between `"acpx received request"` and the response
+        // is dark, which is exactly what made a real grok-build failure
+        // undiagnosable from outside the process.
+        tracing::debug!(
+            agent_id = %agent_id,
+            spawn = ?r.supervisor.spec(&agent_id).map(|s| (&s.program, &s.args)),
+            "session/new resolved agent; ensuring backend process is running"
+        );
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         // The demux consumer (spawned below, once handshake completes)
         // subsumes the idle scavenger's job for this process -- see

@@ -142,6 +142,7 @@ export component SettingsPage inherits Rectangle {
     callback profile-delete(string);
     callback agent-install-requested(string);
     callback agent-set-enabled(string, bool);
+    callback agent-website-clicked(string);
     callback recover-session-attach(string, string, string);
     callback skill-promote-to-global(string);
     callback dev-mode-toggled(bool);
@@ -209,10 +210,12 @@ export component SettingsPage inherits Rectangle {
             }
 
             top-search-bar := SettingsSearchBar {
-                // Concrete remaining width -- stretch factors do not
-                // propagate reliably in this nesting (see the content
-                // row's comment below).
-                width: parent.width - 148px - Metrics.space-4;
+                // Temporarily hidden while the settings information
+                // architecture settles. Keep the binding/wiring intact so
+                // the page-level filter can be restored without reworking
+                // the section views.
+                visible: false;
+                width: 0px;
                 placeholder: "Search settings...";
                 bar-accessible-label: "Search settings";
                 query <=> root.search-query;
@@ -306,6 +309,7 @@ export component SettingsPage inherits Rectangle {
                     profile-delete(name) => { root.profile-delete(name); }
                     agent-install-requested(id) => { root.agent-install-requested(id); }
                     agent-set-enabled(id, enabled) => { root.agent-set-enabled(id, enabled); }
+                    agent-website-clicked(website) => { root.agent-website-clicked(website); }
                     recover-session-attach(session-id, provider, title) => {
                         root.recover-session-attach(session-id, provider, title);
                     }

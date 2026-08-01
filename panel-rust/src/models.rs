@@ -2243,6 +2243,7 @@ pub fn to_agent_catalog_entry_rows(
                 id: id.clone().into(),
                 name: entry.name.into(),
                 version: entry.version.into(),
+                website: entry.website.into(),
                 status: entry.status.as_wire_str().into(),
                 enabled: entry.enabled,
                 loading: loading_ids.iter().any(|loading_id| loading_id == &id),
@@ -2341,6 +2342,7 @@ mod tests {
             id: id.to_owned(),
             name: id.to_owned(),
             version: String::new(),
+            website: String::new(),
             status,
             enabled: true,
         }
@@ -3845,6 +3847,7 @@ mod transcript_model_tests {
                 id: id.to_owned(),
                 name: id.to_owned(),
                 version: String::new(),
+                website: String::new(),
                 status,
                 enabled: true,
             }

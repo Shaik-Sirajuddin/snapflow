@@ -39,6 +39,8 @@ pub struct AgentListEntry {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub website: Option<String>,
     pub status: AgentStatus,
     #[serde(default = "default_enabled")]
     pub enabled: bool,

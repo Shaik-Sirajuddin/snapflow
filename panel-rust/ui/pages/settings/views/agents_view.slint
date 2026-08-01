@@ -94,6 +94,7 @@ export component AgentsView inherits Rectangle {
     // connect/disconnect above -- routes through the admin plane
     // (AgentBridge::set_agent_enabled), not agents/connect.
     callback agent-set-enabled(string, bool);
+    callback agent-website-clicked(string);
 
     property <string> new-profile-name: "";
     property <string> new-profile-agent-id: "";
@@ -107,7 +108,10 @@ export component AgentsView inherits Rectangle {
     // Agents-grid-local search -- scoped to this grid (not the page-level
     // SettingsSearchBar). Uses TextUtil.matches-filter (Rust contains-ci)
     // against each card's name + id, same helper as sidebar thread/skill
-    // search. Empty query shows the full catalog.
+    // search. Empty query shows the full catalog subject to the scope rule:
+    // Project is intentionally an installed-agent view, while Global is the
+    // complete registry view. This is behavior of the Project/Global scope
+    // switch, not an additional user-facing filter control.
     property <string> agent-search-query: "";
     // Page-level SettingsSearchBar (settings_page_search_filter).
     in property <string> page-search-query: "";
@@ -115,6 +119,14 @@ export component AgentsView inherits Rectangle {
 
     pure function agent-matches(index: int) -> bool {
         if (index < 0 || index >= root.agent-catalog.length) {
+            return false;
+        }
+        // Project settings should default to agents that are present on this
+        // machine. Global remains the authoritative complete catalog,
+        // including installable/not-yet-installed entries.
+        if (root.scope == "project"
+            && root.agent-catalog[index].status != "installed"
+            && root.agent-catalog[index].status != "installed_no_session") {
             return false;
         }
         if (root.agent-search-query == "" && root.page-search-query == "") {
@@ -369,8 +381,13 @@ export component AgentsView inherits Rectangle {
         // independently underneath the fixed header above, keeping
         // agent-search-bar pinned in view.
         agents-body-area := Rectangle {
-            vertical-stretch: 1;
-            preferred-height: 0px;
+            // Fit the scroll area to its content when the catalog is short,
+            // while retaining a bounded viewport for larger catalogs. This
+            // prevents an empty/filtered agent grid from reserving the full
+            // remaining Settings page height.
+            vertical-stretch: 0;
+            preferred-height: agents-body.preferred-height;
+            max-height: 420px;
             min-height: 0px;
 
             // settings_scrollbar_discoverability: same "recently scrolled"
@@ -466,6 +483,14 @@ export component AgentsView inherits Rectangle {
                     - Math.mod(agent-count + cards-per-row - 1, cards-per-row))
                     / cards-per-row;
 
+            if agent-count == 0 : Text {
+                text: "No agents found";
+                color: Theme.text-muted;
+                font-size: 11px * Theme.font-scale;
+                vertical-alignment: center;
+                height: 28px;
+            }
+
             for row-idx in row-count : VerticalLayout {
                 spacing: Metrics.space-6;
                 property <int> first-agent-index: row-idx * cards-per-row;
@@ -491,6 +516,7 @@ export component AgentsView inherits Rectangle {
                         agent-id: root.agent-catalog[first-agent-index].id;
                         agent-name: root.agent-catalog[first-agent-index].name != ""
                             ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
+                        website: root.agent-catalog[first-agent-index].website;
                         status: root.agent-catalog[first-agent-index].status;
                         card-width: cards-per-row == 1 ? root.width : 260px;
                         is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
@@ -503,6 +529,7 @@ export component AgentsView inherits Rectangle {
                         connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index].id); }
                         disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index].id); }
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index].id, new-enabled); }
+                        website-clicked => { root.agent-website-clicked(root.agent-catalog[first-agent-index].website); }
                     }
 
                     if second-visible : AgentCard {
@@ -510,6 +537,7 @@ export component AgentsView inherits Rectangle {
                         agent-id: root.agent-catalog[first-agent-index + 1].id;
                         agent-name: root.agent-catalog[first-agent-index + 1].name != ""
                             ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;
+                        website: root.agent-catalog[first-agent-index + 1].website;
                         status: root.agent-catalog[first-agent-index + 1].status;
                         card-width: 260px;
                         is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
@@ -522,6 +550,7 @@ export component AgentsView inherits Rectangle {
                         connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index + 1].id); }
                         disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index + 1].id); }
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index + 1].id, new-enabled); }
+                        website-clicked => { root.agent-website-clicked(root.agent-catalog[first-agent-index + 1].website); }
                     }
                 }
             }

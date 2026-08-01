@@ -347,12 +347,14 @@ impl AgentStatus {
 
 /// One agent-registry catalogue entry, as returned by `agents/list`
 /// (each entry) or `agents/status` (one entry, keyed by the requested
-/// id).
+/// id). `website` is the registry's official public landing page, if one
+/// is supplied; it is kept separate from any ACPX gateway URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCatalogEntry {
     pub id: String,
     pub name: String,
     pub version: String,
+    pub website: String,
     pub status: AgentStatus,
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: `agents/list` itself carries no enablement info (that's an
@@ -382,6 +384,12 @@ impl AgentCatalogEntry {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let website = value
+            .get("website")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let status = value
             .get("status")
             .and_then(|v| v.as_str())
@@ -391,6 +399,7 @@ impl AgentCatalogEntry {
             id,
             name,
             version,
+            website,
             status,
             enabled: true,
         })
@@ -449,12 +458,14 @@ mod parsing_tests {
             "id": "codex-acp",
             "name": "Codex Agent",
             "version": "1.0.0",
+            "website": "https://example.com/codex",
             "status": "installed"
         });
         let entry = AgentCatalogEntry::from_json(&value).expect("entry");
         assert_eq!(entry.id, "codex-acp");
         assert_eq!(entry.name, "Codex Agent");
         assert_eq!(entry.version, "1.0.0");
+        assert_eq!(entry.website, "https://example.com/codex");
         assert_eq!(entry.status, AgentStatus::Installed);
     }
 

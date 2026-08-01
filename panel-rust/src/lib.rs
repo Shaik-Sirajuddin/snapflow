@@ -1660,6 +1660,18 @@ impl PanelSingleton {
         bridge.set_agent_enabled_async(agent_id, enabled);
     }
 
+    /// Opens a registry-provided official website from an agent card. Only
+    /// web URLs are accepted here; registry metadata must never turn the
+    /// card into a general local-file or command opener.
+    pub(crate) fn dispatch_agent_website_clicked(&self, website: &str) {
+        let website = website.trim();
+        if website.starts_with("https://") || website.starts_with("http://") {
+            open_md_link_target(website);
+        } else if !website.is_empty() {
+            eprintln!("panel-rust: refusing non-web agent website URL: {website}");
+        }
+    }
+
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
         let paths = settings_file::SettingsPaths::from_env();
         if let Err(error) = paths.set_dev_mode(enabled) {
@@ -2862,6 +2874,18 @@ fn panel_rust_create_with_initial_identity(
                         &component,
                         agent_id.to_string(),
                     );
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_agent_website_clicked(move |website| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    panel.dispatch_agent_website_clicked(website.as_str());
                 }
             });
         });

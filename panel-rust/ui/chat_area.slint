@@ -1004,40 +1004,56 @@ export component ChatArea inherits Rectangle {
                 padding-right: Metrics.pad-2xl;
                 padding-top: Metrics.pad-xl;
                 padding-bottom: Metrics.pad-xl;
-                spacing: compact ? Metrics.gap-md : Metrics.gap-lg;
-                if has-older-messages : Rectangle {
-                    height: 22px;
-                    border-radius: Theme.radius-sm;
-                    background: load-older-button.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
-                    animate background { duration: 100ms; }
-                    load-older-button := TouchArea {
-                        mouse-cursor: loading-older-messages ? default : pointer;
-                        accessible-role: button;
-                        accessible-label: "Load older messages";
-                        enabled: !loading-older-messages;
-                        accessible-action-default => {
-                            if !loading-older-messages {
-                                loading-older-messages = true;
-                                load-older-requested();
+                // Per-row trailing spacer (below), not layout `spacing` --
+                // see the `for msg[i] in messages` loop's own doc comment
+                // for why: a tool group with multiple internal tool uses
+                // put several *extra*, content-less rows into this flat
+                // `messages`-indexed list (one per sub-call, only the
+                // group's first index actually renders a ToolGroupView),
+                // and a VerticalLayout's `spacing` applies between EVERY
+                // adjacent child including empty ones -- same PUI-009
+                // class as the full-view popup's tool list below and the
+                // sidebar lists, just not fixed here yet until now.
+                spacing: 0px;
+                if has-older-messages : VerticalLayout {
+                    spacing: 0px;
+                    Rectangle {
+                        height: 22px;
+                        border-radius: Theme.radius-sm;
+                        background: load-older-button.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
+                        animate background { duration: 100ms; }
+                        load-older-button := TouchArea {
+                            mouse-cursor: loading-older-messages ? default : pointer;
+                            accessible-role: button;
+                            accessible-label: "Load older messages";
+                            enabled: !loading-older-messages;
+                            accessible-action-default => {
+                                if !loading-older-messages {
+                                    loading-older-messages = true;
+                                    load-older-requested();
+                                }
+                            }
+                            clicked => {
+                                if !loading-older-messages {
+                                    loading-older-messages = true;
+                                    load-older-requested();
+                                }
+                            }
+                            changed has-hover => {
+                                CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
                             }
                         }
-                        clicked => {
-                            if !loading-older-messages {
-                                loading-older-messages = true;
-                                load-older-requested();
-                            }
-                        }
-                        changed has-hover => {
-                            CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
+                        Text {
+                            text: loading-older-messages ? "Loading older messages..." : "Load older messages";
+                            color: Theme.text-secondary;
+                            font-size: 10px * Theme.font-scale;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
                         }
                     }
-                    Text {
-                        text: loading-older-messages ? "Loading older messages..." : "Load older messages";
-                        color: Theme.text-secondary;
-                        font-size: 10px * Theme.font-scale;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                    // This block is only ever visible alongside real message
+                    // rows below it, so it always needs its own trailing gap.
+                    Rectangle { height: compact ? Metrics.gap-md : Metrics.gap-lg; }
                 }
                 // Phase 18 empty/loading states: never leave the chat
                 // view blank. While (re)connecting, a blinking loading
@@ -1073,8 +1089,22 @@ export component ChatArea inherits Rectangle {
                 }
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
-                for msg[i] in messages : HorizontalLayout {
-                    padding-right: compact ? Metrics.space-2 : Metrics.space-4;
+                // Wrapped in a VerticalLayout (spacing 0) with its own
+                // trailing spacer below, rather than a bare HorizontalLayout
+                // relying on `message-col`'s own layout `spacing` above --
+                // see that `spacing: 0px` change's doc comment for why: a
+                // tool group with N internal tool uses puts N-1 *extra*,
+                // content-less entries into this flat, `messages`-indexed
+                // list (every index but the group's first renders nothing
+                // here -- see `is-first-tool-event` below -- because
+                // ToolGroupView already renders every sub-call itself from
+                // `group-start`/`group-length`), and layout `spacing`
+                // applies between EVERY adjacent child including empty
+                // ones, so those N-1 invisible rows used to each add a full
+                // row gap before the next real row, compounding into a gap
+                // N-1x too wide.
+                for msg[i] in messages : VerticalLayout {
+                    spacing: 0px;
                     property <bool> is-queued: msg.queued;
                     // Phase 18: synthetic awaiting-response row (models.rs
                     // appends kind "pending" while a just-sent user message
@@ -1116,143 +1146,157 @@ export component ChatArea inherits Rectangle {
                         : 0.0;
                     property <length> flow-blob: 36px;
 
-                    // Left rail track — always reserved for non-user rows
-                    // so agent/tool width is stable when is-live-tail flips.
-                    // User rows keep a fixed indent instead (no rail).
-                    live-rail := Rectangle {
-                        // Always claim rail-w for non-user rows (placeholder
-                        // when idle) so live pulse never changes row width.
-                        width: is-user ? 0px : rail-w;
-                        horizontal-stretch: 0;
-                        min-height: 12px;
-                        clip: true;
-                        border-radius: 1.5px;
-                        // Dim track only while live; transparent placeholder
-                        // otherwise (same width, no layout shift). Tool-event
-                        // rows are excluded here -- ToolGroupView already
-                        // draws its own left-edge pulse rail (see its
-                        // `pulse-opacity`/loading rail) while a tool call is
-                        // active, so this traveling highlight would just be
-                        // a second, redundant left-border animation on the
-                        // same row.
-                        background: (is-live-tail && !is-tool-event)
-                            ? Theme.bg-primary.with-alpha(0.18)
-                            : transparent;
+                    HorizontalLayout {
+                        padding-right: compact ? Metrics.space-2 : Metrics.space-4;
 
-                        // Bright segment that travels down the rail.
-                        if is-live-tail && !is-tool-event : Rectangle {
-                            width: parent.width;
-                            height: min(flow-blob, parent.height);
-                            y: (parent.height + flow-blob) * flow-t - flow-blob;
+                        // Left rail track — always reserved for non-user rows
+                        // so agent/tool width is stable when is-live-tail flips.
+                        // User rows keep a fixed indent instead (no rail).
+                        live-rail := Rectangle {
+                            // Always claim rail-w for non-user rows (placeholder
+                            // when idle) so live pulse never changes row width.
+                            width: is-user ? 0px : rail-w;
+                            horizontal-stretch: 0;
+                            min-height: 12px;
+                            clip: true;
                             border-radius: 1.5px;
-                            background: Theme.bg-primary.with-alpha(0.95);
+                            // Dim track only while live; transparent placeholder
+                            // otherwise (same width, no layout shift). Tool-event
+                            // rows are excluded here -- ToolGroupView already
+                            // draws its own left-edge pulse rail (see its
+                            // `pulse-opacity`/loading rail) while a tool call is
+                            // active, so this traveling highlight would just be
+                            // a second, redundant left-border animation on the
+                            // same row.
+                            background: (is-live-tail && !is-tool-event)
+                                ? Theme.bg-primary.with-alpha(0.18)
+                                : transparent;
+
+                            // Bright segment that travels down the rail.
+                            if is-live-tail && !is-tool-event : Rectangle {
+                                width: parent.width;
+                                height: min(flow-blob, parent.height);
+                                y: (parent.height + flow-blob) * flow-t - flow-blob;
+                                border-radius: 1.5px;
+                                background: Theme.bg-primary.with-alpha(0.95);
+                            }
+                            if is-live-tail && !is-tool-event : Rectangle {
+                                width: parent.width;
+                                height: min(flow-blob * 0.55, parent.height);
+                                y: (parent.height + flow-blob) * flow-t - flow-blob * 1.45;
+                                border-radius: 1.5px;
+                                background: Theme.bg-primary.with-alpha(0.35);
+                            }
                         }
-                        if is-live-tail && !is-tool-event : Rectangle {
-                            width: parent.width;
-                            height: min(flow-blob * 0.55, parent.height);
-                            y: (parent.height + flow-blob) * flow-t - flow-blob * 1.45;
-                            border-radius: 1.5px;
-                            background: Theme.bg-primary.with-alpha(0.35);
+                        // Gap after rail / user indent — fixed per kind.
+                        Rectangle {
+                            width: is-user ? 36px : rail-gap;
+                            horizontal-stretch: 0;
+                        }
+                        if is-pending : PendingStatusRow {
+                            // No padding-left here -- unlike every other row
+                            // kind below (UserBubble/AgentBubble/
+                            // ToolGroupView/QueuedMessageBar), this used to add
+                            // its own rail-w + gap offset on top of the one
+                            // already reserved by the preceding live-rail +
+                            // gap Rectangle siblings, pushing the status text
+                            // further right than every other row's content
+                            // actually starts.
+                            label: root.last-error != "" ? root.last-error : "waiting for response";
+                        }
+                        if is-queued : QueuedMessageBar {
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            text: msg.text;
+                            can-edit: msg.can-edit;
+                            can-send-now: msg.can-send-now;
+                            sending: msg.sending;
+                            cancel-requested => { root.queue-cancel-requested(msg.index); }
+                            edit-requested => { root.queue-edit-requested(msg.index); }
+                            send-now-requested => { root.queue-send-now-requested(msg.index); }
+                            stop-requested => { root.queue-stop-requested(); }
+                        }
+                        if is-user : UserBubble {
+                            // Stretch within the available chat column instead
+                            // of binding width back to the Flickable viewport.
+                            // A fixed width clips at the 20%-dock target, while
+                            // a parent.width binding creates a Slint layout loop.
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            item: msg;
+                            copy-message(text) => { root.copy-message(text); }
+                        }
+                        if is-agent-side : AgentBubble {
+                            link-activated(target) => { root.md-link-activated(target); }
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            vertical-stretch: 0;
+                            item: msg;
+                            // Thinking rows reuse MessageItem.expanded + the
+                            // shared toggle-expanded round-trip (same as
+                            // ToolEventRow / MessageCard log bodies).
+                            toggle-expanded(idx) => { toggle-expanded(idx); }
+                            copy-message(text) => { root.copy-message(text); }
+                        }
+                        if is-first-tool-event : ToolGroupView {
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            label: root.tool-groups.length > 0 ? root.tool-groups[msg.index].label : (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE");
+                            item-count: root.tool-groups.length > 0 ? root.tool-groups[msg.index].item-count : tool-group-size;
+                            messages: root.tool-groups.length > 0 ? root.tool-groups[msg.index].messages : root.messages;
+                            group-start: i;
+                            group-length: tool-group-size;
+                            group-local: root.tool-groups.length > 0;
+                            row-cap-height: root.height * 0.3;
+                            loading: is-live-tail;
+                            // Tool/MCP execution groups are opt-in surfaces:
+                            // even the newest live group stays collapsed until
+                            // the user explicitly expands it.
+                            default-expanded: false;
+                            mcp-variant: root.tool-groups.length > 0 ? root.tool-groups[msg.index].label == "MCP CALL" : msg.kind == "mcp_server_call";
+                            max-visible-height: min(230px, root.height * 0.35);
+                            open-group-full-view => {
+                                root.full-view-title = (root.tool-groups.length > 0 ? root.tool-groups[msg.index].label : (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE")) + " EXECUTION (" + (root.tool-groups.length > 0 ? root.tool-groups[msg.index].item-count : tool-group-size) + " TOTAL CALLS)";
+                                root.full-view-is-mcp = root.tool-groups.length > 0 ? root.tool-groups[msg.index].label == "MCP CALL" : msg.kind == "mcp_server_call";
+                                root.full-view-group-idx = i;
+                                root.full-view-open = true;
+                            }
+                            toggle-expanded(idx) => { toggle-expanded(idx); }
+                            open-full-view(title, input, output, term, mcp) => {
+                                root.full-view-title = title;
+                                root.full-view-raw-input = input;
+                                root.full-view-raw-output = output;
+                                root.full-view-is-terminal = term;
+                                root.full-view-is-mcp = mcp;
+                                root.full-view-group-idx = -1;
+                                root.full-view-open = true;
+                            }
+                        }
+                        if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            item: msg;
+                            toggle-expanded(idx) => { toggle-expanded(idx); }
+                        }
+                        Rectangle {
+                            width: (is-agent-side || is-first-tool-event) ? 36px : 0px;
+                            horizontal-stretch: 0;
                         }
                     }
-                    // Gap after rail / user indent — fixed per kind.
+                    // This row's own trailing gap -- 0px for a tool-group
+                    // continuation row (renders nothing of its own above,
+                    // already covered by the group's first-index
+                    // ToolGroupView) and for the very last row (no
+                    // `spacing`-equivalent gap after the last child,
+                    // matching the previous layout-`spacing` behavior).
                     Rectangle {
-                        width: is-user ? 36px : rail-gap;
-                        horizontal-stretch: 0;
-                    }
-                    if is-pending : PendingStatusRow {
-                        // No padding-left here -- unlike every other row
-                        // kind below (UserBubble/AgentBubble/
-                        // ToolGroupView/QueuedMessageBar), this used to add
-                        // its own rail-w + gap offset on top of the one
-                        // already reserved by the preceding live-rail +
-                        // gap Rectangle siblings, pushing the status text
-                        // further right than every other row's content
-                        // actually starts.
-                        label: root.last-error != "" ? root.last-error : "waiting for response";
-                    }
-                    if is-queued : QueuedMessageBar {
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        text: msg.text;
-                        can-edit: msg.can-edit;
-                        can-send-now: msg.can-send-now;
-                        sending: msg.sending;
-                        cancel-requested => { root.queue-cancel-requested(msg.index); }
-                        edit-requested => { root.queue-edit-requested(msg.index); }
-                        send-now-requested => { root.queue-send-now-requested(msg.index); }
-                        stop-requested => { root.queue-stop-requested(); }
-                    }
-                    if is-user : UserBubble {
-                        // Stretch within the available chat column instead
-                        // of binding width back to the Flickable viewport.
-                        // A fixed width clips at the 20%-dock target, while
-                        // a parent.width binding creates a Slint layout loop.
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        item: msg;
-                        copy-message(text) => { root.copy-message(text); }
-                    }
-                    if is-agent-side : AgentBubble {
-                        link-activated(target) => { root.md-link-activated(target); }
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        vertical-stretch: 0;
-                        item: msg;
-                        // Thinking rows reuse MessageItem.expanded + the
-                        // shared toggle-expanded round-trip (same as
-                        // ToolEventRow / MessageCard log bodies).
-                        toggle-expanded(idx) => { toggle-expanded(idx); }
-                        copy-message(text) => { root.copy-message(text); }
-                    }
-                    if is-first-tool-event : ToolGroupView {
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        label: root.tool-groups.length > 0 ? root.tool-groups[msg.index].label : (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE");
-                        item-count: root.tool-groups.length > 0 ? root.tool-groups[msg.index].item-count : tool-group-size;
-                        messages: root.tool-groups.length > 0 ? root.tool-groups[msg.index].messages : root.messages;
-                        group-start: i;
-                        group-length: tool-group-size;
-                        group-local: root.tool-groups.length > 0;
-                        row-cap-height: root.height * 0.3;
-                        loading: is-live-tail;
-                        // Tool/MCP execution groups are opt-in surfaces:
-                        // even the newest live group stays collapsed until
-                        // the user explicitly expands it.
-                        default-expanded: false;
-                        mcp-variant: root.tool-groups.length > 0 ? root.tool-groups[msg.index].label == "MCP CALL" : msg.kind == "mcp_server_call";
-                        max-visible-height: min(230px, root.height * 0.35);
-                        open-group-full-view => {
-                            root.full-view-title = (root.tool-groups.length > 0 ? root.tool-groups[msg.index].label : (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE")) + " EXECUTION (" + (root.tool-groups.length > 0 ? root.tool-groups[msg.index].item-count : tool-group-size) + " TOTAL CALLS)";
-                            root.full-view-is-mcp = root.tool-groups.length > 0 ? root.tool-groups[msg.index].label == "MCP CALL" : msg.kind == "mcp_server_call";
-                            root.full-view-group-idx = i;
-                            root.full-view-open = true;
-                        }
-                        toggle-expanded(idx) => { toggle-expanded(idx); }
-                        open-full-view(title, input, output, term, mcp) => {
-                            root.full-view-title = title;
-                            root.full-view-raw-input = input;
-                            root.full-view-raw-output = output;
-                            root.full-view-is-terminal = term;
-                            root.full-view-is-mcp = mcp;
-                            root.full-view-group-idx = -1;
-                            root.full-view-open = true;
-                        }
-                    }
-                    if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        item: msg;
-                        toggle-expanded(idx) => { toggle-expanded(idx); }
-                    }
-                    Rectangle {
-                        width: (is-agent-side || is-first-tool-event) ? 36px : 0px;
-                        horizontal-stretch: 0;
+                        height: (!(is-tool-event && !is-first-tool-event) && i < root.messages.length - 1)
+                            ? (compact ? Metrics.gap-md : Metrics.gap-lg) : 0px;
                     }
                 }
             }

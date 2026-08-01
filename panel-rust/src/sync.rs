@@ -165,10 +165,31 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::PendingRequest { thread_id } => {
             // Empty id = transition clear on thread switch (leak_audit §2.3).
+            //
+            // Bug fix: this used `thread_for_id` (any thread by id), so a
+            // *background* thread's pending-request change -- e.g. its
+            // request resolving while a different thread is displayed --
+            // clobbered the singleton `pending_request` Slint property even
+            // though that property is only ever read as "the displayed
+            // thread's pending request" (see `shown-pending`/`status-
+            // needs-attention` in chat_area.slint). Concretely: viewing
+            // thread A with a live approval card up, thread B (background)
+            // resolves its own unrelated request, and this handler fired
+            // for B's `thread_id`, finding no match against A only by
+            // accident of iteration order -- or worse, matching and
+            // overwriting A's real pending state with B's (now-cleared)
+            // one, silently dropping A's approval indicator. Gate on
+            // `displayed_thread_for_id` like every other per-thread
+            // singleton-property sync in this file (see
+            // `sync_has_older_messages`, `Dirty::Error`'s `for_displayed`)
+            // so only the currently-displayed thread's pending request can
+            // ever reach the component.
             if thread_id.is_empty() {
                 component.set_pending_request(crate::PendingRequestItem::default());
-            } else if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_pending_request(thread.pending_request.clone());
+            } else if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_pending_request(thread.pending_request.clone());
+                }
             }
         }
         Dirty::Terminal { .. } => {
@@ -1267,15 +1288,30 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let mcp_tools_total_count: i32 =
         mcp_rows.iter().map(|row| row.tools.row_count() as i32).sum();
 
-    let agent_rows = crate::models::to_agent_catalog_entry_rows(
-        model.agent_catalog.clone(),
-        &model.agent_operations_in_flight,
-    );
-    let agent_keys: Vec<String> = model
+    // Settings > Project is an installed-agent view. Filter the UI model at
+    // reconciliation time so hidden catalog entries do not consume grid
+    // rows or leave an incorrect non-empty state. Keep model.agent_catalog
+    // untouched: the complete gateway catalog is still needed by profile
+    // resolution and Global settings. Re-running this on every Settings
+    // snapshot also picks up install/uninstall/status changes immediately.
+    let visible_agents: Vec<_> = model
         .agent_catalog
         .iter()
-        .map(|agent| agent.id.clone())
+        .filter(|agent| {
+            model.settings_scope != "project"
+                || matches!(
+                    &agent.status,
+                    crate::protocol_types::AgentStatus::Installed
+                        | crate::protocol_types::AgentStatus::InstalledNoSession
+                )
+        })
+        .cloned()
         .collect();
+    let agent_rows = crate::models::to_agent_catalog_entry_rows(
+        visible_agents.clone(),
+        &model.agent_operations_in_flight,
+    );
+    let agent_keys: Vec<String> = visible_agents.iter().map(|agent| agent.id.clone()).collect();
     crate::list_model::reconcile(
         &model.agent_catalog_model,
         &mut model.agent_catalog_model_keys.borrow_mut(),

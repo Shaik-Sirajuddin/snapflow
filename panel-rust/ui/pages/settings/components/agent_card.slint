@@ -4,6 +4,7 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { AgentLogo } from "../components/agent_logo.slint";
 import { Button } from "../../../base/button.slint";
+import { LinkText } from "../../../base/link_text.slint";
 import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
 
 // Grid tile for the Agents view -- one per catalog entry (auto-discovered
@@ -36,6 +37,7 @@ import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
 export component AgentCard inherits Rectangle {
     in property <string> agent-id;
     in property <string> agent-name;
+    in property <string> website: "";
     // settings_scope_visibility_gate: "project" | "global". Install and
     // enable/disable are both admin-plane/registry actions with no
     // per-project dimension (agent_enablement is a single global sqlite
@@ -71,6 +73,7 @@ export component AgentCard inherits Rectangle {
     callback connect-requested();
     callback disconnect-requested();
     callback set-enabled(bool);
+    callback website-clicked();
 
     // "installed" is the registry's "present with a live session" state --
     // treat as connected. "installed_no_session" is present-but-not-running.
@@ -86,7 +89,7 @@ export component AgentCard inherits Rectangle {
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: +16px over the original 136px for the new Enabled toggle
     // row (only present once installed).
-    height: 152px;
+    height: root.website != "" ? 174px : 152px;
     // Same tertiary tone the search box uses so cards read as one
     // consistent surface with the rest of this page's chrome; the default
     // card gets the primary-container tint to stand out. No hover tint on
@@ -146,6 +149,16 @@ export component AgentCard inherits Rectangle {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
                 overflow: elide;
+            }
+        }
+
+        if root.website != "" : Rectangle {
+            height: 16px;
+            width: parent.width;
+            LinkText {
+                text: "Official website";
+                font-size: 10px * Theme.font-scale;
+                clicked => { root.website-clicked(); }
             }
         }
 

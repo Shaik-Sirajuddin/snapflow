@@ -306,6 +306,7 @@ export component ChatPanel inherits Window {
     callback profile-delete(string);
     callback agent-install-requested(string);
     callback agent-set-enabled(string, bool);
+    callback agent-website-clicked(string);
     callback recover-session-attach(string, string, string);
     callback search-changed(string);
     callback toggle-expanded(int);
@@ -998,6 +999,7 @@ export component ChatPanel inherits Window {
             profile-delete(name) => { profile-delete(name); }
             agent-install-requested(id) => { agent-install-requested(id); }
             agent-set-enabled(id, enabled) => { agent-set-enabled(id, enabled); }
+            agent-website-clicked(website) => { agent-website-clicked(website); }
             recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
             skill-promote-to-global(path) => { skill-promote-to-global(path); }
             dev-mode-toggled(enabled) => { dev-mode-toggled(enabled); }
