@@ -1036,6 +1036,54 @@ fn resolve_acpx_server_bin() -> PathBuf {
     )
 }
 
+/// Best-effort self-heal for a real, recurring production failure: real
+/// installs (2026-08-01 `system_launch.yaml` log, "failed to spawn
+/// acpx-server for codex on port ...: Permission denied (os error 13)",
+/// twice in one session) hit `Command::spawn`'s own `EACCES` -- confirmed
+/// by tracing `spawn_gateway_process` below, where `cmd.spawn()` is the
+/// *only* syscall in this whole function whose error is wrapped into the
+/// "failed to spawn" message (the other candidate EACCES source, the
+/// per-provider stderr log `File::create` a few lines down, has its own
+/// separate error handling that falls back to `Stdio::null()` instead of
+/// failing the spawn at all -- so it can never produce this message).
+///
+/// `EACCES` from `execve` on a path that *does* resolve to a real file
+/// (as opposed to `ENOENT`, which `resolve_acpx_server_bin_from`'s own
+/// fallback chain can also produce, but that surfaces as a distinctly
+/// different os error 2) means the file exists but lacks the execute
+/// bit for this process's effective uid/gid -- exactly what a plain
+/// `cp`/archive-extract/artifact-download step that does not preserve
+/// POSIX permission bits produces (this project's own Linux packaging
+/// pipeline, `shotcut/scripts/build-snapflow.sh`'s `install_snapflow_linux`,
+/// assembles the bundle with a long sequence of manual `cp`/`install`
+/// calls rather than exclusively CMake's `install(PROGRAMS ...)`, which
+/// is the one step that would otherwise always normalize this). Rather
+/// than hard-failing the whole gateway (and every thread on this
+/// provider) over a one-bit permission defect this process is fully
+/// entitled to fix on a file it already resolved by path, attempt to add
+/// the owner/group/world execute bits before spawning. Best-effort and
+/// silent on failure (e.g. a read-only install root) -- `cmd.spawn()`'s
+/// own error still surfaces normally if this doesn't help.
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mut perms = metadata.permissions();
+    let mode = perms.mode();
+    // 0o111 = owner+group+world execute. Only touched when at least one
+    // of those bits is missing, so an already-correct file's mtime/ctime
+    // is left alone.
+    if mode & 0o111 != 0o111 {
+        perms.set_mode(mode | 0o111);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}
+
 /// Resolves the `snapflowd-mcp` binary path (`skill_injection_
 /// verification` phase): `RUI_SNAPFLOWD_MCP_BIN` env override, else a
 /// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
@@ -2638,10 +2686,29 @@ fn spawn_gateway_process(
         // TOCTOU-safe convention `reserve_ephemeral_port`'s own caller
         // (the main HTTP port, `lock` above) already uses.
     }
+    // See `ensure_executable`'s doc comment: a real, recurring production
+    // failure (`system_launch.yaml`, "Permission denied (os error 13)")
+    // traced to this exact `cmd.spawn()` call losing the resolved
+    // binary's execute bit somewhere in packaging/transfer. Self-heal
+    // before attempting the exec so a stripped permission bit does not
+    // fail every thread on this provider.
+    let acpx_server_bin = resolve_acpx_server_bin();
+    ensure_executable(&acpx_server_bin);
     let mut child = cmd.spawn().map_err(|e| {
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
-        format!("failed to spawn acpx-server for {provider} on port {port}: {e}")
+        // Distinguish "never resolved a real binary" (EACCES self-heal
+        // above cannot help, and a bare `ENOENT`/os error 2 from Command
+        // is easy to misread as a permissions problem) from "resolved a
+        // real file that still failed to exec" -- surfaces the exact
+        // path this process tried, which the bare `io::Error` alone does
+        // not include, so an operator does not have to reconstruct
+        // `resolve_acpx_server_bin_from`'s own fallback chain by hand.
+        let exists = acpx_server_bin.is_file();
+        format!(
+            "failed to spawn acpx-server for {provider} on port {port} \
+             (resolved path {acpx_server_bin:?}, exists={exists}): {e}"
+        )
     })?;
     for _ in 0..50 {
         if probe_acpx_gateway_for_agent(port, Some(provider)) {
