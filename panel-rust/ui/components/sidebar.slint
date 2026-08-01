@@ -24,6 +24,13 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // PUI-016 fix: was a local property on the conditionally-instantiated
+    // `archived-section` (`if root.expanded : archived-section := ...`)
+    // below -- Slint destroys/recreates conditional elements, so every
+    // sidebar collapse/reopen (root.expanded false->true) silently reset
+    // this back to its `false` default, losing the user's collapse choice.
+    // Hoisted here (always-present) so it survives.
+    property <bool> archived-collapsed: false;
     // Project identity is independent from the panel-level ACPX server
     // connection. A gateway-backed panel can create an unscoped first chat.
     in property <bool> project-open: false;
@@ -122,6 +129,17 @@ export component Sidebar inherits Rectangle {
         if (root.rename-thread-index >= 0 && root.rename-focus-target == "sidebar") {
             root.rename-focus-index = root.rename-thread-index;
         }
+    }
+
+    // settings_search_reparse_on_clear: the Rust-side filtered thread
+    // list (`visible_indices`) only rebuilds when `search-changed` fires,
+    // which previously only happened from the TextInput's `edited` event
+    // (a real keystroke) -- a programmatic clear of `search-query` (e.g.
+    // closing the search UI) bypassed that, leaving the filtered list
+    // stuck on the last typed query. React to the property itself so any
+    // change, not just typed edits, re-syncs it.
+    changed search-query => {
+        root.search-changed(root.search-query);
     }
 
     // Per-thread identity accent -- deliberately the one departure from
@@ -641,7 +659,6 @@ export component Sidebar inherits Rectangle {
                 // PUI-016: collapsible archived section. Header click toggles;
                 // the arrow at the row end points down when collapsed (expand)
                 // and up when expanded (collapse).
-                property <bool> archived-collapsed: false;
                 vertical-stretch: 0;
                 spacing: 0px;
                 // Header + up to ~3 model-rows of content.
@@ -682,13 +699,13 @@ export component Sidebar inherits Rectangle {
                             source: @image-url("../assets/icons/arrow-down.svg");
                             size: 12px;
                             color: Theme.text-muted;
-                            transform-rotation: archived-section.archived-collapsed ? 0deg : 180deg;
+                            transform-rotation: root.archived-collapsed ? 0deg : 180deg;
                         }
                     }
                     TouchArea {
                         mouse-cursor: pointer;
                         clicked => {
-                            archived-section.archived-collapsed = !archived-section.archived-collapsed;
+                            root.archived-collapsed = !root.archived-collapsed;
                         }
                     }
                 }
@@ -698,10 +715,10 @@ export component Sidebar inherits Rectangle {
                     // Grow with content up to 3 rows, then scroll.
                     // Prefer content height; cap via max-height only (do not
                     // also bind `height` -- Slint rejects height+max-height).
-                    preferred-height: archived-section.archived-collapsed ? 0px : archived-thread-col.preferred-height;
-                    max-height: archived-section.archived-collapsed ? 0px : 156px;
+                    preferred-height: root.archived-collapsed ? 0px : archived-thread-col.preferred-height;
+                    max-height: root.archived-collapsed ? 0px : 156px;
                     min-height: 0px;
-                    visible: !archived-section.archived-collapsed && archived-thread-col.preferred-height > 0px;
+                    visible: !root.archived-collapsed && archived-thread-col.preferred-height > 0px;
                     viewport-height: archived-thread-col.preferred-height;
                     // PUI-009 review finding: same spacing-accumulation
                     // pattern as active-thread-col above (fixed there

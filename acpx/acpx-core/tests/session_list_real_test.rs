@@ -280,6 +280,78 @@ done
     );
 }
 
+/// **Live capacity vs list-import catalog rows.** A `session/list` bulk
+/// import of many backend history rows must **not** consume the tenant's
+/// live session admission budget. Only real `session/new` (and first
+/// active turn on a discovery row) should. Mirrors the production bug:
+/// user opens a few threads, Settings triggers session/list, foreign
+/// claude-acp history saturates 16/16, next thread fails capacity.
+#[tokio::test]
+async fn session_list_import_does_not_consume_live_session_capacity() {
+    let list_many_and_new_script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/list'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessions":[{"sessionId":"b1","cwd":"/a"},{"sessionId":"b2","cwd":"/b"},{"sessionId":"b3","cwd":"/c"},{"sessionId":"b4","cwd":"/d"},{"sessionId":"b5","cwd":"/e"}]}}\n' "$id"
+  elif echo "$line" | grep -q 'session/new'; then
+    sid=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"new-backend-%s"}}\n' "$id" "$sid"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+    // Tiny live cap: if list-import counted, one session/list of 5 would
+    // already fill/overflow the budget and block every session/new.
+    let mut router = Router::new("stand-in-agent").with_lifecycle_config(LifecycleConfig {
+        max_sessions_per_tenant: 2,
+        max_sessions_total: 4,
+        max_new_sessions_per_list_call: Some(5),
+        ..Default::default()
+    });
+    router.register_agent(
+        "stand-in-agent",
+        SpawnSpec::new(
+            "sh",
+            vec!["-c".to_string(), list_many_and_new_script.to_string()],
+        ),
+    );
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/list",
+            "params": {"_acpx": {"agentId": "stand-in-agent"}}
+        }))
+        .await
+        .expect("session/list bulk import must not hit capacity");
+
+    // Two real opens must still succeed under the live cap of 2 -- the
+    // five catalog rows did not spend those slots.
+    for id in [2, 3] {
+        router
+            .dispatch(json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []}
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("session/new #{id} must succeed after list import: {e}"));
+    }
+
+    // Third real open must hit the *live* cap (2), not the catalog size.
+    let err = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "session/new",
+            "params": {"cwd": "/tmp", "mcpServers": []}
+        }))
+        .await
+        .expect_err("third session/new must hit live capacity of 2");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("capacity") && msg.contains("2/2"),
+        "error must report live 2/2 capacity, got: {msg}"
+    );
+}
+
 /// A backend that rejects `session/list` outright (a real, if unusual,
 /// possibility -- e.g. an agent that advertised the capability but hit an
 /// internal error) must surface as a real `RouterError`, not panic, not

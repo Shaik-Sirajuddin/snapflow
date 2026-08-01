@@ -1102,6 +1102,7 @@ pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPa
         selected_thread_id,
         background_override_set: model.background_override_set,
         background_override: model.background_override,
+        show_global_skills: model.show_global_skills,
     };
     drop(model);
     let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))));
@@ -1115,16 +1116,21 @@ pub(crate) fn dispatch_settings_close(panel: &PanelSingleton, _component: &ChatP
 pub(crate) fn dispatch_mcp_server_create(
     panel: &PanelSingleton,
     component: &ChatPanel,
-    name: String,
-    command: String,
+    entry: crate::protocol_types::McpServerEntry,
 ) {
-    let (effects, _) = update_persistent(
-        panel,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
-            name: name.clone(),
-            command: command.clone(),
-        })),
-    );
+    let (effects, _) =
+        update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate { entry })));
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_update(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    entry: crate::protocol_types::McpServerEntry,
+) {
+    let (effects, _) =
+        update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerUpdate { entry })));
     let _ = component;
     execute_effects(panel, effects);
 }
@@ -1176,6 +1182,15 @@ pub(crate) fn dispatch_mcp_server_authenticate(
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_mcp_server_logout(panel: &PanelSingleton, component: &ChatPanel, name: String) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerLogout { name })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
     panel: &PanelSingleton,
     component: &ChatPanel,
@@ -1189,6 +1204,40 @@ pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
             server_name: server_name.clone(),
             tool_name: tool_name.clone(),
             enabled,
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_tool_deferred_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    server_name: String,
+    tool_name: String,
+    deferred: bool,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
+            server_name: server_name.clone(),
+            tool_name: tool_name.clone(),
+            deferred,
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_tools_fetch_requested(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    server_name: String,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
+            server_name: server_name.clone(),
         })),
     );
     let _ = component;

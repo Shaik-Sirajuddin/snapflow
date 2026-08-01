@@ -13,8 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownBlock, MarkdownLine, MarkdownRun,
-    McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
-    TerminalItem, ThreadItem,
+    McpServerFormData, McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption,
+    SkillOption, TerminalItem, ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -890,10 +890,13 @@ pub fn message_rows_for_thread_with_state(
     render_index: &mut crate::thread_message_index::ThreadMessageIndex,
 ) -> (Vec<MessageItem>, Vec<String>) {
     let mut keys = transcript_row_keys(&transcript);
-    let last_is_user = transcript
-        .last()
-        .map(|item| matches!(item, crate::conversation::TranscriptItem::User { .. }))
-        .unwrap_or(false);
+    // Note: the render_index-threading call below is main's addition (new
+    // markdown-render pipeline); the transcript-tail `last_is_user` check
+    // that main computed here is intentionally NOT kept -- this branch's
+    // fix (see the comment below, "Checked against `rows`") already
+    // recomputes an equivalent, more-correct `last_is_user` from `rows`
+    // after they're built, so keeping both would just shadow/waste the
+    // earlier one.
     let mut rows = to_message_rows_from_transcript(transcript, expanded, render_index);
     // Phase 18 (send_feedback_and_empty_states): the instant the user's
     // message is the transcript tail and a generation is in flight,
@@ -901,6 +904,18 @@ pub fn message_rows_for_thread_with_state(
     // chat shows immediate feedback before any real agent event
     // arrives. Rendered as a subtle thinking-style item with a loading
     // animation, deliberately distinct from real "thinking" rows.
+    //
+    // Checked against `rows` (the actually-displayed, post-filter list),
+    // not the raw transcript: `to_message_rows_from_transcript` can drop
+    // a trailing item (e.g. `filter_map` skipping an empty in-progress
+    // chunk), which let a stale "user is last" read survive even after a
+    // real "thinking" row had already landed -- rendering both "Agent is
+    // working..." and "Thinking" at once instead of the pending
+    // placeholder yielding to the real one, as intended.
+    let last_is_user = rows
+        .last()
+        .map(|row| row.kind == "user")
+        .unwrap_or(false);
     if generation_in_flight && last_is_user {
         rows.push(MessageItem {
             kind: "pending".into(),
@@ -1749,82 +1764,119 @@ pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile
 }
 
 /// Builds the settings sheet's MCP-server list row model from a real
-/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`). Each
-/// entry is an opaque JSON object on the Rust side (`acpx-core::
-/// McpServerStore` never interprets more than `"name"`) -- this only
-/// extracts the two fields the list view shows, `"command"` falling
-/// back to an empty string for an entry that omits it (still a valid
-/// MCP server entry per ACP's own schema, e.g. a URL-based server with
-/// no `command` field at all).
+/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`), now typed
+/// end to end (`crate::protocol_types::McpServerEntry`, re-exported from
+/// `acpx_client::mcp`) -- `transport`/`command`/`url`/`needs_auth`/
+/// `auth_status` below are read from real struct fields, not guessed out
+/// of an opaque JSON blob's inconsistently-named keys the way this used
+/// to work.
 pub fn to_mcp_server_options(
     servers: Vec<crate::protocol_types::McpServerEntry>,
 ) -> ModelRc<McpServerOption> {
-    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers)))
+    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers, &[])))
 }
 
+/// `busy_keys` is `AgentBridge::mcp_operations_in_flight`'s raw output
+/// (`"<action>:<server-name>"` per in-flight RPC, see that method's doc
+/// comment) -- folded here into each row's `remove-busy`/`enabled-busy`/
+/// `authenticate-busy`/`logout-busy` booleans so the Spinner in
+/// `mcp_servers_view.slint` shows precisely on the button whose action is
+/// actually in flight for *that* server, not a global spinner. Tools-fetch
+/// deliberately reads `tool_fetch_status` instead (see `AgentBridge::
+/// fetch_mcp_server_tools_async`'s doc comment for why).
 pub fn to_mcp_server_option_rows(
     servers: Vec<crate::protocol_types::McpServerEntry>,
+    busy_keys: &[String],
 ) -> Vec<McpServerOption> {
+    use crate::protocol_types::{McpAuthStatus, McpServerConfig};
+
+    let is_busy = |action: &str, name: &str| {
+        busy_keys
+            .iter()
+            .any(|key| key == &format!("{action}:{name}"))
+    };
+
     servers
         .into_iter()
         .map(|entry| {
-            let enabled = entry
-                .extra
-                .get("enabled")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true);
-            let url = entry
-                .extra
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            // Prefer explicit transport; fall back to type: remote/http or
-            // presence of a url field (opencode remote servers).
-            let transport = entry
-                .extra
-                .get("transport")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .or_else(|| {
-                    entry
-                        .extra
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|t| match t {
-                            "remote" | "http" | "sse" | "streamable_http" => "http".to_owned(),
-                            "local" | "stdio" => "stdio".to_owned(),
-                            other => other.to_owned(),
-                        })
-                })
-                .unwrap_or_else(|| {
-                    if !url.is_empty() {
-                        "http".to_owned()
-                    } else {
-                        String::new()
-                    }
-                });
+            let enabled = entry.enabled;
+            let transport = entry.config.transport_name().to_owned();
+            let command = entry.command().unwrap_or("").to_owned();
+            let url = entry.url().unwrap_or("").to_owned();
+            let needs_auth = entry.needs_auth();
+            let auth = match entry.auth_status {
+                Some(McpAuthStatus::Authenticated) => "authenticated",
+                Some(McpAuthStatus::Unauthenticated) => "unauthenticated",
+                None => "",
+            }
+            .to_owned();
+            let (args, env, headers, timeout, oauth_client_id) = match &entry.config {
+                McpServerConfig::Stdio {
+                    args, env, timeout, ..
+                } => (
+                    args.join(" "),
+                    format_kv_lines(env, "="),
+                    String::new(),
+                    timeout.map(|t| t.to_string()).unwrap_or_default(),
+                    String::new(),
+                ),
+                McpServerConfig::Http {
+                    headers,
+                    timeout,
+                    oauth,
+                    ..
+                } => (
+                    String::new(),
+                    String::new(),
+                    format_kv_lines(headers, ": "),
+                    timeout.map(|t| t.to_string()).unwrap_or_default(),
+                    oauth
+                        .as_ref()
+                        .map(|o| o.client_id.clone())
+                        .unwrap_or_default(),
+                ),
+            };
+            // Connection status for StatusDot: prefer a real probe value
+            // from `extra["status"]` when the gateway supplies one; else
+            // derive from enable/auth so the enable toggle visibly
+            // rewires the UI (disabled → red "disconnected", auth-needed
+            // → yellow, otherwise green "connected"). Previously this
+            // only read `extra`, which is almost always empty today.
             let status = entry
                 .extra
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let auth = entry
-                .extra
-                .get("auth_status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let needs_auth = entry
-                .extra
-                .get("needs_auth")
-                .and_then(|v| v.as_bool())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    // Remote HTTP servers that are not yet authenticated.
-                    transport == "http" && auth != "authenticated"
+                    if !enabled {
+                        "disconnected".to_owned()
+                    } else if needs_auth {
+                        "auth required".to_owned()
+                    } else {
+                        "connected".to_owned()
+                    }
                 });
-            let tools = mcp_tools_from_extra(&entry.extra);
+            let tools = mcp_tools_from_entry(&entry);
+            // Kickoff RPC marks server-side toolCatalog Fetching before
+            // returning; until the next list poll lands, also treat an
+            // in-flight `tools_fetch:<name>` key as fetching so the
+            // Fetch button spinner is never stuck waiting on the poll.
+            let (tool_fetch_status, tool_fetch_error) = match &entry.tool_catalog {
+                None if is_busy("tools_fetch", &entry.name) => {
+                    ("fetching".to_string(), String::new())
+                }
+                None => (String::new(), String::new()),
+                Some(crate::protocol_types::McpToolCatalog::Fetching) => {
+                    ("fetching".to_string(), String::new())
+                }
+                Some(crate::protocol_types::McpToolCatalog::Ready { .. }) => {
+                    ("ready".to_string(), String::new())
+                }
+                Some(crate::protocol_types::McpToolCatalog::Error { message }) => {
+                    ("error".to_string(), message.clone())
+                }
+            };
             // Pre-format status subtitle in Rust (audit §4.3) so Slint
             // does not concatenate nested ternaries.
             let mut parts: Vec<&str> = Vec::new();
@@ -1834,16 +1886,29 @@ pub fn to_mcp_server_option_rows(
             if !status.is_empty() {
                 parts.push(status.as_str());
             }
-            if !auth.is_empty() {
+            if !auth.is_empty() && auth != "unauthenticated" {
                 parts.push(auth.as_str());
             }
             if !enabled {
                 parts.push("disabled");
             }
             let status_line = parts.join(" · ");
+            // Lets the page search bar find a server by one of its real
+            // discovered tool names/descriptions, same reasoning as
+            // widening the predicate to args/env/headers earlier.
+            let tools_search_blob = tools
+                .iter()
+                .flat_map(|t| [t.name.as_str(), t.description.as_str()])
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let remove_busy = is_busy("delete", &entry.name);
+            let enabled_busy = is_busy("enabled", &entry.name);
+            let authenticate_busy = is_busy("authenticate", &entry.name);
+            let logout_busy = is_busy("logout", &entry.name);
             McpServerOption {
                 name: entry.name.into(),
-                command: entry.command.unwrap_or_default().into(),
+                command: command.into(),
                 status_line: status_line.into(),
                 transport: transport.into(),
                 url: url.into(),
@@ -1852,14 +1917,104 @@ pub fn to_mcp_server_option_rows(
                 needs_auth,
                 auth_status: auth.into(),
                 tools: ModelRc::new(VecModel::from(tools)),
+                tool_fetch_status: tool_fetch_status.into(),
+                tool_fetch_error: tool_fetch_error.into(),
+                tools_search_blob: tools_search_blob.into(),
                 // Every acpx `mcp_servers/list` row is a user-added registry
                 // entry -- removable. The one non-removable row (the built-in
                 // snapshotd daemon) is prepended separately, see
                 // [`builtin_snapshotd_option`].
                 removable: true,
+                remove_busy,
+                enabled_busy,
+                authenticate_busy,
+                logout_busy,
+                args: args.into(),
+                env: env.into(),
+                headers: headers.into(),
+                timeout: timeout.into(),
+                oauth_client_id: oauth_client_id.into(),
             }
         })
         .collect()
+}
+
+/// Formats a `HashMap<String, String>` (env vars or HTTP headers) as
+/// `key<sep>value` lines, one per entry, sorted by key for deterministic
+/// output (a `HashMap`'s iteration order is otherwise unspecified, which
+/// would make the form's textarea re-shuffle lines on every reload).
+fn format_kv_lines(map: &std::collections::HashMap<String, String>, sep: &str) -> String {
+    let mut pairs: Vec<(&String, &String)> = map.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}{sep}{v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parses `format_kv_lines`' inverse: one `key<sep>value` pair per
+/// non-empty line, splitting on the *first* `sep` only (so an HTTP
+/// header's value may itself contain `:` -- `Authorization: Bearer a:b`
+/// stays intact). Blank lines and lines with an empty key are silently
+/// skipped rather than erroring -- this is user-typed free text in a
+/// settings form, not a wire payload with a validation contract to
+/// enforce.
+fn parse_kv_lines(text: &str, sep: char) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (key, value) = line.split_once(sep)?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Builds a full typed [`crate::protocol_types::McpServerEntry`] from the
+/// add/edit form's submitted [`McpServerFormData`] -- the Rust-side
+/// counterpart to `mcp_servers_view.slint`'s `mcp-server-submit`
+/// callback. `args` is whitespace-split (`str::split_whitespace`, no
+/// shell-style quoting/escaping); `timeout` is parsed as whole seconds,
+/// `None` on empty/invalid input rather than erroring, since 0 is a
+/// meaningless timeout and the field is optional.
+pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_types::McpServerEntry {
+    use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
+
+    let timeout = data.timeout.trim().parse::<u64>().ok();
+    let config = if data.transport.as_str() == "http" {
+        let client_id = data.oauth_client_id.trim();
+        McpServerConfig::Http {
+            url: data.url.trim().to_string(),
+            headers: parse_kv_lines(&data.headers, ':'),
+            timeout,
+            oauth: if client_id.is_empty() {
+                None
+            } else {
+                Some(OAuthClientConfig {
+                    client_id: client_id.to_string(),
+                })
+            },
+        }
+    } else {
+        McpServerConfig::Stdio {
+            command: data.command.trim().to_string(),
+            args: data
+                .args
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            env: parse_kv_lines(&data.env, '='),
+            timeout,
+        }
+    };
+    McpServerEntry::new(data.name.trim(), config)
 }
 
 /// PUI-015: the built-in `snapflow` daemon MCP row for the Settings list,
@@ -1872,49 +2027,116 @@ pub fn to_mcp_server_option_rows(
 /// injection uses (`agent_bridge::snapshotd_mcp_addr`).
 pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption> {
     let addr = addr?;
+    // Live injection gate (Settings toggle) — not always-on once the
+    // user has disabled snapflow; still show the row so they can re-enable.
+    let enabled = crate::agent_bridge::snapflow_mcp_enabled();
+    let status = if enabled {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    let status_line = if enabled {
+        "built-in daemon · injected into sessions"
+    } else {
+        "built-in daemon · disabled (not in live sessions)"
+    };
     Some(McpServerOption {
         name: "snapflow".into(),
         command: String::new().into(),
-        status_line: "built-in daemon · always available".into(),
+        status_line: status_line.into(),
         transport: "http".into(),
         url: format!("http://{addr}/mcp").into(),
-        enabled: true,
-        status: "connected".into(),
+        enabled,
+        status: status.into(),
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
+        // The built-in daemon isn't a registry entry at all -- there's no
+        // `mcp_servers/tools_fetch` target for it, so it never has a
+        // fetch status to show.
+        tool_fetch_status: String::new().into(),
+        tool_fetch_error: String::new().into(),
+        tools_search_blob: String::new().into(),
         removable: false,
+        // Not a registry entry -- none of these actions have a target to
+        // dispatch against for this row, so never busy.
+        remove_busy: false,
+        enabled_busy: false,
+        authenticate_busy: false,
+        logout_busy: false,
+        args: String::new().into(),
+        env: String::new().into(),
+        headers: String::new().into(),
+        timeout: String::new().into(),
+        oauth_client_id: String::new().into(),
     })
 }
 
-/// Parse a persisted `tools` array from an MCP server registry entry.
-fn mcp_tools_from_extra(extra: &serde_json::Value) -> Vec<McpToolOption> {
-    let Some(arr) = extra.get("tools").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|tool| {
-            let name = tool.get("name")?.as_str()?.to_owned();
-            let enabled = tool
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let deferred = tool
-                .get("deferred")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let token_usage = tool
-                .get("token_usage")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            Some(McpToolOption {
-                name: name.into(),
+/// Reconciles a server's live-fetched tool catalog (`entry.tool_catalog`,
+/// populated by the real `mcp_servers/tools_fetch` background probe --
+/// see `crate::protocol_types::McpToolCatalog`'s doc comment) with its
+/// durable per-tool preferences (`entry.extra["tools"]`, written by
+/// `dispatch_mcp_server_tool_enabled_changed`/`dispatch_mcp_server_tool_
+/// deferred_changed`) into one row list for the settings UI.
+///
+/// A tool present in the live catalog with no persisted preference yet
+/// defaults to `enabled: true, deferred: false` (same default a freshly
+/// discovered ACP capability gets). A tool with a persisted preference
+/// but currently absent from the live catalog (never fetched yet, or the
+/// server just doesn't currently advertise it) still shows up, carrying
+/// its last-known preference -- toggling something once must never
+/// silently vanish just because a later fetch didn't happen to include
+/// it.
+fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<McpToolOption> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut preferences: HashMap<String, (bool, bool, i32)> = HashMap::new();
+    if let Some(arr) = entry.extra.get("tools").and_then(|v| v.as_array()) {
+        for tool in arr {
+            let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let enabled = tool.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let deferred = tool.get("deferred").and_then(|v| v.as_bool()).unwrap_or(false);
+            let token_usage = tool.get("token_usage").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            preferences.insert(name.to_string(), (enabled, deferred, token_usage));
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(crate::protocol_types::McpToolCatalog::Ready { tools }) = &entry.tool_catalog {
+        for tool in tools {
+            let (enabled, deferred, token_usage) =
+                preferences.get(&tool.name).copied().unwrap_or((true, false, 0));
+            seen.insert(tool.name.clone());
+            rows.push(McpToolOption {
+                name: tool.name.clone().into(),
+                description: tool.description.clone().unwrap_or_default().into(),
                 enabled,
                 deferred,
                 token_usage,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    let mut leftover: Vec<(String, (bool, bool, i32))> = preferences
+        .into_iter()
+        .filter(|(name, _)| !seen.contains(name))
+        .collect();
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, (enabled, deferred, token_usage)) in leftover {
+        rows.push(McpToolOption {
+            name: name.into(),
+            description: String::new().into(),
+            enabled,
+            deferred,
+            token_usage,
+        });
+    }
+
+    rows
 }
 
 /// Builds the skill-manager sidebar/settings row model from discovered
@@ -1934,6 +2156,7 @@ pub fn to_skill_option_rows(entries: Vec<SkillEntry>) -> Vec<SkillOption> {
             scope: entry.scope.as_str().into(),
             path: entry.path.to_string_lossy().into_owned().into(),
             started_from: entry.started_from.unwrap_or_default().into(),
+            is_dev_only: entry.is_dev_only,
         })
         .collect()
 }
@@ -2222,19 +2445,409 @@ mod tests {
             row.url.contains(addr),
             "must name the same address the session injection uses"
         );
+        // Enabled state tracks the live injection gate (default true).
+        assert_eq!(
+            row.enabled,
+            crate::agent_bridge::snapflow_mcp_enabled(),
+            "built-in row.enabled must mirror injection gate"
+        );
     }
 
     // Registry-derived rows stay removable (only the built-in daemon is not).
     #[test]
     fn registry_mcp_rows_are_removable() {
-        let entry = crate::protocol_types::McpServerEntry {
-            name: "my-server".to_string(),
-            command: Some("do-thing".to_string()),
-            extra: serde_json::json!({}),
-        };
-        let rows = to_mcp_server_option_rows(vec![entry]);
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "my-server",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "do-thing".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].removable, "user-added registry rows are removable");
+    }
+
+    #[test]
+    fn stdio_option_row_surfaces_args_and_env_as_formatted_lines() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec!["--root".to_string(), "/tmp".to_string()],
+                env: std::collections::HashMap::from([
+                    ("B_KEY".to_string(), "2".to_string()),
+                    ("A_KEY".to_string(), "1".to_string()),
+                ]),
+                timeout: Some(30),
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].args.as_str(), "--root /tmp");
+        // Sorted by key for deterministic output, not HashMap iteration order.
+        assert_eq!(rows[0].env.as_str(), "A_KEY=1\nB_KEY=2");
+        assert_eq!(rows[0].timeout.as_str(), "30");
+        assert_eq!(rows[0].headers.as_str(), "");
+        assert_eq!(rows[0].oauth_client_id.as_str(), "");
+    }
+
+    #[test]
+    fn http_option_row_surfaces_headers_and_oauth_client_id() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "remote",
+            crate::protocol_types::McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer abc".to_string(),
+                )]),
+                timeout: None,
+                oauth: Some(crate::protocol_types::OAuthClientConfig {
+                    client_id: "client-123".to_string(),
+                }),
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].headers.as_str(), "Authorization: Bearer abc");
+        assert_eq!(rows[0].oauth_client_id.as_str(), "client-123");
+        assert_eq!(rows[0].args.as_str(), "");
+        assert_eq!(rows[0].env.as_str(), "");
+        assert_eq!(rows[0].timeout.as_str(), "");
+    }
+
+    /// A tool present in a real `Ready` live catalog with no persisted
+    /// preference yet must still show up, defaulting to enabled/not
+    /// deferred.
+    #[test]
+    fn tool_row_defaults_to_enabled_when_only_seen_in_the_live_catalog() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![crate::protocol_types::McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        let tools: Vec<_> = rows[0].tools.iter().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_str(), "read_file");
+        assert!(tools[0].enabled);
+        assert!(!tools[0].deferred);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "ready");
+        assert_eq!(rows[0].tool_fetch_error.as_str(), "");
+    }
+
+    /// A tool's persisted preference (set by a previous enabled/deferred
+    /// toggle) must override the live catalog's bare-discovery default,
+    /// and must survive even when the live catalog temporarily doesn't
+    /// include that tool (e.g. before the first fetch, or a fetch that
+    /// failed).
+    #[test]
+    fn persisted_tool_preference_overrides_live_default_and_survives_a_missing_catalog_entry() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                {"name": "read_file", "enabled": false, "deferred": true, "token_usage": 42},
+                {"name": "vanished_tool", "enabled": true, "deferred": false},
+            ]),
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![crate::protocol_types::McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        let tools: Vec<_> = rows[0].tools.iter().collect();
+        assert_eq!(tools.len(), 2);
+        let read_file = tools.iter().find(|t| t.name == "read_file").expect("read_file row");
+        assert!(!read_file.enabled, "persisted preference must override the live default");
+        assert!(read_file.deferred);
+        assert_eq!(read_file.token_usage, 42);
+        let vanished = tools
+            .iter()
+            .find(|t| t.name == "vanished_tool")
+            .expect("a tool absent from the live catalog must still show its last preference");
+        assert!(vanished.enabled);
+        assert!(!vanished.deferred);
+    }
+
+    /// `tool_fetch_status`/`tool_fetch_error` reflect a failed background
+    /// probe -- distinct from "never fetched" (empty string).
+    #[test]
+    fn tool_fetch_error_state_surfaces_the_real_message() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Error {
+            message: "process exited before responding".to_string(),
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "error");
+        assert_eq!(rows[0].tool_fetch_error.as_str(), "process exited before responding");
+    }
+
+    /// Never-fetched entries (no `tool_catalog` at all) must not be
+    /// confused with a `Fetching` state -- both differ from "ready"/
+    /// "error", but only one means "nothing has ever been requested".
+    #[test]
+    fn never_fetched_entry_has_empty_fetch_status() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "");
+        assert!(rows[0].tools.iter().next().is_none());
+    }
+
+    /// In-flight `tools_fetch:<name>` must surface as fetching even when
+    /// the catalog has not yet stamped `toolCatalog` (optimistic UI path).
+    #[test]
+    fn busy_tools_fetch_key_marks_row_fetching() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows =
+            to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
+        assert_eq!(rows[0].tool_fetch_status.as_str(), "fetching");
+    }
+
+    /// Enable toggle drives StatusDot via derived connection status when
+    /// the gateway does not supply `extra["status"]`.
+    #[test]
+    fn disabled_server_status_is_disconnected() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.enabled = false;
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].status.as_str(), "disconnected");
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn enabled_server_status_is_connected() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.enabled = true;
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].status.as_str(), "connected");
+        assert!(rows[0].enabled);
+    }
+
+    /// `tools_search_blob` is what the Settings page search bar matches
+    /// against (see `mcp_servers_view.slint`'s widened predicate) --
+    /// verify it actually joins every real discovered tool's name and
+    /// description, and skips empty descriptions rather than leaving a
+    /// stray blank line that would still (harmlessly, but confusingly)
+    /// match an empty query.
+    #[test]
+    fn tools_search_blob_joins_real_tool_names_and_descriptions() {
+        let mut entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Ready {
+            tools: vec![
+                crate::protocol_types::McpToolInfo {
+                    name: "read_file".to_string(),
+                    description: Some("Reads a file from disk".to_string()),
+                },
+                crate::protocol_types::McpToolInfo {
+                    name: "ping".to_string(),
+                    description: None,
+                },
+            ],
+        });
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(
+            rows[0].tools_search_blob.as_str(),
+            "read_file\nReads a file from disk\nping"
+        );
+    }
+
+    #[test]
+    fn tools_search_blob_is_empty_when_no_tools_have_ever_been_fetched() {
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "fs",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-fs".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let rows = to_mcp_server_option_rows(vec![entry], &[]);
+        assert_eq!(rows[0].tools_search_blob.as_str(), "");
+    }
+
+    #[test]
+    fn parse_kv_lines_splits_on_first_separator_and_skips_malformed_lines() {
+        let parsed = parse_kv_lines(
+            "A=1\n\nB=2\nNO_SEPARATOR_HERE\n=empty-key\nC=has=equals=too",
+            '=',
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.get("A").map(String::as_str), Some("1"));
+        assert_eq!(parsed.get("B").map(String::as_str), Some("2"));
+        // Splits on the FIRST '=' only -- the value keeps any further '='s.
+        assert_eq!(parsed.get("C").map(String::as_str), Some("has=equals=too"));
+    }
+
+    #[test]
+    fn parse_kv_lines_keeps_colons_inside_a_header_value() {
+        let parsed = parse_kv_lines("Authorization: Bearer a:b:c", ':');
+        assert_eq!(
+            parsed.get("Authorization").map(String::as_str),
+            Some("Bearer a:b:c")
+        );
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_builds_a_stdio_entry() {
+        let form = McpServerFormData {
+            name: "fs".into(),
+            transport: "stdio".into(),
+            command: "mcp-fs".into(),
+            args: "--root /tmp  --verbose".into(),
+            env: "TOKEN=abc\nDEBUG=1".into(),
+            url: "".into(),
+            headers: "".into(),
+            timeout: "30".into(),
+            oauth_client_id: "".into(),
+            is_edit: false,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        assert_eq!(entry.name, "fs");
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Stdio {
+                command,
+                args,
+                env,
+                timeout,
+            } => {
+                assert_eq!(command, "mcp-fs");
+                assert_eq!(args, vec!["--root", "/tmp", "--verbose"]);
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("abc"));
+                assert_eq!(timeout, Some(30));
+            }
+            other => panic!("expected Stdio config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_builds_an_http_entry_with_oauth() {
+        let form = McpServerFormData {
+            name: "remote".into(),
+            transport: "http".into(),
+            command: "".into(),
+            args: "".into(),
+            env: "".into(),
+            url: "https://example.com/mcp".into(),
+            headers: "Authorization: Bearer xyz".into(),
+            timeout: "".into(),
+            oauth_client_id: "client-abc".into(),
+            is_edit: true,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Http {
+                url,
+                headers,
+                timeout,
+                oauth,
+            } => {
+                assert_eq!(url, "https://example.com/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer xyz")
+                );
+                assert_eq!(timeout, None, "blank timeout must parse to None, not 0");
+                assert_eq!(
+                    oauth.map(|o| o.client_id),
+                    Some("client-abc".to_string())
+                );
+            }
+            other => panic!("expected Http config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_from_form_treats_blank_oauth_client_id_as_no_oauth() {
+        let form = McpServerFormData {
+            name: "remote".into(),
+            transport: "http".into(),
+            command: "".into(),
+            args: "".into(),
+            env: "".into(),
+            url: "https://example.com/mcp".into(),
+            headers: "".into(),
+            timeout: "".into(),
+            oauth_client_id: "   ".into(),
+            is_edit: false,
+        };
+        let entry = mcp_server_entry_from_form(&form);
+        match entry.config {
+            crate::protocol_types::McpServerConfig::Http { oauth, .. } => {
+                assert!(oauth.is_none());
+            }
+            other => panic!("expected Http config, got {other:?}"),
+        }
     }
 
     const NAMES: &[&str] = &[
@@ -2584,17 +3197,28 @@ mod tests {
 
     #[test]
     fn to_mcp_server_options_extracts_name_and_command_falling_back_to_empty() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
         let servers = vec![
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "central-fs", "command": "mcp-central-fs"
-            }))
-            .unwrap(),
-            // No "command" field at all -- still a valid MCP server
-            // entry (e.g. URL-based), must not panic or drop the row.
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "url-only"
-            }))
-            .unwrap(),
+            McpServerEntry::new(
+                "central-fs",
+                McpServerConfig::Stdio {
+                    command: "mcp-central-fs".to_string(),
+                    args: vec![],
+                    env: Default::default(),
+                    timeout: None,
+                },
+            ),
+            // A URL-based (http transport) server -- must not panic or
+            // drop the row, and must fall back to an empty `command`.
+            McpServerEntry::new(
+                "url-only",
+                McpServerConfig::Http {
+                    url: "https://example.com/mcp".to_string(),
+                    headers: Default::default(),
+                    timeout: None,
+                    oauth: None,
+                },
+            ),
         ];
         let model = to_mcp_server_options(servers);
         assert_eq!(model.row_count(), 2);
@@ -2608,20 +3232,27 @@ mod tests {
 
     #[test]
     fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
         use slint::Model;
-        let servers = vec![
-            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
-                "name": "remote-tools",
-                "url": "https://example.com/mcp",
-                "type": "remote",
-                "auth_status": "not authenticated",
-                "tools": [
-                    { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
-                    { "name": "write", "enabled": false, "deferred": true }
-                ]
-            }))
-            .unwrap(),
-        ];
+        let mut entry = McpServerEntry::new(
+            "remote-tools",
+            McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: Some(OAuthClientConfig {
+                    client_id: "client-123".to_string(),
+                }),
+            },
+        );
+        entry.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
+                { "name": "write", "enabled": false, "deferred": true }
+            ]),
+        );
+        let servers = vec![entry];
         let model = to_mcp_server_options(servers);
         let row = model.row_data(0).unwrap();
         assert_eq!(row.transport.as_str(), "http");

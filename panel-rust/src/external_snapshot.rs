@@ -240,6 +240,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .as_ref()
                 .map(AgentBridge::agent_operations_in_flight)
                 .unwrap_or_default(),
+            mcp_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::mcp_operations_in_flight)
+                .unwrap_or_default(),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold
             // the result, so the live skills view tracks filesystem/state
@@ -323,16 +329,19 @@ impl<'a> ExternalSnapshotSource<'a> {
             selected_thread_id.clone(),
             &mut discarded_warnings,
         );
-        let (defaults, default_agent_id) = prefs
-            .map(|prefs| (prefs.defaults, prefs.default_agent_id))
+        let (defaults, default_agent_id, show_global_skills) = prefs
+            .map(|prefs| (prefs.defaults, prefs.default_agent_id, prefs.show_global_skills))
             .unwrap_or_else(|| {
                 let defaults =
                     crate::load_panel_prefs(selected_thread_id.clone(), &mut discarded_warnings);
-                let default_agent_id = crate::settings_file::SettingsPaths::from_env()
+                let resolved = crate::settings_file::SettingsPaths::from_env()
                     .load_resolved()
-                    .ok()
-                    .and_then(|resolved| resolved.default_agent_id);
-                (defaults, default_agent_id)
+                    .ok();
+                let default_agent_id =
+                    resolved.as_ref().and_then(|r| r.default_agent_id.clone());
+                let show_global_skills =
+                    resolved.map(|r| r.show_global_skills).unwrap_or(true);
+                (defaults, default_agent_id, show_global_skills)
             });
         let (background_override_set, background_override) = selected_thread_id
             .as_deref()
@@ -354,6 +363,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             dev_mode: crate::settings_file::SettingsPaths::from_env().dev_mode(),
             background_override_set,
             background_override,
+            show_global_skills,
         };
         store_prefs_snapshot(snap.clone());
         snap

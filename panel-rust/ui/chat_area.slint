@@ -489,7 +489,7 @@ export component ChatArea inherits Rectangle {
             property <bool> header-spinning:
                 root.sending || connection-status == "Connecting...";
             property <angle> header-spin: header-spinning
-                ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                 : 0deg;
             // PUI-011: loading shimmer along the header's bottom border while
             // the selected ACP's details are being fetched. Deliberately
@@ -511,7 +511,7 @@ export component ChatArea inherits Rectangle {
                 Rectangle {
                     height: 100%;
                     width: parent.width * 0.35;
-                    x: (parent.width + self.width) * (mod(animation-tick(), 1200ms) / 1200ms) - self.width;
+                    x: (parent.width + self.width) * (mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period) - self.width;
                     background: @linear-gradient(90deg,
                         transparent 0%, Theme.bg-primary 50%, transparent 100%);
                 }
@@ -1007,7 +1007,7 @@ export component ChatArea inherits Rectangle {
                     height: 160px;
                     alignment: center;
                     property <bool> reloading: connection-status == "Connecting...";
-                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), 1000ms) / 1000ms));
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
                     Text {
                         text: reloading ? "loading conversation..."
                             : "Send a message to start the conversation";
@@ -1060,7 +1060,7 @@ export component ChatArea inherits Rectangle {
                     // must not mount already at 1.0 (animate never runs).
                     // Drive travel with animation-tick while live.
                     property <float> flow-t: is-live-tail
-                        ? mod(animation-tick(), 1200ms) / 1200ms
+                        ? mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
                         : 0.0;
                     property <length> flow-blob: 36px;
 
@@ -1109,8 +1109,15 @@ export component ChatArea inherits Rectangle {
                         horizontal-stretch: 0;
                     }
                     if is-pending : PendingStatusRow {
-                        padding-left: rail-w + Metrics.space-2;
-                        label: root.last-error != "" ? root.last-error : "thinking...";
+                        // No padding-left here -- unlike every other row
+                        // kind below (UserBubble/AgentBubble/
+                        // ToolGroupView/QueuedMessageBar), this used to add
+                        // its own rail-w + gap offset on top of the one
+                        // already reserved by the preceding live-rail +
+                        // gap Rectangle siblings, pushing the status text
+                        // further right than every other row's content
+                        // actually starts.
+                        label: root.last-error != "" ? root.last-error : "waiting for response";
                     }
                     if is-queued : QueuedMessageBar {
                         horizontal-stretch: 1;

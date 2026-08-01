@@ -41,6 +41,9 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
+/// Prefers SNAPFLOW_BIN_OVERRIDE, then rebranded snapflow (dev.make BUILD_DIR
+/// convention), then the older shotcut path. Matches
+/// `slint_mcp_acp_provider_matrix_e2e_test.rs`.
 fn shotcut_bin() -> PathBuf {
     // `PANEL_MCP_E2E_SHOTCUT_BIN` lets a worktree without access to (or in
     // contention over) the shared `shotcut-rebrand/build-local` docker
@@ -49,6 +52,26 @@ fn shotcut_bin() -> PathBuf {
     // below, just for the binary path rather than a behavior flag.
     if let Ok(path) = std::env::var("PANEL_MCP_E2E_SHOTCUT_BIN") {
         return PathBuf::from(path);
+    }
+    if let Ok(path) = std::env::var("SNAPFLOW_BIN_OVERRIDE") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return p;
+        }
+    }
+    let snapflow = repo_root().join("shotcut-rebrand/build-local/src/snapflow");
+    if snapflow.exists() {
+        return snapflow;
+    }
+    // Shared main-repo BUILD_DIR when this is a nested worktree checkout.
+    let shared = repo_root()
+        .join("../../shotcut-rebrand/build-local/src/snapflow")
+        .canonicalize()
+        .ok();
+    if let Some(p) = shared {
+        if p.exists() {
+            return p;
+        }
     }
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
 }
@@ -626,6 +649,15 @@ where
 /// `debug_watch_thread_row_churn` + live probes -- generation stays 1
 /// while arena index advances every tree walk; invoke reports
 /// "element that was destroyed").
+// The sidebar row's "Close thread" power-button was removed at the
+// user's explicit request (see `sidebar_thread_row.slint`'s close-btn
+// removal note); `close-requested()` and `pending-close-index` stay
+// wired for a possible future trigger, but no control fires them
+// anymore, so the "Close thread " assertion below is now permanently
+// stale on top of the pre-existing ignore reason. Left as-is (ignored,
+// not run) rather than rewritten, since this is a live-harness test
+// out of scope for that UI change; a future pass touching this file
+// should drop the close-arm assertion entirely.
 #[tokio::test]
 #[ignore = "legacy sidebar IconButton accessibility assertion; retained as a diagnostic baseline"]
 async fn sidebar_close_arm_control_exists_on_the_real_compiled_ui() {

@@ -219,6 +219,8 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_default(model.background_default);
             component.set_default_agent_id(model.default_agent_id.clone().into());
             component.set_dev_mode(model.dev_mode);
+            component.set_show_global_skills(model.show_global_skills);
+            component.set_profile_wiring_enabled(model.profile_wiring_enabled);
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);
@@ -1237,6 +1239,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     }
     mcp_rows.extend(crate::models::to_mcp_server_option_rows(
         model.available_mcp_servers.clone(),
+        &model.mcp_operations_in_flight,
     ));
     mcp_keys.extend(
         model
@@ -1250,6 +1253,13 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         &mcp_keys,
         &mcp_rows,
     );
+    // Total real tools discovered across every server's reconciled list
+    // (`mcp_tools_from_entry` already merges live-fetched + persisted
+    // rows) -- shown as a summary next to the "MCP Servers" section
+    // header, computed here rather than in Slint since it has no
+    // array-sum/reduce.
+    let mcp_tools_total_count: i32 =
+        mcp_rows.iter().map(|row| row.tools.row_count() as i32).sum();
 
     let agent_rows = crate::models::to_agent_catalog_entry_rows(
         model.agent_catalog.clone(),
@@ -1285,6 +1295,16 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
 
     component.set_available_profiles(slint::ModelRc::from(model.profiles_model.clone()));
     component.set_available_mcp_servers(slint::ModelRc::from(model.mcp_servers_model.clone()));
+    component.set_mcp_tools_total_count(mcp_tools_total_count);
+    // Only one add/edit form can be open at a time, so "any create/update
+    // in flight" is an accurate proxy for "the visible form's own submit
+    // is in flight" without needing to match a specific server name (see
+    // `McpServersView.submit-busy`'s own doc comment).
+    let mcp_server_submit_busy = model
+        .mcp_operations_in_flight
+        .iter()
+        .any(|key| key.starts_with("create:") || key.starts_with("update:"));
+    component.set_mcp_server_submit_busy(mcp_server_submit_busy);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),
@@ -2316,6 +2336,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/some-local-skill"),
                 scope: crate::skills_state::SkillScope::Global,
                 started_from: None,
+                is_dev_only: false,
             },
             crate::skills_state::SkillEntry {
                 name: "another-skill".to_owned(),
@@ -2323,6 +2344,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/another-skill"),
                 scope: crate::skills_state::SkillScope::Project,
                 started_from: None,
+                is_dev_only: false,
             },
         ];
         let thread = crate::model::ThreadModel {
@@ -2353,6 +2375,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/some-local-skill"),
             scope: crate::skills_state::SkillScope::Global,
             started_from: None,
+            is_dev_only: false,
         }];
         let thread = crate::model::ThreadModel {
             available_commands: vec![crate::protocol_types::AvailableCommandInfo {

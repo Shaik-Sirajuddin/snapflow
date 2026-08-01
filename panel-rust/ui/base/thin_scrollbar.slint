@@ -5,10 +5,24 @@ import { Metrics } from "../tokens/metrics.slint";
 // - Width minimized (default 4px)
 // - Fades out smoothly when not actively scrolling or hovered
 // - Drag & click position tracking supported
+//
+// Vertical by default (original chat-view usage: viewport-height/
+// visible-height/viewport-y). Set `horizontal: true` to lay the same
+// thumb out along the x-axis instead (viewport-width/visible-width/
+// viewport-x) -- e.g. the compose bar's row2 selector strip
+// (chat_input_layout.slint) on a narrow dock, so a horizontally-scrollable
+// row gets the same visible/consistent scrollbar affordance as the
+// message list rather than a bespoke one-off.
 export component ThinScrollbar inherits Rectangle {
+    in property <bool> horizontal: false;
+    // Vertical-axis extents (used when `horizontal` is false).
     in property <length> viewport-height: 1px;
     in property <length> visible-height: 1px;
     in-out property <length> viewport-y: 0px;
+    // Horizontal-axis extents (used when `horizontal` is true).
+    in property <length> viewport-width: 1px;
+    in property <length> visible-width: 1px;
+    in-out property <length> viewport-x: 0px;
     in property <length> thumb-width: 4px;
     in property <bool> active: false;
     // Exposed so a caller's own `viewport-y` alias (e.g. the Flickable
@@ -30,13 +44,22 @@ export component ThinScrollbar inherits Rectangle {
     // bindings form one graph, not sequential statements).
     animate viewport-y { duration: touch.pressed ? 0ms : 90ms; easing: ease-out; }
 
-    property <bool> is-overflowing: root.viewport-height > root.visible-height;
-    property <length> thumb-h: max(24px, root.visible-height * (root.visible-height / max(1px, root.viewport-height)));
-    property <length> max-travel: max(1px, root.visible-height - root.thumb-h);
-    property <length> scroll-range: max(1px, root.viewport-height - root.visible-height);
-    property <length> thumb-pos-y: (- root.viewport-y) * (root.max-travel / root.scroll-range);
+    property <length> extent: root.horizontal ? root.viewport-width : root.viewport-height;
+    property <length> visible-extent: root.horizontal ? root.visible-width : root.visible-height;
+    property <length> offset: root.horizontal ? root.viewport-x : root.viewport-y;
 
-    width: root.thumb-width;
+    property <bool> is-overflowing: root.extent > root.visible-extent;
+    property <length> thumb-len: max(24px, root.visible-extent * (root.visible-extent / max(1px, root.extent)));
+    property <length> max-travel: max(1px, root.visible-extent - root.thumb-len);
+    property <length> scroll-range: max(1px, root.extent - root.visible-extent);
+    property <length> thumb-pos: (- root.offset) * (root.max-travel / root.scroll-range);
+
+    // Cross-axis extent = the caller-supplied visible-* dimension (the
+    // same value already driving the thumb-position math below), so the
+    // box's real geometry always matches what the ratio math assumes.
+    // Main-axis (scroll direction) is fixed to thumb-width.
+    width: root.horizontal ? root.visible-width : root.thumb-width;
+    height: root.horizontal ? root.thumb-width : root.visible-height;
     visible: root.is-overflowing;
 
     // Shown only while actively scrolled away from the resting position
@@ -50,18 +73,20 @@ export component ThinScrollbar inherits Rectangle {
     animate opacity { duration: 300ms; easing: ease-out; }
 
     Rectangle {
-        x: 0px;
-        y: min(root.max-travel, max(0px, root.thumb-pos-y));
-        width: root.thumb-width;
-        height: root.thumb-h;
+        x: root.horizontal ? min(root.max-travel, max(0px, root.thumb-pos)) : 0px;
+        y: root.horizontal ? 0px : min(root.max-travel, max(0px, root.thumb-pos));
+        width: root.horizontal ? root.thumb-len : root.thumb-width;
+        height: root.horizontal ? root.thumb-width : root.thumb-len;
         border-radius: root.thumb-width / 2;
         background: touch.has-hover ? Theme.text-primary : Theme.text-muted.with-alpha(0.5);
         animate background { duration: 150ms; }
     }
 
     touch := TouchArea {
-        width: root.thumb-width + 6px;
-        x: - 3px;
+        width: root.horizontal ? parent.width : root.thumb-width + 6px;
+        height: root.horizontal ? root.thumb-width + 6px : parent.height;
+        x: root.horizontal ? 0px : - 3px;
+        y: root.horizontal ? - 3px : 0px;
         mouse-cursor: pointer;
         pointer-event(event) => {
             // `PointerEventKind.move` fires on every hover move, not just
@@ -71,9 +96,15 @@ export component ThinScrollbar inherits Rectangle {
             // `down` still jumps immediately on click; `move` now only
             // continues tracking while the button is actually held.
             if (event.kind == PointerEventKind.down || (event.kind == PointerEventKind.move && self.pressed)) {
-                let target-y = self.mouse-y - (root.thumb-h / 2);
-                let ratio = max(0.0, min(1.0, target-y / root.max-travel));
-                root.viewport-y = - (ratio * root.scroll-range);
+                if (root.horizontal) {
+                    let target-x = self.mouse-x - (root.thumb-len / 2);
+                    let ratio = max(0.0, min(1.0, target-x / root.max-travel));
+                    root.viewport-x = - (ratio * root.scroll-range);
+                } else {
+                    let target-y = self.mouse-y - (root.thumb-len / 2);
+                    let ratio = max(0.0, min(1.0, target-y / root.max-travel));
+                    root.viewport-y = - (ratio * root.scroll-range);
+                }
             }
         }
     }

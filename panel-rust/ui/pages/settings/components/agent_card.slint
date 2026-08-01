@@ -36,6 +36,16 @@ import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
 export component AgentCard inherits Rectangle {
     in property <string> agent-id;
     in property <string> agent-name;
+    // settings_scope_visibility_gate: "project" | "global". Install and
+    // enable/disable are both admin-plane/registry actions with no
+    // per-project dimension (agent_enablement is a single global sqlite
+    // table, install has no project concept either) -- those two controls
+    // below are hidden under Project. The make-default toggle stays
+    // unconditional: default-agent-id is a genuinely dual-tier field
+    // (settings_file.rs's SettingsDocument merge), and this toggle is its
+    // only UI affordance (unlike default-profile/permission-profile,
+    // which also have a plain always-visible TextField).
+    in property <string> scope: "global";
     // Registry wire status string (`AgentStatus::as_wire_str`):
     // "installed" | "installed_no_session" | "not_installed" |
     // "runtime_missing" | <unknown>. Derived into the three display states
@@ -179,7 +189,9 @@ export component AgentCard inherits Rectangle {
 
         // Row 2b: install > enable. Only meaningful once installed --
         // an agent that isn't present yet has nothing to enable/disable.
-        if root.is-present : HorizontalLayout {
+        // Global-only (see root.scope's doc comment) -- hidden under
+        // Project scope.
+        if root.is-present && root.scope == "global" : HorizontalLayout {
             spacing: Metrics.space-2;
             Text {
                 text: root.loading ? "Updating…" : Strings.enabled;
@@ -212,7 +224,7 @@ export component AgentCard inherits Rectangle {
                 y: parent.height - self.height;
                 width: parent.width;
                 alignment: start;
-                if !root.is-present : Button {
+                if !root.is-present && root.scope == "global" : Button {
                     label: Strings.install;
                     button-accessible-label: Strings.install-agent-prefix + root.agent-name;
                     btn-width: 72px;

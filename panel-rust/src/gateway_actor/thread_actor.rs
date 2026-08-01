@@ -64,12 +64,17 @@ fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
 }
 
 /// Result of [`AcpxThreadHandle::acquire_and_attach`]. `resumed_from_saved`
-/// distinguishes a session the pool resumed from a persisted id (which
-/// already carries capability/config info from its `session/resume`
-/// response, emitted as the usual capability events) from one the pool
-/// freshly created (whose capabilities are not yet known to this actor --
-/// callers should fall back to `models/list` per the plan's capability-
-/// loading precedence rather than expect capability events for that case).
+/// distinguishes a session the pool resumed from a persisted id from one
+/// the pool freshly created. Not currently consumed by any caller --
+/// `Command::AcquireAndAttach`'s own handler already emits capability
+/// events uniformly for both cases (resumed: from the `session/resume`
+/// response; freshly created: from `SessionLease::capabilities`, which
+/// `ProjectSessionPool` populates from `session/new`'s response and
+/// carries through even a warm-pool reuse, see `pool.rs`'s
+/// `reusing an idle entry must not drop its captured capabilities` test)
+/// -- so no caller-side models/list fallback decision needs this flag.
+/// Kept for now as a cheap diagnostic signal (e.g. logging) rather than
+/// removed outright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedSession {
     pub session_id: String,
@@ -122,10 +127,13 @@ enum Command {
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// ACP's lighter `session/resume` reattachment path. Unlike
-    /// `session/load`, it does not replay prior history.
+    /// `session/load`, it does not replay prior history. Clients are
+    /// expected to resupply `mcpServers` on resume (same list as
+    /// `session/new`); see mcp-registry-live-propagation plan.
     ReattachSession {
         session_id: String,
         cwd: PathBuf,
+        mcp_servers: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// acpx-client-session-lease-pool: acquires an exclusive lease from
@@ -221,19 +229,41 @@ enum Command {
     ListMcpServers {
         resp: oneshot::Sender<Result<Vec<crate::protocol_types::McpServerEntry>, AcpxThreadError>>,
     },
-    /// `mcp_servers/create`. `entry` must include a `"name"` field (the
-    /// merge key `acpx-core::mcp_servers::McpServerStore` uses).
+    /// `mcp_servers/create`.
     CreateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/update` -- same payload shape as create.
     UpdateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/delete`.
     DeleteMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/authenticate` -- begins the MCP OAuth 2.1 flow server
+    /// side (see `acpx_core::router::Router::authenticate_mcp_server`'s
+    /// doc comment) and returns the `authorizationUrl` the caller must
+    /// open in a browser.
+    AuthenticateMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<String, AcpxThreadError>>,
+    },
+    /// `mcp_servers/logout`.
+    LogoutMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe (see `acpx_core::router::Router::spawn_mcp_
+    /// tools_fetch`'s doc comment). The real tool list is not this
+    /// command's result -- it comes back through a later `ListMcpServers`
+    /// call's `tool_catalog` field, once the gateway's detached probe
+    /// finishes.
+    FetchMcpServerTools {
         name: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
@@ -415,17 +445,22 @@ impl AcpxThreadHandle {
     }
 
     /// Attaches this client connection to an existing session with ACP's
-    /// no-history-replay `session/resume` operation.
+    /// no-history-replay `session/resume` operation. `mcp_servers` is the
+    /// same client-computed list `session/new` would send -- required by
+    /// the protocol so a resumed session can reconnect MCP clients under
+    /// the current registry.
     pub async fn reattach_session(
         &self,
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<(), AcpxThreadError> {
         let session_id = session_id.into();
         let cwd = cwd.into();
         self.call(|resp| Command::ReattachSession {
             session_id,
             cwd,
+            mcp_servers,
             resp,
         })
         .await
@@ -577,11 +612,11 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListMcpServers { resp }).await
     }
 
-    /// `mcp_servers/create`. `entry` must include a `"name"` field.
+    /// `mcp_servers/create`.
     pub async fn create_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::CreateMcpServer { entry, resp })
             .await
     }
@@ -589,8 +624,8 @@ impl AcpxThreadHandle {
     /// `mcp_servers/update` -- same payload shape as `create_mcp_server`.
     pub async fn update_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::UpdateMcpServer { entry, resp })
             .await
     }
@@ -599,6 +634,36 @@ impl AcpxThreadHandle {
     pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
         self.call(|resp| Command::DeleteMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/authenticate` -- returns the authorization URL to open
+    /// in a browser. See `Command::AuthenticateMcpServer`'s doc comment.
+    pub async fn authenticate_mcp_server(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<String, AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::AuthenticateMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/logout`.
+    pub async fn logout_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::LogoutMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/tools_fetch`. See `Command::FetchMcpServerTools`'s
+    /// doc comment -- returns once the gateway has scheduled the
+    /// background probe, not once it finishes.
+    pub async fn fetch_mcp_server_tools(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::FetchMcpServerTools { name, resp })
             .await
     }
 
@@ -1719,12 +1784,20 @@ async fn run_thread_actor(
             Command::ReattachSession {
                 session_id: sid,
                 cwd,
+                mcp_servers,
                 resp,
             } => {
-                let params = serde_json::json!({
-                    "sessionId": sid,
-                    "cwd": cwd.to_string_lossy(),
-                });
+                let params = match acpx_client::build_resume_session_params(
+                    &sid,
+                    &cwd,
+                    &mcp_servers,
+                ) {
+                    Ok(params) => params,
+                    Err(err) => {
+                        let _ = resp.send(Err(err.into()));
+                        continue;
+                    }
+                };
                 client.register_session_replay(&sid, "session/resume", params.clone(), None);
                 let mut early_notifications = client.subscribe_session(&sid);
                 let mut result = Err(AcpxThreadError::ActorGone);
@@ -1806,11 +1879,19 @@ async fn run_thread_actor(
                     // shares this loop's local `live_rx`/`session_id`/
                     // `session_tx` state, which a standalone helper fn
                     // can't borrow across this `select!`-driven loop as
-                    // cleanly as an inline arm can.
-                    let params = serde_json::json!({
-                        "sessionId": sid,
-                        "cwd": cwd.to_string_lossy(),
-                    });
+                    // cleanly as an inline arm can. Carries the same
+                    // client-computed mcpServers list as session/new.
+                    let params = match acpx_client::build_resume_session_params(
+                        &sid,
+                        &cwd,
+                        &mcp_servers,
+                    ) {
+                        Ok(params) => params,
+                        Err(err) => {
+                            let _ = resp.send(Err(err.into()));
+                            continue;
+                        }
+                    };
                     client.register_session_replay(&sid, "session/resume", params.clone(), None);
                     let mut early_notifications = client.subscribe_session(&sid);
                     let mut attempt_result = Err(AcpxThreadError::ActorGone);
@@ -1919,6 +2000,79 @@ async fn run_thread_actor(
                 let _ = resp.send(result);
             }
             Command::SendPrompt { text, resp } => {
+                if session_id.is_none() {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                }
+                // mcp-registry-live-propagation: if the pool generation
+                // bumped (registry change) while we held a lease but had
+                // not yet started a turn, release+reacquire so the first
+                // prompt lands on a session opened under the current
+                // registry merge. Safe because turn is still NotStarted
+                // (ActiveTurnNotReleasable cannot fire). Prefer
+                // session/new (saved_session_id: None) so backends that
+                // ignore mcpServers on resume still get a real reconnect.
+                let stale = match (pool.as_ref(), current_lease.as_ref()) {
+                    (Some(pool), Some(lease)) => pool.is_lease_stale(lease).await,
+                    _ => false,
+                };
+                if stale {
+                    if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                        let key = lease.key.clone();
+                        let thread_id = lease.thread_id.clone();
+                        match pool.release(&lease).await {
+                            Ok(()) => match pool
+                                .acquire(
+                                    key,
+                                    thread_id,
+                                    OpenSpec {
+                                        saved_session_id: None,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(new_lease) => {
+                                    let new_sid = new_lease.session_id.clone();
+                                    if let Some(value) = new_lease.capabilities.as_ref() {
+                                        emit_capability_events(value, &event_tx);
+                                        baseline_config_options = value
+                                            .get("configOptions")
+                                            .and_then(parse_config_options)
+                                            .unwrap_or_default();
+                                        config_overrides.clear();
+                                    }
+                                    client.register_session_replay(
+                                        &new_sid,
+                                        "session/load",
+                                        serde_json::json!({
+                                            "sessionId": new_sid,
+                                            "cwd": new_lease.key.project_dir,
+                                            "mcpServers": [],
+                                        }),
+                                        None,
+                                    );
+                                    let _ = client.subscribe_session(&new_sid);
+                                    session_id = Some(new_sid.clone());
+                                    let _ = session_tx.send(Some(new_sid));
+                                    current_lease = Some(new_lease);
+                                }
+                                Err(err) => {
+                                    session_id = None;
+                                    let _ = session_tx.send(None);
+                                    let _ = resp.send(Err(AcpxThreadError::Pool(err.to_string())));
+                                    continue;
+                                }
+                            },
+                            Err(err) => {
+                                // Put the lease back; still try the prompt.
+                                current_lease = Some(lease);
+                                eprintln!(
+                                    "panel-rust: pool.release of stale lease before prompt failed ({err}) -- sending on original session"
+                                );
+                            }
+                        }
+                    }
+                }
                 let Some(sid) = session_id.clone() else {
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
@@ -2235,47 +2389,39 @@ async fn run_thread_actor(
                 break;
             }
             Command::ListMcpServers { resp } => {
-                // Deliberately `client.call(...)` (the transport-neutral
-                // `Gateway` facade this actor already holds), not
-                // `acpx_client::ext::mcp_servers::list` -- that helper is
-                // typed against the raw HTTP-only `GatewayClient`, which
-                // would silently drop this actor onto HTTP even in a live
-                // WS session. Same reasoning `ListProfiles`/`ListSessions`
-                // above already follow.
-                let result = client
-                    .call("mcp_servers/list", serde_json::json!({}), None)
-                    .await
-                    .map(|value| {
-                        value
-                            .get("servers")
-                            .and_then(|s| s.as_array())
-                            .map(|entries| {
-                                entries
-                                    .iter()
-                                    .filter_map(crate::protocol_types::McpServerEntry::from_json)
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    });
+                // Deliberately `client.list_mcp_servers()` (a typed method
+                // on the transport-neutral `Gateway` facade this actor
+                // already holds, `acpx_client::mcp`), not `acpx_client::
+                // ext::mcp_servers::list` -- that helper is typed against
+                // the raw HTTP-only `GatewayClient`, which would silently
+                // drop this actor onto HTTP even in a live WS session.
+                // Same reasoning `ListProfiles`/`ListSessions` above
+                // already follow.
+                let result = client.list_mcp_servers().await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/create", entry, None).await;
+                let result = client.create_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::UpdateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/update", entry, None).await;
+                let result = client.update_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::DeleteMcpServer { name, resp } => {
-                let result = client
-                    .call(
-                        "mcp_servers/delete",
-                        serde_json::json!({ "name": name }),
-                        None,
-                    )
-                    .await
-                    .map(|_| ());
+                let result = client.delete_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::AuthenticateMcpServer { name, resp } => {
+                let result = client.authenticate_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::LogoutMcpServer { name, resp } => {
+                let result = client.logout_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::FetchMcpServerTools { name, resp } => {
+                let result = client.fetch_mcp_server_tools(&name).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateProfile { entry, resp } => {

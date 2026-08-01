@@ -1,5 +1,5 @@
 import { Theme } from "tokens/theme.slint";
-import { MarkdownLine, ThreadItem, ThreadViewItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, PlanEntryItem, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { MarkdownLine, ThreadItem, ThreadViewItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, PlanEntryItem, ConfigOptionRow, DropdownEntry, McpServerOption, McpServerFormData, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { ChatViewStack } from "chat_view_stack.slint";
@@ -82,6 +82,8 @@ export component ChatPanel inherits Window {
     callback load-older-requested();
     in-out property <string> compose-text: "";
     in-out property <bool> settings-open: false;
+    // Keep in sync with SettingsPage.scope's own default -- see its doc
+    // comment for why a `<=>` alias makes a mismatch silently misleading.
     in-out property <string> settings-scope: "global";
     // Retains the active settings section while the page is open. The dev
     // fixture sets this to "agents" so its agent cards are visible on load.
@@ -91,6 +93,12 @@ export component ChatPanel inherits Window {
     in-out property <string> permission-profile: "";
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
+    // Skills settings view's "Show global skills" row -- genuinely
+    // dual-tier like `background-default` above (see
+    // `settings_file::SettingsDocument::show_global_skills`'s doc
+    // comment), staged here and committed on the Save button along with
+    // the rest of the form.
+    in-out property <bool> show-global-skills: true;
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <string> connection-status: "Connecting...";
@@ -165,6 +173,12 @@ export component ChatPanel inherits Window {
     // PUI-003: the active thread's ACP agent slash-commands for the `/` menu.
     in property <[SkillOption]> available-commands: [];
     in property <bool> dev-mode: false;
+    // Env-var feature-flag gate (PANEL_PROFILE_WIRING_ENABLED, see
+    // lib.rs's profile_wiring_enabled()) for the "default profile"/
+    // "permission profile" Settings controls in agents_view.slint. Off by
+    // default -- those two settings are hidden entirely, in both Project
+    // and Global scope, until this is explicitly turned on.
+    in property <bool> profile-wiring-enabled: false;
     // `active_pane_and_editor_view` phase: which surface the main content
     // area shows -- "chat" (ChatArea, the default) or "skill" (a live
     // SkillEditorView for the sidebar's currently-selected skill).
@@ -269,16 +283,25 @@ export component ChatPanel inherits Window {
     callback settings-scope-changed(string);
     callback settings-save();
     callback settings-close();
-    callback mcp-server-create(string, string);
+    callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
     callback mcp-server-authenticate(string);
+    callback mcp-server-logout(string);
     // Phase 17: host opens files/URLs from markdown Ctrl+Click.
     callback md-link-activated(string);
     // Phase 19: section counters computed Rust-side.
     in-out property <int> active-thread-count: 0;
     in-out property <int> archived-thread-count: 0;
+    // Rust-computed sum of every server's real reconciled tool list --
+    // see `sync.rs`'s own comment for why this can't be a pure Slint
+    // expression (no array-sum/reduce).
+    in-out property <int> mcp-tools-total-count: 0;
+    // See `McpServersView.submit-busy`'s own doc comment.
+    in-out property <bool> mcp-server-submit-busy: false;
     callback mcp-server-tool-enabled-changed(string, string, bool);
+    callback mcp-server-tool-deferred-changed(string, string, bool);
+    callback mcp-server-tools-fetch-requested(string);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -835,6 +858,10 @@ export component ChatPanel inherits Window {
         // Phase 28: the shared toast surface. Bottom-center of the main
         // content area, above the compose box, color-coded by kind.
         if root.toast-visible && root.toast-message != "" : Rectangle {
+            // SettingsPage is a later sibling and otherwise paints over this
+            // shared feedback surface. Keep action errors above every page
+            // overlay, including Settings.
+            z: 10000;
             x: sidebar.width + ((root.width - sidebar.width) - self.width) / 2;
             y: root.height - self.height - 84px;
             width: min(root.width - sidebar.width - 24px, max(220px, toast-text.preferred-width + 28px));
@@ -895,6 +922,7 @@ export component ChatPanel inherits Window {
         // then binds width/height to that parent and never paints even
         // when `settings-open` is true (sidebar click / Ctrl+, look dead).
         if settings-open : Rectangle {
+            z: 7000;
             width: root.width;
             height: root.height;
             // Dim chat behind the sheet so the overlay is obvious.
@@ -914,6 +942,7 @@ export component ChatPanel inherits Window {
         // is the same `width: root.width; height: root.height` Rectangle
         // the dimmer above uses, so the x/y/width math is unchanged.
         settings-page-instance := SettingsPage {
+            z: 8000;
             visible: root.settings-open;
             x: 8px;
             y: 8px;
@@ -924,12 +953,16 @@ export component ChatPanel inherits Window {
             sections-expanded <=> root.settings-sections-expanded;
             default-profile <=> default-profile;
             permission-profile <=> permission-profile;
+            profile-wiring-enabled: root.profile-wiring-enabled;
             background-default <=> background-default;
             default-agent-id <=> root.default-agent-id;
+            show-global-skills <=> show-global-skills;
             background-override-set <=> background-override-set;
             background-override <=> background-override;
             available-profiles: available-profiles;
             available-mcp-servers: available-mcp-servers;
+            mcp-tools-total-count: root.mcp-tools-total-count;
+            mcp-server-submit-busy: root.mcp-server-submit-busy;
             agent-catalog: agent-catalog;
             recoverable-sessions: recoverable-sessions;
             available-skills: available-skills;
@@ -941,14 +974,21 @@ export component ChatPanel inherits Window {
                 settings-close();
                 root.restore-active-compose-focus();
             }
-            mcp-server-create(name, command) => { mcp-server-create(name, command); }
+            mcp-server-submit(data) => { mcp-server-submit(data); }
             mcp-server-delete(name) => { mcp-server-delete(name); }
             mcp-server-enabled-changed(name, enabled) => {
                 mcp-server-enabled-changed(name, enabled);
             }
             mcp-server-authenticate(name) => { mcp-server-authenticate(name); }
+            mcp-server-logout(name) => { mcp-server-logout(name); }
             mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
                 mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
+            }
+            mcp-server-tool-deferred-changed(server-name, tool-name, deferred) => {
+                mcp-server-tool-deferred-changed(server-name, tool-name, deferred);
+            }
+            mcp-server-tools-fetch-requested(server-name) => {
+                mcp-server-tools-fetch-requested(server-name);
             }
             profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
                 profile-create(name, agent-id, terminal-enabled, fs-enabled);

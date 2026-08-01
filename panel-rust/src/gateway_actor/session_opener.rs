@@ -165,10 +165,27 @@ impl SessionOpener for GatewaySessionOpener {
         saved_session_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, OpenError>> + Send + 'a>> {
         Box::pin(async move {
-            let params = serde_json::json!({
-                "sessionId": saved_session_id,
-                "cwd": Self::cwd_for(key).to_string_lossy(),
-            });
+            // Same mcpServers the create path would send -- protocol
+            // expects clients to resupply them on session/resume (see
+            // mcp-registry-live-propagation plan). Typed via
+            // acpx_client::build_resume_session_params so a shape
+            // mismatch surfaces rather than silently dropping the list.
+            let mcp_servers = self
+                .mcp_servers
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mcp_list: Vec<serde_json::Value> = match mcp_servers {
+                serde_json::Value::Array(entries) => entries,
+                other if other.is_null() => Vec::new(),
+                other => vec![other],
+            };
+            let params = acpx_client::build_resume_session_params(
+                saved_session_id,
+                Self::cwd_for(key),
+                &mcp_list,
+            )
+            .map_err(classify)?;
             let (params, profile) = apply_explicit_agent_selection(key, params);
             self.gateway
                 .call("session/resume", params, profile)

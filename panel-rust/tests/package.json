@@ -1,0 +1,9 @@
+{
+  "name": "panel-rust-tests-oauth-browser-driver",
+  "private": true,
+  "description": "Playwright dependency for live_oauth_browser_e2e.sh's oauth_browser_driver.mjs -- the only JS in this directory. `npm install` is run by that script itself; node_modules/ is gitignored, not vendored.",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.62.0"
+  }
+}

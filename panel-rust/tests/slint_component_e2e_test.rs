@@ -555,10 +555,10 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     }
     {
         let created_mcp = created_mcp.clone();
-        panel.on_mcp_server_create(move |name, command| {
+        panel.on_mcp_server_submit(move |data| {
             created_mcp
                 .borrow_mut()
-                .push((name.to_string(), command.to_string()));
+                .push((data.name.to_string(), data.command.to_string()));
         });
     }
     {
@@ -666,7 +666,6 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         // This target had rotted out of compiling entirely; it is not built
         // by `cargo test --lib` nor by any single-target run, so the drift
         // accumulated silently.
-        removable: false,
         name: "media-fs".into(),
         command: "node server.js".into(),
         status_line: "".into(),
@@ -677,6 +676,19 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         needs_auth: false,
         auth_status: "".into(),
         tools: Default::default(),
+        tool_fetch_status: "".into(),
+        tool_fetch_error: "".into(),
+        tools_search_blob: "".into(),
+        removable: true,
+        remove_busy: false,
+        enabled_busy: false,
+        authenticate_busy: false,
+        logout_busy: false,
+        args: "".into(),
+        env: "".into(),
+        headers: "".into(),
+        timeout: "".into(),
+        oauth_client_id: "".into(),
     }])));
     panel.set_agent_catalog(ModelRc::new(VecModel::from(vec![AgentCatalogEntry {
         id: "claude".into(),
@@ -874,13 +886,22 @@ fn connection_status_is_exposed_to_accessibility() {
         .is_some_and(|label| label.contains("HTTP fallback - approvals unavailable")));
 }
 
-/// Coverage Matrix `session/close`/`session/delete` row -- sidebar's
-/// per-thread two-step arm/confirm close/delete controls. Real
-/// interaction coverage (accessible labels, click, confirm/cancel),
-/// same discipline as this file's other component tests: proves the
-/// UI wiring, not the gateway call itself (that's
-/// `gateway_actor_e2e_test.rs::close_then_delete_session_round_trip_
+/// Coverage Matrix `session/delete` row -- sidebar's per-thread two-step
+/// arm/confirm delete control. Real interaction coverage (accessible
+/// labels, click, confirm), same discipline as this file's other
+/// component tests: proves the UI wiring, not the gateway call itself
+/// (that's `gateway_actor_e2e_test.rs::close_then_delete_session_round_trip_
 /// through_a_real_gateway`'s job).
+///
+/// The sidebar row's "close thread" power-button affordance (armed/
+/// confirm two-step, previously covered by this same test) was removed
+/// at the user's explicit request -- `close-requested()` and its
+/// backing `pending-close-index` state remain wired in
+/// `sidebar_thread_row.slint` for a possible future UI trigger, but no
+/// control currently fires them, so there is nothing left to exercise
+/// here for close. This test now only covers delete, driving the closed
+/// state directly (as `refresh_threads_model` would push it once the
+/// bridge reports a thread closed) instead of via a close button click.
 ///
 /// Previously documented as a "harness anomaly": the controls were in
 /// the tree once `selected-thread` revealed them, but the sidebar width
@@ -889,7 +910,7 @@ fn connection_status_is_exposed_to_accessibility() {
 /// skipped the clipped IconButtons. Settling the expand animation
 /// (see `settle_sidebar_expand`) makes them addressable.
 #[test]
-fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirmed() {
+fn sidebar_thread_delete_control_is_addressable_and_two_step_confirmed() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
@@ -902,65 +923,25 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
     )])));
     panel.set_selected_thread(0);
 
-    let closed_index = Rc::new(Cell::new(-1i32));
     let deleted_index = Rc::new(Cell::new(-1i32));
-    {
-        let closed_index = closed_index.clone();
-        panel.on_thread_close_requested(move |i| closed_index.set(i));
-    }
     {
         let deleted_index = deleted_index.clone();
         panel.on_thread_delete_requested(move |i| deleted_index.set(i));
     }
 
-    // An open thread shows only the close (arm) control -- no delete
-    // control, and no confirm/cancel pair, until armed.
+    // An open thread shows no delete control and no close control (the
+    // close power-button was removed) until it's actually closed.
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Delete thread Fix timeline crash")
             .next()
             .is_none(),
         "an open thread must not show a delete control"
     );
-    let close_arm =
-        ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-            .next()
-            .expect("close-arm control must be accessible on an open thread");
-
-    close_arm.invoke_accessible_default_action();
-    // Armed: confirm/cancel pair now accessible, the plain arm control
-    // is gone (replaced, not merely covered).
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
             .next()
             .is_none(),
-        "the arm control must disappear once armed"
-    );
-    let cancel_close =
-        ElementHandle::find_by_accessible_label(&panel, "Cancel close thread Fix timeline crash")
-            .next()
-            .expect("cancel-close control must be accessible once armed");
-    cancel_close.invoke_accessible_default_action();
-    assert_eq!(closed_index.get(), -1, "cancel must not fire the callback");
-    // Cancelling re-shows the plain arm control.
-    ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-        .next()
-        .expect("arm control must reappear after cancel");
-
-    // Real arm -> confirm round trip.
-    let close_arm =
-        ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-            .next()
-            .expect("close-arm control must still be accessible");
-    close_arm.invoke_accessible_default_action();
-    let confirm_close =
-        ElementHandle::find_by_accessible_label(&panel, "Confirm close thread Fix timeline crash")
-            .next()
-            .expect("confirm-close control must be accessible once armed");
-    confirm_close.invoke_accessible_default_action();
-    assert_eq!(
-        closed_index.get(),
-        0,
-        "confirming close must fire thread-close-requested(0)"
+        "the close power-button was removed and must not be addressable"
     );
 
     // Once the bridge reports the thread closed (Rust re-reads
@@ -1036,8 +1017,11 @@ fn sidebar_thread_archive_and_rename_controls_are_addressable_and_dispatch() {
     );
 
     // After the host marks the row archived (Dirty::ThreadRow path),
-    // the archive arm disappears and the close arm remains (archive
-    // does not close the session).
+    // the archive arm disappears (archive does not close the session,
+    // but there is no close control at all any more -- the close
+    // power-button was removed from the row, see
+    // `sidebar_thread_delete_control_is_addressable_and_two_step_confirmed`'s
+    // doc comment).
     let mut archived = sample_open_thread("Fix timeline crash");
     archived.status = "archived".into();
     archived.archived = true;
@@ -1048,9 +1032,12 @@ fn sidebar_thread_archive_and_rename_controls_are_addressable_and_dispatch() {
             .is_none(),
         "an archived thread must not show an archive control"
     );
-    ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
-        .next()
-        .expect("archive must not remove the close control on an open-but-archived thread");
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
+            .next()
+            .is_none(),
+        "the close power-button was removed and must not be addressable"
+    );
 }
 
 /// setup-followups plan, agent_enable_button_e2e_coverage_missing: phase
@@ -1328,6 +1315,7 @@ fn skill_selection_opens_the_editor_and_close_returns_to_chat() {
         scope: "project".into(),
         path: "/repo/.claude/skills/release-checklist".into(),
         started_from: "".into(),
+        is_dev_only: false,
     }])));
 
     let opened_paths = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -1734,6 +1722,7 @@ fn newly_added_skill_appears_in_the_skills_list() {
         scope: "project".into(),
         path: "/proj/.skills/voice-embedding".into(),
         started_from: "".into(),
+        is_dev_only: false,
     }])));
 
     let skill_row = ElementHandle::find_by_accessible_label(&panel, "Open skill voice-embedding")
@@ -1764,6 +1753,7 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
             scope: "project".into(),
             path: "/p/.skills/project-only".into(),
             started_from: "".into(),
+            is_dev_only: false,
         },
         SkillOption {
             name: "global-only".into(),
@@ -1771,6 +1761,7 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
             scope: "global".into(),
             path: "/cache/skills/global-only".into(),
             started_from: "".into(),
+            is_dev_only: false,
         },
     ])));
 
@@ -1953,4 +1944,78 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
          stretch may still be distributing them",
         max_right - min_x
     );
+}
+
+/// Regression test for the "built by Anthropic..." one-character-per-line
+/// markdown rendering bug. `markdown.rs`'s parser/wrapper produces
+/// perfectly normal runs for this text (see
+/// `markdown::tests::built_by_sentence_with_inline_code_parses_as_normal_runs`)
+/// -- the bug was purely a `markdown_view.slint` layout issue: the per-run
+/// `Text` cluster's `HorizontalLayout` uses `alignment: start`, which sizes
+/// a non-stretch child to its *minimum* width rather than its preferred
+/// width, and turning on `wrap: word-wrap` (added to bound long unbreakable
+/// tokens) let that auto-computed minimum collapse toward a single glyph
+/// for every run, not just oversized ones -- at a realistic (narrow) chat
+/// bubble width, ordinary runs rendered as a handful-of-pixels-wide,
+/// many-lines-tall `Text` box: a vertical stack of near-single characters.
+/// Reproduced here by checking real layout geometry (not just parsed
+/// runs) at a narrow window width where the collapse was visible before
+/// the fix (each run's `Text` box got an explicit `width` clamped to its
+/// own natural size instead of being left to the layout's min-width
+/// fallback).
+#[test]
+fn agent_markdown_run_does_not_collapse_to_one_char_per_line() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(420.0, 700.0));
+    panel.set_sidebar_expanded(false);
+
+    let text = "I'm Claude Sonnet 5 (model ID `claude-sonnet-5`), built by Anthropic, running here as your Claude Code agent.";
+    let markdown_lines = panel_rust::models::skill_markdown_preview(text);
+    panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        can_send_now: false,
+        tool_group_len: 0,
+        kind: "agent".into(),
+        text: text.into(),
+        markdown_lines,
+        expanded: false,
+        index: 0,
+        ..MessageItem::default()
+    }])));
+
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(420.0, 700.0));
+
+    // Every markdown-run `Text` box in the message band. A collapsed run
+    // renders as a narrow-but-very-tall box (many single-character
+    // internal lines stacked vertically); a healthy run is either a
+    // short single line (small height) or a normally word-wrapped
+    // multi-line block (width stays well above a couple of glyphs even
+    // when it wraps internally).
+    let mut boxes: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h)
+    for el in ElementHandle::find_by_element_type_name(&panel, "Text") {
+        let size = el.size();
+        let pos = el.absolute_position();
+        if pos.y > 48.0 && pos.y < 650.0 && pos.x > 48.0 && size.height > 0.0 {
+            boxes.push((pos.x, pos.y, size.width, size.height));
+        }
+    }
+    assert!(
+        !boxes.is_empty(),
+        "expected agent-body markdown Text runs in the message column"
+    );
+    for (x, y, w, h) in &boxes {
+        // A box narrower than ~2 characters (20px) that is also several
+        // lines tall (>30px) is the one-char-per-line collapse signature
+        // -- a healthy run is never both narrow *and* tall at once.
+        assert!(
+            !(*w < 20.0 && *h > 30.0),
+            "markdown run collapsed to one-character-per-line: \
+             x={x:.1} y={y:.1} w={w:.1} h={h:.1} (all boxes: {boxes:?})"
+        );
+    }
 }
