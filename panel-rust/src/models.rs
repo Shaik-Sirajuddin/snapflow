@@ -2336,19 +2336,32 @@ pub fn to_skill_option_rows(entries: Vec<SkillEntry>) -> Vec<SkillOption> {
 pub fn to_remote_session_options(
     sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     provider: &str,
+    busy_session_ids: &[String],
 ) -> ModelRc<crate::RemoteSessionOption> {
     ModelRc::new(VecModel::from(to_remote_session_option_rows(
-        sessions, provider,
+        sessions,
+        provider,
+        busy_session_ids,
     )))
 }
 
+/// `busy_session_ids` is `AgentBridge::recover_session_operations_in_
+/// flight`'s raw output (Settings > Agents "Attach" click -> `session/
+/// load` still in flight) -- same `is_busy` shape `to_mcp_server_option_
+/// rows` already established for the MCP-servers row spinners, applied
+/// here since this row previously had no busy-state tracking at all
+/// (symptom #2).
 pub fn to_remote_session_option_rows(
     sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     provider: &str,
+    busy_session_ids: &[String],
 ) -> Vec<crate::RemoteSessionOption> {
     sessions
         .into_iter()
         .map(|session| crate::RemoteSessionOption {
+            busy: busy_session_ids
+                .iter()
+                .any(|id| id == &session.acp_session_id),
             session_id: session.acp_session_id.into(),
             provider: provider.into(),
             title: session.title.unwrap_or_default().into(),

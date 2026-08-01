@@ -378,6 +378,10 @@ pub struct FrameInput {
     /// in flight -- see `AgentBridge::mcp_operations_in_flight`'s doc
     /// comment.
     pub mcp_operations_in_flight: Vec<String>,
+    /// Remote session ids with a Settings > Agents "Attach" `session/
+    /// load` still in flight -- see `AgentBridge::recover_session_
+    /// operations_in_flight`'s doc comment.
+    pub recover_session_operations_in_flight: Vec<String>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
     /// PISO-8 (project-isolation-mlt-binding plan): true at most once
     /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors

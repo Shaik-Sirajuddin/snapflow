@@ -1343,6 +1343,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let session_rows = crate::models::to_remote_session_option_rows(
         model.recoverable_sessions.clone(),
         &model.recovery_provider,
+        &model.recover_session_operations_in_flight,
     );
     let session_keys: Vec<String> = model
         .recoverable_sessions

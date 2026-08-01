@@ -577,6 +577,12 @@ export struct RemoteSessionOption {
     provider: string,
     title: string,
     updated_at: string,
+    // recoverable-attach-fix: true while this session's `session/load`
+    // attach is in flight (Settings > Agents "Attach" click), sourced
+    // from `AgentBridge::recover_session_operations_in_flight`. Drives
+    // the Attach Button's own `busy` spinner -- this row previously had
+    // no busy-state tracking at all.
+    busy: bool,
 }
 
 // Settings-sheet addition: one agent-catalog entry, as returned by

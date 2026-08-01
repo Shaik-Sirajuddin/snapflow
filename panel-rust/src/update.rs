@@ -2759,6 +2759,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         model.mcp_operations_in_flight = frame.mcp_operations_in_flight;
         dirty.push(Dirty::Settings);
     }
+    if model.recover_session_operations_in_flight != frame.recover_session_operations_in_flight {
+        model.recover_session_operations_in_flight = frame.recover_session_operations_in_flight;
+        dirty.push(Dirty::Settings);
+    }
     if let Some(snapshot) = frame.settings_preferences_snapshot {
         let changed = model.settings_scope != snapshot.scope
             || model.default_profile != snapshot.default_profile
@@ -5328,6 +5332,7 @@ mod tests {
                 settings_preferences_snapshot: None,
                 agent_operations_in_flight: Vec::new(),
                 mcp_operations_in_flight: Vec::new(),
+                recover_session_operations_in_flight: Vec::new(),
                 skills_snapshot: None,
                 daemon_projects_refresh_due: false,
             }),

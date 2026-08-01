@@ -600,6 +600,14 @@ export component AgentsView inherits Rectangle {
                 font-weight: 400;
                 bg: Theme.bg-card;
                 fg: Theme.text-secondary;
+                // recoverable-attach-fix: `session.busy` (`AgentBridge::
+                // recover_session_operations_in_flight`) is true for the
+                // whole `session/load` round trip -- Button's own `busy`
+                // prop swaps the label for a Spinner and ignores further
+                // clicks (see button.slint), so this can no longer be
+                // double-clicked into two attach attempts for the same
+                // session while the first is still in flight.
+                busy: session.busy;
                 clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
             }
         }

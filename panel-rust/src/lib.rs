@@ -4113,8 +4113,18 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // without requiring mouse movement.
         let component_connection_animating =
             panel.component.get_connection_status().as_str() == "Connecting...";
+        // recoverable-attach-fix: Settings > Agents "Attach" (symptom #2)
+        // -- same gap `busy_mcp_server_animating` above was added to
+        // close for the MCP-servers rows: `RemoteSessionOption.busy` is
+        // real per-row state now (`recover_session_operations_in_
+        // flight`), but without an explicit busy-thread reason here the
+        // Attach button's Spinner only got one correct frame at
+        // click-time and then froze until unrelated mouse movement.
+        let busy_recover_session_animating =
+            !panel.model.borrow().recover_session_operations_in_flight.is_empty();
         let busy_animation = busy_thread_animating
             || busy_mcp_server_animating
+            || busy_recover_session_animating
             || component_connection_animating;
         let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software

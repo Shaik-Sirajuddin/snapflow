@@ -349,6 +349,13 @@ pub struct Model {
     /// rows`, driving the Spinner shown on whichever button's action is
     /// actually in flight.
     pub mcp_operations_in_flight: Vec<String>,
+    /// Same shape/lifecycle as `mcp_operations_in_flight` above, sourced
+    /// from `AgentBridge::recover_session_operations_in_flight`. Folded
+    /// into `RemoteSessionOption.busy` by `to_remote_session_option_
+    /// rows`, driving the Attach button's Spinner while a recoverable
+    /// session's `session/load` is in flight (symptom #2: this row
+    /// previously had no busy-state tracking at all).
+    pub recover_session_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot
