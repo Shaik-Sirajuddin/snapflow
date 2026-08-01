@@ -2,6 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Strings } from "../tokens/strings.slint";
 import { Icon } from "../base/icon.slint";
+import { Spinner } from "../base/spinner.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
@@ -750,15 +751,13 @@ export component ChatInputLayout inherits Rectangle {
                         alignment: center;
                         HorizontalLayout {
                             alignment: center;
-                            Icon {
+                            Spinner {
                                 // Larger than the stop icon (icon-sm, 12px)
                                 // so it reads as a ring around it, not an
                                 // overlapping duplicate at the same size.
-                                source: @image-url("../assets/icons/loader-circle.svg");
                                 size: 26px;
-                                color: Theme.text-secondary.with-alpha(0.55);
-                                transform-rotation: load-spin;
-                                transform-origin: { x: self.width / 2, y: self.height / 2 };
+                                stroke: Theme.text-secondary.with-alpha(0.55);
+                                stroke-width: 2px;
                             }
                         }
                     }

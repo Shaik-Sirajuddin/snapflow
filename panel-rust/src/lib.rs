@@ -4043,8 +4043,19 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
                     || (entry.tool_catalog.is_none() && is_busy("tools_fetch", &entry.name))
             })
         };
-        let needs_paint =
-            frame_changed || animating || busy_thread_animating || busy_mcp_server_animating;
+        // With zero durable threads, App mounts `legacy-chat-area` instead of
+        // a ChatViewStack delegate. That ChatArea still renders its
+        // connection-status spinner and topbar shimmer from the component-
+        // level default `connection-status == "Connecting..."`, but there is
+        // no ThreadModel for the predicate above to inspect. Include the
+        // component projection so the no-thread loading state keeps ticking
+        // without requiring mouse movement.
+        let component_connection_animating =
+            panel.component.get_connection_status().as_str() == "Connecting...";
+        let busy_animation = busy_thread_animating
+            || busy_mcp_server_animating
+            || component_connection_animating;
+        let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software
         // buffer. `MinimalSoftwareWindow::draw_if_needed` no-ops unless
         // Slint itself was told to redraw. `animation-tick()` bindings
@@ -4052,7 +4063,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // a busy loader froze: poll returned true, paint ran, but the
         // buffer was never re-rendered. Force the flag whenever we
         // need continuous tick-driven paint.
-        if needs_paint && (animating || busy_thread_animating || busy_mcp_server_animating) {
+        if needs_paint && (animating || busy_animation) {
             panel.window.window().request_redraw();
         }
         needs_paint

@@ -13,6 +13,7 @@ import { QueuedMessageBar } from "./chat-view/components/message/queued_message_
 import { PendingStatusRow } from "./chat-view/components/message/pending_status_row.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { ToolGroupView } from "./chat-view/components/message/tool_group_view.slint";
+import { Spinner } from "./base/spinner.slint";
 import { PermissionCard } from "./components/permission_card.slint";
 import { LocalTerminalCard } from "./components/local_terminal_card.slint";
 // PUI-002b: reuse the same boxed-row primitive the @/#/skill mention
@@ -566,14 +567,10 @@ export component ChatArea inherits Rectangle {
                         height: Metrics.icon-md;
                         accessible-role: text;
                         accessible-label: "Connection status: " + connection-status;
-                        if root.sending || connection-status == "Connecting..." : Icon {
-                            source: @image-url("./assets/icons/loader-circle.svg");
+                        if root.sending || connection-status == "Connecting..." : Spinner {
                             size: Metrics.icon-md;
-                            color: Theme.bg-primary;
-                            transform-rotation: header-spin;
-                            // Center on the icon itself (not a fixed 8px
-                            // assumption) so the ring actually spins.
-                            transform-origin: { x: self.width / 2, y: self.height / 2 };
+                            stroke: Theme.bg-primary;
+                            stroke-width: 2px;
                         }
                         if !(root.sending || connection-status == "Connecting...")
                             && root.status-needs-attention : Icon {
