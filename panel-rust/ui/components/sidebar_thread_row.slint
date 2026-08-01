@@ -4,6 +4,7 @@ import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
 import { ThreadItem } from "../types.slint";
+import { Spinner } from "../base/spinner.slint";
 
 // One sidebar thread row -- shared by the active list and the bottom
 // Archived section so both share one implementation.
@@ -136,16 +137,22 @@ export component SidebarThreadRow inherits HoverSurface {
                     // (fixed-height children sit at the cross-axis start),
                     // so the loader rode high against the first-row title;
                     // each state icon now lives in a height-stretching
-                    // cell whose inner fixed-size child self-centers
-                    // (default x/y center an element in its parent).
+                    // cell whose explicit center layout keeps the native
+                    // spinner centered in collapsed rows as well.
                     if row-busy : Rectangle {
                         width: 14px;
-                        Icon {
-                            source: @image-url("../assets/icons/loader-circle.svg");
-                            size: 14px;
-                            color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
-                            transform-rotation: load-spin;
-                            transform-origin: { x: self.width / 2, y: self.height / 2 };
+                        VerticalLayout {
+                            width: 100%;
+                            height: 100%;
+                            alignment: center;
+                            HorizontalLayout {
+                                alignment: center;
+                                Spinner {
+                                    size: 14px;
+                                    stroke: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
+                                    stroke-width: 2px;
+                                }
+                            }
                         }
                     }
                     if thread.status == "error" : Rectangle {
