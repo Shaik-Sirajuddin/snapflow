@@ -251,6 +251,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_dev_mode(model.dev_mode);
             component.set_show_global_skills(model.show_global_skills);
             component.set_profile_wiring_enabled(model.profile_wiring_enabled);
+            component.set_beta_mode_enabled(model.beta_mode_enabled);
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);

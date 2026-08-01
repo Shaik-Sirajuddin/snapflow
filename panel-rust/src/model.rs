@@ -301,6 +301,13 @@ pub struct Model {
     /// entirely, in both scopes, until this flag is turned on. Computed
     /// once at startup from the environment and never mutated afterward.
     pub profile_wiring_enabled: bool,
+    /// Feature-flag gate (env-var driven, see `beta_mode_enabled()` in
+    /// lib.rs, `BETA_MODE`) for in-development UI surfaces: the Chat
+    /// Defaults "Profile" field (`agents_view.slint`, additive on top of
+    /// `profile_wiring_enabled` above) and the whole Harness settings tab
+    /// (`left_tabs.slint` / `settings_page.slint`). Computed once at
+    /// startup from the environment and never mutated afterward.
+    pub beta_mode_enabled: bool,
     pub background_override_set: bool,
     pub background_override: bool,
     /// Skills settings view's "Show global skills" row

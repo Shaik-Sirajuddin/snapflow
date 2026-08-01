@@ -48,6 +48,14 @@ export component AgentsView inherits Rectangle {
     // profile-registry chip picker below (gated Global-only in
     // 6745aa0e), these two fields stay dual-tier once the flag is on.
     in property <bool> profile-wiring-enabled: false;
+    // Env-var feature-flag gate (BETA_MODE, read in lib.rs's
+    // beta_mode_enabled() and threaded down through settings_page.slint /
+    // app.slint). Additive on top of profile-wiring-enabled above -- gates
+    // ONLY the "Profile" SettingsField (default-profile) below; the
+    // adjacent "Permission profile" field is unaffected and stays governed
+    // solely by profile-wiring-enabled, same as before. Both flags must be
+    // true for the Profile field to show.
+    in property <bool> beta-mode-enabled: false;
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
@@ -66,6 +74,11 @@ export component AgentsView inherits Rectangle {
         if (!self.profile-wiring-enabled) {
             self.default-profile-focus-mirror = false;
             self.permission-profile-focus-mirror = false;
+        }
+    }
+    changed beta-mode-enabled => {
+        if (!self.beta-mode-enabled) {
+            self.default-profile-focus-mirror = false;
         }
     }
     // See FilterSearchBar.input-has-focus's doc comment. Also covers the
@@ -176,7 +189,7 @@ export component AgentsView inherits Rectangle {
 
         SettingsSectionHeader { text: Strings.chat-defaults; }
 
-        if root.profile-wiring-enabled : SettingsField {
+        if root.profile-wiring-enabled && root.beta-mode-enabled : SettingsField {
             width: parent.width;
             label: Strings.profile;
             default-profile-field := TextField {

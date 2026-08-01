@@ -25,6 +25,11 @@ export component SettingsLeftTabs inherits Rectangle {
     in property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
     in property <bool> expanded: true;
     in property <string> scope: "project"; // "project" | "global"
+    // Env-var feature-flag gate (BETA_MODE, see lib.rs's
+    // beta_mode_enabled()) -- the Harness nav item below is hidden
+    // entirely, in both scopes, until this is turned on, same
+    // conditional-nav-item precedent as MCP Servers' scope gate above.
+    in property <bool> beta-mode-enabled: false;
     callback section-selected(string);
     callback collapse-requested();
 
@@ -63,7 +68,7 @@ export component SettingsLeftTabs inherits Rectangle {
             clicked => { root.section-selected("agents"); }
             double-clicked => { root.collapse-requested(); }
         }
-        NavItem {
+        if root.beta-mode-enabled : NavItem {
             height: 34px;
             label: Strings.harness;
             button-accessible-label: Strings.harness-section;

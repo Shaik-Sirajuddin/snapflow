@@ -179,6 +179,13 @@ export component ChatPanel inherits Window {
     // default -- those two settings are hidden entirely, in both Project
     // and Global scope, until this is explicitly turned on.
     in property <bool> profile-wiring-enabled: false;
+    // Env-var feature-flag gate (BETA_MODE, see lib.rs's
+    // beta_mode_enabled()) for in-development UI surfaces: the Chat
+    // Defaults "Profile" field in agents_view.slint (additive on top of
+    // profile-wiring-enabled above -- both must be true for that field to
+    // show) and the whole Harness settings tab (left_tabs.slint /
+    // settings_page.slint). Off by default.
+    in property <bool> beta-mode-enabled: false;
     // `active_pane_and_editor_view` phase: which surface the main content
     // area shows -- "chat" (ChatArea, the default) or "skill" (a live
     // SkillEditorView for the sidebar's currently-selected skill).
@@ -955,6 +962,7 @@ export component ChatPanel inherits Window {
             default-profile <=> default-profile;
             permission-profile <=> permission-profile;
             profile-wiring-enabled: root.profile-wiring-enabled;
+            beta-mode-enabled: root.beta-mode-enabled;
             background-default <=> background-default;
             default-agent-id <=> root.default-agent-id;
             show-global-skills <=> show-global-skills;

@@ -553,6 +553,21 @@ fn profile_wiring_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Feature-flag gate for in-development UI surfaces that aren't ready to
+/// ship broadly yet: the Chat Defaults "Profile" field (`agents_view.slint`,
+/// stacked additively on top of `profile_wiring_enabled` above -- both must
+/// be on for that field to show) and the whole Harness settings tab
+/// (`left_tabs.slint`'s nav item + `settings_page.slint`'s `HarnessView`
+/// mount). Named `BETA_MODE` (not `PANEL_`-prefixed like the sibling flag
+/// above) per explicit naming from the request that introduced it. Defaults
+/// OFF (unset env var => hidden) so an unset environment never surfaces
+/// either gated surface.
+fn beta_mode_enabled() -> bool {
+    std::env::var("BETA_MODE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 /// Verifies the Project-vs-Global tiering that `HarnessView`'s
 /// "Background sessions" toggle (`background_session_default`) is
 /// supposed to have, end to end through the exact functions the UI save
@@ -2306,6 +2321,7 @@ fn panel_rust_create_with_initial_identity(
         };
         let mut model = model::Model::default();
         model.profile_wiring_enabled = profile_wiring_enabled();
+        model.beta_mode_enabled = beta_mode_enabled();
         let thread_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();
