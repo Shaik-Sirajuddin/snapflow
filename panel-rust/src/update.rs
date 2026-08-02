@@ -2041,15 +2041,56 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                         vec![thread_row_dirty(model, real_index)],
                     )
                 }
-                Err(err) => (
-                    vec![],
-                    vec![Dirty::Error {
-                        thread_id: thread.thread_id.clone(),
-                        detail: ErrorDetail {
-                            message: err.message,
-                        },
-                    }],
-                ),
+                Err(err) => {
+                    // top-bar-stuck-loading fix (2026-08-02): this used to
+                    // push only Dirty::Error (the banner) and leave
+                    // `thread.state` untouched -- so a thread whose attach
+                    // failed here (gateway provisioning/EACCES/etc., both
+                    // the async `spawn_background_attachment` path and the
+                    // synchronous `dispatch_compose_send_maybe_attach`
+                    // path route their failure through this exact arm)
+                    // never actually reached `ThreadState::Error`. `087dd6
+                    // 41` guarded `collect_thread_list_snapshot`'s per-row
+                    // loop against re-clobbering an already-"error" status
+                    // back to "loading" -- but that guard only helps once
+                    // `status` genuinely reads "error", and
+                    // `models::build_thread_items` derives `status` from
+                    // `thread.state`, which this arm never set. Without a
+                    // binding (a failed attach never gets one) and not
+                    // deferred, `shows_starting_thread_loading` kept
+                    // re-forcing "loading" on this row every frame forever
+                    // -- the sidebar row AND the chat-area top-bar dot
+                    // (bound to the same `connection_status` / thread-row
+                    // plumbing) both looked permanently stuck loading
+                    // instead of ever surfacing the real failure. Setting
+                    // `thread.state`/`thread.error` here, the same as every
+                    // other terminal-failure arm in this file (see
+                    // `AgentEvent::Error` and `PromptSent`'s `Err` arm just
+                    // below), and pushing `ThreadRow`/`Connection` dirty
+                    // alongside the banner (mirroring `PromptSent`'s `Err`
+                    // arm) gets both surfaces to reflect it on the very
+                    // next frame instead of relying on some later,
+                    // unrelated dirty event to eventually pick it up.
+                    thread.state = ThreadState::Error;
+                    thread.error = Some(err.message.clone());
+                    (
+                        vec![],
+                        vec![
+                            Dirty::Error {
+                                thread_id: thread.thread_id.clone(),
+                                detail: ErrorDetail {
+                                    message: err.message,
+                                },
+                            },
+                            Dirty::ThreadRow {
+                                thread_id: thread.thread_id.clone(),
+                            },
+                            Dirty::Connection {
+                                thread_id: thread.thread_id.clone(),
+                            },
+                        ],
+                    )
+                }
             }
         }
         // Skills list is refreshed by effect_executor before this
@@ -3907,6 +3948,60 @@ mod tests {
             vec![Dirty::ThreadRow {
                 thread_id: "durable-new".to_owned()
             }]
+        );
+    }
+
+    /// top-bar-stuck-loading fix (2026-08-02): a failed attach (the
+    /// `SessionAttached { result: Err(..) }` fold both `spawn_background_
+    /// attachment` and `dispatch_compose_send_maybe_attach` route their
+    /// failure through) must land the thread on `ThreadState::Error` --
+    /// not just emit the error banner -- and dirty `ThreadRow`/
+    /// `Connection` so both the sidebar row and the chat-area top-bar
+    /// status dot pick up the real failure on the very next frame instead
+    /// of staying on whatever pre-failure state (`Loading`, or seeded
+    /// `Idle` for a never-before-attached thread) they had. Before this
+    /// fix, `thread.state` was left untouched here, so `models::
+    /// build_thread_items` never derived "error" for this row and `087dd6
+    /// 41`'s `shows_starting_thread_loading` guard (which only stops
+    /// re-forcing "loading" once `status == "error"`) never got a chance
+    /// to engage -- the row looked stuck loading forever.
+    #[test]
+    fn session_attached_failure_sets_error_state_and_dirties_row_and_connection() {
+        let mut model = model_with_threads(&["existing"]);
+        model.threads[0].state = ThreadState::Loading;
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SessionAttached {
+                real_index: 0,
+                thread_id: None,
+                provider: None,
+                result: Err(crate::effect::EffectError::new("Permission denied (os error 13)")),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Error);
+        assert_eq!(
+            model.threads[0].error.as_deref(),
+            Some("Permission denied (os error 13)")
+        );
+        assert_eq!(
+            dirty,
+            vec![
+                Dirty::Error {
+                    thread_id: "thread-0".to_owned(),
+                    detail: ErrorDetail {
+                        message: "Permission denied (os error 13)".to_owned(),
+                    },
+                },
+                Dirty::ThreadRow {
+                    thread_id: "thread-0".to_owned(),
+                },
+                Dirty::Connection {
+                    thread_id: "thread-0".to_owned(),
+                },
+            ]
         );
     }
 
