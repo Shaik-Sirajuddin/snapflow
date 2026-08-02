@@ -781,102 +781,120 @@ export component Sidebar inherits Rectangle {
     }
 
     // Skills config sits directly above Settings in the Skills sidebar.
+    //
+    // click-non-responsiveness investigation follow-up: this was the one
+    // element in the whole sidebar/panel that positioned its clickable
+    // children with explicit x/y math instead of normal layout flow (every
+    // other working button -- collapse toggle, new-thread, Threads/Skills
+    // tabs -- uses plain layout containers). That structural difference
+    // was never confirmed as the root cause of the reported click bug
+    // (Slint's hit-testing doesn't distinguish explicit-position items
+    // from layout-positioned ones), but converting to layout flow removes
+    // a real variable at low risk, so doing it as a defensive cleanup
+    // rather than a claimed fix. Visual result is unchanged: the VerticalLayout's
+    // `padding`/`spacing` below reproduce settings-footer-h's own formula
+    // exactly (margin top/bottom/gap, margin*2 subtracted from each row's
+    // width by the old explicit `parent.width - 2 * margin`).
     settings-footer := Rectangle {
         x: 0px;
         y: parent.height - self.height;
         width: parent.width;
         height: root.settings-footer-h;
         background: Theme.bg-sidebar;
-        if root.skills-config-h > 0px : skills-config := HoverSurface {
-            x: root.settings-margin;
-            y: root.settings-margin;
-            width: parent.width - 2 * root.settings-margin;
-            height: root.skills-config-h;
-            idle-bg: transparent;
-            selected: false;
-            button-accessible-label: "Open Skills settings";
-            clicked => { root.skills-settings-requested(); }
-            border-width: 0px;
-            border-radius: Theme.radius-md;
-            HorizontalLayout {
-                width: 100%;
-                height: 100%;
-                padding-left: Metrics.pad-sm;
-                padding-right: Metrics.pad-sm;
-                spacing: Metrics.gap-sm;
-                cross-axis-alignment: center;
-                Text {
-                    text: "Skills config";
-                    color: Theme.text-secondary;
-                    font-size: 10px * Theme.font-scale;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-                Icon {
-                    source: @image-url("../assets/icons/chevron-right.svg");
-                    size: Metrics.icon-sm;
-                    color: Theme.text-muted;
-                }
-            }
-        }
-        // Expanded: full-width settings row with the normal hover surface.
-        if expanded : settings-box := HoverSurface {
-            x: root.settings-margin;
-            y: root.skills-config-h > 0px
-                ? root.skills-config-h + 2 * root.settings-margin
-                : root.settings-margin;
-            width: parent.width - 2 * root.settings-margin;
-            height: root.settings-box-h;
-            idle-bg: Theme.bg-tertiary;
-            selected: false;
-            button-accessible-label: "Open settings";
-            clicked => { root.settings-requested(); }
-            border-width: 0px;
-            border-radius: Theme.radius-md;
-            HorizontalLayout {
-                width: 100%;
-                height: 100%;
-                padding-left: Metrics.pad-sm;
-                padding-right: Metrics.pad-sm;
-                spacing: Metrics.gap-sm;
-                alignment: start;
-                cross-axis-alignment: center;
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 0;
-                    Icon {
-                        source: @image-url("../assets/icons/settings.svg");
-                        size: Metrics.icon-md;
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
+            padding: root.settings-margin;
+            spacing: root.settings-margin;
+            if root.skills-config-h > 0px : skills-config := HoverSurface {
+                height: root.skills-config-h;
+                idle-bg: transparent;
+                selected: false;
+                button-accessible-label: "Open Skills settings";
+                clicked => { root.skills-settings-requested(); }
+                border-width: 0px;
+                border-radius: Theme.radius-md;
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: Metrics.pad-sm;
+                    padding-right: Metrics.pad-sm;
+                    spacing: Metrics.gap-sm;
+                    cross-axis-alignment: center;
+                    Text {
+                        text: "Skills config";
                         color: Theme.text-secondary;
+                        font-size: 10px * Theme.font-scale;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Icon {
+                        source: @image-url("../assets/icons/chevron-right.svg");
+                        size: Metrics.icon-sm;
+                        color: Theme.text-muted;
                     }
                 }
-                Text {
-                    text: "Settings";
-                    color: Theme.text-secondary;
-                    font-size: 11px * Theme.font-scale;
-                    font-family: Theme.font-sans;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
+            }
+            // Expanded: full-width settings row with the normal hover surface.
+            if expanded : settings-box := HoverSurface {
+                height: root.settings-box-h;
+                idle-bg: Theme.bg-tertiary;
+                selected: false;
+                button-accessible-label: "Open settings";
+                clicked => { root.settings-requested(); }
+                border-width: 0px;
+                border-radius: Theme.radius-md;
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: Metrics.pad-sm;
+                    padding-right: Metrics.pad-sm;
+                    spacing: Metrics.gap-sm;
+                    alignment: start;
+                    cross-axis-alignment: center;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Icon {
+                            source: @image-url("../assets/icons/settings.svg");
+                            size: Metrics.icon-md;
+                            color: Theme.text-secondary;
+                        }
+                    }
+                    Text {
+                        text: "Settings";
+                        color: Theme.text-secondary;
+                        font-size: 11px * Theme.font-scale;
+                        font-family: Theme.font-sans;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
                 }
             }
-        }
-        // Collapsed: use the same icon-button primitive as the header.
-        // The expanded row's horizontal padding cannot fit a 48px rail,
-        // which made both its background and hover hit area look broken.
-        if !expanded : IconButton {
-            x: (parent.width - self.width) / 2;
-            y: root.skills-config-h > 0px
-                ? root.skills-config-h + 2 * root.settings-margin
-                    + (root.settings-box-h - self.height) / 2
-                : (parent.height - self.height) / 2;
-            btn-width: 28px;
-            btn-height: 28px;
-            button-accessible-label: "Open settings";
-            clicked => { root.settings-requested(); }
-            Icon {
-                source: @image-url("../assets/icons/settings.svg");
-                size: Metrics.icon-md;
-                color: Theme.text-secondary;
+            // Collapsed: use the same icon-button primitive as the header.
+            // The expanded row's horizontal padding cannot fit a 48px rail,
+            // which made both its background and hover hit area look broken.
+            // Centered via layout (VerticalLayout+HorizontalLayout
+            // alignment: center), matching the collapse-toggle/new-thread
+            // IconButton centering pattern earlier in this file, instead
+            // of manual (parent.width - self.width) / 2 math.
+            if !expanded : VerticalLayout {
+                height: root.settings-box-h;
+                alignment: center;
+                HorizontalLayout {
+                    alignment: center;
+                    IconButton {
+                        btn-width: 28px;
+                        btn-height: 28px;
+                        button-accessible-label: "Open settings";
+                        clicked => { root.settings-requested(); }
+                        Icon {
+                            source: @image-url("../assets/icons/settings.svg");
+                            size: Metrics.icon-md;
+                            color: Theme.text-secondary;
+                        }
+                    }
+                }
             }
         }
     }
