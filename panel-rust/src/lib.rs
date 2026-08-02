@@ -4249,6 +4249,25 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
                     )
                     || (entry.tool_catalog.is_none() && is_busy("tools_fetch", &entry.name))
             })
+            // mcp_server_submit_spinner_repaint_gap: the Add/Edit MCP Server
+            // form's Save-button Spinner (mcp_servers_view.slint's
+            // `submit-busy`) is driven by `sync.rs`'s
+            // `mcp_server_submit_busy`, which is true for ANY in-flight
+            // `create:`/`update:` key -- not per-existing-row like the
+            // actions above (a server being created doesn't have an
+            // `available_mcp_servers` entry yet at all, so the per-entry
+            // `is_busy` closure above can never see it). Without this,
+            // that Spinner got one correct frame at Save-click time and
+            // then had its repaint cadence throttled to the idle-backoff
+            // rate (kIdlePollFps, rustpanelitem.h) while still visually
+            // spinning -- reads as a "jumping"/stepped rotation instead of
+            // smooth motion, same root cause `busy_mcp_server_animating`
+            // and `busy_recover_session_animating` were added to close for
+            // their own rows, just never extended to this one.
+                || model
+                    .mcp_operations_in_flight
+                    .iter()
+                    .any(|key| key.starts_with("create:") || key.starts_with("update:"))
         };
         // With zero durable threads, App mounts `legacy-chat-area` instead of
         // a ChatViewStack delegate. That ChatArea still renders its
@@ -4423,6 +4442,51 @@ mod lifecycle_tests {
              false.",
             elapsed / TICKS as u32,
         );
+
+        panel_rust_destroy(handle);
+    }
+
+    /// mcp_server_submit_spinner_repaint_gap regression: the Add/Edit MCP
+    /// Server form's Save-button Spinner (`mcp_servers_view.slint`'s
+    /// `submit-busy`, sourced from `sync.rs`'s `mcp_server_submit_busy`,
+    /// true for ANY in-flight `create:`/`update:` key in
+    /// `mcp_operations_in_flight`) was invisible to `panel_rust_poll`'s
+    /// `busy_mcp_server_animating` check -- that check only walked
+    /// `available_mcp_servers` looking for `delete:`/`enabled:`/
+    /// `authenticate:`/`logout:`/`tools_fetch:` keys per existing row, and
+    /// a server being created has no `available_mcp_servers` entry yet at
+    /// all. Left uncovered, `RustPanelItem::applyPollCadence` (rustpanel
+    /// item.cpp) would back the poll timer off to `kIdlePollFps` (8Hz)
+    /// while that Spinner was still visually mid-animation-tick-driven
+    /// rotation, reading as a jumping/stepped spin instead of smooth
+    /// motion. Confirms `panel_rust_poll` reports `needs_paint == true` on
+    /// every tick while a `create:`/`update:` key is in flight, with no
+    /// other busy signal present.
+    #[test]
+    fn panel_rust_poll_stays_busy_for_in_flight_mcp_server_create() {
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let panel = slot.as_ref().expect("panel exists");
+            panel
+                .model
+                .borrow_mut()
+                .mcp_operations_in_flight
+                .push("create:new-server".to_owned());
+        });
+
+        const TICKS: usize = 30;
+        for i in 0..TICKS {
+            assert!(
+                panel_rust_poll(handle),
+                "tick {i}/{TICKS}: panel_rust_poll returned needs_paint == false while an \
+                 mcp_operations_in_flight \"create:...\" entry was present -- the MCP Server \
+                 submit-form Spinner would be silently throttled to the idle poll cadence \
+                 while still animating"
+            );
+        }
 
         panel_rust_destroy(handle);
     }
