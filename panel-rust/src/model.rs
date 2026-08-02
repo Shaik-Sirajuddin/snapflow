@@ -390,6 +390,17 @@ pub struct Model {
     pub toast_kind: String,
     pub toast_seq: i32,
     pub provider_errors: HashMap<String, String>,
+    /// mcp-servers-settings follow-up (chat-view provider-switch loading
+    /// indicator): providers with a `probe_provider_selection` acquire+
+    /// release round-trip currently in flight (see `SettingsMsg::
+    /// ProfileSelected`'s `Effect::ProbeProvider` dispatch for the insert
+    /// and `AgentEvent::ProviderProbe`'s handling in `update_frame` for the
+    /// removal on completion). Keyed by provider like `provider_errors`
+    /// above, not by thread -- the probe itself has no other per-thread
+    /// state worth tracking and this mirrors `provider_errors`'s own
+    /// "keyed off the selected thread's *provider*" contract exactly (see
+    /// `sync::selected_provider_unavailable`'s doc comment).
+    pub provider_probes_in_flight: HashSet<String>,
     pub active_skill_name: String,
     pub active_skill_path: String,
     /// PUI-010: the actual SKILL.md file path (active_skill_path is the

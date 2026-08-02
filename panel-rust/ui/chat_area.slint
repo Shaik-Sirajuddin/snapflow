@@ -70,6 +70,15 @@ export component ChatArea inherits Rectangle {
     in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
+    // mcp-servers-settings follow-up: true while the displayed thread's
+    // provider has a `probe_provider_selection` acquire+release
+    // round-trip in flight against the session-lease pool (start ->
+    // `SettingsMsg::ProfileSelected` dispatching `Effect::ProbeProvider`;
+    // end -> `AgentEvent::ProviderProbe`, Ok or Err). Drives a
+    // chat-view-local pulsing "Switching provider..." line, same
+    // pulse mechanism as the `reloading`/"loading conversation..." block
+    // below (Metrics.pulse-period-driven opacity blink), not a new one.
+    in property <bool> provider-switching: false;
     callback error-banner-dismissed();
     // PROF-8: persistent (not dismissible) yellow strip -- the displayed
     // thread's agent is reachable but not authenticated. Clears itself
@@ -1037,6 +1046,30 @@ export component ChatArea inherits Rectangle {
                     // This block is only ever visible alongside real message
                     // rows below it, so it always needs its own trailing gap.
                     Rectangle { height: compact ? Metrics.gap-md : Metrics.gap-lg; }
+                }
+                // mcp-servers-settings follow-up: chat-view-local pulsing
+                // indicator for a pool-acquire probe in flight
+                // (provider-switching). Shown above the empty/loading
+                // states below and above any real messages alike -- a
+                // provider switch can happen on a thread that already has
+                // messages queued, not just an empty one, so this can't be
+                // folded into the "messages.length == 0" blocks below.
+                // Same blink formula as `reloading`'s "loading
+                // conversation..." line just below (Metrics.pulse-period-
+                // driven opacity), reused rather than a new animation.
+                if root.provider-switching : VerticalLayout {
+                    height: 28px;
+                    alignment: center;
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                    Text {
+                        text: "Switching provider...";
+                        color: Theme.text-muted;
+                        opacity: blink;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
                 // Phase 18 empty/loading states: never leave the chat
                 // view blank. While (re)connecting, a blinking loading

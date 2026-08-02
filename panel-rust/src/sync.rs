@@ -137,6 +137,15 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 }
             }
         }
+        Dirty::ProviderSwitch { thread_id } => {
+            // Same displayed-thread gate as Connection above: a
+            // background thread's provider-probe finishing must not
+            // clobber the singleton pulse property for whatever thread is
+            // actually on screen.
+            if displayed_thread_for_id(model, thread_id).is_some() {
+                component.set_selected_provider_switching(chat_view_provider_switching(model));
+            }
+        }
         Dirty::Toast => {
             component.set_toast_message(model.toast_message.clone().into());
             component.set_toast_kind(model.toast_kind.clone().into());
@@ -1350,6 +1359,26 @@ fn selected_provider_unavailable(model: &Model) -> bool {
         .is_some_and(|thread| model.provider_errors.contains_key(&thread.provider))
 }
 
+/// True while the currently selected/displayed thread's provider has a
+/// `probe_provider_selection` acquire+release round-trip in flight
+/// (`Model::provider_probes_in_flight`, populated in `SettingsMsg::
+/// ProfileSelected`'s reducer arm and cleared in `update_frame`'s
+/// `ProviderProbe` arm on Ok *or* Err). Drives the chat-view pulsing
+/// "Switching provider..." indicator (`ChatArea.provider-switching`) --
+/// deliberately loading-only: the probe's *error* text still flows only
+/// through the existing `provider_errors` map / toast
+/// (`selected_provider_unavailable` above, `show_toast` in `update_frame`),
+/// not duplicated into a second chat-view-local error surface. Same
+/// "keyed off the selected thread's own provider, not any in-flight probe
+/// anywhere" contract as `selected_provider_unavailable`, and same pure,
+/// `ChatPanel`-free shape so it's unit-testable without a live Slint
+/// platform.
+fn chat_view_provider_switching(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.provider_probes_in_flight.contains(&thread.provider))
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -1501,6 +1530,12 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
             {
                 sync_profile_picker(model, component, thread);
             }
+            // mcp-servers-settings follow-up: same reasoning as the
+            // profile-picker resync just above -- a thread switch can
+            // land on a thread whose OWN provider probe is (or isn't)
+            // in flight, and nothing else re-fires for a pure selection
+            // change, so recompute the singleton pulse property here too.
+            component.set_selected_provider_switching(chat_view_provider_switching(model));
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());
@@ -1834,6 +1869,43 @@ mod tests {
         assert!(
             !selected_provider_unavailable(&model),
             "clearing the selected thread's provider error must re-enable Send"
+        );
+    }
+
+    /// mcp-servers-settings follow-up: same "keyed off the selected
+    /// thread's own provider" contract as
+    /// `selected_provider_unavailable_is_keyed_to_the_selected_threads_own_provider`
+    /// above, for the sibling loading signal that drives the chat-view
+    /// pulsing "Switching provider..." indicator.
+    #[test]
+    fn chat_view_provider_switching_is_keyed_to_the_selected_threads_own_provider() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !chat_view_provider_switching(&model),
+            "no probe in flight yet -- no pulse"
+        );
+
+        model
+            .provider_probes_in_flight
+            .insert("some-other-provider".to_owned());
+        assert!(
+            !chat_view_provider_switching(&model),
+            "an in-flight probe for a provider the selected thread isn't using must not \
+             pulse this thread's chat view"
+        );
+
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+        assert!(
+            chat_view_provider_switching(&model),
+            "an in-flight probe for the selected thread's own provider must pulse"
+        );
+
+        model.provider_probes_in_flight.remove("codex-acp");
+        assert!(
+            !chat_view_provider_switching(&model),
+            "clearing the in-flight marker must stop the pulse"
         );
     }
 

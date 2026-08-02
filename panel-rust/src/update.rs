@@ -1435,13 +1435,39 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             let thread_id = thread.thread_id.clone();
             let provider = thread.provider.clone();
             let profile_name = thread.profile_name.clone();
+            if provider.is_empty() {
+                return (
+                    vec![],
+                    vec![
+                        Dirty::ThreadRow {
+                            thread_id: thread_id.clone(),
+                        },
+                        Dirty::Capabilities { thread_id },
+                    ],
+                );
+            }
+            // mcp-servers-settings follow-up: mark the probe in flight
+            // *here*, in the same reducer call that dispatches
+            // `Effect::ProbeProvider`, not from inside the effect executor
+            // -- same "model mutation happens in `update`, never in the
+            // async effect body" convention every other in-flight tracker
+            // in this file already follows (`mcp_operations_in_flight`,
+            // `recover_session_operations_in_flight`, etc).
+            model.provider_probes_in_flight.insert(provider.clone());
             (
-                if provider.is_empty() { vec![] } else { vec![Effect::ProbeProvider { real_index: idx, provider, profile_name }] },
+                vec![Effect::ProbeProvider {
+                    real_index: idx,
+                    provider,
+                    profile_name,
+                }],
                 vec![
                     Dirty::ThreadRow {
                         thread_id: thread_id.clone(),
                     },
-                    Dirty::Capabilities { thread_id },
+                    Dirty::Capabilities {
+                        thread_id: thread_id.clone(),
+                    },
+                    Dirty::ProviderSwitch { thread_id },
                 ],
             )
         }
@@ -2491,6 +2517,17 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     model.provider_errors.insert(provider.clone(), error.clone());
                     dirty.push(show_toast(model, "error", format!("Provider {provider} unavailable: {error}")));
                 }
+            }
+            // mcp-servers-settings follow-up: the probe's acquire+release
+            // round-trip (`ProbeProvider` dispatch above) has now
+            // completed either way -- clear the in-flight marker so the
+            // chat-view loading pulse clears, regardless of Ok/Err (an
+            // error still ends the *loading* state even though it also
+            // populates provider_errors/toast separately above).
+            if model.provider_probes_in_flight.remove(provider) {
+                dirty.push(Dirty::ProviderSwitch {
+                    thread_id: model.threads[target_index].thread_id.clone(),
+                });
             }
             continue;
         }
@@ -3796,8 +3833,17 @@ mod tests {
                 },
                 Dirty::Capabilities {
                     thread_id: "thread-0".to_owned()
+                },
+                Dirty::ProviderSwitch {
+                    thread_id: "thread-0".to_owned()
                 }
             ]
+        );
+        assert!(
+            model
+                .provider_probes_in_flight
+                .contains("codex-acp"),
+            "dispatching the probe effect must mark it in flight for the chat-view pulse"
         );
 
         // Once a real session has attached, the same message must be a
@@ -3822,6 +3868,109 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    // mcp-servers-settings follow-up: the chat-view pulsing "Switching
+    // provider..." indicator's loading-state transition. Covers the pool
+    // probe's start (this test) and both ways it can end (the two tests
+    // below), keyed off `Model::provider_probes_in_flight` /
+    // `sync::chat_view_provider_switching`.
+    #[test]
+    fn provider_probe_completion_clears_in_flight_on_success() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::ProviderProbe {
+                        provider: "codex-acp".to_owned(),
+                        result: Ok(()),
+                    },
+                }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            !model.provider_probes_in_flight.contains("codex-acp"),
+            "a successful probe must clear the in-flight marker so the pulse stops"
+        );
+        assert!(
+            !model.provider_errors.contains_key("codex-acp"),
+            "a successful probe must not leave a stale failure behind"
+        );
+        assert!(dirty.contains(&Dirty::ProviderSwitch {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn provider_probe_completion_clears_in_flight_on_failure_too() {
+        // The *loading* half of this must end on an error just as much as
+        // on success -- only the error *text* additionally goes through
+        // provider_errors/the toast (existing behavior, unchanged here).
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::ProviderProbe {
+                        provider: "codex-acp".to_owned(),
+                        result: Err("auth required".to_owned()),
+                    },
+                }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            !model.provider_probes_in_flight.contains("codex-acp"),
+            "a failed probe must still clear the in-flight marker so the pulse stops"
+        );
+        assert_eq!(
+            model.provider_errors.get("codex-acp").map(String::as_str),
+            Some("auth required"),
+            "the failure itself must still land in provider_errors as before"
+        );
+        assert!(dirty.contains(&Dirty::ProviderSwitch {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn provider_probe_completion_with_no_prior_in_flight_marker_is_a_quiet_no_op() {
+        // A probe result arriving for a provider this model never marked
+        // in flight (e.g. a stale/duplicate event, or provider_errors
+        // populated some other way in a future refactor) must not emit a
+        // spurious ProviderSwitch dirty -- there is nothing for the chat
+        // view to un-pulse.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::ProviderProbe {
+                        provider: "codex-acp".to_owned(),
+                        result: Ok(()),
+                    },
+                }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
     }
 
     #[test]
