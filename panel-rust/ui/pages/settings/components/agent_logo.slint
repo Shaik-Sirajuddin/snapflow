@@ -11,6 +11,20 @@ import { Icon } from "../../../base/icon.slint";
 // LICENSE). Any unknown id falls back to the same `sparkles` placeholder
 // `Icon` the rest of the settings UI uses.
 //
+// ID MISMATCH FIX: `AgentCatalogEntry.id` (`protocol_types.rs`) is
+// populated verbatim from whatever the gateway's live `agents/list` RPC
+// returns, which in turn is the ACP registry's own id
+// (`acpx/acpx-registry/registry.fallback.json`) -- `"claude-acp"`,
+// `"codex-acp"`, `"gemini"`. Those are NOT the same strings as the
+// short/transitional aliases (`"codex"`, `"claude"`) `skills_manager::
+// agent_registry` separately tracks (see that module's own `aliases`
+// field doc comment). Every branch below therefore matches BOTH the
+// real registry id and its known short alias, so a live card renders
+// its brand mark regardless of which form the catalog happens to hand
+// this component today. `"gemini-cli"` has no alias in the skill
+// registry but is kept alongside `"gemini"` since it's the more
+// descriptive/likely id and costs nothing extra to also match.
+//
 // COLORIZE, per mark: brand marks that carry their own real brand color
 // (Claude orange, Gemini purple) render un-colorized so they show in their
 // native colors -- tinting them to `Theme.text-*` would destroy the brand.
@@ -30,7 +44,7 @@ export component AgentLogo {
     width: size;
     height: size;
 
-    if root.agent-id == "claude-code" : Image {
+    if root.agent-id == "claude-code" || root.agent-id == "claude-acp" || root.agent-id == "claude" : Image {
         width: root.size;
         height: root.size;
         image-fit: contain;
@@ -38,7 +52,7 @@ export component AgentLogo {
         source-clip-height: 24;
         source: @image-url("../../../assets/logos/claude-code.svg");
     }
-    if root.agent-id == "gemini-cli" : Image {
+    if root.agent-id == "gemini-cli" || root.agent-id == "gemini" : Image {
         width: root.size;
         height: root.size;
         image-fit: contain;
@@ -46,7 +60,7 @@ export component AgentLogo {
         source-clip-height: 24;
         source: @image-url("../../../assets/logos/gemini-cli.svg");
     }
-    if root.agent-id == "codex" : Image {
+    if root.agent-id == "codex" || root.agent-id == "codex-acp" : Image {
         width: root.size;
         height: root.size;
         image-fit: contain;
@@ -65,8 +79,12 @@ export component AgentLogo {
         source: @image-url("../../../assets/logos/amp.svg");
     }
     if root.agent-id != "claude-code"
+        && root.agent-id != "claude-acp"
+        && root.agent-id != "claude"
         && root.agent-id != "gemini-cli"
+        && root.agent-id != "gemini"
         && root.agent-id != "codex"
+        && root.agent-id != "codex-acp"
         && root.agent-id != "amp" : Icon {
         size: root.size;
         color: root.color;
