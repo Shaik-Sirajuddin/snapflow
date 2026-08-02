@@ -279,6 +279,19 @@ pub enum EffectResultMsg {
         provider: Option<String>,
         result: Result<String, EffectError>,
     },
+    /// mcp-servers-settings follow-up: dispatched synchronously from
+    /// `dispatch::dispatch_compose_send_maybe_attach`, in the same call
+    /// that kicks off `AgentBridge::attach_deferred_thread_with_config_
+    /// options` for a deferred thread's first message -- marks
+    /// `Model::first_attach_in_flight` before the background attach has
+    /// any chance to resolve, so the chat-view pulsing indicator can show
+    /// on the very next frame. Not a `Result` wrapper like the other
+    /// variants here (there is nothing to fail synchronously that isn't
+    /// already routed through `SessionAttached { result: Err(..) }`
+    /// immediately after this dispatch) -- purely a "this started" marker.
+    SessionAttachStarted {
+        thread_id: String,
+    },
     SkillWritten(Result<(), EffectError>),
     SkillCreated(Result<std::path::PathBuf, EffectError>),
     SkillPromoted(Result<(), EffectError>),

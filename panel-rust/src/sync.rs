@@ -146,6 +146,16 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_selected_provider_switching(chat_view_provider_switching(model));
             }
         }
+        Dirty::ThreadAttaching { thread_id } => {
+            // Same displayed-thread gate as ProviderSwitch/Connection
+            // above: a background thread's first-attach resolving must
+            // not clobber the singleton pulse property for whatever
+            // thread is actually on screen.
+            if displayed_thread_for_id(model, thread_id).is_some() {
+                component
+                    .set_selected_first_attach_in_flight(chat_view_first_attach_in_flight(model));
+            }
+        }
         Dirty::Toast => {
             component.set_toast_message(model.toast_message.clone().into());
             component.set_toast_kind(model.toast_kind.clone().into());
@@ -1379,6 +1389,25 @@ fn chat_view_provider_switching(model: &Model) -> bool {
         .is_some_and(|thread| model.provider_probes_in_flight.contains(&thread.provider))
 }
 
+/// True while the currently selected/displayed thread's FIRST real ACP
+/// session attach (deferred to first send -- `dispatch::dispatch_compose_
+/// send_maybe_attach`) is in flight (`Model::first_attach_in_flight`,
+/// populated by `EffectResultMsg::SessionAttachStarted` and cleared either
+/// by `update_frame`'s `frame.thread_list_snapshot` fold on success or by
+/// `SessionAttached`'s `Err` arm / `AgentEvent::Error` on failure). Drives
+/// the chat-view pulsing "Starting new thread..." indicator
+/// (`ChatArea.first-attach-in-flight`) -- same "keyed off the selected
+/// thread's own identity, not any in-flight attach anywhere" contract as
+/// `chat_view_provider_switching` above (there keyed by provider, here by
+/// thread_id since this is inherently a per-thread transition), and same
+/// pure, `ChatPanel`-free shape so it's unit-testable without a live
+/// Slint platform.
+fn chat_view_first_attach_in_flight(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.first_attach_in_flight.contains(&thread.thread_id))
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -1536,6 +1565,11 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
             // in flight, and nothing else re-fires for a pure selection
             // change, so recompute the singleton pulse property here too.
             component.set_selected_provider_switching(chat_view_provider_switching(model));
+            // mcp-servers-settings follow-up: same reasoning again -- a
+            // thread switch can land on a thread whose OWN first-attach
+            // is (or isn't) in flight.
+            component
+                .set_selected_first_attach_in_flight(chat_view_first_attach_in_flight(model));
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());
@@ -1905,6 +1939,43 @@ mod tests {
         model.provider_probes_in_flight.remove("codex-acp");
         assert!(
             !chat_view_provider_switching(&model),
+            "clearing the in-flight marker must stop the pulse"
+        );
+    }
+
+    /// mcp-servers-settings follow-up: same "keyed off the selected
+    /// thread's own identity" contract as
+    /// `chat_view_provider_switching_is_keyed_to_the_selected_threads_own_provider`
+    /// above, for the sibling first-attach loading signal that drives the
+    /// chat-view pulsing "Starting new thread..." indicator -- here keyed
+    /// by thread_id rather than provider, since a first-attach is
+    /// inherently a per-thread transition.
+    #[test]
+    fn chat_view_first_attach_in_flight_is_keyed_to_the_selected_threads_own_thread_id() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !chat_view_first_attach_in_flight(&model),
+            "no attach in flight yet -- no pulse"
+        );
+
+        model
+            .first_attach_in_flight
+            .insert("some-other-thread".to_owned());
+        assert!(
+            !chat_view_first_attach_in_flight(&model),
+            "an in-flight attach for a thread that isn't selected must not pulse this \
+             thread's chat view"
+        );
+
+        model.first_attach_in_flight.insert("thread-0".to_owned());
+        assert!(
+            chat_view_first_attach_in_flight(&model),
+            "an in-flight attach for the selected thread's own id must pulse"
+        );
+
+        model.first_attach_in_flight.remove("thread-0");
+        assert!(
+            !chat_view_first_attach_in_flight(&model),
             "clearing the in-flight marker must stop the pulse"
         );
     }

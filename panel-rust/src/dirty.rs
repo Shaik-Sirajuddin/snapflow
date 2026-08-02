@@ -317,6 +317,19 @@ pub enum Dirty {
     ProviderSwitch {
         thread_id: String,
     },
+    /// mcp-servers-settings follow-up: `thread_id`'s first-session-attach
+    /// (`Model::first_attach_in_flight`) loading state changed -- start
+    /// on `dispatch::dispatch_compose_send_maybe_attach`'s
+    /// `EffectResultMsg::SessionAttachStarted` dispatch, end either on
+    /// `update_frame`'s `frame.thread_list_snapshot` fold observing
+    /// `session_id` go `None` -> `Some` (success) or on `SessionAttached`'s
+    /// `Err` arm / `AgentEvent::Error` (failure). Same singleton-property,
+    /// displayed-thread-gated shape as `ProviderSwitch`/`Connection`
+    /// above -- see `sync::chat_view_first_attach_in_flight`'s doc
+    /// comment.
+    ThreadAttaching {
+        thread_id: String,
+    },
     Error {
         thread_id: String,
         detail: ErrorDetail,

@@ -27,6 +27,10 @@ export component ChatViewStack inherits Rectangle {
     // whichever delegate is actually visible" convention as
     // connection-status/last-error/sending above.
     in property <bool> provider-switching: false;
+    // mcp-servers-settings follow-up: same forwarding convention as
+    // provider-switching above, for the sibling first-attach-in-flight
+    // loading signal.
+    in property <bool> first-attach-in-flight: false;
     in property <bool> agent-unauthenticated: false;
     in property <[PlanEntryItem]> plan-entries: [];
     in property <string> live-session-title: "";
@@ -159,6 +163,7 @@ export component ChatViewStack inherits Rectangle {
         connection-status: root.connection-status;
         last-error: root.last-error;
         provider-switching: root.provider-switching;
+        first-attach-in-flight: root.first-attach-in-flight;
         agent-unauthenticated: root.agent-unauthenticated;
         plan-entries: root.plan-entries;
         live-session-title: root.live-session-title;
@@ -270,6 +275,7 @@ export component ChatViewStack inherits Rectangle {
         connection-status: root.connection-status;
         last-error: root.last-error;
         provider-switching: root.provider-switching;
+        first-attach-in-flight: root.first-attach-in-flight;
         agent-unauthenticated: root.agent-unauthenticated;
         plan-entries: root.plan-entries;
         live-session-title: root.live-session-title;

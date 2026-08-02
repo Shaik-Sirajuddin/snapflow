@@ -177,6 +177,16 @@ export component ChatPanel inherits Window {
     // indicator, distinct from selected-provider-unavailable above
     // (which is the probe's stored *failure*, not its in-progress state).
     in property <bool> selected-provider-switching: false;
+    // mcp-servers-settings follow-up: true while the currently selected
+    // thread's FIRST real ACP session attach (deferred to first send --
+    // see dispatch.rs's dispatch_compose_send_maybe_attach) is in flight
+    // (Model.first_attach_in_flight) -- drives ChatArea's chat-view-local
+    // pulsing "Starting new thread..." indicator, same mechanism as
+    // selected-provider-switching above but a distinct, temporally
+    // non-overlapping scenario (a provider switch can only happen BEFORE
+    // a thread has a real session; this is the window that follows,
+    // right after the first send kicks the attach off).
+    in property <bool> selected-first-attach-in-flight: false;
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     // Skill-manager backend addition (skill_discovery_backend phase) --
     // populated by `lib.rs` from `models::to_skill_options`. Plumbed
@@ -666,6 +676,7 @@ export component ChatPanel inherits Window {
                     && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
                     && !root.selected-provider-unavailable;
                 provider-switching: root.selected-provider-switching;
+                first-attach-in-flight: root.selected-first-attach-in-flight;
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
@@ -799,6 +810,7 @@ export component ChatPanel inherits Window {
                     && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
                     && !root.selected-provider-unavailable;
                 provider-switching: root.selected-provider-switching;
+                first-attach-in-flight: root.selected-first-attach-in-flight;
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }

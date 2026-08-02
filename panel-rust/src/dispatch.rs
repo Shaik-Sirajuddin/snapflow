@@ -611,10 +611,11 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
             .as_ref()
             .is_some_and(|bridge| bridge.is_deferred(real_idx));
         if is_deferred {
-            let (provider, profile, desired_config_options) = {
+            let (thread_id, provider, profile, desired_config_options) = {
                 let model = panel.model.borrow();
                 match model.threads.get(real_idx) {
                     Some(thread) => (
+                        thread.thread_id.clone(),
                         thread.provider.clone(),
                         thread.profile_name.clone(),
                         thread
@@ -627,9 +628,22 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
                             })
                             .collect(),
                     ),
-                    None => (String::new(), None, Vec::new()),
+                    None => (String::new(), String::new(), None, Vec::new()),
                 }
             };
+            // mcp-servers-settings follow-up: mark the first-attach pulse
+            // in flight *here*, synchronously, before the background
+            // attach below has any chance to resolve -- same "mark it in
+            // the same call that dispatches the real work" convention as
+            // `SettingsMsg::ProfileSelected`'s `provider_probes_in_flight`
+            // insert. See `Model::first_attach_in_flight`'s doc comment
+            // for the full start/end contract.
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(crate::effect::EffectResultMsg::SessionAttachStarted {
+                    thread_id: thread_id.clone(),
+                }),
+            );
             if let Some(bridge) = panel.bridge.as_mut() {
                 let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
                 if let Err(error) = bridge.attach_deferred_thread_with_config_options(
