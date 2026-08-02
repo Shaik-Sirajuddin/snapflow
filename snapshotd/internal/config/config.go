@@ -331,17 +331,47 @@ func exeSuffix() string {
 // Checks, in order:
 //  1. The real packaged-install layout: a `snapflow`/`snapflow.exe`
 //     sibling right next to the running snapshotd/snapflowd binary's own
-//     directory (Linux/macOS tarball layout -- both binaries are copied
-//     into the same "bin/" dir by build-linux.yml/build-macos.yml's
-//     package step), or one level up in a sibling "Snapflow" directory
-//     (Windows: WINDOWS_DEPLOY installs snapflow.exe directly into
+//     directory (a layout that build-linux.yml/build-macos.yml's package
+//     step does NOT actually produce -- see candidate 2 below -- but is
+//     kept as the cheapest, first-tried check in case some other
+//     packaging path ever does flatten it this way).
+//  2. One level up, a sibling "Snapflow" directory (Windows packaging
+//     layout: WINDOWS_DEPLOY installs snapflow.exe directly into
 //     CMAKE_INSTALL_PREFIX, which build-windows.yml's package job zips as
 //     a top-level "Snapflow/" dir sitting beside "bin/snapflowd.exe" --
 //     this exactly matches a real user's install root, e.g.
-//     %LOCALAPPDATA%\snapflow\Snapflow\snapflow.exe).
-//  2. The macOS .app bundle layout (Snapflow.app/Contents/MacOS/Snapflow,
-//     OUTPUT_NAME "Snapflow" per CMakeLists.txt's APPLE branch).
-//  3. A `shotcut/build*/src/snapflow(.exe)` glob candidate under each
+//     %LOCALAPPDATA%\snapflow\Snapflow\snapflow.exe), OR a sibling
+//     "Snapflow.app" directory (the REAL Linux packaged-tarball layout --
+//     confirmed against build-linux.yml's package step and
+//     build-snapflow.sh's `create_startup_script`/non-Darwin branch:
+//     `FINAL_INSTALL_DIR="$INSTALL_DIR/Snapflow/Snapflow.app"` is used for
+//     Linux too, not just macOS, and its own `tar -C Snapflow -cJvf
+//     "$tarball" Snapflow.app` archives that whole directory verbatim, so
+//     the Linux install bundle really does end up with a top-level
+//     "Snapflow.app/" directory sitting beside "bin/snapflowd" -- despite
+//     the ".app" suffix, this is a plain directory on Linux, not a macOS
+//     bundle). Two entry points exist inside it: a `snapflow` wrapper
+//     script directly under "Snapflow.app/" (written by the same
+//     function, execs `bin/snapflow` after setting
+//     LD_LIBRARY_PATH/MLT_*/QT_PLUGIN_PATH -- required for the Qt/MLT
+//     binary to find its plugins when launched standalone, so it is
+//     strongly preferred over the raw binary), and the raw ELF itself at
+//     "Snapflow.app/bin/snapflow" (checked only as a fallback in case a
+//     repackage ever ships without the wrapper). This exact gap
+//     (unhandled "Snapflow.app" nesting on Linux) was still live after
+//     0857316e -- that commit's own candidates only covered the flat
+//     bin/-sibling and Windows-flat "Snapflow/" shapes, matching neither
+//     real Linux layout, and reproduced the exact real failure signature
+//     reported live: a daemon at
+//     "~/.local/share/snapflow/bin/snapflowd" fell through every
+//     candidate and landed on the final dev-checkout-shaped fallback,
+//     "~/.local/share/snapflow/sap-rust/target/debug/sap-rust".
+//  3. The macOS .app bundle layout (Snapflow.app/Contents/MacOS/Snapflow,
+//     OUTPUT_NAME "Snapflow" per CMakeLists.txt's APPLE branch) --
+//     distinct from candidate 2's Linux "Snapflow.app/" directory despite
+//     the shared name: this is the real macOS bundle's nested
+//     Contents/MacOS layout.
+//  4. A `shotcut/build*/src/snapflow(.exe)` glob candidate under each
 //     ancestor root, for a plain dev checkout/build dir, preferring a
 //     build dir name containing "release" over any other match.
 func discoverShotcutBinPath(roots []string) string {
@@ -349,13 +379,24 @@ func discoverShotcutBinPath(roots []string) string {
 
 	if execPath, err := os.Executable(); err == nil {
 		execDir := filepath.Dir(execPath)
-		// Same directory as the daemon binary (Linux/macOS packaging layout).
+		// Same directory as the daemon binary -- see candidate 1's doc
+		// comment above; kept as a cheap first check even though the real
+		// CI packaging step does not produce this shape today.
 		if sibling := filepath.Join(execDir, "snapflow"+suffix); fileExists(sibling) {
 			return sibling
 		}
 		// One level up, sibling "Snapflow" dir (Windows packaging layout).
 		if sibling := filepath.Join(execDir, "..", "Snapflow", "snapflow"+suffix); fileExists(sibling) {
 			return sibling
+		}
+		// One level up, sibling "Snapflow.app" dir (real Linux packaged-
+		// tarball layout -- see candidate 2's doc comment above). Prefer
+		// the env-setting wrapper script over the raw nested binary.
+		if wrapper := filepath.Join(execDir, "..", "Snapflow.app", "snapflow"+suffix); fileExists(wrapper) {
+			return wrapper
+		}
+		if raw := filepath.Join(execDir, "..", "Snapflow.app", "bin", "snapflow"+suffix); fileExists(raw) {
+			return raw
 		}
 		// macOS .app bundle, one level up from the daemon's own bin/ dir.
 		if matches, err := filepath.Glob(filepath.Join(execDir, "..", "*.app", "Contents", "MacOS", "Snapflow")); err == nil {
