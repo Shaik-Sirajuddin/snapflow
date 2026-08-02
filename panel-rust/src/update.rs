@@ -1408,8 +1408,10 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 thread.provider = resolved_agent;
             }
             let thread_id = thread.thread_id.clone();
+            let provider = thread.provider.clone();
+            let profile_name = thread.profile_name.clone();
             (
-                vec![],
+                if provider.is_empty() { vec![] } else { vec![Effect::ProbeProvider { real_index: idx, provider, profile_name }] },
                 vec![
                     Dirty::ThreadRow {
                         thread_id: thread_id.clone(),
@@ -2416,6 +2418,16 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // hydration makes the identity available.
             continue;
         };
+        if let crate::protocol_types::AgentEvent::ProviderProbe { provider, result } = &bridge_event.event {
+            match result {
+                Ok(()) => { model.provider_errors.remove(provider); }
+                Err(error) => {
+                    model.provider_errors.insert(provider.clone(), error.clone());
+                    dirty.push(show_toast(model, "error", format!("Provider {provider} unavailable: {error}")));
+                }
+            }
+            continue;
+        }
         let target_thread_id = model.threads[target_index].thread_id.clone();
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
@@ -2583,6 +2595,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 // per-event beyond letting the frame refresh.
             }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
+            | crate::protocol_types::AgentEvent::ProviderProbe { .. }
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
@@ -3704,10 +3717,11 @@ mod tests {
             model.threads[0].provider, "codex-acp",
             "Provider picker must update thread.provider (agent id) for deferred attach"
         );
-        assert!(
-            effects.is_empty(),
-            "no backend to notify yet -- nothing to send"
-        );
+        assert_eq!(effects, vec![Effect::ProbeProvider {
+            real_index: 0,
+            provider: "codex-acp".to_owned(),
+            profile_name: Some("codex-tools".to_owned()),
+        }]);
         assert_eq!(
             dirty,
             vec![

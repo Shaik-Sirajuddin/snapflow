@@ -389,6 +389,7 @@ pub struct Model {
     pub toast_message: String,
     pub toast_kind: String,
     pub toast_seq: i32,
+    pub provider_errors: HashMap<String, String>,
     pub active_skill_name: String,
     pub active_skill_path: String,
     /// PUI-010: the actual SKILL.md file path (active_skill_path is the

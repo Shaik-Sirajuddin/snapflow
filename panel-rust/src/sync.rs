@@ -1286,6 +1286,23 @@ fn registry_mcp_servers_excluding_builtin(
         .collect()
 }
 
+/// True when the currently selected thread's provider has a stored
+/// pool-acquire probe failure (`Model::provider_errors`, populated from
+/// `AgentEvent::ProviderProbe` on a provider-picker toggle -- see
+/// `update_frame`'s `ProviderProbe` arm). Keyed off the *selected*
+/// thread's provider specifically, not "any provider_errors entry
+/// exists" -- a stale probe failure for a provider the user has since
+/// switched away from (or a different thread's provider) must not block
+/// Send on an unrelated, healthy thread. Extracted as a pure,
+/// `ChatPanel`-free function so it's unit-testable without a live Slint
+/// platform, same convention as
+/// [`registry_mcp_servers_excluding_builtin`].
+fn selected_provider_unavailable(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.provider_errors.contains_key(&thread.provider))
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -1410,6 +1427,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     component.set_mcp_server_submit_busy(mcp_server_submit_busy);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
     component.set_agent_catalog_fetched(model.agent_catalog_fetched);
+    component.set_selected_provider_unavailable(selected_provider_unavailable(model));
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),
     ));
@@ -1606,6 +1624,55 @@ mod tests {
              (models::builtin_snapshotd_option) is the only row rendered for the \
              built-in daemon -- a real registry sync must never produce a second, \
              visually-duplicate 'snapflow' row"
+        );
+    }
+
+    fn model_with_one_thread(provider: &str) -> Model {
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-0".to_owned(),
+            provider: provider.to_owned(),
+            ..Default::default()
+        });
+        model.selected_thread = 0;
+        model
+    }
+
+    /// Regression test for the provider-toggle pool-auth-probe feature
+    /// (`AgentEvent::ProviderProbe` -> `Model::provider_errors`): Send
+    /// must be gated on the *selected* thread's own provider, not on
+    /// `provider_errors` being non-empty anywhere -- a stored failure for
+    /// a provider the selected thread isn't even using must not block
+    /// Send on that thread.
+    #[test]
+    fn selected_provider_unavailable_is_keyed_to_the_selected_threads_own_provider() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !selected_provider_unavailable(&model),
+            "no stored provider error yet -- Send must stay enabled"
+        );
+
+        model
+            .provider_errors
+            .insert("some-other-provider".to_owned(), "auth failed".to_owned());
+        assert!(
+            !selected_provider_unavailable(&model),
+            "a stored error for a provider the selected thread isn't using must not \
+             block Send on this thread"
+        );
+
+        model
+            .provider_errors
+            .insert("codex-acp".to_owned(), "auth failed".to_owned());
+        assert!(
+            selected_provider_unavailable(&model),
+            "a stored error for the selected thread's own provider must block Send"
+        );
+
+        model.provider_errors.remove("codex-acp");
+        assert!(
+            !selected_provider_unavailable(&model),
+            "clearing the selected thread's provider error must re-enable Send"
         );
     }
 

@@ -3138,6 +3138,7 @@ fn spawn_event_forwarder(
                     *slot_for_task.usage.lock().expect("usage mutex poisoned") = (*used, *size);
                 }
                 AgentEvent::Error(_) => {}
+                AgentEvent::ProviderProbe { .. } => {}
                 AgentEvent::PermissionRequest(req) => {
                     slot_for_task
                         .pending_requests
@@ -3983,6 +3984,33 @@ impl AgentBridge {
             base_url,
             mcp_servers,
         )
+    }
+
+    pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) {
+        let Some(slot) = self.slots.get(idx) else { return };
+        let Some(project_dir) = thread_project_dir(slot.project_path_snapshot().as_deref(), &self.session_cwd_override) else {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result: Err("no active project is available".to_owned()) } });
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("no gateway is configured for {provider}")) } });
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers) else {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("could not initialize the gateway pool for {provider}")) } });
+            return;
+        };
+        let events = self.events.clone();
+        let key = acpx_client::pool::PoolKey::new(project_dir.to_string_lossy().into_owned(), provider.clone(), crate::gateway_actor::provider_profile_key(profile_name.as_deref()));
+        let preview_thread_id = format!("provider-probe:{idx}:{provider}");
+        self.runtime.spawn(async move {
+            let result = match pool.acquire(key, preview_thread_id, acpx_client::pool::OpenSpec { saved_session_id: None }).await {
+                Ok(lease) => pool.release(&lease).await.map_err(|error| format!("provider probe cleanup failed: {error}")),
+                Err(error) => Err(error.to_string()),
+            };
+            events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result } });
+        });
     }
 
     /// Notify every pool for the settings gateway that its admin-plane MCP

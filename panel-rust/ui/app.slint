@@ -165,6 +165,11 @@ export component ChatPanel inherits Window {
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <bool> agent-catalog-fetched: false;
+    // provider-toggle-auth-probe: true when the currently selected
+    // thread's provider has a stored pool-acquire probe failure
+    // (Model.provider_errors, populated from AgentEvent::ProviderProbe).
+    // Gates Send the same way agent-catalog-fetched does below.
+    in property <bool> selected-provider-unavailable: false;
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     // Skill-manager backend addition (skill_discovery_backend phase) --
     // populated by `lib.rs` from `models::to_skill_options`. Plumbed
@@ -651,7 +656,8 @@ export component ChatPanel inherits Window {
                     : "agent . ask";
                 inputs-enabled: root.gateway-ready
                     && !(threads.length > 0 && threads[selected-thread].archived)
-                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0);
+                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
+                    && !root.selected-provider-unavailable;
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
@@ -782,7 +788,8 @@ export component ChatPanel inherits Window {
                     : "agent . ask";
                 inputs-enabled: root.gateway-ready
                     && !(threads.length > 0 && threads[selected-thread].archived)
-                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0);
+                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
+                    && !root.selected-provider-unavailable;
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }

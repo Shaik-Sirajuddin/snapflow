@@ -549,6 +549,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     panel.execute_send_prompt_real(real_index, &text);
                 }
             }
+            Effect::ProbeProvider { real_index, provider, profile_name } => {
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    bridge.probe_provider_selection(real_index, provider, profile_name);
+                }
+            }
             Effect::CancelGeneration { real_index } => {
                 panel.execute_cancel_generation_real(real_index);
             }
