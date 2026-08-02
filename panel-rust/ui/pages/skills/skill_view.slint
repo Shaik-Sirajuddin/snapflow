@@ -115,15 +115,6 @@ export component SkillEditorView inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
-                    if root.skill-saving : Text {
-                        text: "Saving…";
-                        color: Theme.text-muted;
-                        font-size: 9px * Theme.font-scale;
-                        font-family: Theme.font-mono;
-                        vertical-alignment: center;
-                        horizontal-stretch: 0;
-                    }
-
                     // Variable-width text actions — token-colored pills
                     // (Button is fixed-width; long "Open in …" labels need flex).
                     TextPillButton {
