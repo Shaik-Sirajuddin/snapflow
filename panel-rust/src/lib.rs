@@ -523,6 +523,22 @@ fn load_scoped_panel_prefs(
 /// show-global-skills into the selected JSON tier. Existing unrelated
 /// fields (harness, dev mode, ...) are retained by the read-modify-write
 /// operation.
+///
+/// `settings_page.slint`'s `SettingsTopTabs` "[Project | Global]" switcher
+/// (`top_tabs.slint`) shows the Project tab unconditionally -- it has no
+/// wiring to hide/disable itself when no project is currently open (i.e.
+/// `RUI_PANEL_PROJECT_ROOT` unset, so `SettingsPaths::project` is `None`).
+/// A user can therefore land on/select "Project" and hit Save with no
+/// project open at all. `load_scoped_panel_prefs` already treats that same
+/// "project scope unavailable" condition leniently -- callers fall back to
+/// `load_panel_prefs`'s Global read (see its two call sites above). Saving
+/// used to be the asymmetric case: it hard-failed with `settings scope
+/// "project" is unavailable`, surfaced to the user as "failed to save
+/// panel settings; settings scope project is unavailable" and silently
+/// discarding whatever the user just edited. Since there is no project to
+/// hold a project-scoped file in that state, fall back to writing Global
+/// instead -- symmetric with the read side, and it actually persists the
+/// user's change instead of losing it.
 fn save_panel_prefs_to_json(
     scope: &str,
     defaults: &PanelDefaults,
@@ -530,8 +546,13 @@ fn save_panel_prefs_to_json(
     show_global_skills: bool,
 ) -> Result<(), String> {
     let paths = settings_file::SettingsPaths::from_env();
-    let path = scoped_settings_path(&paths, scope)
-        .ok_or_else(|| format!("settings scope {scope:?} is unavailable"))?;
+    let effective_scope = if scope == "project" && paths.project.is_none() {
+        "global"
+    } else {
+        scope
+    };
+    let path = scoped_settings_path(&paths, effective_scope)
+        .ok_or_else(|| format!("settings scope {effective_scope:?} is unavailable"))?;
     let mut doc = settings_file::load_document(path).map_err(|error| error.to_string())?;
     doc.schema_version = 1;
     doc.default_profile = defaults.profile_name.clone();
@@ -792,6 +813,49 @@ mod scoped_panel_prefs_tests {
             global_prefs.show_global_skills,
             "a project-scope write must not affect the separately-read global value"
         );
+    }
+
+    /// Real-user-reported bug: `settings_page.slint`'s Project/Global
+    /// scope switcher (`top_tabs.slint`) shows "Project" unconditionally,
+    /// with no gating on whether a project is actually open. Saving with
+    /// scope "project" while `RUI_PANEL_PROJECT_ROOT` is unset used to hard
+    /// fail with `settings scope "project" is unavailable`, surfaced to the
+    /// user as "failed to save panel settings; settings scope project is
+    /// unavailable" -- and the user's edited value was never persisted
+    /// anywhere. This proves the fix: with no project open, a "project"
+    /// scope save falls back to Global (symmetric with
+    /// `load_scoped_panel_prefs`'s already-lenient read-side fallback) and
+    /// the value round-trips through the Global file instead of being
+    /// dropped.
+    #[test]
+    fn project_scope_save_falls_back_to_global_when_no_project_is_open() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::remove_var("RUI_PANEL_PROJECT_ROOT");
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        let paths = settings_file::SettingsPaths::from_env();
+        assert!(
+            paths.project.is_none(),
+            "test setup: no project should be open"
+        );
+
+        save_panel_prefs_to_json("project", &defaults_with_background(true), None, true)
+            .expect("save must fall back to global instead of hard-failing");
+
+        let mut warnings = Vec::new();
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global");
+        assert!(
+            global_prefs.defaults.background_session,
+            "the value must have actually been persisted, into the global file"
+        );
+
+        let global_doc =
+            settings_file::load_document(&paths.global).expect("read global doc");
+        assert_eq!(global_doc.background_session_default, Some(true));
     }
 }
 
