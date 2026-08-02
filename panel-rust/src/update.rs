@@ -231,10 +231,35 @@ pub(crate) fn visible_thread_row(
                 .map(|c| c.description.clone())
                 .unwrap_or_default(),
             background: cached.as_ref().map(|c| c.background).unwrap_or(false),
+            // Bug (default-thread-provider-not-shown): unlike model/
+            // project_path/project_name/project_instance_live (which only
+            // ever live on the AgentBridge-collected frame snapshot, with
+            // no equivalent field on `ThreadModel` to fall back to),
+            // `provider` IS also tracked directly on `ThreadModel` (set at
+            // thread-creation time from the seeded/configured default, see
+            // `cold_start_thread_specs`/`ThreadMsg::New`) and is reliably
+            // correct from the very first call, before any frame snapshot
+            // has ever run. `cached` is `None` on a thread's very first
+            // row build (cold-start seed, or a freshly `ThreadMsg::New`-
+            // created thread) -- with no fallback, this produced an empty
+            // `ThreadItem.provider` that stayed empty until some *unrelated*
+            // event (e.g. session attach on first send) happened to also
+            // trigger a `Dirty::ThreadRow` full resync, since
+            // `dirty.rs::diff_by_id` only emits ops for identity
+            // (insert/remove/move) changes, never for content changes on a
+            // row whose key/position didn't move -- so a corrected
+            // provider from a later frame snapshot folded into
+            // `model.thread_rows` never actually reached the Slint-facing
+            // `thread_model` for that already-inserted row. Falling back to
+            // `thread.provider` (not `String::default()`) on the first,
+            // cache-less build fixes exactly that gap: the sidebar/compose
+            // provider badge reflects the real provider immediately, and a
+            // later frame snapshot's own value (once collected) still wins
+            // once cached, same as before.
             provider: cached
                 .as_ref()
                 .map(|c| c.provider.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(|| thread.provider.clone().into()),
             model: cached.as_ref().map(|c| c.model.clone()).unwrap_or_default(),
             project_path: cached
                 .as_ref()
@@ -5300,6 +5325,67 @@ mod tests {
             &model.recoverable_sessions_model
         ));
         assert!(!dirty.is_empty());
+    }
+
+    /// Regression test (default-thread-provider-not-shown, real user
+    /// report): a cold-start seeded default thread's `ThreadSpec.provider`
+    /// is already correctly populated from the Settings-configured default
+    /// (`lib.rs::cold_start_thread_specs`, per commit a8058a45) -- that part
+    /// was never broken. The actual gap was downstream, in what reaches the
+    /// Slint-facing `ThreadItem` row: `thread_list_dirty_with_keys`'s
+    /// `Dirty::ThreadListDiff(RowOp::Insert { row, .. })` is exactly the
+    /// payload `sync.rs::apply_thread_ops` pushes into `model.thread_model`
+    /// (the real `thread_model` VecModel a live `ChatPanel` binds to) for a
+    /// brand-new row -- so asserting on it here pins the same value that
+    /// would actually reach Slint, not just `Model.threads[0].provider`.
+    /// Before the fix, `visible_thread_row`'s `cached` lookup (populated
+    /// only by a *later* frame snapshot) was `None` on this first build and
+    /// `provider` silently defaulted to `""` -- and because
+    /// `dirty::diff_by_id` only emits ops for identity (insert/remove/move)
+    /// changes, never content changes on an unchanged key/position, a later
+    /// frame snapshot's corrected provider never actually reached this
+    /// already-inserted row until an unrelated event (session attach on
+    /// first send) happened to also force a full `Dirty::ThreadRow` resync.
+    #[test]
+    fn cold_start_default_thread_row_insert_carries_the_configured_provider() {
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
+                crate::model::InitialState {
+                    threads: vec![crate::agent_bridge::ThreadSpec {
+                        display_name: "Chat".to_owned(),
+                        provider: "claude".to_owned(),
+                        session_id: None,
+                        profile_name: Some("claude".to_owned()),
+                        project_path: None,
+                    }],
+                    thread_ids: vec!["thread:0".to_owned()],
+                    selected_thread_id: None,
+                    permission_profiles: vec![],
+                    thread_states: vec![],
+                    startup_warnings: vec![],
+                    send_queues: vec![],
+                    onboarding_completed: false,
+                },
+            ))),
+        );
+        assert_eq!(model.threads[0].provider, "claude");
+        let insert_row_provider = dirty.iter().find_map(|d| match d {
+            Dirty::ThreadListDiff(ops) => ops.iter().find_map(|op| match op {
+                RowOp::Insert { row, .. } => Some(row.item.provider.to_string()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(
+            insert_row_provider.as_deref(),
+            Some("claude"),
+            "the seeded default thread's very first ThreadListDiff Insert row -- the \
+             exact payload sync.rs pushes into the Slint-facing thread_model -- must \
+             already carry the configured provider, not an empty string that only a \
+             later, unrelated event happens to correct"
+        );
     }
 
     #[test]
