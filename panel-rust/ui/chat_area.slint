@@ -461,6 +461,30 @@ export component ChatArea inherits Rectangle {
     // How far the message Flickable can scroll -- viewport-y ranges from
     // `-msg-max-scroll` (bottom) to 0 (top).
     property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
+    // mcp-servers-settings follow-up (infinite-scroll auto-load): the
+    // `flicked` handler below only ever fires from a real drag/wheel
+    // gesture, which needs the Flickable to actually be scrollable
+    // (`msg-max-scroll > 0`) to fire at all. A short thread whose
+    // loaded messages don't yet fill the viewport can have
+    // `has-older-messages: true` with nothing to scroll -- previously
+    // the persistent "Load older messages" button covered exactly this
+    // case; now that it's gone, auto-load has to cover it itself by
+    // eagerly paging in more history whenever there's room (and more
+    // pages) until the view either becomes scrollable or runs out of
+    // older pages. Called from both `changed has-older-messages` and
+    // `message-scroll`'s own `changed viewport-height` (the latter also
+    // re-checks after every successful page-in, so a thread needing
+    // several pages before it's scrollable keeps chaining automatically).
+    function maybe-load-older-messages() {
+        if has-older-messages && !loading-older-messages && root.msg-max-scroll <= 0px {
+            loading-older-messages = true;
+            message-scroll.pending-height-fix = true;
+            load-older-requested();
+        }
+    }
+    changed has-older-messages => {
+        root.maybe-load-older-messages();
+    }
     // Independent scroll position for the popup view (not synced with main message scroll)
     property <length> popup-scroll-y: 0px;
     // PROF-11: keep the live plan visible below the chat header without
@@ -969,13 +993,35 @@ export component ChatArea inherits Rectangle {
                 // except this one and settings_page.slint's (fixed
                 // alongside this for the same reported "scroll issues").
                 viewport-height: message-col.preferred-height;
+                // mcp-servers-settings follow-up (infinite-scroll auto-load):
+                // tracks the pre-fetch `viewport-height` and whether the
+                // *next* height change is expected to come from an older-
+                // messages page-in, so that change can compensate
+                // `viewport-y` (see `changed viewport-height` below) instead
+                // of a brand-new-message append (also grows viewport-height,
+                // but from the bottom, never needs this compensation).
+                property <length> prev-viewport-height: 0px;
+                property <bool> pending-height-fix: false;
                 // Live updates grow `viewport-height`; snap back to the bottom
                 // only while the user is following the latest message, so a
                 // read-back-in-history scroll position is never stolen.
+                // Otherwise, if this growth was just caused by paging in
+                // older history above the current view, shift viewport-y by
+                // exactly how much content was added so the message the
+                // user was reading stays anchored on screen -- without this
+                // the Flickable keeps viewport-y at the same absolute
+                // coordinate, which after prepending taller content above
+                // now points at different (newly-loaded) messages, reading
+                // as a jarring jump.
                 changed viewport-height => {
                     if (root.stick-to-bottom) {
                         self.viewport-y = -root.msg-max-scroll;
+                    } else if (self.pending-height-fix) {
+                        self.viewport-y -= (self.viewport-height - self.prev-viewport-height);
                     }
+                    self.prev-viewport-height = self.viewport-height;
+                    self.pending-height-fix = false;
+                    root.maybe-load-older-messages();
                 }
                 // A user scroll updates whether they're following the bottom
                 // and -- only a user-originated movement at the real top
@@ -986,6 +1032,7 @@ export component ChatArea inherits Rectangle {
                         && !loading-older-messages
                         && self.viewport-y >= -1px {
                         loading-older-messages = true;
+                        self.pending-height-fix = true;
                         load-older-requested();
                     }
                 }
@@ -1007,41 +1054,27 @@ export component ChatArea inherits Rectangle {
                 // class as the full-view popup's tool list below and the
                 // sidebar lists, just not fixed here yet until now.
                 spacing: 0px;
-                if has-older-messages : VerticalLayout {
+                // Pure scroll-triggered auto-load: the `flicked` handler
+                // above (real top boundary) is the ONLY way an older-
+                // messages fetch is triggered now -- no clickable
+                // affordance. This row is purely an in-flight indicator,
+                // visible only while `loading-older-messages` is true, and
+                // reuses the same pulsing-text formula as
+                // `root.provider-switching`'s "Switching provider..." line
+                // just below rather than inventing new visual chrome.
+                if has-older-messages && loading-older-messages : VerticalLayout {
                     spacing: 0px;
-                    Rectangle {
-                        height: 22px;
-                        border-radius: Theme.radius-sm;
-                        background: load-older-button.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
-                        animate background { duration: 100ms; }
-                        load-older-button := TouchArea {
-                            mouse-cursor: loading-older-messages ? default : pointer;
-                            accessible-role: button;
-                            accessible-label: "Load older messages";
-                            enabled: !loading-older-messages;
-                            accessible-action-default => {
-                                if !loading-older-messages {
-                                    loading-older-messages = true;
-                                    load-older-requested();
-                                }
-                            }
-                            clicked => {
-                                if !loading-older-messages {
-                                    loading-older-messages = true;
-                                    load-older-requested();
-                                }
-                            }
-                            changed has-hover => {
-                                CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
-                            }
-                        }
-                        Text {
-                            text: loading-older-messages ? "Loading older messages..." : "Load older messages";
-                            color: Theme.text-secondary;
-                            font-size: 10px * Theme.font-scale;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+                    height: 22px;
+                    alignment: center;
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                    Text {
+                        text: "Loading older messages...";
+                        color: Theme.text-secondary;
+                        opacity: blink;
+                        font-size: 10px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                     // This block is only ever visible alongside real message
                     // rows below it, so it always needs its own trailing gap.
