@@ -1015,17 +1015,29 @@ fn resolve_acpx_server_bin_from(
     if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
         return PathBuf::from(bin);
     }
+    // A real Windows install's `acpx-server` binary is named
+    // `acpx-server.exe` -- shotcut-rebrand's CMakeLists.txt installs it
+    // via `install(PROGRAMS $<TARGET_FILE:acpx-server> ...)` with no
+    // RENAME, and CMake's `TARGET_FILE` generator expression already
+    // includes the platform executable suffix. Every candidate below
+    // previously joined a bare `"acpx-server"` with no suffix, so
+    // `candidate.is_file()` could never match the installed
+    // `acpx-server.exe` on Windows -- it always fell through to the
+    // dev-checkout fallback (which doesn't exist on a packaged install),
+    // silently leaving `gateway-ready` false forever and the sidebar's
+    // "+ New Thread" button (`sidebar.slint`'s `enabled: root.gateway-
+    // ready`) permanently, silently disabled. `EXE_SUFFIX` is `""` on
+    // Unix, so this is a no-op there.
+    let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
+    let libexec_name = format!("../libexec/acpx-server{}", std::env::consts::EXE_SUFFIX);
     if let Some(parent) = current_exe.and_then(Path::parent) {
-        for candidate in [
-            parent.join("acpx-server"),
-            parent.join("../libexec/acpx-server"),
-        ] {
+        for candidate in [parent.join(&exe_name), parent.join(&libexec_name)] {
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
-    manifest_dir.join("../acpx/target/debug/acpx-server")
+    manifest_dir.join(format!("../acpx/target/debug/{exe_name}"))
 }
 
 fn resolve_acpx_server_bin() -> PathBuf {
@@ -9960,10 +9972,16 @@ done
 
     #[test]
     fn packaged_gateway_binary_resolution_prefers_override_then_relative_install() {
+        // Windows installs the real binary as `acpx-server.exe`
+        // (`EXE_SUFFIX`) -- exercise the exact platform-appropriate name
+        // so this test still proves the resolver finds a real packaged
+        // install on every CI OS (build-windows.yml runs `cargo test
+        // --release` on windows-latest too), not just Unix's bare name.
+        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        let packaged = bin_dir.join("acpx-server");
+        let packaged = bin_dir.join(&exe_name);
         std::fs::write(&packaged, b"binary").expect("packaged binary");
         let exe = bin_dir.join("panel");
 
@@ -9982,20 +10000,21 @@ done
 
         let libexec_dir = temp.path().join("libexec");
         std::fs::create_dir_all(&libexec_dir).expect("libexec dir");
-        let libexec_bin = libexec_dir.join("acpx-server");
+        let libexec_bin = libexec_dir.join(&exe_name);
         std::fs::write(&libexec_bin, b"binary").expect("libexec binary");
         std::fs::remove_file(&packaged).expect("remove sibling binary");
         assert_eq!(
             resolve_acpx_server_bin_from(None, Some(&exe), Path::new("/manifest")),
-            bin_dir.join("../libexec/acpx-server")
+            bin_dir.join(format!("../libexec/{exe_name}"))
         );
     }
 
     #[test]
     fn packaged_gateway_binary_resolution_falls_back_to_dev_checkout() {
+        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         assert_eq!(
             resolve_acpx_server_bin_from(None, None, Path::new("/manifest")),
-            PathBuf::from("/manifest/../acpx/target/debug/acpx-server")
+            PathBuf::from(format!("/manifest/../acpx/target/debug/{exe_name}"))
         );
     }
 
