@@ -804,80 +804,108 @@ export component Sidebar inherits Rectangle {
         VerticalLayout {
             width: 100%;
             height: 100%;
-            padding: root.settings-margin;
+            // Only vertical inset/gap is shared across all three rows here.
+            // Horizontal inset is intentionally NOT part of this shared
+            // padding: the skills-config/expanded-settings rows need it
+            // (they're inset from the full rail width, same as the old
+            // explicit `x: settings-margin; width: parent.width - 2 *
+            // settings-margin` math), but the collapsed icon row must NOT
+            // get it -- it needs to center against the FULL settings-footer
+            // width, exactly like the pre-layout-flow code's
+            // `x: (parent.width - self.width) / 2` did with `parent` ==
+            // the full-width settings-footer Rectangle. Applying the same
+            // horizontal padding to all three (as a single shared `padding:
+            // root.settings-margin;` did before this fix) shrank the
+            // collapsed row's available width to `rail-width - 2 *
+            // settings-margin` -- in compact mode that's 48px - 40px = 8px,
+            // too small for the 28px icon, which broke centering (icon
+            // ended up flush against the left inset instead of centered).
+            padding-top: root.settings-margin;
+            padding-bottom: root.settings-margin;
             spacing: root.settings-margin;
-            if root.skills-config-h > 0px : skills-config := HoverSurface {
-                height: root.skills-config-h;
-                idle-bg: transparent;
-                selected: false;
-                button-accessible-label: "Open Skills settings";
-                clicked => { root.skills-settings-requested(); }
-                border-width: 0px;
-                border-radius: Theme.radius-md;
-                HorizontalLayout {
-                    width: 100%;
-                    height: 100%;
-                    padding-left: Metrics.pad-sm;
-                    padding-right: Metrics.pad-sm;
-                    spacing: Metrics.gap-sm;
-                    cross-axis-alignment: center;
-                    Text {
-                        text: "Skills config";
-                        color: Theme.text-secondary;
-                        font-size: 10px * Theme.font-scale;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                    }
-                    Icon {
-                        source: @image-url("../assets/icons/chevron-right.svg");
-                        size: Metrics.icon-sm;
-                        color: Theme.text-muted;
+            if root.skills-config-h > 0px : HorizontalLayout {
+                padding-left: root.settings-margin;
+                padding-right: root.settings-margin;
+                skills-config := HoverSurface {
+                    height: root.skills-config-h;
+                    idle-bg: transparent;
+                    selected: false;
+                    button-accessible-label: "Open Skills settings";
+                    clicked => { root.skills-settings-requested(); }
+                    border-width: 0px;
+                    border-radius: Theme.radius-md;
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding-left: Metrics.pad-sm;
+                        padding-right: Metrics.pad-sm;
+                        spacing: Metrics.gap-sm;
+                        cross-axis-alignment: center;
+                        Text {
+                            text: "Skills config";
+                            color: Theme.text-secondary;
+                            font-size: 10px * Theme.font-scale;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Icon {
+                            source: @image-url("../assets/icons/chevron-right.svg");
+                            size: Metrics.icon-sm;
+                            color: Theme.text-muted;
+                        }
                     }
                 }
             }
             // Expanded: full-width settings row with the normal hover surface.
-            if expanded : settings-box := HoverSurface {
-                height: root.settings-box-h;
-                idle-bg: Theme.bg-tertiary;
-                selected: false;
-                button-accessible-label: "Open settings";
-                clicked => { root.settings-requested(); }
-                border-width: 0px;
-                border-radius: Theme.radius-md;
-                HorizontalLayout {
-                    width: 100%;
-                    height: 100%;
-                    padding-left: Metrics.pad-sm;
-                    padding-right: Metrics.pad-sm;
-                    spacing: Metrics.gap-sm;
-                    alignment: start;
-                    cross-axis-alignment: center;
-                    VerticalLayout {
-                        alignment: center;
-                        horizontal-stretch: 0;
-                        Icon {
-                            source: @image-url("../assets/icons/settings.svg");
-                            size: Metrics.icon-md;
-                            color: Theme.text-secondary;
+            if expanded : HorizontalLayout {
+                padding-left: root.settings-margin;
+                padding-right: root.settings-margin;
+                settings-box := HoverSurface {
+                    height: root.settings-box-h;
+                    idle-bg: Theme.bg-tertiary;
+                    selected: false;
+                    button-accessible-label: "Open settings";
+                    clicked => { root.settings-requested(); }
+                    border-width: 0px;
+                    border-radius: Theme.radius-md;
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding-left: Metrics.pad-sm;
+                        padding-right: Metrics.pad-sm;
+                        spacing: Metrics.gap-sm;
+                        alignment: start;
+                        cross-axis-alignment: center;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 0;
+                            Icon {
+                                source: @image-url("../assets/icons/settings.svg");
+                                size: Metrics.icon-md;
+                                color: Theme.text-secondary;
+                            }
                         }
-                    }
-                    Text {
-                        text: "Settings";
-                        color: Theme.text-secondary;
-                        font-size: 11px * Theme.font-scale;
-                        font-family: Theme.font-sans;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
+                        Text {
+                            text: "Settings";
+                            color: Theme.text-secondary;
+                            font-size: 11px * Theme.font-scale;
+                            font-family: Theme.font-sans;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
                     }
                 }
             }
             // Collapsed: use the same icon-button primitive as the header.
             // The expanded row's horizontal padding cannot fit a 48px rail,
             // which made both its background and hover hit area look broken.
-            // Centered via layout (VerticalLayout+HorizontalLayout
-            // alignment: center), matching the collapse-toggle/new-thread
-            // IconButton centering pattern earlier in this file, instead
-            // of manual (parent.width - self.width) / 2 math.
+            // Deliberately NOT wrapped in the settings-margin horizontal
+            // padding used by the two rows above -- see the comment on the
+            // outer VerticalLayout for why. Centered via layout
+            // (VerticalLayout+HorizontalLayout alignment: center) against
+            // the row's full available width, matching the collapse-toggle/
+            // new-thread IconButton centering pattern earlier in this file,
+            // instead of manual (parent.width - self.width) / 2 math.
             if !expanded : VerticalLayout {
                 height: root.settings-box-h;
                 alignment: center;
