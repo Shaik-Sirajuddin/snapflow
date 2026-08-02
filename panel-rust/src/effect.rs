@@ -292,6 +292,25 @@ pub enum EffectResultMsg {
     SessionAttachStarted {
         thread_id: String,
     },
+    /// mcp-servers-settings plan: unlike `SessionAttached { result: Err(..)
+    /// }` (a thread that already claimed a real `AgentBridge` slot failed
+    /// to open its ACP session -- the row stays and shows an error, see
+    /// that variant's fold), this is for the two lifecycle effects that
+    /// create the slot itself (`Effect::NewThreadDeferred`/
+    /// `Effect::RecoverSessionAttach`, both of which claim a `model.
+    /// threads` row up front but only push an `AgentBridge` slot on
+    /// success -- see `AgentBridge::add_thread_deferred`'s doc comment on
+    /// the `model.threads[i] <-> slots[i]` invariant). When the bridge
+    /// call fails, NO slot was ever pushed, so leaving the row in place
+    /// (the `SessionAttached` Err pattern) permanently shifts every later
+    /// real_index one off from its actual bridge slot -- e.g. a later
+    /// `ArchiveThread { real_index }` effect lands on a DIFFERENT
+    /// thread's slot than the one the user archived. The fold for this
+    /// variant removes the orphaned row instead, restoring alignment.
+    ThreadCreationFailed {
+        real_index: usize,
+        message: String,
+    },
     SkillWritten(Result<(), EffectError>),
     SkillCreated(Result<std::path::PathBuf, EffectError>),
     SkillPromoted(Result<(), EffectError>),

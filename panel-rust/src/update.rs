@@ -2165,6 +2165,63 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             model.first_attach_in_flight.insert(thread_id.clone());
             (vec![], vec![Dirty::ThreadAttaching { thread_id }])
         }
+        // mcp-servers-settings plan: the real-user-reported bug where a
+        // thread that is NOT archived nonetheless renders with
+        // `inputs-enabled` gated as if `archived` were true. Root cause:
+        // `Effect::NewThreadDeferred`/`Effect::RecoverSessionAttach`
+        // claim a `model.threads` row (real_index = model.threads.len())
+        // BEFORE the matching `AgentBridge::add_thread_deferred`/
+        // `add_thread_recovering_session` call, but those bridge calls
+        // return `Err` *before* pushing their slot on failure (see their
+        // doc comments) -- so a failed create used to leave that row
+        // sitting in `model.threads` forever (previously folded through
+        // `SessionAttached { result: Err(..) }`, which sets
+        // `ThreadState::Error` but never removes the row -- correct for
+        // an EXISTING slot's failed attach, e.g.
+        // `dispatch_compose_send_maybe_attach`'s reattach failure, but
+        // wrong here since no slot was ever created). From that point on
+        // `model.threads.len() == bridge.slots.len() + 1`, so every
+        // later real_index reads one bridge slot off from the thread it
+        // actually names -- e.g. `Effect::ArchiveThread { real_index }`
+        // (`AgentBridge::set_thread_archived`) lands on a completely
+        // different thread's slot than the one the user archived, and
+        // that OTHER thread's row then reads `archived: true` despite
+        // never having been archived. Removing the orphaned row restores
+        // the `model.threads[i] <-> bridge.slots[i]` alignment instead of
+        // leaving a permanent one-off drift for every thread created
+        // after it.
+        EffectResultMsg::ThreadCreationFailed { real_index, message } => {
+            if real_index >= model.threads.len() {
+                return (vec![], vec![]);
+            }
+            let old_keys = current_visible_keys(model);
+            let thread_id = model
+                .threads
+                .get(real_index)
+                .map(|thread| thread.thread_id.clone())
+                .unwrap_or_default();
+            model.threads.remove(real_index);
+            model.rebuild_thread_indices();
+            let list_dirty = thread_list_dirty_with_keys(model, old_keys);
+            let mut dirty = vec![
+                Dirty::Error {
+                    thread_id,
+                    detail: ErrorDetail { message },
+                },
+                list_dirty,
+            ];
+            // The removed row can never have been the displayed/selected
+            // thread (it had no session yet), but its position may have
+            // been at or before the current filtered selection -- clamp
+            // rather than leave a stale out-of-range index pointing past
+            // the now-shorter visible list.
+            let visible_len = current_visible_indices(model).len();
+            if model.selected_thread >= visible_len {
+                model.selected_thread = visible_len.saturating_sub(1);
+                dirty.push(Dirty::Scalar(ScalarField::SelectedThread));
+            }
+            (vec![], dirty)
+        }
         // Skills list is refreshed by effect_executor before this
         // result is folded (see CreateSkill's refresh-before-open
         // order); do not emit an empty SkillsListDiff here -- that
@@ -4361,6 +4418,106 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// mcp-servers-settings plan (real-user-reported bug): a thread that
+    /// is NOT archived was rendering with `inputs-enabled` gated as if it
+    /// WERE archived. Root cause: `Effect::NewThreadDeferred`/
+    /// `Effect::RecoverSessionAttach` claim a `model.threads` row up
+    /// front (real_index = model.threads.len(), BEFORE the matching
+    /// `AgentBridge::add_thread_deferred`/`add_thread_recovering_session`
+    /// call), but those bridge calls return `Err` *before* ever pushing
+    /// their `AgentBridge` slot on failure (see
+    /// `AgentBridge::add_thread_deferred`'s doc comment on the `model.
+    /// threads[i] <-> slots[i]` invariant). The old fold for this failure
+    /// (`SessionAttached { result: Err(..) }`, correct for a DIFFERENT
+    /// case -- an already-slotted thread's reattach failing, see
+    /// `session_attached_failure_sets_error_state_and_dirties_row_and_
+    /// connection` above) only set `ThreadState::Error` and left the row
+    /// in `model.threads` -- so `model.threads.len()` permanently grew
+    /// one past `bridge.slots.len()`, and every thread real_index created
+    /// after the failure read one bridge slot off from the thread it
+    /// actually named. E.g. archiving thread C (whose real_index now
+    /// landed on thread D's actual bridge slot due to the drift) flips
+    /// `archived: true` on D's slot instead -- D. a thread the user never
+    /// archived, then renders as archived. `ThreadCreationFailed` removes
+    /// the orphaned row instead, restoring the parallel-array alignment.
+    #[test]
+    fn thread_creation_failed_removes_the_orphaned_row_restoring_bridge_alignment() {
+        let mut model = model_with_threads(&["a", "b"]);
+        // Simulate `ThreadMsg::AddRequested`'s reducer-side push for a
+        // third thread ("c") whose matching `Effect::NewThreadDeferred`
+        // is about to fail on the bridge side -- i.e. exactly the state
+        // `model.threads` is in immediately after that push, before the
+        // bridge result comes back.
+        model.threads.push(ThreadModel {
+            thread_id: "thread-2".to_owned(),
+            display_name: "c".to_owned(),
+            ..ThreadModel::default()
+        });
+        model.rebuild_thread_indices();
+        assert_eq!(model.threads.len(), 3);
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ThreadCreationFailed {
+                real_index: 2,
+                message: "thread already exists: c".to_owned(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        // The orphaned row is gone -- `model.threads` is back to exactly
+        // the two threads that actually have a bridge slot, restoring
+        // the `model.threads[i] <-> bridge.slots[i]` alignment instead of
+        // leaving a permanent one-off drift for "b" and any thread
+        // created after it.
+        assert_eq!(model.threads.len(), 2);
+        assert_eq!(model.threads[0].thread_id, "thread-0");
+        assert_eq!(model.threads[1].thread_id, "thread-1");
+        assert_eq!(
+            dirty,
+            vec![
+                Dirty::Error {
+                    thread_id: "thread-2".to_owned(),
+                    detail: ErrorDetail {
+                        message: "thread already exists: c".to_owned(),
+                    },
+                },
+                Dirty::ThreadListDiff(crate::dirty::diff_by_id(
+                    &["thread-0".to_owned(), "thread-1".to_owned(), "thread-2".to_owned()],
+                    &["thread-0".to_owned(), "thread-1".to_owned()],
+                    &[visible_row(0, "thread-0"), visible_row(1, "thread-1")],
+                )),
+            ]
+        );
+    }
+
+    /// The removed row's position can sit at or before the current
+    /// filtered selection -- e.g. the user switched away from the
+    /// still-creating thread before its failure resolved. Selection must
+    /// clamp to the shorter list rather than point past the end.
+    #[test]
+    fn thread_creation_failed_clamps_a_selection_left_pointing_past_the_shorter_list() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.threads.push(ThreadModel {
+            thread_id: "thread-2".to_owned(),
+            display_name: "c".to_owned(),
+            ..ThreadModel::default()
+        });
+        model.rebuild_thread_indices();
+        model.selected_thread = 2;
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ThreadCreationFailed {
+                real_index: 2,
+                message: "boom".to_owned(),
+            }),
+        );
+
+        assert_eq!(model.selected_thread, 1);
+        assert!(dirty.contains(&Dirty::Scalar(ScalarField::SelectedThread)));
     }
 
     // -- markdown-render-cache-layer plan Phase 2: EffectResultMsg::

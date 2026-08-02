@@ -52,11 +52,15 @@ fn execute_thread_lifecycle_effect(
         } => {
             if let Some(bridge) = panel.bridge.as_mut() {
                 if let Err(error) = bridge.add_thread_deferred(&display_name, Some(&provider)) {
-                    return Some(crate::effect::EffectResultMsg::SessionAttached {
+                    // mcp-servers-settings plan: `add_thread_deferred`
+                    // returns Err BEFORE pushing a slot (see its doc
+                    // comment), so this real_index's `model.threads` row
+                    // has no bridge slot at all -- `ThreadCreationFailed`,
+                    // not `SessionAttached`, so the fold removes the row
+                    // instead of leaving a permanently unaligned one.
+                    return Some(crate::effect::EffectResultMsg::ThreadCreationFailed {
                         real_index,
-                        thread_id: None,
-                        provider: Some(provider),
-                        result: Err(crate::effect::EffectError::new(error.to_string())),
+                        message: error.to_string(),
                     });
                 }
             }
@@ -97,13 +101,14 @@ fn execute_thread_lifecycle_effect(
                 });
             match result {
                 Ok(_real_idx) => None,
-                Err(error) => Some(crate::effect::EffectResultMsg::SessionAttached {
+                // mcp-servers-settings plan: same reasoning as
+                // `NewThreadDeferred`'s Err arm above -- `add_thread_
+                // recovering_session` also returns Err before pushing a
+                // slot, so this row has no bridge slot to fold an attach
+                // failure onto; remove it instead of leaving it unaligned.
+                Err(error) => Some(crate::effect::EffectResultMsg::ThreadCreationFailed {
                     real_index,
-                    thread_id: None,
-                    provider: None,
-                    result: Err(crate::effect::EffectError::new(format!(
-                        "recovery thread {real_index}: {error}"
-                    ))),
+                    message: format!("recovery thread {real_index}: {error}"),
                 }),
             }
         }
