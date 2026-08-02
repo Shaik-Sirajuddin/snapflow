@@ -2222,9 +2222,15 @@ pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption>
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
-        // The built-in daemon isn't a registry entry at all -- there's no
-        // `mcp_servers/tools_fetch` target for it, so it never has a
-        // fetch status to show.
+        // Placeholder defaults -- this synthetic row has no registry
+        // entry of its own to read `tool_catalog` from. The background
+        // watcher (`agent_bridge::ensure_snapshotd_watcher_started`) does
+        // sync a real "snapflow" registry entry that `mcp_servers/
+        // tools_fetch` actually targets; `sync::reconcile_settings_models`
+        // looks that entry up by `agent_bridge::is_builtin_snapflow_mcp_
+        // name` and overwrites these four fields with its live-fetched
+        // state before this row is displayed. Do not rely on these
+        // defaults being final.
         tool_fetch_status: String::new().into(),
         tool_fetch_error: String::new().into(),
         tools_search_blob: String::new().into(),

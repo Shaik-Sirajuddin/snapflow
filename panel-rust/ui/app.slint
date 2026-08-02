@@ -916,14 +916,25 @@ export component ChatPanel inherits Window {
         }
         // Phase 28: the shared toast surface. Bottom-center of the main
         // content area, above the compose box, color-coded by kind.
+        //
+        // The "main content area" is not always the same region: normally
+        // it's everything right of the sidebar, but SettingsPage (below)
+        // paints full-window (x:8px, width: parent.width-16px) and covers
+        // the sidebar entirely while open. Centering against
+        // `sidebar.width..root.width` while Settings is open left the
+        // toast (e.g. the MCP "Fetching tools for ..." status) visibly
+        // shifted right of true-center in the Settings pane. Mirror
+        // SettingsPage's own left-edge so this stays centered in whatever
+        // region is actually visible underneath.
+        property <length> toast-region-left: root.settings-open ? 0px : sidebar.width;
         if root.toast-visible && root.toast-message != "" : Rectangle {
             // SettingsPage is a later sibling and otherwise paints over this
             // shared feedback surface. Keep action errors above every page
             // overlay, including Settings.
             z: 10000;
-            x: sidebar.width + ((root.width - sidebar.width) - self.width) / 2;
+            x: toast-region-left + ((root.width - toast-region-left) - self.width) / 2;
             y: root.height - self.height - 84px;
-            width: min(root.width - sidebar.width - 24px, max(220px, toast-text.preferred-width + 28px));
+            width: min(root.width - toast-region-left - 24px, max(220px, toast-text.preferred-width + 28px));
             height: toast-text.preferred-height + 16px;
             background: Theme.bg-primary-container;
             border-radius: Theme.radius-sm;
