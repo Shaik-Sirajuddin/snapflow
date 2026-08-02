@@ -24,7 +24,9 @@ export component UserBubble inherits Rectangle {
 
     vertical-stretch: 0;
 
-    background: Theme.bg-tertiary;
+    // Use the dedicated user-message surface so outgoing rows have a
+    // slightly clearer contrast against the chat background in both themes.
+    background: Theme.bg-user-bubble;
     border-width: 0px;
     border-top-left-radius: Theme.radius-lg;
     border-top-right-radius: Theme.radius-lg;

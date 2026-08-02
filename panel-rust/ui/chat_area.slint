@@ -4,7 +4,7 @@ import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
 import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
-import { MessageItem, ToolGroupItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
+import { MessageItem, ToolGroupItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem, AgentCatalogEntry } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -23,6 +23,7 @@ import { MentionPickRow } from "./base/mention_pick_row.slint";
 import { ThinScrollbar } from "./base/thin_scrollbar.slint";
 import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
 import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
+import { OnboardingGuideView } from "./chat-view/components/onboarding_guide_view.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -33,6 +34,8 @@ import { TerminalView } from "./chat-view/components/execution/terminal_view.sli
 // for why tool-call gets the richer timeline-style card instead of the
 // bubble layout's flat text dump.
 export component ChatArea inherits Rectangle {
+    in-out property <bool> onboarding-completed: false;
+    callback complete-onboarding();
     // Retained-view command generations. A stack host can address the
     // selected ChatArea without invoking methods on hidden delegates.
     in property <int> focus-command: 0;
@@ -67,6 +70,15 @@ export component ChatArea inherits Rectangle {
     in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
+    // mcp-servers-settings follow-up: true while the displayed thread's
+    // provider has a `probe_provider_selection` acquire+release
+    // round-trip in flight against the session-lease pool (start ->
+    // `SettingsMsg::ProfileSelected` dispatching `Effect::ProbeProvider`;
+    // end -> `AgentEvent::ProviderProbe`, Ok or Err). Drives a
+    // chat-view-local pulsing "Switching provider..." line, same
+    // pulse mechanism as the `reloading`/"loading conversation..." block
+    // below (Metrics.pulse-period-driven opacity blink), not a new one.
+    in property <bool> provider-switching: false;
     callback error-banner-dismissed();
     // PROF-8: persistent (not dismissible) yellow strip -- the displayed
     // thread's agent is reachable but not authenticated. Clears itself
@@ -131,8 +143,11 @@ export component ChatArea inherits Rectangle {
     // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
     // archived threads -- inputs render disabled, not just inert).
     in property <bool> inputs-enabled: true;
+    in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <bool> agent-catalog-fetched: false;
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
+    callback mention-filter-changed(string, string);
     // Phase 17: markdown Ctrl+Click link target, host opens it.
     callback md-link-activated(string);
     // Mode/model selector addition: the *currently displayed* thread's
@@ -446,6 +461,30 @@ export component ChatArea inherits Rectangle {
     // How far the message Flickable can scroll -- viewport-y ranges from
     // `-msg-max-scroll` (bottom) to 0 (top).
     property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
+    // mcp-servers-settings follow-up (infinite-scroll auto-load): the
+    // `flicked` handler below only ever fires from a real drag/wheel
+    // gesture, which needs the Flickable to actually be scrollable
+    // (`msg-max-scroll > 0`) to fire at all. A short thread whose
+    // loaded messages don't yet fill the viewport can have
+    // `has-older-messages: true` with nothing to scroll -- previously
+    // the persistent "Load older messages" button covered exactly this
+    // case; now that it's gone, auto-load has to cover it itself by
+    // eagerly paging in more history whenever there's room (and more
+    // pages) until the view either becomes scrollable or runs out of
+    // older pages. Called from both `changed has-older-messages` and
+    // `message-scroll`'s own `changed viewport-height` (the latter also
+    // re-checks after every successful page-in, so a thread needing
+    // several pages before it's scrollable keeps chaining automatically).
+    function maybe-load-older-messages() {
+        if has-older-messages && !loading-older-messages && root.msg-max-scroll <= 0px {
+            loading-older-messages = true;
+            message-scroll.pending-height-fix = true;
+            load-older-requested();
+        }
+    }
+    changed has-older-messages => {
+        root.maybe-load-older-messages();
+    }
     // Independent scroll position for the popup view (not synced with main message scroll)
     property <length> popup-scroll-y: 0px;
     // PROF-11: keep the live plan visible below the chat header without
@@ -578,8 +617,37 @@ export component ChatArea inherits Rectangle {
                             size: Metrics.icon-md;
                             color: Theme.bg-primary;
                         }
+                        // gateway-fail-state: `connection-status` reads
+                        // "Unavailable" whenever `AgentBridge::transport_
+                        // status` finds no gateway URL recorded for this
+                        // thread's provider -- exactly the state left behind
+                        // by a failed `provision_gateway`/`spawn_gateway_
+                        // process` call (see that function's real production
+                        // failure log, `system_launch.yaml`, "Permission
+                        // denied (os error 13)"). Before this branch existed
+                        // that state fell straight through to the plain
+                        // neutral dot below, indistinguishable from "idle,
+                        // nothing to report" -- a real, silent failure looked
+                        // identical to nothing happening. A plain dash, not a
+                        // colored icon: matches this project's established
+                        // monochrome-only status language (see
+                        // `agent_card.slint`'s doc comment) rather than
+                        // introducing a red/error-colored treatment here.
                         if !(root.sending || connection-status == "Connecting...")
-                            && !root.status-needs-attention : Rectangle {
+                            && !root.status-needs-attention
+                            && connection-status == "Unavailable" : Text {
+                            text: "-";
+                            color: Theme.text-secondary;
+                            font-size: Metrics.icon-md * 0.9;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+                        if !(root.sending || connection-status == "Connecting...")
+                            && !root.status-needs-attention
+                            && connection-status != "Unavailable" : Rectangle {
                             width: 6px;
                             height: 6px;
                             border-radius: 3px;
@@ -703,29 +771,6 @@ export component ChatArea inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
-                    if root.project-name != "" : HorizontalLayout {
-                        spacing: Metrics.space-1;
-                        horizontal-stretch: 0;
-                        cross-axis-alignment: center;
-                        accessible-role: text;
-                        accessible-label: "Project " + root.project-path
-                            + (root.project-mcp-live ? " (MCP connected)" : " (MCP disconnected)");
-                        Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: root.project-mcp-live ? #22c55e : #ef4444;
-                        }
-                        Text {
-                            text: root.project-name;
-                            color: Theme.text-muted;
-                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
-                            font-family: Theme.font-mono;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            max-width: compact ? 70px : 130px;
-                        }
-                    }
                     Text {
                         text: agent-badge;
                         color: Theme.text-primary;
@@ -948,13 +993,35 @@ export component ChatArea inherits Rectangle {
                 // except this one and settings_page.slint's (fixed
                 // alongside this for the same reported "scroll issues").
                 viewport-height: message-col.preferred-height;
+                // mcp-servers-settings follow-up (infinite-scroll auto-load):
+                // tracks the pre-fetch `viewport-height` and whether the
+                // *next* height change is expected to come from an older-
+                // messages page-in, so that change can compensate
+                // `viewport-y` (see `changed viewport-height` below) instead
+                // of a brand-new-message append (also grows viewport-height,
+                // but from the bottom, never needs this compensation).
+                property <length> prev-viewport-height: 0px;
+                property <bool> pending-height-fix: false;
                 // Live updates grow `viewport-height`; snap back to the bottom
                 // only while the user is following the latest message, so a
                 // read-back-in-history scroll position is never stolen.
+                // Otherwise, if this growth was just caused by paging in
+                // older history above the current view, shift viewport-y by
+                // exactly how much content was added so the message the
+                // user was reading stays anchored on screen -- without this
+                // the Flickable keeps viewport-y at the same absolute
+                // coordinate, which after prepending taller content above
+                // now points at different (newly-loaded) messages, reading
+                // as a jarring jump.
                 changed viewport-height => {
                     if (root.stick-to-bottom) {
                         self.viewport-y = -root.msg-max-scroll;
+                    } else if (self.pending-height-fix) {
+                        self.viewport-y -= (self.viewport-height - self.prev-viewport-height);
                     }
+                    self.prev-viewport-height = self.viewport-height;
+                    self.pending-height-fix = false;
+                    root.maybe-load-older-messages();
                 }
                 // A user scroll updates whether they're following the bottom
                 // and -- only a user-originated movement at the real top
@@ -965,6 +1032,7 @@ export component ChatArea inherits Rectangle {
                         && !loading-older-messages
                         && self.viewport-y >= -1px {
                         loading-older-messages = true;
+                        self.pending-height-fix = true;
                         load-older-requested();
                     }
                 }
@@ -986,45 +1054,55 @@ export component ChatArea inherits Rectangle {
                 // class as the full-view popup's tool list below and the
                 // sidebar lists, just not fixed here yet until now.
                 spacing: 0px;
-                if has-older-messages : VerticalLayout {
+                // Pure scroll-triggered auto-load: the `flicked` handler
+                // above (real top boundary) is the ONLY way an older-
+                // messages fetch is triggered now -- no clickable
+                // affordance. This row is purely an in-flight indicator,
+                // visible only while `loading-older-messages` is true, and
+                // reuses the same pulsing-text formula as
+                // `root.provider-switching`'s "Switching provider..." line
+                // just below rather than inventing new visual chrome.
+                if has-older-messages && loading-older-messages : VerticalLayout {
                     spacing: 0px;
-                    Rectangle {
-                        height: 22px;
-                        border-radius: Theme.radius-sm;
-                        background: load-older-button.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
-                        animate background { duration: 100ms; }
-                        load-older-button := TouchArea {
-                            mouse-cursor: loading-older-messages ? default : pointer;
-                            accessible-role: button;
-                            accessible-label: "Load older messages";
-                            enabled: !loading-older-messages;
-                            accessible-action-default => {
-                                if !loading-older-messages {
-                                    loading-older-messages = true;
-                                    load-older-requested();
-                                }
-                            }
-                            clicked => {
-                                if !loading-older-messages {
-                                    loading-older-messages = true;
-                                    load-older-requested();
-                                }
-                            }
-                            changed has-hover => {
-                                CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
-                            }
-                        }
-                        Text {
-                            text: loading-older-messages ? "Loading older messages..." : "Load older messages";
-                            color: Theme.text-secondary;
-                            font-size: 10px * Theme.font-scale;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+                    height: 22px;
+                    alignment: center;
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                    Text {
+                        text: "Loading older messages...";
+                        color: Theme.text-secondary;
+                        opacity: blink;
+                        font-size: 10px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                     // This block is only ever visible alongside real message
                     // rows below it, so it always needs its own trailing gap.
                     Rectangle { height: compact ? Metrics.gap-md : Metrics.gap-lg; }
+                }
+                // mcp-servers-settings follow-up: chat-view-local pulsing
+                // indicator for a pool-acquire probe in flight
+                // (provider-switching). Shown above the empty/loading
+                // states below and above any real messages alike -- a
+                // provider switch can happen on a thread that already has
+                // messages queued, not just an empty one, so this can't be
+                // folded into the "messages.length == 0" blocks below.
+                // Same blink formula as `reloading`'s "loading
+                // conversation..." line just below (Metrics.pulse-period-
+                // driven opacity), reused rather than a new animation.
+                if root.provider-switching : VerticalLayout {
+                    height: 28px;
+                    alignment: center;
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                    Text {
+                        text: "Switching provider...";
+                        color: Theme.text-muted;
+                        opacity: blink;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
                 // Phase 18 empty/loading states: never leave the chat
                 // view blank. While (re)connecting, a blinking loading
@@ -1042,7 +1120,43 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                if root.messages.length == 0 && !root.no-project : VerticalLayout {
+                if root.messages.length == 0 && !root.no-project
+                    && root.agent-catalog-fetched && root.agent-catalog.length == 0 : VerticalLayout {
+                    height: 160px;
+                    alignment: center;
+                    Rectangle {
+                        border-radius: Theme.radius-md;
+                        background: configure-agent-button.has-hover
+                            ? Theme.bg-primary.with-alpha(0.85)
+                            : Theme.bg-primary;
+                        animate background { duration: 100ms; }
+                        HorizontalLayout {
+                            padding-left: Metrics.pad-lg;
+                            padding-right: Metrics.pad-lg;
+                            padding-top: Metrics.pad-sm;
+                            padding-bottom: Metrics.pad-sm;
+                            alignment: center;
+                            Text {
+                                text: "Configure Agent";
+                                color: Theme.text-on-primary;
+                                font-size: 11px * Theme.font-scale;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        configure-agent-button := TouchArea {
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Configure Agent";
+                            clicked => { configure-provider-requested(); }
+                            changed has-hover => {
+                                CursorHost.kind = self.has-hover ? "pointer" : "default";
+                            }
+                        }
+                    }
+                }
+                if root.messages.length == 0 && !root.no-project
+                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0) : VerticalLayout {
                     height: 160px;
                     alignment: center;
                     property <bool> reloading: connection-status == "Connecting...";
@@ -1560,6 +1674,7 @@ export component ChatArea inherits Rectangle {
             inputs-enabled: root.inputs-enabled;
             mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
             mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
+            mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
             width: 100%;
             horizontal-stretch: 1;
             vertical-stretch: 0;
@@ -1661,4 +1776,13 @@ export component ChatArea inherits Rectangle {
         }
     }
     restore-compose-focus => { chat-input.focus-compose(); }
+
+    if !root.onboarding-completed : OnboardingGuideView {
+        width: 100%;
+        height: 100%;
+        z: 9000;
+        start-chat-clicked => {
+            root.complete-onboarding();
+        }
+    }
 }

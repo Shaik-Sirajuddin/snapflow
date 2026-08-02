@@ -10,7 +10,6 @@ acpx/
   Cargo.lock
   README.md              top-level overview + config quick reference
   COVERAGE.md            phase-by-phase implementation/test evidence log (authoritative)
-  PHASE6-NOTES.md        phase 6 design notes (historical)
   docs/                  this directory
   scripts/
     self_test.sh          black-box smoke test (real acpx-server + acpx-selftest)

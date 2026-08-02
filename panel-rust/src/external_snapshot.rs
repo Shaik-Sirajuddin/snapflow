@@ -73,6 +73,7 @@ fn model_gateway_catalog_snapshot(model: &crate::model::Model) -> msg::SettingsG
         profiles: model.available_profiles.clone(),
         mcp_servers: model.available_mcp_servers.clone(),
         agents: model.agent_catalog.clone(),
+        agents_fetched: model.agent_catalog_fetched,
         recoverable_sessions: model.recoverable_sessions.clone(),
         recovery_provider: model.recovery_provider.clone(),
     }
@@ -168,6 +169,31 @@ pub(crate) fn hydrate_thread_ids_from_bridge(model: &mut crate::model::Model, br
         }
     }
     changed
+}
+
+/// PUI-014: a DEFERRED slot (created but intentionally not yet attached --
+/// provider still editable, no message sent) is idle and ready for input,
+/// NOT an attach-in-flight, so it never gets the "Starting new thread..."
+/// loading affordance. A slot whose attach has actually begun (eager or
+/// recovered) but has no binding yet *does* get it -- with one exception:
+/// gateway-fail-state fix, `2026-08-01`. A binding never arrives after a
+/// failed attach (gateway provisioning error, e.g. the real "Permission
+/// denied (os error 13)" `spawn_gateway_process` failure -- see
+/// `agent_bridge.rs`'s `ensure_executable`), so without the `status`
+/// check this used to re-force "loading" on that exact row every single
+/// frame forever, silently overwriting the correct "error" status
+/// `models::build_thread_items` already computed from `ThreadState::Error`
+/// (set by `update.rs`'s `AgentEvent::Error`/`SessionAttached{Err}`
+/// handling, which both the async attach-failure path
+/// (`spawn_background_attachment`) and the synchronous gateway-
+/// provisioning-failure path (`dispatch_compose_send_maybe_attach`)
+/// already route through) -- the thread looked permanently stuck loading
+/// instead of showing its real failure. Once a frame has landed the row
+/// on "error", this leaves it there; only a fresh attach attempt (which
+/// re-derives `status` from `ThreadState` again, not this function) can
+/// clear it.
+fn shows_starting_thread_loading(closed: bool, status: &str, has_binding: bool, is_deferred: bool) -> bool {
+    !closed && status != "error" && !has_binding && !is_deferred
 }
 
 pub(crate) struct ExternalSnapshotSource<'a> {
@@ -289,6 +315,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .as_ref()
                 .map(AgentBridge::mcp_operations_in_flight)
                 .unwrap_or_default(),
+            recover_session_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::recover_session_operations_in_flight)
+                .unwrap_or_default(),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold
             // the result, so the live skills view tracks filesystem/state
@@ -323,6 +355,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                 profiles: Vec::new(),
                 mcp_servers: Vec::new(),
                 agents: Vec::new(),
+                agents_fetched: false,
                 recoverable_sessions: Vec::new(),
                 recovery_provider: String::new(),
             })
@@ -449,6 +482,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .map(|thread| thread.error.clone().unwrap_or_default())
             .collect();
+        // thread-unread-state: unlike archived/closed this lives on the TEA
+        // ThreadModel, not on an AgentBridge slot -- it is in-memory only
+        // (see ThreadModel::unread) and is folded by `update_frame`, so the
+        // model is its single source of truth.
+        let unread: Vec<bool> = model.threads.iter().map(|thread| thread.unread).collect();
         drop(model);
 
         let descriptions: Vec<String> = names
@@ -462,8 +500,8 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .bridge
                     .as_ref()
                     .map(|bridge| {
-                        models::describe_thread(
-                            &bridge.history(idx),
+                        models::describe_thread_from_last(
+                            bridge.last_message(idx).as_ref(),
                             crate::THREAD_DESCRIPTION_MAX_CHARS,
                         )
                     })
@@ -557,6 +595,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             &background_sessions,
             &closed,
             &archived,
+            &unread,
             &query,
         );
         // Plan phase 26: the chat view binds to the selected project --
@@ -629,17 +668,20 @@ impl<'a> ExternalSnapshotSource<'a> {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
                     row.has_session = thread.session_id.is_some();
                 }
-                // PUI-014: a DEFERRED slot (created but intentionally not yet
-                // attached -- provider still editable, no message sent) is idle
-                // and ready for input, NOT an attach-in-flight. Only show the
-                // "Starting new thread..." loading state for a slot whose attach
-                // has actually begun (eager/recovered) but not yet bound.
-                if !row.closed
-                    && self.panel.bridge.as_ref().is_some_and(|bridge| {
-                        bridge.thread_binding(item.real_index).is_none()
-                            && !bridge.is_deferred(item.real_index)
-                    })
-                {
+                // See `shows_starting_thread_loading`'s doc comment for the
+                // full PUI-014 / gateway-fail-state contract this predicate
+                // implements.
+                if shows_starting_thread_loading(
+                    row.closed,
+                    row.status.as_str(),
+                    self.panel.bridge.as_ref().is_some_and(|bridge| {
+                        bridge.thread_binding(item.real_index).is_some()
+                    }),
+                    self.panel
+                        .bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.is_deferred(item.real_index)),
+                ) {
                     row.status = "loading".into();
                     row.busy = true;
                     // Plan phase 30: immediate feedback while the
@@ -884,6 +926,18 @@ impl<'a> ExternalSnapshotSource<'a> {
         selected.and_then(|real_idx| self.collect_thread_snapshot_for(real_idx))
     }
 
+    /// One `ThreadRecord` per bound thread that `update()`'s frame fold
+    /// hasn't already persisted (`model.traced_attachment_threads`, checked
+    /// via `HashSet::insert` in `update.rs`'s `for record in frame.
+    /// thread_record_snapshots` loop -- every already-traced thread's
+    /// record is built here just to be thrown away there). Filtering by the
+    /// same set here, rather than after collection, means a poll tick
+    /// (60-90fps) with N already-persisted open threads skips N thread_
+    /// binding/thread_provider bridge lookups and ~7 `String` clones per
+    /// thread (`display_name`, `profile_name`, `permission_profile`,
+    /// `thread_id`, `session_id`, `project_path`, ...) that would otherwise
+    /// be built and discarded on every single tick regardless of whether
+    /// any new thread ever attaches.
     pub(crate) fn collect_thread_record_snapshots(&self) -> Vec<crate::state_store::ThreadRecord> {
         let Some(bridge) = self.panel.bridge.as_ref() else {
             return Vec::new();
@@ -895,6 +949,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             .enumerate()
             .filter_map(|(idx, thread)| {
                 let binding = bridge.thread_binding(idx)?;
+                if model.traced_attachment_threads.contains(&binding.thread_id) {
+                    return None;
+                }
                 let provider = bridge.thread_provider(idx)?;
                 Some(crate::state_store::ThreadRecord {
                     thread_id: binding.thread_id,
@@ -967,6 +1024,56 @@ mod tests {
     use crate::protocol_types::AgentEvent;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
+
+    /// gateway-fail-state (2026-08-01): pins the exact regression this fix
+    /// closes -- a thread whose attach already failed (no binding, not a
+    /// deliberately-unattached deferred slot -- indistinguishable from
+    /// "attach still in flight" by binding/deferred state alone) must NOT
+    /// have its already-correct "error" status forced back to "loading"
+    /// on the next frame. Pure-function coverage (no `PanelSingleton`/
+    /// `AgentBridge` needed) for the predicate `collect_thread_list_
+    /// snapshot`'s per-row loop calls; see that call site's real
+    /// production trigger (`spawn_gateway_process`'s "Permission denied
+    /// (os error 13)" failure, `system_launch.yaml`) in this function's
+    /// own doc comment.
+    #[test]
+    fn shows_starting_thread_loading_does_not_override_an_already_failed_attach() {
+        // The exact state a thread lands in after `spawn_background_
+        // attachment`'s error branch (or the synchronous gateway-
+        // provisioning-failure path in `dispatch_compose_send_maybe_
+        // attach`) has folded through to `ThreadState::Error` and
+        // `models::build_thread_items` has already produced "error":
+        // never bound, not deferred, not closed.
+        assert!(
+            !shows_starting_thread_loading(false, "error", false, false),
+            "an already-failed attach's row must stay on its real \"error\" \
+             status, not be forced back to \"loading\" forever"
+        );
+    }
+
+    #[test]
+    fn shows_starting_thread_loading_still_covers_the_real_in_flight_case() {
+        // The case this predicate exists FOR: a genuinely in-flight eager/
+        // recovered attach (status not yet "error" -- e.g. still "idle"
+        // from the row's initial seed) with no binding yet and not
+        // deferred. PUI-014's "Starting new thread..." affordance must
+        // still show here; this fix must not have regressed it.
+        assert!(shows_starting_thread_loading(false, "idle", false, false));
+    }
+
+    #[test]
+    fn shows_starting_thread_loading_leaves_deferred_and_closed_rows_alone() {
+        // PUI-014: a deferred (intentionally unattached) slot is idle and
+        // ready for input, never shown as loading.
+        assert!(!shows_starting_thread_loading(false, "idle", false, true));
+        // A closed thread never gets the loading affordance either,
+        // regardless of binding/status.
+        assert!(!shows_starting_thread_loading(true, "idle", false, false));
+        // A thread that already has a binding is attached; no loading
+        // affordance needed even if some other status value slipped
+        // through.
+        assert!(!shows_starting_thread_loading(false, "idle", true, false));
+    }
 
     fn autohand_adapter_entry() -> std::path::PathBuf {
         std::path::Path::new(&std::env::var("HOME").expect("HOME set"))

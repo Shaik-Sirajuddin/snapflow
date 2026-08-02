@@ -256,8 +256,42 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                             // succeeded -- syncing content that was never
                             // actually saved would be worse than not
                             // syncing at all.
+                            //
+                            // `path` here is `active_skill_md_path` -- the
+                            // SKILL.md FILE itself (see the doc comment on
+                            // this match arm above) -- but
+                            // `schedule_debounced_skill_resync` and
+                            // everything downstream of it
+                            // (`skills_manager_adapter::
+                            // update_and_resync_edited_skill`,
+                            // `project_root_from_skill_dir`, and
+                            // ultimately `skills_manager::register_skill`/
+                            // `update_content`) all expect the skill's
+                            // DIRECTORY, not the file. This call was added
+                            // in b4803eeb, before 60820a2f split
+                            // `active_skill_path` (directory) from
+                            // `active_skill_md_path` (file); it was never
+                            // updated for the new file-shaped `path`, so
+                            // autosave was silently passing a file where a
+                            // directory was expected. `register_skill`'s
+                            // `source_dir.join("SKILL.md")` check then
+                            // produces `SkillError::MissingSkillMd`
+                            // ("skill source directory has no SKILL.md")
+                            // for every real autosave once a reactive-sync
+                            // vendor is enabled -- distinct from (and a
+                            // sibling of) the ENOTDIR bug 0a9ac4e7 fixed
+                            // in this same match arm's direct write.
+                            // `path.parent()` recovers the directory.
                             if write_succeeded {
-                                schedule_debounced_skill_resync(path.clone());
+                                if let Some(skill_dir) = path.parent() {
+                                    schedule_debounced_skill_resync(skill_dir.to_path_buf());
+                                } else {
+                                    eprintln!(
+                                        "panel-rust: SkillWrite path {} has no parent directory, \
+                                         skipping reactive resync",
+                                        path.display()
+                                    );
+                                }
                             }
                         });
                     });
@@ -517,6 +551,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             }
             Effect::MutateQueue { real_index, params } => {
                 panel.execute_queue_mutation_real(real_index, params);
+            }
+            Effect::ProbeProvider { real_index, provider, profile_name } => {
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    bridge.probe_provider_selection(real_index, provider, profile_name);
+                }
             }
             Effect::CancelGeneration { real_index } => {
                 panel.execute_cancel_generation_real(real_index);
@@ -1159,6 +1198,53 @@ mod skill_editor_path_tests {
         assert_eq!(
             std::fs::read_to_string(&md_path).unwrap(),
             "new content"
+        );
+    }
+
+    // Sibling regression to the two tests above, but for the reactive-sync
+    // side-effect rather than the direct file write: `schedule_debounced_
+    // skill_resync` (and everything it forwards to --
+    // `skills_manager_adapter::update_and_resync_edited_skill` /
+    // `project_root_from_skill_dir` -- and ultimately
+    // `skills_manager::Manager::register_skill`) all expect a skill
+    // DIRECTORY, exactly like `register_skill`'s own doc comment says
+    // ("source_dir (must contain SKILL.md or skill.md)"). Passing it the
+    // SKILL.md FILE reproduces the exact user-facing error message
+    // ("skill source directory has no SKILL.md") this test's name refers
+    // to -- distinct from the ENOTDIR bug the two tests above cover,
+    // which is about the direct `std::fs::write` call, not this
+    // downstream reactive-sync call.
+    #[test]
+    fn passing_the_skill_md_file_where_the_resync_path_expects_a_directory_has_no_skill_md() {
+        let dir = tempfile_dir();
+        let md_path = dir.join("SKILL.md");
+        std::fs::write(&md_path, "---\nname: demo\n---\nbody").unwrap();
+
+        // The bug: `schedule_debounced_skill_resync(path.clone())` used to
+        // pass `path` (== `content_path` == the SKILL.md FILE) straight
+        // through as the "skill_dir" downstream code expects. Reproduce
+        // that same check here without needing skills-manager's sqlite
+        // plumbing: `register_skill`'s own guard is exactly
+        // `!source_dir.join("SKILL.md").is_file() && !source_dir.join(
+        // "skill.md").is_file()`.
+        let buggy_source_dir = &md_path; // what the old call site passed
+        assert!(
+            !buggy_source_dir.join("SKILL.md").is_file()
+                && !buggy_source_dir.join("skill.md").is_file(),
+            "reproduces skills_manager::Manager::register_skill's \
+             MissingSkillMd guard tripping on a file path"
+        );
+
+        // The fix: resolve the directory via `path.parent()` before
+        // handing it to the resync call, exactly like the real handler
+        // now does.
+        let fixed_source_dir = md_path.parent().expect("SKILL.md has a parent dir");
+        assert_eq!(fixed_source_dir, dir);
+        assert!(
+            fixed_source_dir.join("SKILL.md").is_file(),
+                "the fix (path.parent()) resolves to a directory that \
+             genuinely contains SKILL.md, so register_skill's guard \
+             passes"
         );
     }
 

@@ -89,6 +89,14 @@ pub enum Effect {
         real_index: usize,
         params: serde_json::Value,
     },
+    /// Probe a provider/profile selection without attaching a real chat
+    /// session. The bridge performs a pool acquire/release asynchronously
+    /// and reports the result through the normal frame event stream.
+    ProbeProvider {
+        real_index: usize,
+        provider: String,
+        profile_name: Option<String>,
+    },
     CancelGeneration {
         real_index: usize,
     },

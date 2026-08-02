@@ -115,15 +115,6 @@ export component SkillEditorView inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
-                    if root.skill-saving : Text {
-                        text: "Saving…";
-                        color: Theme.text-muted;
-                        font-size: 9px * Theme.font-scale;
-                        font-family: Theme.font-mono;
-                        vertical-alignment: center;
-                        horizontal-stretch: 0;
-                    }
-
                     // Variable-width text actions — token-colored pills
                     // (Button is fixed-width; long "Open in …" labels need flex).
                     TextPillButton {
@@ -210,6 +201,10 @@ export component SkillEditorView inherits Rectangle {
                 font-size: 11px * Theme.font-scale;
                 wrap: word-wrap;
                 single-line: false;
+                // Explicit accessible-label -- without one, MCP/UI-test
+                // element lookups (find-by-label) have no reliable way to
+                // address the skill content editor at all.
+                accessible-label: "Skill content editor";
                 text <=> root.skill-content;
                 edited => { root.content-edited(self.text); }
                 changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
