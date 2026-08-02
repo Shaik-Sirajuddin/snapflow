@@ -358,6 +358,7 @@ pub struct Model {
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub agent_catalog_fetched: bool,
     pub agent_operations_in_flight: Vec<String>,
     /// Same shape/lifecycle as `agent_operations_in_flight` above, sourced
     /// from `AgentBridge::mcp_operations_in_flight` -- keys are `"<action>:

@@ -1,5 +1,5 @@
 import { ChatArea } from "chat_area.slint";
-import { ThreadViewItem, MessageItem, PendingRequestItem, TerminalItem, PlanEntryItem, LocalTerminalItem, DropdownEntry, SkillOption, McpServerOption } from "types.slint";
+import { ThreadViewItem, MessageItem, PendingRequestItem, TerminalItem, PlanEntryItem, LocalTerminalItem, DropdownEntry, SkillOption, McpServerOption, AgentCatalogEntry } from "types.slint";
 
 // Retained ChatArea instances, one per durable thread. The stack deliberately
 // owns no transcript data: each delegate receives the Rc-backed model carried
@@ -31,6 +31,8 @@ export component ChatViewStack inherits Rectangle {
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
     in property <bool> inputs-enabled: true;
+    in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <bool> agent-catalog-fetched: false;
     in property <[DropdownEntry]> mode-dropdown-entries: [];
     in property <[DropdownEntry]> config-dropdown-entries: [];
     in property <string> mode-trigger-label: "";
@@ -163,6 +165,8 @@ export component ChatViewStack inherits Rectangle {
         compose-text <=> root.compose-text;
         compose-text-changed(text) => { root.compose-draft-changed(text); }
         inputs-enabled: root.inputs-enabled;
+        agent-catalog: root.agent-catalog;
+        agent-catalog-fetched: root.agent-catalog-fetched;
         mode-dropdown-entries: root.mode-dropdown-entries;
         config-dropdown-entries: root.config-dropdown-entries;
         mode-trigger-label: root.mode-trigger-label;
@@ -276,6 +280,8 @@ export component ChatViewStack inherits Rectangle {
             if (index == root.selected-index) { root.compose-draft-changed(text); }
         }
         inputs-enabled: root.inputs-enabled;
+        agent-catalog: root.agent-catalog;
+        agent-catalog-fetched: root.agent-catalog-fetched;
         mode-dropdown-entries: root.mode-dropdown-entries;
         config-dropdown-entries: root.config-dropdown-entries;
         mode-trigger-label: root.mode-trigger-label;

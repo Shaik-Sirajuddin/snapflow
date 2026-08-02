@@ -6216,6 +6216,7 @@ impl AgentBridge {
                 profiles: cache.profiles.clone(),
                 mcp_servers: cache.mcp_servers.clone(),
                 agents: cache.agents.clone(),
+                agents_fetched: cache.gen > 0,
                 recoverable_sessions: cache.recoverable_sessions.clone(),
                 recovery_provider: cache.recovery_provider.clone(),
             })
@@ -12256,6 +12257,7 @@ done
             profiles: Vec::new(),
             mcp_servers: Vec::new(),
             agents: Vec::new(),
+            agents_fetched: false,
             recoverable_sessions: Vec::new(),
             recovery_provider: String::new(),
         };

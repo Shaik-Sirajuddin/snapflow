@@ -2780,12 +2780,14 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let changed = model.available_profiles != snapshot.profiles
             || model.available_mcp_servers != snapshot.mcp_servers
             || model.agent_catalog != snapshot.agents
+            || model.agent_catalog_fetched != snapshot.agents_fetched
             || model.recoverable_sessions != snapshot.recoverable_sessions
             || model.recovery_provider != snapshot.recovery_provider;
         if changed {
             model.available_profiles = snapshot.profiles;
             model.available_mcp_servers = snapshot.mcp_servers;
             model.agent_catalog = snapshot.agents;
+            model.agent_catalog_fetched = snapshot.agents_fetched;
             model.recoverable_sessions = snapshot.recoverable_sessions;
             model.recovery_provider = snapshot.recovery_provider;
             dirty.push(Dirty::Settings);
@@ -5819,6 +5821,7 @@ mod tests {
                     }],
                     mcp_servers: vec![],
                     agents: vec![],
+                    agents_fetched: false,
                     recoverable_sessions: vec![],
                     recovery_provider: "codex".to_owned(),
                 }),
@@ -5836,6 +5839,7 @@ mod tests {
             profiles: model.available_profiles.clone(),
             mcp_servers: model.available_mcp_servers.clone(),
             agents: model.agent_catalog.clone(),
+            agents_fetched: model.agent_catalog_fetched,
             recoverable_sessions: model.recoverable_sessions.clone(),
             recovery_provider: model.recovery_provider.clone(),
         };

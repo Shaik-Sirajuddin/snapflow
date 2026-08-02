@@ -1409,6 +1409,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         .any(|key| key.starts_with("create:") || key.starts_with("update:"));
     component.set_mcp_server_submit_busy(mcp_server_submit_busy);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
+    component.set_agent_catalog_fetched(model.agent_catalog_fetched);
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),
     ));
