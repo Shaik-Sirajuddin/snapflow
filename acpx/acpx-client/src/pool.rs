@@ -26,7 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 /// How many total warm sessions (leased + idle) a pool tries to maintain
 /// for a key once that key has been requested at least once. Providers
 /// never requested are never pre-warmed.
-pub const WARM_TARGET_PER_KEY: usize = 2;
+pub const WARM_TARGET_PER_KEY: usize = 4;
 
 /// Bound on a single `session/new`/`session/resume` attempt during
 /// acquire. An acquire that can't get a usable session within this window
