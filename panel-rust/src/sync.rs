@@ -137,6 +137,15 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 }
             }
         }
+        Dirty::ProviderSwitch { thread_id } => {
+            // Same displayed-thread gate as Connection above: a
+            // background thread's provider-probe finishing must not
+            // clobber the singleton pulse property for whatever thread is
+            // actually on screen.
+            if displayed_thread_for_id(model, thread_id).is_some() {
+                component.set_selected_provider_switching(chat_view_provider_switching(model));
+            }
+        }
         Dirty::Toast => {
             component.set_toast_message(model.toast_message.clone().into());
             component.set_toast_kind(model.toast_kind.clone().into());
@@ -1204,9 +1213,13 @@ fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::mod
         &model.agent_catalog,
         current,
     ));
-    // Compose trigger shows provider/agent id, not raw profile name.
+    // Compose trigger shows provider/agent id, not raw profile name. See
+    // `models::resolve_provider_trigger_label`'s doc comment for why this
+    // falls back to `thread.provider` instead of calling
+    // `current_provider_trigger_label` directly.
     component.set_profile_trigger_label(
-        crate::models::current_provider_trigger_label(&profile_rows, current).into(),
+        crate::models::resolve_provider_trigger_label(&profile_rows, current, &thread.provider)
+            .into(),
     );
     component.set_active_thread_has_session(thread.session_id.is_some());
 }
@@ -1286,6 +1299,49 @@ fn registry_mcp_servers_excluding_builtin(
         .collect()
 }
 
+/// Merges the real, registry-synced `"snapflow"`/`"snapshotd"` entry's
+/// live-fetched tool state onto the synthetic built-in row, if the watcher
+/// (`agent_bridge::ensure_snapshotd_watcher_started`) has synced one yet.
+///
+/// Real, live-found bug (mcp-servers-settings follow-up): the synthetic
+/// row from `models::builtin_snapshotd_option` has no registry entry of
+/// its own, so it always renders `tool_fetch_status: ""` and `tools: []`
+/// by construction -- but `mcp_servers/tools_fetch` (fired by the Fetch
+/// button on that exact row) actually targets the *real* registry entry
+/// the watcher synced (see `agent_bridge::builtin_snapflow_registry_
+/// entry`'s doc comment), and `registry_mcp_servers_excluding_builtin`
+/// deliberately drops that real entry from the displayed list so it isn't
+/// rendered a second time. Without this merge, a completed fetch had
+/// nowhere to land: the user would see the one-shot "Fetching tools for
+/// snapflow..." toast, the backend probe would succeed, and the row would
+/// still show "No tools discovered yet" forever. Extracted as a pure,
+/// `ChatPanel`-free function so this is unit-testable without a live
+/// Slint platform, same convention as
+/// [`registry_mcp_servers_excluding_builtin`].
+fn merge_builtin_snapshotd_tool_state(
+    builtin: &mut crate::McpServerOption,
+    registry_servers: &[crate::protocol_types::McpServerEntry],
+    busy_keys: &[String],
+) {
+    let Some(real_entry) = registry_servers
+        .iter()
+        .find(|server| crate::agent_bridge::is_builtin_snapflow_mcp_name(&server.name))
+    else {
+        return;
+    };
+    let Some(real_row) =
+        crate::models::to_mcp_server_option_rows(vec![real_entry.clone()], busy_keys)
+            .into_iter()
+            .next()
+    else {
+        return;
+    };
+    builtin.tools = real_row.tools;
+    builtin.tool_fetch_status = real_row.tool_fetch_status;
+    builtin.tool_fetch_error = real_row.tool_fetch_error;
+    builtin.tools_search_blob = real_row.tools_search_blob;
+}
+
 /// True when the currently selected thread's provider has a stored
 /// pool-acquire probe failure (`Model::provider_errors`, populated from
 /// `AgentEvent::ProviderProbe` on a provider-picker toggle -- see
@@ -1301,6 +1357,26 @@ fn selected_provider_unavailable(model: &Model) -> bool {
     crate::update::selected_real_index(model)
         .and_then(|idx| model.threads.get(idx))
         .is_some_and(|thread| model.provider_errors.contains_key(&thread.provider))
+}
+
+/// True while the currently selected/displayed thread's provider has a
+/// `probe_provider_selection` acquire+release round-trip in flight
+/// (`Model::provider_probes_in_flight`, populated in `SettingsMsg::
+/// ProfileSelected`'s reducer arm and cleared in `update_frame`'s
+/// `ProviderProbe` arm on Ok *or* Err). Drives the chat-view pulsing
+/// "Switching provider..." indicator (`ChatArea.provider-switching`) --
+/// deliberately loading-only: the probe's *error* text still flows only
+/// through the existing `provider_errors` map / toast
+/// (`selected_provider_unavailable` above, `show_toast` in `update_frame`),
+/// not duplicated into a second chat-view-local error surface. Same
+/// "keyed off the selected thread's own provider, not any in-flight probe
+/// anywhere" contract as `selected_provider_unavailable`, and same pure,
+/// `ChatPanel`-free shape so it's unit-testable without a live Slint
+/// platform.
+fn chat_view_provider_switching(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.provider_probes_in_flight.contains(&thread.provider))
 }
 
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
@@ -1322,28 +1398,33 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     // non-blocking; the control-socket poll runs on its own thread.
     let mut mcp_rows = Vec::new();
     let mut mcp_keys: Vec<String> = Vec::new();
-    if let Some(builtin) =
+    if let Some(mut builtin) =
         crate::models::builtin_snapshotd_option(crate::agent_bridge::snapshotd_mcp_addr())
     {
+        // See `merge_builtin_snapshotd_tool_state`'s doc comment: the
+        // watcher-synced real "snapflow" registry entry is what
+        // `mcp_servers/tools_fetch` actually targets, and its live-fetched
+        // tool state must land on this synthetic row or a completed fetch
+        // has nowhere to surface.
+        merge_builtin_snapshotd_tool_state(
+            &mut builtin,
+            &model.available_mcp_servers,
+            &model.mcp_operations_in_flight,
+        );
         mcp_keys.push(builtin.name.to_string());
         mcp_rows.push(builtin);
     }
-    // The background watcher (`agent_bridge::ensure_snapshotd_watcher_
-    // started` / `sync_snapshotd_registry_if_changed`) syncs a real
-    // `"snapflow"` row into the central registry so `mcp_servers/
-    // tools_fetch` has an actual target to query (see
-    // `agent_bridge::builtin_snapflow_registry_entry`'s doc comment).
-    // That means `model.available_mcp_servers` can now legitimately
-    // contain an entry under the built-in daemon's own name(s)
-    // (`agent_bridge::is_builtin_snapflow_mcp_name` -- `"snapflow"` or
-    // its wire alias `"snapshotd"`) once that sync lands, *in addition*
-    // to the synthetic row prepended above. Left unfiltered, both would
+    // `model.available_mcp_servers` can legitimately contain an entry under
+    // the built-in daemon's own name(s) (`agent_bridge::
+    // is_builtin_snapflow_mcp_name` -- `"snapflow"` or its wire alias
+    // `"snapshotd"`) once the watcher's registry sync lands, *in addition*
+    // to the synthetic row prepended above (whose tool state that entry
+    // was just merged into, if present). Left unfiltered, both would
     // render, showing two rows for the same daemon (found live: PUI-015
-    // mcp-servers-settings follow-up). The synthetic row stays the
-    // single source of truth for this row's display (it's always
-    // present, non-removable, and reflects the live toggle even before
-    // any registry sync succeeds); the registry row's only job is
-    // giving `tools_fetch`/other RPCs a real target, so it is excluded
+    // mcp-servers-settings follow-up). The synthetic row stays the single
+    // *display* source of truth for this row (it's always present,
+    // non-removable, and reflects the live toggle even before any
+    // registry sync succeeds), so the registry row itself is excluded
     // here rather than rendered a second time.
     let extra_mcp_servers = registry_mcp_servers_excluding_builtin(&model.available_mcp_servers);
     mcp_rows.extend(crate::models::to_mcp_server_option_rows(
@@ -1449,6 +1530,12 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
             {
                 sync_profile_picker(model, component, thread);
             }
+            // mcp-servers-settings follow-up: same reasoning as the
+            // profile-picker resync just above -- a thread switch can
+            // land on a thread whose OWN provider probe is (or isn't)
+            // in flight, and nothing else re-fires for a pure selection
+            // change, so recompute the singleton pulse property here too.
+            component.set_selected_provider_switching(chat_view_provider_switching(model));
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());
@@ -1627,6 +1714,115 @@ mod tests {
         );
     }
 
+    /// Regression test for the "Fetching tools for snapflow..." toast
+    /// firing but the row never actually showing the fetched tools (real
+    /// user report, mcp-servers-settings follow-up part 2): once the
+    /// watcher-synced real "snapflow" registry entry has a `Ready`
+    /// `tool_catalog` (a completed `mcp_servers/tools_fetch`),
+    /// `merge_builtin_snapshotd_tool_state` must copy that fetched tool
+    /// list, status, and search blob onto the synthetic built-in row --
+    /// otherwise the real result is computed successfully but has nowhere
+    /// to land, since `registry_mcp_servers_excluding_builtin` drops the
+    /// real entry from the displayed list entirely.
+    #[test]
+    fn merge_builtin_snapshotd_tool_state_surfaces_a_completed_fetch() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo};
+
+        let real_entry = McpServerEntry {
+            name: "snapflow".to_string(),
+            enabled: true,
+            config: McpServerConfig::Http {
+                url: "http://127.0.0.1:9/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+            auth_status: None,
+            tool_catalog: Some(McpToolCatalog::Ready {
+                tools: vec![McpToolInfo {
+                    name: "render_frame".to_string(),
+                    description: Some("Renders a video frame".to_string()),
+                }],
+            }),
+            extra: Default::default(),
+        };
+
+        let mut builtin = crate::models::builtin_snapshotd_option(Some("127.0.0.1:9".to_string()))
+            .expect("builtin row present when reachable");
+        // Sanity: the synthetic row starts with no tool state of its own,
+        // same defaults `models::builtin_snapshotd_option` always sets.
+        assert_eq!(builtin.tool_fetch_status.as_str(), "");
+        assert_eq!(builtin.tools.row_count(), 0);
+
+        merge_builtin_snapshotd_tool_state(&mut builtin, &[real_entry], &[]);
+
+        assert_eq!(
+            builtin.tool_fetch_status.as_str(),
+            "ready",
+            "a completed fetch on the real registry entry must surface on the \
+             synthetic row's fetch status, not stay stuck empty"
+        );
+        assert_eq!(builtin.tools.row_count(), 1);
+        assert_eq!(builtin.tools.row_data(0).unwrap().name.as_str(), "render_frame");
+        assert!(builtin.tools_search_blob.as_str().contains("render_frame"));
+    }
+
+    /// A still-in-flight fetch (`Fetching` catalog state, or no catalog yet
+    /// but a matching `tools_fetch:<name>` busy key) must also reach the
+    /// synthetic row -- this is what lets the Fetch button's spinner and
+    /// the "Fetching tools from server…" inline row actually show while
+    /// the real probe against the registry entry is still running.
+    #[test]
+    fn merge_builtin_snapshotd_tool_state_surfaces_in_flight_fetch() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
+
+        let real_entry = McpServerEntry {
+            name: "snapflow".to_string(),
+            enabled: true,
+            config: McpServerConfig::Http {
+                url: "http://127.0.0.1:9/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+            auth_status: None,
+            tool_catalog: None,
+            extra: Default::default(),
+        };
+
+        let mut builtin = crate::models::builtin_snapshotd_option(Some("127.0.0.1:9".to_string()))
+            .expect("builtin row present when reachable");
+
+        merge_builtin_snapshotd_tool_state(
+            &mut builtin,
+            &[real_entry],
+            &["tools_fetch:snapflow".to_string()],
+        );
+
+        assert_eq!(
+            builtin.tool_fetch_status.as_str(),
+            "fetching",
+            "an in-flight tools_fetch kickoff (no catalog yet, but a matching busy \
+             key) must show as 'fetching' on the synthetic row so the Fetch \
+             button spinner and inline status text actually activate"
+        );
+    }
+
+    /// No real registry entry synced yet (watcher hasn't run, or no
+    /// gateway existed when it last ticked): the synthetic row must keep
+    /// its placeholder defaults rather than panicking or clearing
+    /// something that was never there.
+    #[test]
+    fn merge_builtin_snapshotd_tool_state_is_a_no_op_without_a_real_entry() {
+        let mut builtin = crate::models::builtin_snapshotd_option(Some("127.0.0.1:9".to_string()))
+            .expect("builtin row present when reachable");
+
+        merge_builtin_snapshotd_tool_state(&mut builtin, &[], &[]);
+
+        assert_eq!(builtin.tool_fetch_status.as_str(), "");
+        assert_eq!(builtin.tools.row_count(), 0);
+    }
+
     fn model_with_one_thread(provider: &str) -> Model {
         let mut model = Model::default();
         model.threads.push(crate::model::ThreadModel {
@@ -1673,6 +1869,43 @@ mod tests {
         assert!(
             !selected_provider_unavailable(&model),
             "clearing the selected thread's provider error must re-enable Send"
+        );
+    }
+
+    /// mcp-servers-settings follow-up: same "keyed off the selected
+    /// thread's own provider" contract as
+    /// `selected_provider_unavailable_is_keyed_to_the_selected_threads_own_provider`
+    /// above, for the sibling loading signal that drives the chat-view
+    /// pulsing "Switching provider..." indicator.
+    #[test]
+    fn chat_view_provider_switching_is_keyed_to_the_selected_threads_own_provider() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !chat_view_provider_switching(&model),
+            "no probe in flight yet -- no pulse"
+        );
+
+        model
+            .provider_probes_in_flight
+            .insert("some-other-provider".to_owned());
+        assert!(
+            !chat_view_provider_switching(&model),
+            "an in-flight probe for a provider the selected thread isn't using must not \
+             pulse this thread's chat view"
+        );
+
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+        assert!(
+            chat_view_provider_switching(&model),
+            "an in-flight probe for the selected thread's own provider must pulse"
+        );
+
+        model.provider_probes_in_flight.remove("codex-acp");
+        assert!(
+            !chat_view_provider_switching(&model),
+            "clearing the in-flight marker must stop the pulse"
         );
     }
 

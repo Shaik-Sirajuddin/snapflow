@@ -1922,6 +1922,35 @@ pub fn current_provider_trigger_label(profiles: &[ProfileOption], current_profil
         .unwrap_or_else(|| current_profile.to_owned())
 }
 
+/// Compose-bar Provider trigger label, with a live fallback to the
+/// thread's own `provider` field.
+///
+/// `current_provider_trigger_label` resolves through `profile_name`
+/// (`current_profile`), which is legitimately empty for native/unmanaged-
+/// mode threads and for threads restored from `state_store` (a
+/// `thread_settings` row can have a real `provider` with a NULL
+/// `profile_name` -- see `StateStore::thread_records`'s doc comment), even
+/// though the thread has a real, active provider. Bug report: the compose
+/// Provider trigger showed the literal placeholder "Provider" for such a
+/// thread even though a provider was already selected/active, while
+/// `agent-badge` (app.slint), which reads `thread.provider` directly,
+/// showed the real value. Falling back to `thread_provider` here keeps the
+/// trigger label live-derived the same way `agent-badge` already is,
+/// instead of leaving it stuck on the generic placeholder whenever
+/// `profile_name` alone doesn't resolve to anything.
+pub fn resolve_provider_trigger_label(
+    profiles: &[ProfileOption],
+    current_profile: &str,
+    thread_provider: &str,
+) -> String {
+    let label = current_provider_trigger_label(profiles, current_profile);
+    if label.is_empty() {
+        thread_provider.to_owned()
+    } else {
+        label
+    }
+}
+
 /// Agent/provider id for the thread's selected profile (empty if unknown).
 pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile: &str) -> String {
     if current_profile.is_empty() {
@@ -2222,9 +2251,15 @@ pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption>
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
-        // The built-in daemon isn't a registry entry at all -- there's no
-        // `mcp_servers/tools_fetch` target for it, so it never has a
-        // fetch status to show.
+        // Placeholder defaults -- this synthetic row has no registry
+        // entry of its own to read `tool_catalog` from. The background
+        // watcher (`agent_bridge::ensure_snapshotd_watcher_started`) does
+        // sync a real "snapflow" registry entry that `mcp_servers/
+        // tools_fetch` actually targets; `sync::reconcile_settings_models`
+        // looks that entry up by `agent_bridge::is_builtin_snapflow_mcp_
+        // name` and overwrites these four fields with its live-fetched
+        // state before this row is displayed. Do not rely on these
+        // defaults being final.
         tool_fetch_status: String::new().into(),
         tool_fetch_error: String::new().into(),
         tools_search_blob: String::new().into(),
@@ -4336,6 +4371,55 @@ mod transcript_model_tests {
             filtered.row_data(2).unwrap().value.as_str(),
             "claude-acp/sonnet"
         );
+    }
+
+    /// Regression test for a live-reported bug: the compose-bar Provider
+    /// trigger showed the literal placeholder "Provider" instead of the
+    /// real provider name for a thread that already had one
+    /// selected/active (cold-start restore or a prior explicit pick),
+    /// unless the user re-touched the dropdown. Root cause:
+    /// `current_provider_trigger_label` resolves the label through the
+    /// thread's `profile_name`, which is legitimately empty for
+    /// native/unmanaged-mode threads and for threads restored from
+    /// `state_store` (a `thread_settings` row can persist a real
+    /// `provider` with a NULL `profile_name` -- see
+    /// `StateStore::thread_records`'s doc comment), even though the
+    /// thread's own `provider` field is a real, active value. Unlike
+    /// `agent-badge` (app.slint), which already reads `thread.provider`
+    /// directly and stayed correct, the compose trigger had no such
+    /// fallback and fell straight to `""`, which
+    /// `chat_input_layout.slint`'s `profile-label-shown` renders as the
+    /// generic "Provider ›" placeholder. `resolve_provider_trigger_label`
+    /// (the fix, wired into `sync.rs`'s `sync_profile_picker`) falls back
+    /// to the thread's live `provider` field whenever the profile-name
+    /// resolution comes back empty.
+    #[test]
+    fn provider_trigger_label_falls_back_to_thread_provider_when_profile_name_is_empty() {
+        // No profiles loaded/matched at all (e.g. native/unmanaged mode, or
+        // a cold-start-restored thread with no persisted `profile_name`).
+        assert_eq!(
+            resolve_provider_trigger_label(&[], "", "codex-acp"),
+            "codex-acp",
+            "an empty profile_name must not blank out an already-active provider"
+        );
+
+        // A non-empty profile_name that still resolves normally must keep
+        // taking priority over the raw `thread.provider` fallback.
+        let profiles = vec![ProfileOption {
+            name: "work".into(),
+            agent_id: "codex-acp".into(),
+            terminal_enabled: true,
+            fs_enabled: true,
+        }];
+        assert_eq!(
+            resolve_provider_trigger_label(&profiles, "work", "claude-acp"),
+            "codex-acp",
+            "a resolved profile_name label must win over the thread_provider fallback"
+        );
+
+        // Both profile_name and thread.provider empty (genuinely nothing
+        // selected yet) must still render as the "Provider ›" placeholder.
+        assert_eq!(resolve_provider_trigger_label(&[], "", ""), "");
     }
 
     /// PROF-10: a provider whose agent the catalog genuinely reports as

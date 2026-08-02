@@ -4096,8 +4096,17 @@ impl AgentBridge {
 
     pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) {
         let Some(slot) = self.slots.get(idx) else { return };
+        // A thread with no resolvable project directory (no project bound
+        // and no session cwd override) is a normal, fully-supported state
+        // -- not a provider problem. `PoolKey`/session acquisition require a
+        // real project dir structurally, so the probe mechanism itself
+        // cannot run here; that's a precondition failure of the probe, not
+        // evidence this provider's auth is broken. Skip silently: no
+        // `provider_errors` entry, no toast, Send stays unaffected by
+        // provider state. Push nothing at all (not even an `Ok`) so a
+        // stale error from a previous project stays until a probe that can
+        // actually run replaces it.
         let Some(project_dir) = thread_project_dir(slot.project_path_snapshot().as_deref(), &self.session_cwd_override) else {
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result: Err("no active project is available".to_owned()) } });
             return;
         };
         let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
@@ -10006,6 +10015,33 @@ done
                 .iter()
                 .all(|spec| spec.provider == NO_PROVIDER_REQUESTED_FALLBACK),
             "got: {specs:?}"
+        );
+    }
+
+    /// A thread with no project bound and no session cwd override is a
+    /// normal, fully-supported state (default cold-start thread, unscoped
+    /// thread kept open across a project switch -- see
+    /// `retain_items_for_project` and the `2e20021c`/`a8058a45` seeded
+    /// default thread). `probe_provider_selection` must not treat "no
+    /// project" as a provider auth failure: no `ProviderProbe` event at all
+    /// should be emitted, since a stored `Err` here becomes a
+    /// "Provider unavailable" toast and disables Send
+    /// (`selected-provider-unavailable`) for a reason that has nothing to
+    /// do with the provider itself.
+    #[test]
+    fn probe_provider_selection_is_a_silent_noop_when_thread_has_no_project() {
+        let mut bridge = AgentBridge::new_with_gateway_url(&["Untitled"], "http://127.0.0.1:1".to_owned())
+            .expect("bridge");
+
+        bridge.probe_provider_selection(0, "codex".to_owned(), None);
+
+        // Give any (unexpected) spawned task a chance to land before
+        // asserting the queue is empty.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let events = bridge.poll();
+        assert!(
+            events.is_empty(),
+            "no-project probe must not emit any ProviderProbe event, got: {events:?}"
         );
     }
 
