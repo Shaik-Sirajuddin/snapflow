@@ -2425,24 +2425,70 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
     // spawn there directly (keeps the common case's URL predictable);
     // otherwise it's occupied by some unrelated service, so probe for a
     // real free ephemeral port instead of fighting over the default one.
-    let (port, lock) = if std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
-        std::time::Duration::from_millis(100),
-    )
-    .is_err()
-    {
-        match reserve_port(default_port) {
-            Ok(lock) => (default_port, lock),
-            Err(_) => reserve_ephemeral_port()
-                .ok_or_else(|| "could not reserve a loopback port".to_string())?,
-        }
-    } else {
-        reserve_ephemeral_port().ok_or_else(|| "could not reserve a loopback port".to_string())?
-    };
+    //
+    // That check only catches a port that's already *listening* --
+    // `reserve_port`'s own lock file only guards against two calls in
+    // *this* process racing each other, not an unrelated process binding
+    // the same port between this check and `spawn_gateway_process`'s own
+    // `cmd.spawn()` a moment later. When that race loses, `acpx-server`
+    // itself fails to bind and exits immediately with the real "Address
+    // already in use" -- `spawn_gateway_process` tags that specific
+    // failure with `PORT_COLLISION_ERROR_MARKER` (see its doc comment), so
+    // retry a small, bounded number of times on a fresh ephemeral port
+    // instead of surfacing a bare crash with no fallback. Any other
+    // failure shape (missing binary, bad config, permission error, ...) is
+    // returned immediately -- a retry would never fix those.
+    const MAX_PORT_COLLISION_RETRIES: u32 = 3;
+    let mut attempt = 0;
+    loop {
+        let (port, lock) = if attempt == 0 {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_err()
+            {
+                match reserve_port(default_port) {
+                    Ok(lock) => (default_port, lock),
+                    Err(_) => reserve_ephemeral_port()
+                        .ok_or_else(|| "could not reserve a loopback port".to_string())?,
+                }
+            } else {
+                reserve_ephemeral_port()
+                    .ok_or_else(|| "could not reserve a loopback port".to_string())?
+            }
+        } else {
+            reserve_ephemeral_port()
+                .ok_or_else(|| "could not reserve a loopback port".to_string())?
+        };
 
-    spawn_gateway_process(provider, port, lock, cache_dir)?;
-    Ok(format!("http://127.0.0.1:{port}"))
+        match spawn_gateway_process(provider, port, lock, cache_dir) {
+            Ok(()) => return Ok(format!("http://127.0.0.1:{port}")),
+            Err(e)
+                if e.starts_with(PORT_COLLISION_ERROR_MARKER)
+                    && attempt < MAX_PORT_COLLISION_RETRIES =>
+            {
+                attempt += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(e
+                    .strip_prefix(PORT_COLLISION_ERROR_MARKER)
+                    .unwrap_or(&e)
+                    .to_string());
+            }
+        }
+    }
 }
+
+/// Prefix `spawn_gateway_process` puts on its error string when the spawned
+/// `acpx-server` exited during startup for what its own stderr log confirms
+/// was a port collision -- lets [`provision_gateway`] distinguish "retry on
+/// a different port" from every other startup failure (missing binary, bad
+/// config, permission error, ...) that a retry would never fix. Not a real
+/// error type since every other error in this module is already a bare
+/// `String`; a marker prefix keeps this one consistent with that.
+const PORT_COLLISION_ERROR_MARKER: &str = "\u{0}PORT_COLLISION\u{0}";
 
 /// The actual `Command::spawn` -- split from [`provision_gateway`] so the
 /// port-selection policy above stays readable. See that function's doc
@@ -2746,8 +2792,30 @@ fn spawn_gateway_process(
             let _ = std::fs::remove_file(
                 std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
             );
+            // `reserve_port`/the pre-spawn `TcpStream::connect_timeout` probe
+            // in `provision_gateway` only catch a port that's already
+            // *listening*; a port bound-but-not-accepting (TIME_WAIT, or an
+            // unrelated process racing this one between the probe and this
+            // exact `cmd.spawn()`) sails through both checks and only shows
+            // up here, as `acpx-server` itself failing to bind and exiting
+            // immediately. Scan its stderr log (the only place that real
+            // "Address already in use" / EADDRINUSE text lands, see the
+            // stderr redirection above) so `provision_gateway` can tell this
+            // apart from every other startup failure and retry on a fresh
+            // port instead of surfacing a bare crash with no fallback.
+            let looks_like_port_collision = std::fs::read_to_string(&stderr_log)
+                .map(|log| {
+                    let lower = log.to_ascii_lowercase();
+                    lower.contains("address already in use") || lower.contains("eaddrinuse")
+                })
+                .unwrap_or(false);
             return Err(format!(
-                "acpx-server exited during startup for {provider} on port {port}: {status}"
+                "{}acpx-server exited during startup for {provider} on port {port}: {status}",
+                if looks_like_port_collision {
+                    PORT_COLLISION_ERROR_MARKER
+                } else {
+                    ""
+                }
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
