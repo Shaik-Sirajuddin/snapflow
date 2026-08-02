@@ -6553,7 +6553,7 @@ mod tests {
 
     #[test]
     fn mcp_server_tool_deferred_changed_produces_a_matching_effect() {
-        let mut model = Model::default();
+        let mut model = model_with_threads(&["Thread"]);
         let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
@@ -6566,10 +6566,10 @@ mod tests {
         assert!(matches!(
             &effects[0],
             Effect::McpServerToolDeferredChanged {
+                real_index: 0,
                 server_name,
                 tool_name,
                 deferred: true,
-                ..
             } if server_name == "fs" && tool_name == "read_file"
         ));
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
@@ -6577,7 +6577,7 @@ mod tests {
 
     #[test]
     fn mcp_server_tools_fetch_requested_produces_a_matching_effect() {
-        let mut model = Model::default();
+        let mut model = model_with_threads(&["Thread"]);
         let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
@@ -6587,7 +6587,10 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             &effects[0],
-            Effect::McpServerToolsFetchRequested { server_name, .. } if server_name == "fs"
+            Effect::McpServerToolsFetchRequested {
+                real_index: 0,
+                server_name,
+            } if server_name == "fs"
         ));
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
     }
