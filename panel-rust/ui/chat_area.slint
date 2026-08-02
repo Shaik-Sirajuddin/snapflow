@@ -79,6 +79,16 @@ export component ChatArea inherits Rectangle {
     // pulse mechanism as the `reloading`/"loading conversation..." block
     // below (Metrics.pulse-period-driven opacity blink), not a new one.
     in property <bool> provider-switching: false;
+    // mcp-servers-settings follow-up: true while the displayed thread's
+    // FIRST real ACP session attach -- deferred to first send, see
+    // `dispatch::dispatch_compose_send_maybe_attach`'s doc comment -- is
+    // in flight (start -> that dispatch's `EffectResultMsg::
+    // SessionAttachStarted`; end -> the frame-poll thread-list-snapshot
+    // fold observing `session_id` go `None` -> `Some`, or a failure via
+    // `SessionAttached`'s `Err` arm / `AgentEvent::Error`). Same pulse
+    // mechanism as provider-switching above, a distinct, temporally
+    // non-overlapping scenario -- see that property's own doc comment.
+    in property <bool> first-attach-in-flight: false;
     callback error-banner-dismissed();
     // PROF-8: persistent (not dismissible) yellow strip -- the displayed
     // thread's agent is reachable but not authenticated. Clears itself
@@ -606,12 +616,52 @@ export component ChatArea inherits Rectangle {
                         height: Metrics.icon-md;
                         accessible-role: text;
                         accessible-label: "Connection status: " + connection-status;
-                        if root.sending || connection-status == "Connecting..." : Spinner {
+                        // project-reopen dash-marker follow-up: `connecting`
+                        // used to fall into the same `root.sending ||
+                        // connection-status == "Connecting..."` bucket as an
+                        // in-flight generation, rendering the spinner below
+                        // for BOTH. That's wrong for the project-reopen
+                        // window specifically: `connection-status` reads
+                        // "Connecting..." for the whole
+                        // history-fetch/reconnect/metadata-fetch stretch
+                        // while a thread's gateway is re-attaching after a
+                        // project reopen (`AgentBridge::transport_status`,
+                        // agent_bridge.rs -- `None` gateway mode ->
+                        // "Connecting...", written into `thread.
+                        // connection_status` via `Dirty::Connection` off the
+                        // snapshot poll, external_snapshot.rs). Split it out
+                        // from `root.sending` so it gets the same "-" dash
+                        // treatment as the other two acquisition states
+                        // below (provider-switching / first-attach-in-flight)
+                        // instead of the spinner, while a real in-flight
+                        // generation (`root.sending` alone, session already
+                        // live) keeps the spinner unchanged.
+                        property <bool> connecting: connection-status == "Connecting...";
+                        if root.sending : Spinner {
                             size: Metrics.icon-md;
                             stroke: Theme.bg-primary;
                             stroke-width: 2px;
                         }
-                        if !(root.sending || connection-status == "Connecting...")
+                        // Pulsing dash for the project-reopen reconnect
+                        // window -- same glyph/monochrome treatment and
+                        // Metrics.pulse-period blink formula as the
+                        // provider-switching/first-attach-in-flight dash
+                        // below, just keyed off `connecting` instead of
+                        // those two `Model` sets. Takes priority over the
+                        // hand-icon/dash/dot branches below by construction
+                        // (mirrors the old spinner's precedence).
+                        if !root.sending && connecting : Text {
+                            text: "-";
+                            color: Theme.text-secondary;
+                            font-size: Metrics.icon-md * 0.9;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                            opacity: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                        }
+                        if !root.sending && !connecting
                             && root.status-needs-attention : Icon {
                             source: @image-url("./assets/icons/hand-filled.svg");
                             size: Metrics.icon-md;
@@ -633,7 +683,7 @@ export component ChatArea inherits Rectangle {
                         // monochrome-only status language (see
                         // `agent_card.slint`'s doc comment) rather than
                         // introducing a red/error-colored treatment here.
-                        if !(root.sending || connection-status == "Connecting...")
+                        if !root.sending && !connecting
                             && !root.status-needs-attention
                             && connection-status == "Unavailable" : Text {
                             text: "-";
@@ -645,9 +695,42 @@ export component ChatArea inherits Rectangle {
                             width: 100%;
                             height: 100%;
                         }
-                        if !(root.sending || connection-status == "Connecting...")
+                        // mcp-servers-settings follow-up: a pulsing sibling
+                        // of the static "Unavailable" dash just above, for
+                        // an ACQUISITION-in-progress state rather than a
+                        // known-broken one -- the provider-switch pool
+                        // probe (provider-switching, already surfaced as
+                        // its own chat-body pulsing text) and the first
+                        // real session attach (first-attach-in-flight,
+                        // this task's new chat-body text) both also get a
+                        // top-bar echo here, same dash glyph/monochrome
+                        // treatment as the error dash but animated with
+                        // the same Metrics.pulse-period blink formula the
+                        // chat-body pulsing lines use. Mutually exclusive
+                        // with the branches above/below by construction:
+                        // an acquisition in flight means transport is not
+                        // yet known "Unavailable" (that dash), and this
+                        // branch's condition is subtracted from the plain
+                        // idle dot's below so exactly one of the three
+                        // ever shows.
+                        if !root.sending && !connecting
                             && !root.status-needs-attention
-                            && connection-status != "Unavailable" : Rectangle {
+                            && connection-status != "Unavailable"
+                            && (root.provider-switching || root.first-attach-in-flight) : Text {
+                            text: "-";
+                            color: Theme.text-secondary;
+                            font-size: Metrics.icon-md * 0.9;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                            opacity: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                        }
+                        if !root.sending && !connecting
+                            && !root.status-needs-attention
+                            && connection-status != "Unavailable"
+                            && !(root.provider-switching || root.first-attach-in-flight) : Rectangle {
                             width: 6px;
                             height: 6px;
                             border-radius: 3px;
@@ -1096,6 +1179,35 @@ export component ChatArea inherits Rectangle {
                     property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
                     Text {
                         text: "Switching provider...";
+                        color: Theme.text-muted;
+                        opacity: blink;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                // mcp-servers-settings follow-up: same reasoning as the
+                // provider-switching block just above, for the sibling
+                // first-real-session-attach scenario -- a compose send on
+                // a not-yet-attached thread queues the outgoing message
+                // (messages.length > 0) the instant it's sent, so this
+                // can't be folded into the "messages.length == 0" blocks
+                // below either. Distinct wording ("Starting new
+                // thread...") matches the existing sidebar-row convention
+                // for this exact scenario (`external_snapshot.rs`'s
+                // `shows_starting_thread_loading`/PUI-014 "Starting new
+                // thread..." affordance) rather than inventing new
+                // copy. Mutually exclusive with provider-switching above
+                // in practice: a provider switch is only possible before
+                // a thread has a real session, and this is the window
+                // right after that.
+                if root.first-attach-in-flight : VerticalLayout {
+                    height: 28px;
+                    alignment: center;
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+                    Text {
+                        text: "Starting new thread...";
                         color: Theme.text-muted;
                         opacity: blink;
                         font-size: 11px * Theme.font-scale;
