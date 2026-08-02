@@ -2770,13 +2770,41 @@ fn spawn_gateway_process(
     })?;
     for _ in 0..50 {
         if probe_acpx_gateway_for_agent(port, Some(provider)) {
+            // Health-visibility gap: this watcher used to silently `break`
+            // and clean up the port lock on the gateway's own unexpected
+            // exit, with no log line and nothing surfaced to the panel at
+            // all -- an already-running gateway dying (crash, OOM-kill,
+            // operator `kill`) left every thread on it stuck with no
+            // explanation anywhere on disk, the same "zero diagnostics"
+            // failure mode the stderr-log-instead-of-/dev/null fix above
+            // addresses for startup failures. Full model/UI wiring for a
+            // post-start death is a larger TEA-plumbing change (no
+            // existing global channel from this background std::thread
+            // into the reducer); this is the tractable first step so the
+            // event is at least discoverable instead of invisible.
+            let provider_owned = provider.to_string();
             std::thread::spawn(move || {
                 let mut child = child;
-                loop {
+                let exit_status = loop {
                     match child.try_wait() {
-                        Ok(Some(_)) | Err(_) => break,
+                        Ok(Some(status)) => break Some(status),
+                        Err(error) => {
+                            eprintln!(
+                                "panel-rust: lost track of acpx-server for {provider_owned} \
+                                 on port {port} (pid wait error: {error})"
+                            );
+                            break None;
+                        }
                         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
                     }
+                };
+                if let Some(status) = exit_status {
+                    eprintln!(
+                        "panel-rust: acpx-server for {provider_owned} on port {port} exited \
+                         unexpectedly ({status}); every thread still bound to this gateway \
+                         will fail its next request -- see gateway-{provider_owned}.stderr.log \
+                         for the process's own diagnostics"
+                    );
                 }
                 drop(lock);
                 let _ = std::fs::remove_file(
