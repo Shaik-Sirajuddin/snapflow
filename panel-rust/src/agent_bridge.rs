@@ -1015,17 +1015,29 @@ fn resolve_acpx_server_bin_from(
     if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
         return PathBuf::from(bin);
     }
+    // A real Windows install's `acpx-server` binary is named
+    // `acpx-server.exe` -- shotcut-rebrand's CMakeLists.txt installs it
+    // via `install(PROGRAMS $<TARGET_FILE:acpx-server> ...)` with no
+    // RENAME, and CMake's `TARGET_FILE` generator expression already
+    // includes the platform executable suffix. Every candidate below
+    // previously joined a bare `"acpx-server"` with no suffix, so
+    // `candidate.is_file()` could never match the installed
+    // `acpx-server.exe` on Windows -- it always fell through to the
+    // dev-checkout fallback (which doesn't exist on a packaged install),
+    // silently leaving `gateway-ready` false forever and the sidebar's
+    // "+ New Thread" button (`sidebar.slint`'s `enabled: root.gateway-
+    // ready`) permanently, silently disabled. `EXE_SUFFIX` is `""` on
+    // Unix, so this is a no-op there.
+    let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
+    let libexec_name = format!("../libexec/acpx-server{}", std::env::consts::EXE_SUFFIX);
     if let Some(parent) = current_exe.and_then(Path::parent) {
-        for candidate in [
-            parent.join("acpx-server"),
-            parent.join("../libexec/acpx-server"),
-        ] {
+        for candidate in [parent.join(&exe_name), parent.join(&libexec_name)] {
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
-    manifest_dir.join("../acpx/target/debug/acpx-server")
+    manifest_dir.join(format!("../acpx/target/debug/{exe_name}"))
 }
 
 fn resolve_acpx_server_bin() -> PathBuf {
@@ -2413,24 +2425,70 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
     // spawn there directly (keeps the common case's URL predictable);
     // otherwise it's occupied by some unrelated service, so probe for a
     // real free ephemeral port instead of fighting over the default one.
-    let (port, lock) = if std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
-        std::time::Duration::from_millis(100),
-    )
-    .is_err()
-    {
-        match reserve_port(default_port) {
-            Ok(lock) => (default_port, lock),
-            Err(_) => reserve_ephemeral_port()
-                .ok_or_else(|| "could not reserve a loopback port".to_string())?,
-        }
-    } else {
-        reserve_ephemeral_port().ok_or_else(|| "could not reserve a loopback port".to_string())?
-    };
+    //
+    // That check only catches a port that's already *listening* --
+    // `reserve_port`'s own lock file only guards against two calls in
+    // *this* process racing each other, not an unrelated process binding
+    // the same port between this check and `spawn_gateway_process`'s own
+    // `cmd.spawn()` a moment later. When that race loses, `acpx-server`
+    // itself fails to bind and exits immediately with the real "Address
+    // already in use" -- `spawn_gateway_process` tags that specific
+    // failure with `PORT_COLLISION_ERROR_MARKER` (see its doc comment), so
+    // retry a small, bounded number of times on a fresh ephemeral port
+    // instead of surfacing a bare crash with no fallback. Any other
+    // failure shape (missing binary, bad config, permission error, ...) is
+    // returned immediately -- a retry would never fix those.
+    const MAX_PORT_COLLISION_RETRIES: u32 = 3;
+    let mut attempt = 0;
+    loop {
+        let (port, lock) = if attempt == 0 {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_err()
+            {
+                match reserve_port(default_port) {
+                    Ok(lock) => (default_port, lock),
+                    Err(_) => reserve_ephemeral_port()
+                        .ok_or_else(|| "could not reserve a loopback port".to_string())?,
+                }
+            } else {
+                reserve_ephemeral_port()
+                    .ok_or_else(|| "could not reserve a loopback port".to_string())?
+            }
+        } else {
+            reserve_ephemeral_port()
+                .ok_or_else(|| "could not reserve a loopback port".to_string())?
+        };
 
-    spawn_gateway_process(provider, port, lock, cache_dir)?;
-    Ok(format!("http://127.0.0.1:{port}"))
+        match spawn_gateway_process(provider, port, lock, cache_dir) {
+            Ok(()) => return Ok(format!("http://127.0.0.1:{port}")),
+            Err(e)
+                if e.starts_with(PORT_COLLISION_ERROR_MARKER)
+                    && attempt < MAX_PORT_COLLISION_RETRIES =>
+            {
+                attempt += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(e
+                    .strip_prefix(PORT_COLLISION_ERROR_MARKER)
+                    .unwrap_or(&e)
+                    .to_string());
+            }
+        }
+    }
 }
+
+/// Prefix `spawn_gateway_process` puts on its error string when the spawned
+/// `acpx-server` exited during startup for what its own stderr log confirms
+/// was a port collision -- lets [`provision_gateway`] distinguish "retry on
+/// a different port" from every other startup failure (missing binary, bad
+/// config, permission error, ...) that a retry would never fix. Not a real
+/// error type since every other error in this module is already a bare
+/// `String`; a marker prefix keeps this one consistent with that.
+const PORT_COLLISION_ERROR_MARKER: &str = "\u{0}PORT_COLLISION\u{0}";
 
 /// The actual `Command::spawn` -- split from [`provision_gateway`] so the
 /// port-selection policy above stays readable. See that function's doc
@@ -2712,13 +2770,41 @@ fn spawn_gateway_process(
     })?;
     for _ in 0..50 {
         if probe_acpx_gateway_for_agent(port, Some(provider)) {
+            // Health-visibility gap: this watcher used to silently `break`
+            // and clean up the port lock on the gateway's own unexpected
+            // exit, with no log line and nothing surfaced to the panel at
+            // all -- an already-running gateway dying (crash, OOM-kill,
+            // operator `kill`) left every thread on it stuck with no
+            // explanation anywhere on disk, the same "zero diagnostics"
+            // failure mode the stderr-log-instead-of-/dev/null fix above
+            // addresses for startup failures. Full model/UI wiring for a
+            // post-start death is a larger TEA-plumbing change (no
+            // existing global channel from this background std::thread
+            // into the reducer); this is the tractable first step so the
+            // event is at least discoverable instead of invisible.
+            let provider_owned = provider.to_string();
             std::thread::spawn(move || {
                 let mut child = child;
-                loop {
+                let exit_status = loop {
                     match child.try_wait() {
-                        Ok(Some(_)) | Err(_) => break,
+                        Ok(Some(status)) => break Some(status),
+                        Err(error) => {
+                            eprintln!(
+                                "panel-rust: lost track of acpx-server for {provider_owned} \
+                                 on port {port} (pid wait error: {error})"
+                            );
+                            break None;
+                        }
                         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
                     }
+                };
+                if let Some(status) = exit_status {
+                    eprintln!(
+                        "panel-rust: acpx-server for {provider_owned} on port {port} exited \
+                         unexpectedly ({status}); every thread still bound to this gateway \
+                         will fail its next request -- see gateway-{provider_owned}.stderr.log \
+                         for the process's own diagnostics"
+                    );
                 }
                 drop(lock);
                 let _ = std::fs::remove_file(
@@ -2734,8 +2820,30 @@ fn spawn_gateway_process(
             let _ = std::fs::remove_file(
                 std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
             );
+            // `reserve_port`/the pre-spawn `TcpStream::connect_timeout` probe
+            // in `provision_gateway` only catch a port that's already
+            // *listening*; a port bound-but-not-accepting (TIME_WAIT, or an
+            // unrelated process racing this one between the probe and this
+            // exact `cmd.spawn()`) sails through both checks and only shows
+            // up here, as `acpx-server` itself failing to bind and exiting
+            // immediately. Scan its stderr log (the only place that real
+            // "Address already in use" / EADDRINUSE text lands, see the
+            // stderr redirection above) so `provision_gateway` can tell this
+            // apart from every other startup failure and retry on a fresh
+            // port instead of surfacing a bare crash with no fallback.
+            let looks_like_port_collision = std::fs::read_to_string(&stderr_log)
+                .map(|log| {
+                    let lower = log.to_ascii_lowercase();
+                    lower.contains("address already in use") || lower.contains("eaddrinuse")
+                })
+                .unwrap_or(false);
             return Err(format!(
-                "acpx-server exited during startup for {provider} on port {port}: {status}"
+                "{}acpx-server exited during startup for {provider} on port {port}: {status}",
+                if looks_like_port_collision {
+                    PORT_COLLISION_ERROR_MARKER
+                } else {
+                    ""
+                }
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -3138,6 +3246,7 @@ fn spawn_event_forwarder(
                     *slot_for_task.usage.lock().expect("usage mutex poisoned") = (*used, *size);
                 }
                 AgentEvent::Error(_) => {}
+                AgentEvent::ProviderProbe { .. } => {}
                 AgentEvent::PermissionRequest(req) => {
                     slot_for_task
                         .pending_requests
@@ -3983,6 +4092,33 @@ impl AgentBridge {
             base_url,
             mcp_servers,
         )
+    }
+
+    pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) {
+        let Some(slot) = self.slots.get(idx) else { return };
+        let Some(project_dir) = thread_project_dir(slot.project_path_snapshot().as_deref(), &self.session_cwd_override) else {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result: Err("no active project is available".to_owned()) } });
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("no gateway is configured for {provider}")) } });
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers) else {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("could not initialize the gateway pool for {provider}")) } });
+            return;
+        };
+        let events = self.events.clone();
+        let key = acpx_client::pool::PoolKey::new(project_dir.to_string_lossy().into_owned(), provider.clone(), crate::gateway_actor::provider_profile_key(profile_name.as_deref()));
+        let preview_thread_id = format!("provider-probe:{idx}:{provider}");
+        self.runtime.spawn(async move {
+            let result = match pool.acquire(key, preview_thread_id, acpx_client::pool::OpenSpec { saved_session_id: None }).await {
+                Ok(lease) => pool.release(&lease).await.map_err(|error| format!("provider probe cleanup failed: {error}")),
+                Err(error) => Err(error.to_string()),
+            };
+            events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result } });
+        });
     }
 
     /// Notify every pool for the settings gateway that its admin-plane MCP
@@ -6216,6 +6352,7 @@ impl AgentBridge {
                 profiles: cache.profiles.clone(),
                 mcp_servers: cache.mcp_servers.clone(),
                 agents: cache.agents.clone(),
+                agents_fetched: cache.gen > 0,
                 recoverable_sessions: cache.recoverable_sessions.clone(),
                 recovery_provider: cache.recovery_provider.clone(),
             })
@@ -9931,10 +10068,16 @@ done
 
     #[test]
     fn packaged_gateway_binary_resolution_prefers_override_then_relative_install() {
+        // Windows installs the real binary as `acpx-server.exe`
+        // (`EXE_SUFFIX`) -- exercise the exact platform-appropriate name
+        // so this test still proves the resolver finds a real packaged
+        // install on every CI OS (build-windows.yml runs `cargo test
+        // --release` on windows-latest too), not just Unix's bare name.
+        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        let packaged = bin_dir.join("acpx-server");
+        let packaged = bin_dir.join(&exe_name);
         std::fs::write(&packaged, b"binary").expect("packaged binary");
         let exe = bin_dir.join("panel");
 
@@ -9953,20 +10096,21 @@ done
 
         let libexec_dir = temp.path().join("libexec");
         std::fs::create_dir_all(&libexec_dir).expect("libexec dir");
-        let libexec_bin = libexec_dir.join("acpx-server");
+        let libexec_bin = libexec_dir.join(&exe_name);
         std::fs::write(&libexec_bin, b"binary").expect("libexec binary");
         std::fs::remove_file(&packaged).expect("remove sibling binary");
         assert_eq!(
             resolve_acpx_server_bin_from(None, Some(&exe), Path::new("/manifest")),
-            bin_dir.join("../libexec/acpx-server")
+            bin_dir.join(format!("../libexec/{exe_name}"))
         );
     }
 
     #[test]
     fn packaged_gateway_binary_resolution_falls_back_to_dev_checkout() {
+        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         assert_eq!(
             resolve_acpx_server_bin_from(None, None, Path::new("/manifest")),
-            PathBuf::from("/manifest/../acpx/target/debug/acpx-server")
+            PathBuf::from(format!("/manifest/../acpx/target/debug/{exe_name}"))
         );
     }
 
@@ -12256,6 +12400,7 @@ done
             profiles: Vec::new(),
             mcp_servers: Vec::new(),
             agents: Vec::new(),
+            agents_fetched: false,
             recoverable_sessions: Vec::new(),
             recovery_provider: String::new(),
         };

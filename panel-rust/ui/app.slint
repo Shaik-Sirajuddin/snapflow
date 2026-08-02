@@ -164,6 +164,12 @@ export component ChatPanel inherits Window {
     // `available-profiles`.
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <bool> agent-catalog-fetched: false;
+    // provider-toggle-auth-probe: true when the currently selected
+    // thread's provider has a stored pool-acquire probe failure
+    // (Model.provider_errors, populated from AgentEvent::ProviderProbe).
+    // Gates Send the same way agent-catalog-fetched does below.
+    in property <bool> selected-provider-unavailable: false;
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     // Skill-manager backend addition (skill_discovery_backend phase) --
     // populated by `lib.rs` from `models::to_skill_options`. Plumbed
@@ -629,6 +635,8 @@ export component ChatPanel inherits Window {
                 active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
                 active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
                 active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
+                agent-catalog: root.agent-catalog;
+                agent-catalog-fetched: root.agent-catalog-fetched;
                 toggle-background => { thread-toggle-background(selected-thread); }
                 has-older-messages: has-older-messages;
                 loading-older-messages <=> loading-older-messages;
@@ -647,7 +655,9 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 inputs-enabled: root.gateway-ready
-                    && !(threads.length > 0 && threads[selected-thread].archived);
+                    && !(threads.length > 0 && threads[selected-thread].archived)
+                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
+                    && !root.selected-provider-unavailable;
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
@@ -756,6 +766,8 @@ export component ChatPanel inherits Window {
                 active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
                 active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
                 active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
+                agent-catalog: root.agent-catalog;
+                agent-catalog-fetched: root.agent-catalog-fetched;
                 toggle-background => { thread-toggle-background(selected-thread); }
                 messages: messages;
                 has-older-messages: has-older-messages;
@@ -775,7 +787,9 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 inputs-enabled: root.gateway-ready
-                    && !(threads.length > 0 && threads[selected-thread].archived);
+                    && !(threads.length > 0 && threads[selected-thread].archived)
+                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
+                    && !root.selected-provider-unavailable;
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }

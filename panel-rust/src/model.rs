@@ -358,6 +358,7 @@ pub struct Model {
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub agent_catalog_fetched: bool,
     pub agent_operations_in_flight: Vec<String>,
     /// Same shape/lifecycle as `agent_operations_in_flight` above, sourced
     /// from `AgentBridge::mcp_operations_in_flight` -- keys are `"<action>:
@@ -388,6 +389,7 @@ pub struct Model {
     pub toast_message: String,
     pub toast_kind: String,
     pub toast_seq: i32,
+    pub provider_errors: HashMap<String, String>,
     pub active_skill_name: String,
     pub active_skill_path: String,
     /// PUI-010: the actual SKILL.md file path (active_skill_path is the

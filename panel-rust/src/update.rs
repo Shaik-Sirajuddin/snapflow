@@ -1408,8 +1408,10 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 thread.provider = resolved_agent;
             }
             let thread_id = thread.thread_id.clone();
+            let provider = thread.provider.clone();
+            let profile_name = thread.profile_name.clone();
             (
-                vec![],
+                if provider.is_empty() { vec![] } else { vec![Effect::ProbeProvider { real_index: idx, provider, profile_name }] },
                 vec![
                     Dirty::ThreadRow {
                         thread_id: thread_id.clone(),
@@ -2416,6 +2418,16 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // hydration makes the identity available.
             continue;
         };
+        if let crate::protocol_types::AgentEvent::ProviderProbe { provider, result } = &bridge_event.event {
+            match result {
+                Ok(()) => { model.provider_errors.remove(provider); }
+                Err(error) => {
+                    model.provider_errors.insert(provider.clone(), error.clone());
+                    dirty.push(show_toast(model, "error", format!("Provider {provider} unavailable: {error}")));
+                }
+            }
+            continue;
+        }
         let target_thread_id = model.threads[target_index].thread_id.clone();
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
@@ -2583,6 +2595,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 // per-event beyond letting the frame refresh.
             }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
+            | crate::protocol_types::AgentEvent::ProviderProbe { .. }
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
@@ -2780,12 +2793,14 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let changed = model.available_profiles != snapshot.profiles
             || model.available_mcp_servers != snapshot.mcp_servers
             || model.agent_catalog != snapshot.agents
+            || model.agent_catalog_fetched != snapshot.agents_fetched
             || model.recoverable_sessions != snapshot.recoverable_sessions
             || model.recovery_provider != snapshot.recovery_provider;
         if changed {
             model.available_profiles = snapshot.profiles;
             model.available_mcp_servers = snapshot.mcp_servers;
             model.agent_catalog = snapshot.agents;
+            model.agent_catalog_fetched = snapshot.agents_fetched;
             model.recoverable_sessions = snapshot.recoverable_sessions;
             model.recovery_provider = snapshot.recovery_provider;
             dirty.push(Dirty::Settings);
@@ -3702,10 +3717,11 @@ mod tests {
             model.threads[0].provider, "codex-acp",
             "Provider picker must update thread.provider (agent id) for deferred attach"
         );
-        assert!(
-            effects.is_empty(),
-            "no backend to notify yet -- nothing to send"
-        );
+        assert_eq!(effects, vec![Effect::ProbeProvider {
+            real_index: 0,
+            provider: "codex-acp".to_owned(),
+            profile_name: Some("codex-tools".to_owned()),
+        }]);
         assert_eq!(
             dirty,
             vec![
@@ -5819,6 +5835,7 @@ mod tests {
                     }],
                     mcp_servers: vec![],
                     agents: vec![],
+                    agents_fetched: false,
                     recoverable_sessions: vec![],
                     recovery_provider: "codex".to_owned(),
                 }),
@@ -5836,6 +5853,7 @@ mod tests {
             profiles: model.available_profiles.clone(),
             mcp_servers: model.available_mcp_servers.clone(),
             agents: model.agent_catalog.clone(),
+            agents_fetched: model.agent_catalog_fetched,
             recoverable_sessions: model.recoverable_sessions.clone(),
             recovery_provider: model.recovery_provider.clone(),
         };
@@ -6553,7 +6571,7 @@ mod tests {
 
     #[test]
     fn mcp_server_tool_deferred_changed_produces_a_matching_effect() {
-        let mut model = Model::default();
+        let mut model = model_with_threads(&["Thread"]);
         let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
@@ -6566,10 +6584,10 @@ mod tests {
         assert!(matches!(
             &effects[0],
             Effect::McpServerToolDeferredChanged {
+                real_index: 0,
                 server_name,
                 tool_name,
                 deferred: true,
-                ..
             } if server_name == "fs" && tool_name == "read_file"
         ));
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
@@ -6577,7 +6595,7 @@ mod tests {
 
     #[test]
     fn mcp_server_tools_fetch_requested_produces_a_matching_effect() {
-        let mut model = Model::default();
+        let mut model = model_with_threads(&["Thread"]);
         let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
@@ -6587,7 +6605,10 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             &effects[0],
-            Effect::McpServerToolsFetchRequested { server_name, .. } if server_name == "fs"
+            Effect::McpServerToolsFetchRequested {
+                real_index: 0,
+                server_name,
+            } if server_name == "fs"
         ));
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
     }

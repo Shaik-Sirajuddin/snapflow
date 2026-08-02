@@ -79,6 +79,12 @@ pub enum AgentEvent {
     /// than re-exporting the wire enum.
     TurnEnded(String),
     Error(String),
+    /// Result of a provider-picker pool acquire probe, separate from a
+    /// thread's error because selection does not attach a real session.
+    ProviderProbe {
+        provider: String,
+        result: Result<(), String>,
+    },
     /// A live agent-initiated request needing an interactive client
     /// decision -- `session/request_permission`, `fs/read_text_file`,
     /// `fs/write_text_file`, or `terminal/create`, relayed live over the

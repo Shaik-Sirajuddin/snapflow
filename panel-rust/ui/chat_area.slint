@@ -4,7 +4,7 @@ import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
 import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
-import { MessageItem, ToolGroupItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
+import { MessageItem, ToolGroupItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem, AgentCatalogEntry } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -134,6 +134,8 @@ export component ChatArea inherits Rectangle {
     // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
     // archived threads -- inputs render disabled, not just inert).
     in property <bool> inputs-enabled: true;
+    in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <bool> agent-catalog-fetched: false;
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
     callback mention-filter-changed(string, string);
@@ -1052,7 +1054,43 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                if root.messages.length == 0 && !root.no-project : VerticalLayout {
+                if root.messages.length == 0 && !root.no-project
+                    && root.agent-catalog-fetched && root.agent-catalog.length == 0 : VerticalLayout {
+                    height: 160px;
+                    alignment: center;
+                    Rectangle {
+                        border-radius: Theme.radius-md;
+                        background: configure-agent-button.has-hover
+                            ? Theme.bg-primary.with-alpha(0.85)
+                            : Theme.bg-primary;
+                        animate background { duration: 100ms; }
+                        HorizontalLayout {
+                            padding-left: Metrics.pad-lg;
+                            padding-right: Metrics.pad-lg;
+                            padding-top: Metrics.pad-sm;
+                            padding-bottom: Metrics.pad-sm;
+                            alignment: center;
+                            Text {
+                                text: "Configure Agent";
+                                color: Theme.text-on-primary;
+                                font-size: 11px * Theme.font-scale;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        configure-agent-button := TouchArea {
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Configure Agent";
+                            clicked => { configure-provider-requested(); }
+                            changed has-hover => {
+                                CursorHost.kind = self.has-hover ? "pointer" : "default";
+                            }
+                        }
+                    }
+                }
+                if root.messages.length == 0 && !root.no-project
+                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0) : VerticalLayout {
                     height: 160px;
                     alignment: center;
                     property <bool> reloading: connection-status == "Connecting...";
