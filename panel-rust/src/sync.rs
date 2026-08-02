@@ -1204,9 +1204,13 @@ fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::mod
         &model.agent_catalog,
         current,
     ));
-    // Compose trigger shows provider/agent id, not raw profile name.
+    // Compose trigger shows provider/agent id, not raw profile name. See
+    // `models::resolve_provider_trigger_label`'s doc comment for why this
+    // falls back to `thread.provider` instead of calling
+    // `current_provider_trigger_label` directly.
     component.set_profile_trigger_label(
-        crate::models::current_provider_trigger_label(&profile_rows, current).into(),
+        crate::models::resolve_provider_trigger_label(&profile_rows, current, &thread.provider)
+            .into(),
     );
     component.set_active_thread_has_session(thread.session_id.is_some());
 }
