@@ -4287,9 +4287,25 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // click-time and then froze until unrelated mouse movement.
         let busy_recover_session_animating =
             !panel.model.borrow().recover_session_operations_in_flight.is_empty();
+        // agent_install_spinner_repaint_gap: Settings > Agents "Install"
+        // (agent_card.slint) is real per-agent state now
+        // (`agent_operations_in_flight`, populated by
+        // `AgentBridge::begin_agent_operation`/`install_agent_async` and
+        // folded into each catalog row's `loading` bool by
+        // `models::to_agent_card_rows` et al.) -- but without an explicit
+        // busy-thread reason here the Install button's Spinner got one
+        // correct frame at click-time and then froze until unrelated mouse
+        // movement, same root cause `busy_mcp_server_animating` and
+        // `busy_recover_session_animating` above were added to close for
+        // their own rows, just never extended to this one. Not
+        // agent-specific (e.g. not a codex-only gap): every agent's Install
+        // spinner shared this.
+        let busy_agent_operation_animating =
+            !panel.model.borrow().agent_operations_in_flight.is_empty();
         let busy_animation = busy_thread_animating
             || busy_mcp_server_animating
             || busy_recover_session_animating
+            || busy_agent_operation_animating
             || component_connection_animating;
         let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software

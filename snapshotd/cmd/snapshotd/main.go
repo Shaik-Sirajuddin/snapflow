@@ -161,10 +161,23 @@ func cmdServe(cfg config.Config, args []string) error {
 		}
 	}
 
+	// Bind the control socket synchronously before announcing "listening":
+	// Listen()/Serve() are split exactly so this ordering is possible. When
+	// the log line was previously printed right after `go
+	// sdpServer.ListenAndServe()` (which does its own Listen internally, on
+	// that goroutine), there was no guarantee the bind had completed before
+	// the line was logged -- a `status`/`stop` client dialing immediately
+	// after seeing "listening" could race the actual net.Listen and get
+	// "connection refused". Binding here, on the main goroutine, before the
+	// log line and before any client could plausibly be told to dial,
+	// closes that race.
 	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
+	if err := sdpServer.Listen(); err != nil {
+		return fmt.Errorf("binding SDP control socket: %w", err)
+	}
 	sdpErrCh := make(chan error, 1)
 	go func() {
-		sdpErrCh <- sdpServer.ListenAndServe()
+		sdpErrCh <- sdpServer.Serve()
 	}()
 	logger.Info("SDP control socket listening", "path", cfg.ControlSocketPath)
 
