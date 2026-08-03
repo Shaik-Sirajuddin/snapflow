@@ -72,6 +72,12 @@ jobs:
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" Cargo.toml
           grep -m1 '^version = ' Cargo.toml
       - run: cargo build --release
+      - name: Verify native daemon transport and SAP protocol tests
+        run: |
+          cargo test --lib snapshotd_client --no-default-features
+          cargo test --manifest-path ../sap-rust/Cargo.toml --quiet
+      - name: Build SAP Windows static library (compile-time transport variant)
+        run: cargo build --manifest-path ../sap-rust/Cargo.toml --release
       # See build-linux.yml's identical step: RUST_TEST_THREADS=4 didn't
       # reliably fix agent_bridge's flakiness on a real GitHub runner
       # despite being verified locally -- back to advisory.
@@ -84,6 +90,10 @@ jobs:
         with:
           name: panel-rust-staticlib-windows
           path: panel-rust/target/release/panel_rust.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap-rust-staticlib-windows
+          path: sap-rust/target/release/sap_rust.lib
 
   snapshotd:
     runs-on: windows-latest
@@ -100,6 +110,8 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd.exe ./cmd/snapshotd
+      - name: Verify native named-pipe transport and endpoint consumers
+        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       # Windows AF_UNIX has a much shorter max socket path than Linux; the
       # default runner %TEMP% path is too long once the tests' own random
       # subdirectories are appended (snapshotd's daemon/procmgr/sapproxy

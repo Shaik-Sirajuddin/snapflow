@@ -66,6 +66,12 @@ jobs:
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" Cargo.toml
           grep -m1 '^version = ' Cargo.toml
       - run: cargo build --release
+      - name: Verify native daemon transport and SAP protocol tests
+        run: |
+          cargo test --lib snapshotd_client --no-default-features
+          cargo test --manifest-path ../sap-rust/Cargo.toml --quiet
+      - name: Build SAP Linux static library (compile-time transport variant)
+        run: cargo build --manifest-path ../sap-rust/Cargo.toml --release
       # panel-rust's agent_bridge tests spawn real acpx-server + mock-agent
       # subprocesses per test; at full default parallelism, concurrent spawn
       # races cause spurious "crash backoff"/connection-refused failures
@@ -86,6 +92,10 @@ jobs:
         with:
           name: panel-rust-staticlib
           path: panel-rust/target/release/libpanel_rust.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap-rust-staticlib
+          path: sap-rust/target/release/libsap_rust.a
 
   snapshotd:
     runs-on: ubuntu-latest
@@ -102,6 +112,8 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd ./cmd/snapshotd
+      - name: Verify native AF_UNIX transport and endpoint consumers
+        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       - name: Run go test ./... (advisory -- known flaky/pre-existing failures, see workflow header)
         continue-on-error: true
         run: go test ./...
