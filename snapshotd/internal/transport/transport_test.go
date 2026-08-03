@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -20,6 +21,20 @@ func TestDefaultControlEndpointIsPlatformNative(t *testing.T) {
 	}
 	if !strings.HasSuffix(ep, "control.sock") {
 		t.Fatalf("Unix endpoint = %q", ep)
+	}
+}
+
+func TestDefaultSAPEndpointIsPlatformNative(t *testing.T) {
+	ep := DefaultSAPEndpoint(`/tmp/runtime`, "abc123")
+	if runtime.GOOS == "windows" {
+		if !strings.HasPrefix(ep, `\\.\pipe\snapflow-`) || !strings.HasSuffix(ep, "-sap-abc123") {
+			t.Fatalf("Windows SAP endpoint = %q", ep)
+		}
+		return
+	}
+	want := filepath.Join(`/tmp/runtime`, "abc123.sock")
+	if ep != want {
+		t.Fatalf("Unix SAP endpoint = %q, want %q", ep, want)
 	}
 }
 
