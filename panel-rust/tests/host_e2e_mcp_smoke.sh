@@ -27,7 +27,7 @@ gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
 admin_port="${PANEL_HOST_E2E_MCP_ADMIN_PORT:-18797}"
 admin_token="panel-host-e2e-mcp-admin-token-$$"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
-scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|queue-auto-drain|queue-restart|rename|startup-warning|mid-session-write-failure|real-agent-smoke>}"
+scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|queue-auto-drain|queue-during-init|queue-during-init-multi|queue-stop-with-multiple-queued|queue-restart|rename|startup-warning|mid-session-write-failure|real-agent-smoke>}"
 project_path="${PANEL_HOST_E2E_MCP_PROJECT_PATH:-}"
 
 if [[ "$scenario" == "queue-restart" ]]; then

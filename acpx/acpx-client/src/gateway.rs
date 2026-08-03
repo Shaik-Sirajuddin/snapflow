@@ -40,8 +40,9 @@ pub fn build_resume_session_params(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let request = ResumeSessionRequest::new(SessionId::new(session_id), PathBuf::from(cwd.as_ref()))
-        .mcp_servers(typed_servers);
+    let request =
+        ResumeSessionRequest::new(SessionId::new(session_id), PathBuf::from(cwd.as_ref()))
+            .mcp_servers(typed_servers);
     serde_json::to_value(&request).map_err(|err| {
         ClientError::InvalidParams(format!("failed to serialize ResumeSessionRequest: {err}"))
     })

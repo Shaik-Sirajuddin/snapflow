@@ -161,6 +161,78 @@ pub struct QueueMutationResult {
     pub paused: bool,
 }
 
+/// Explicitly steer the active turn.  This is an ACPX gateway method; it is
+/// never forwarded to the backend as `session/steer`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSteerParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<Vec<Value>>,
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_entry_id: Option<String>,
+}
+
+impl SessionSteerParams {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.queue_entry_id.is_none() && self.prompt.is_none() {
+            return Err("either queueEntryId or prompt is required");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSteerResult {
+    pub session_id: String,
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_entry_id: Option<String>,
+}
+
+/// Lifecycle notification for an explicit session steer. This is separate
+/// from queue deltas so clients can render the steer turn state directly.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSteerEvent {
+    pub session_id: String,
+    pub state: SessionSteerState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionSteerState {
+    Queued,
+    Dispatched,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum QueueMutation {
+    Inserted,
+    #[serde(rename = "sent_prompt")]
+    SentPrompt,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMutationEvent {
+    pub session_id: String,
+    pub queue_entry_id: String,
+    pub mutation: QueueMutation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItem {
@@ -212,5 +284,24 @@ mod tests {
             "text": "hello"
         }));
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn steer_requires_queue_entry_or_prompt() {
+        let params = SessionSteerParams {
+            session_id: "s1".into(),
+            prompt: None,
+            idempotency_key: "k".into(),
+            queue_entry_id: None,
+        };
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn sent_prompt_mutation_uses_stable_snake_case_wire_name() {
+        assert_eq!(
+            serde_json::to_value(QueueMutation::SentPrompt).unwrap(),
+            "sent_prompt"
+        );
     }
 }

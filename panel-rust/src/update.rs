@@ -987,10 +987,9 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             let server_queue = thread.server_queue;
             thread.send_queue.resume();
             let resume_effect = if server_queue {
-                queue_session_id(thread)
-                    .map(|session_id| {
-                        queue_mutation(idx, Some(session_id), "resume", None, None, None)
-                    })
+                queue_session_id(thread).map(|session_id| {
+                    queue_mutation(idx, Some(session_id), "resume", None, None, None)
+                })
             } else {
                 None
             };
@@ -2010,7 +2009,9 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
         }
         ChromeMsg::CompleteOnboarding => {
             model.onboarding_completed = true;
-            if let Err(err) = crate::settings_file::SettingsPaths::from_env().set_onboarding_completed(true) {
+            if let Err(err) =
+                crate::settings_file::SettingsPaths::from_env().set_onboarding_completed(true)
+            {
                 eprintln!("panel-rust: failed to save onboarding_completed: {err}");
             }
             (vec![], vec![Dirty::Settings])
@@ -2492,7 +2493,8 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 ));
                 return (vec![], vec![]);
             };
-            let Some(current_hash) = thread.markdown_render_index.borrow().content_hash_for(&key) else {
+            let Some(current_hash) = thread.markdown_render_index.borrow().content_hash_for(&key)
+            else {
                 crate::trace_host_input(format_args!(
                     "markdown worker dropped thread={thread_id} key={key} reason=stale_key"
                 ));
@@ -2527,7 +2529,13 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             crate::trace_host_input(format_args!(
                 "markdown worker delivered thread={thread_id} key={key}"
             ));
-            (vec![], vec![Dirty::MessageRowPatch { thread_id, index: row_index }])
+            (
+                vec![],
+                vec![Dirty::MessageRowPatch {
+                    thread_id,
+                    index: row_index,
+                }],
+            )
         }
         // memory/acpx/gen/plans/acpx-skills/ phase 17: one of the 6
         // reactive-sync trigger call sites (create/promote/edit/agent-
@@ -2775,12 +2783,22 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // hydration makes the identity available.
             continue;
         };
-        if let crate::protocol_types::AgentEvent::ProviderProbe { provider, result } = &bridge_event.event {
+        if let crate::protocol_types::AgentEvent::ProviderProbe { provider, result } =
+            &bridge_event.event
+        {
             match result {
-                Ok(()) => { model.provider_errors.remove(provider); }
+                Ok(()) => {
+                    model.provider_errors.remove(provider);
+                }
                 Err(error) => {
-                    model.provider_errors.insert(provider.clone(), error.clone());
-                    dirty.push(show_toast(model, "error", format!("Provider {provider} unavailable: {error}")));
+                    model
+                        .provider_errors
+                        .insert(provider.clone(), error.clone());
+                    dirty.push(show_toast(
+                        model,
+                        "error",
+                        format!("Provider {provider} unavailable: {error}"),
+                    ));
                 }
             }
             // mcp-servers-settings follow-up: the probe's acquire+release
@@ -2797,6 +2815,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             continue;
         }
         let target_thread_id = model.threads[target_index].thread_id.clone();
+        let expanded_for_event = model.expanded.clone();
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
         };
@@ -2886,7 +2905,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 }
             }
             crate::protocol_types::AgentEvent::QueueChanged { items, paused } => {
-                thread
+                let dispatched_texts = thread
                     .send_queue
                     .replace_remote_items(
                         items.iter().map(|item| {
@@ -2894,12 +2913,67 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                         }),
                         *paused,
                     );
+                // ACPX's server-owned dispatcher sends the promoted entry
+                // directly as `session/prompt`; there is no client-side
+                // Effect::SendPrompt to enter Loading. A confirmed drain is
+                // therefore the hand-off point at which the panel must keep
+                // the busy/stop UI active until the backend's TurnEnded.
+                if thread.server_queue
+                    && !dispatched_texts.is_empty()
+                    // If the backend response won the notification race and
+                    // this drain arrives after the completed turn, do not
+                    // resurrect the spinner. In the normal order this flag
+                    // is false at promotion and the subsequent response
+                    // keeps Loading until TurnEnded.
+                    && !thread.agent_content_this_turn
+                {
+                    thread.state = ThreadState::Loading;
+                    thread.error = None;
+                }
+                // A `server_queue` thread's own entry never gets an
+                // `Effect::SendPrompt` here -- ACPX's `spawn_queue_
+                // dispatcher` sends the real `session/prompt` itself once
+                // this session's turn ends, entirely server-side (see the
+                // `TurnEnded` arm's doc comment above). That means nothing
+                // ever calls the immediate-send path's optimistic
+                // `AgentBridge::push_local` for it either, so once the
+                // queue row disappears here the user's own queued prompt
+                // text would otherwise never become a real transcript
+                // entry -- `replace_remote_items` surfacing "confirmed and
+                // now genuinely drained" texts closes that gap the same
+                // way `start_send_prompt` does for a live send.
+                for text in dispatched_texts {
+                    effects.push(Effect::RecordLocalMessage {
+                        thread_id: thread.thread_id.clone(),
+                        text,
+                    });
+                }
+                // QueueChanged is the authoritative acknowledgement that a
+                // remote queue entry was accepted, reordered, or drained.
+                // Reconcile the retained message projection here, rather
+                // than emitting an empty sentinel diff: the queue rows are
+                // part of `transcript_keys`, so an empty diff leaves a
+                // drained `QueuedMessageBar` rendered until a later
+                // snapshot happens to rebuild the list (or forever when no
+                // snapshot follows the event).
+                let old_keys = thread.transcript_keys.clone();
+                let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
+                let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+                    thread.transcript.clone(),
+                    &expanded_for_event,
+                    &thread.send_queue,
+                    in_flight,
+                    &mut *thread.markdown_render_index.borrow_mut(),
+                );
+                let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
+                thread.transcript_keys = keys;
+                thread.rows_synced_with = Some((thread.send_queue.clone(), in_flight));
                 dirty.push(Dirty::ThreadRow {
                     thread_id: thread.thread_id.clone(),
                 });
                 dirty.push(Dirty::MessagesDiff {
                     thread_id: thread.thread_id.clone(),
-                    ops: Vec::new(),
+                    ops,
                 });
             }
             crate::protocol_types::AgentEvent::HistoryPage { .. } => {
@@ -2947,17 +3021,43 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     });
                 }
                 thread.agent_content_this_turn = false;
-                if let Some(entry) = thread
-                    .send_queue
-                    .on_generation_stopped(false)
-                    .ok()
-                    .flatten()
-                {
-                    thread.state = ThreadState::Loading;
-                    effects.push(Effect::SendPrompt {
-                        thread_id: thread.thread_id.clone(),
-                        text: entry.text,
-                    });
+                // A server-owned queue (`thread.server_queue`) is already
+                // auto-drained authoritatively by ACPX's own
+                // `spawn_queue_dispatcher` (armed on every "enqueue" mutate,
+                // `acpx-core/src/router.rs`'s `dispatch_queue_mutation_
+                // shared`) -- it dispatches the next queued prompt to the
+                // backend itself once this turn ends, independent of
+                // anything the client does. Also popping and re-sending
+                // here used to "work" only by a fragile ordering
+                // coincidence: it relied on the queue's front entry having
+                // *already* been cleared locally (via `dequeue_matching_
+                // remote_message`/an earlier `QueueChanged`) by the time
+                // this `TurnEnded` was processed, so `on_generation_
+                // stopped`'s pop found nothing and silently no-opped. Once
+                // `replace_remote_items` stopped letting a stale/early
+                // snapshot wipe a not-yet-confirmed local entry (see its
+                // own doc comment -- the "queue disappeared during session
+                // initialization" fix), that coincidence broke: the entry
+                // could still genuinely be present here, and popping it
+                // sent a second, duplicate `session/prompt` to the backend
+                // alongside the server's own dispatch (caught by
+                // `host_e2e_mcp_driver.py`'s `queue-during-init` repro).
+                // The local-only (non-`server_queue`) queue has no server
+                // dispatcher at all, so it still needs this client-driven
+                // send.
+                if !thread.server_queue {
+                    if let Some(entry) = thread
+                        .send_queue
+                        .on_generation_stopped(false)
+                        .ok()
+                        .flatten()
+                    {
+                        thread.state = ThreadState::Loading;
+                        effects.push(Effect::SendPrompt {
+                            thread_id: thread.thread_id.clone(),
+                            text: entry.text,
+                        });
+                    }
                 }
                 dirty.push(Dirty::ThreadRow {
                     thread_id: thread.thread_id.clone(),
@@ -3005,9 +3105,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 // per-event beyond letting the frame refresh.
             }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
+            | crate::protocol_types::AgentEvent::AgentResolution(_)
             | crate::protocol_types::AgentEvent::ProviderProbe { .. }
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::TerminalCreated(_)
+            | crate::protocol_types::AgentEvent::SessionSteer(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
             // PUI-003: the agent's slash commands flow through the per-frame
@@ -3607,6 +3709,10 @@ mod tests {
             .map(|(idx, name)| ThreadModel {
                 thread_id: format!("thread-{idx}"),
                 display_name: (*name).to_owned(),
+                // These shared reducer fixtures exercise the local queue
+                // send-now contract. Server-owned queue behavior is covered
+                // explicitly by tests that set `server_queue = true`.
+                server_queue: false,
                 ..ThreadModel::default()
             })
             .collect();
@@ -3784,6 +3890,7 @@ mod tests {
 
         let (_, dirty) = update(&mut model, Msg::Host(HostMsg::ProjectClosed));
         assert_eq!(model.project_lifecycle_reason, "closed");
+        dbg!(&effects);
         assert!(matches!(
             model.active_project,
             crate::model::ProjectIdentity::None
@@ -4154,11 +4261,14 @@ mod tests {
             model.threads[0].provider, "codex-acp",
             "Provider picker must update thread.provider (agent id) for deferred attach"
         );
-        assert_eq!(effects, vec![Effect::ProbeProvider {
-            real_index: 0,
-            provider: "codex-acp".to_owned(),
-            profile_name: Some("codex-tools".to_owned()),
-        }]);
+        assert_eq!(
+            effects,
+            vec![Effect::ProbeProvider {
+                real_index: 0,
+                provider: "codex-acp".to_owned(),
+                profile_name: Some("codex-tools".to_owned()),
+            }]
+        );
         assert_eq!(
             dirty,
             vec![
@@ -4174,9 +4284,7 @@ mod tests {
             ]
         );
         assert!(
-            model
-                .provider_probes_in_flight
-                .contains("codex-acp"),
+            model.provider_probes_in_flight.contains("codex-acp"),
             "dispatching the probe effect must mark it in flight for the chat-view pulse"
         );
 
@@ -4304,7 +4412,9 @@ mod tests {
                 ..FrameInput::default()
             }),
         );
-        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
+        assert!(!dirty
+            .iter()
+            .any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
     }
 
     // stale-provider-switch-pulse fix: regression for the sibling bug to
@@ -4791,7 +4901,9 @@ mod tests {
                 real_index: 0,
                 thread_id: None,
                 provider: None,
-                result: Err(crate::effect::EffectError::new("Permission denied (os error 13)")),
+                result: Err(crate::effect::EffectError::new(
+                    "Permission denied (os error 13)",
+                )),
             }),
         );
 
@@ -5020,10 +5132,11 @@ mod tests {
         // overwrite the cache with the stale render.
         let mut model = model_with_threads(&["a"]);
         let key = "assistant:m1".to_owned();
-        model.threads[0]
-            .markdown_render_index
-            .borrow_mut()
-            .record(&key, 0, "the text has since grown longer");
+        model.threads[0].markdown_render_index.borrow_mut().record(
+            &key,
+            0,
+            "the text has since grown longer",
+        );
         model.threads[0].message_rows = vec![crate::MessageItem {
             kind: "agent".into(),
             text: "the text has since grown longer".into(),
@@ -5044,7 +5157,10 @@ mod tests {
         );
 
         assert!(effects.is_empty());
-        assert!(dirty.is_empty(), "a stale-hash delivery must never patch anything");
+        assert!(
+            dirty.is_empty(),
+            "a stale-hash delivery must never patch anything"
+        );
         assert!(
             model.threads[0]
                 .markdown_render_index
@@ -5240,6 +5356,56 @@ mod tests {
     }
 
     #[test]
+    fn continuous_non_empty_sends_while_loading_only_ever_enqueue_never_cancel() {
+        // Regression for "when user sends messages in continuous queue,
+        // previous turns are aborted" (part 2 of that report -- the
+        // non-empty-Return / rapid-fire-send trigger, as distinct from the
+        // separate empty-Return `try_fast_track` stale-flag bug fixed in
+        // `send_queue.rs`). The compose Return handler
+        // (`chat_input_layout.slint`) routes any Return press with
+        // non-empty text straight to `send-requested` -> `SendRequested`,
+        // never through `QueueFastTrack`/`QueueSendNow`/`StopRequested`, so
+        // this reducer arm's Loading-state branch is the only place a
+        // cancel could sneak in for this trigger. Drives four back-to-back
+        // `SendRequested`s while the thread is `Loading` (queue depths
+        // 1, 2, 3, 4) and asserts every single one produces only a
+        // `MutateQueue` "enqueue" effect -- never `CancelGeneration` --
+        // regardless of how deep the queue already is.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].server_queue = true;
+        model.threads[0].session_id = Some("session-a".to_owned());
+        model.threads[0].state = ThreadState::Loading;
+
+        for (depth, text) in ["msg1", "msg2", "msg3", "msg4"].into_iter().enumerate() {
+            let (effects, _dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.to_owned()))),
+            );
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, Effect::CancelGeneration { .. })),
+                "queue depth {}: SendRequested while Loading must never emit \
+                 CancelGeneration, got {effects:?}",
+                depth + 1
+            );
+            assert!(
+                effects.iter().all(|effect| matches!(
+                    effect,
+                    Effect::MutateQueue { params, .. } if params["operation"] == "enqueue"
+                )),
+                "queue depth {}: SendRequested while Loading must only ever \
+                 produce \"enqueue\" MutateQueue effects, got {effects:?}",
+                depth + 1
+            );
+            assert_eq!(model.threads[0].send_queue.len(), depth + 1);
+            // Still Loading -- an enqueue must never flip the thread's own
+            // turn state, which is exactly what a stray cancel would do.
+            assert_eq!(model.threads[0].state, ThreadState::Loading);
+        }
+    }
+
+    #[test]
     fn settings_save_never_persists_the_literal_default_profile_sentinel() {
         let mut model = model_with_threads(&["existing"]);
         let input = crate::msg::SettingsSaveInput {
@@ -5364,7 +5530,11 @@ mod tests {
             &mut model,
             Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("hi".to_owned()))),
         );
-        assert_eq!(effects, vec![], "no thread is genuinely selected/visible right now");
+        assert_eq!(
+            effects,
+            vec![],
+            "no thread is genuinely selected/visible right now"
+        );
         assert_eq!(dirty, vec![]);
         assert_eq!(
             model.threads[0].state,
@@ -5377,6 +5547,11 @@ mod tests {
     fn turn_ended_drains_a_queued_message_into_send_prompt_effect() {
         let mut model = model_with_threads(&["a"]);
         model.threads[0].session_id = Some("thread-1".to_owned());
+        // Local-only (pre-ACPX-migration) queue path: no server dispatcher
+        // exists for it, so the client itself must send the drained entry.
+        // See `turn_ended_on_a_server_queue_thread_does_not_double_dispatch`
+        // for the server-owned-queue counterpart, which must NOT do this.
+        model.threads[0].server_queue = false;
         model.threads[0]
             .send_queue
             .enqueue("queued".to_owned(), false)
@@ -5403,6 +5578,189 @@ mod tests {
         assert!(dirty.contains(&Dirty::ThreadRow {
             thread_id: "thread-0".to_owned()
         }));
+    }
+
+    /// Regression for a duplicate `session/prompt` dispatch found while
+    /// fixing the "queue disappeared during session initialization" bug
+    /// (`SendQueue::replace_remote_items`'s own doc comment): a
+    /// `server_queue` thread's queued entry is auto-drained by ACPX's own
+    /// `spawn_queue_dispatcher` server-side, so `TurnEnded` must not *also*
+    /// pop it and emit a client-driven `SendPrompt` -- doing so used to
+    /// "work" only because the entry had, by fragile ordering coincidence,
+    /// always already been cleared locally by the time `TurnEnded` arrived.
+    /// Once locally-unconfirmed entries stopped being wiped prematurely,
+    /// that coincidence broke and this became a real double-send, caught
+    /// live by `host_e2e_mcp_driver.py`'s `queue-during-init` scenario
+    /// (`init race turn two queued` reached the mock backend twice).
+    #[test]
+    fn turn_ended_on_a_server_queue_thread_does_not_double_dispatch() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].session_id = Some("thread-1".to_owned());
+        model.threads[0].server_queue = true;
+        model.threads[0]
+            .send_queue
+            .enqueue("queued".to_owned(), false)
+            .expect("queue entry");
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
+                }],
+                bridge_event_thread_ids: vec!["thread-1".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::SendPrompt { .. })),
+            "a server-owned queue's next entry must only be dispatched by ACPX's own \
+             spawn_queue_dispatcher, never re-sent by the client too: {effects:?}"
+        );
+        // The entry itself must still be intact locally -- state is only
+        // ever cleared by a real server confirmation (QueueChanged /
+        // dequeue_matching_remote_message), never by this no-op path.
+        assert_eq!(model.threads[0].send_queue.len(), 1);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+    }
+
+    /// Root-cause regression for the "queue message -> agent replies ->
+    /// message is totally dropped from UI" bug report: a `server_queue`
+    /// thread's entry is auto-drained entirely server-side by ACPX's own
+    /// `spawn_queue_dispatcher` (see `turn_ended_on_a_server_queue_thread_
+    /// does_not_double_dispatch` above -- the client never gets its own
+    /// `Effect::SendPrompt` for it), so nothing ever performed the
+    /// immediate-send path's optimistic `AgentBridge::push_local`
+    /// transcript append for that message. The queue row disappearing
+    /// (via `QueueChanged`) must now also emit `Effect::RecordLocalMessage`
+    /// carrying the drained entry's own text, so the caller can record it
+    /// into the transcript the same way a live, non-queued send does.
+    #[test]
+    fn queue_changed_drain_on_a_server_queue_thread_emits_record_local_message() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].session_id = Some("thread-1".to_owned());
+        model.threads[0].server_queue = true;
+        model.threads[0]
+            .send_queue
+            .enqueue("queued reply-worthy message".to_owned(), false)
+            .expect("queue entry");
+
+        // First: the server confirms the entry with a real remote id
+        // (the normal "enqueue accepted" QueueChanged).
+        let (_effects, _dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::QueueChanged {
+                        items: vec![crate::protocol_types::QueueItemInfo {
+                            queue_entry_id: "remote-1".to_owned(),
+                            idempotency_key: "idem-1".to_owned(),
+                            text: "queued reply-worthy message".to_owned(),
+                            state: "queued".to_owned(),
+                            position: 0,
+                        }],
+                        paused: false,
+                    },
+                }],
+                bridge_event_thread_ids: vec!["thread-1".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].send_queue.len(), 1);
+
+        // Then: the turn ends and ACPX's own dispatcher claims + sends the
+        // entry, so the next QueueChanged reports an empty queue -- the
+        // entry drained without the client ever issuing its own
+        // Effect::SendPrompt for it.
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::QueueChanged {
+                        items: vec![],
+                        paused: false,
+                    },
+                }],
+                bridge_event_thread_ids: vec!["thread-1".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].send_queue.len(), 0);
+        assert_eq!(
+            model.threads[0].state,
+            ThreadState::Loading,
+            "server-owned queue promotion must keep the busy UI active until TurnEnded"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RecordLocalMessage { thread_id, text }
+                    if thread_id == "thread-0" && text == "queued reply-worthy message"
+            )),
+            "draining a server-owned queue entry must record its own text into the transcript, \
+             the way an immediate send's push_local does: {effects:?}"
+        );
+        assert!(dirty.contains(&Dirty::ThreadRow {
+            thread_id: "thread-0".to_owned()
+        }));
+        let queue_diff = dirty.iter().find_map(|entry| match entry {
+            Dirty::MessagesDiff { thread_id, ops } if thread_id == "thread-0" => Some(ops),
+            _ => None,
+        });
+        assert!(
+            queue_diff.is_some_and(|ops| ops.iter().any(|op| matches!(op, crate::dirty::RowOp::Remove { .. }))),
+            "draining QueueChanged must remove the queued row from the retained projection: {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn late_queue_drain_does_not_resurrect_loading_after_response_wins_race() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].session_id = Some("thread-1".to_owned());
+        model.threads[0].server_queue = true;
+        model.threads[0]
+            .send_queue
+            .enqueue("queued response race".to_owned(), false)
+            .unwrap();
+        let queue_event = |items| crate::agent_bridge::BridgeEvent {
+            thread_index: 0,
+            event: crate::protocol_types::AgentEvent::QueueChanged {
+                items,
+                paused: false,
+            },
+        };
+        let item = crate::protocol_types::QueueItemInfo {
+            queue_entry_id: "remote-race".into(),
+            idempotency_key: "idem-race".into(),
+            text: "queued response race".into(),
+            state: "queued".into(),
+            position: 0,
+        };
+        update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![queue_event(vec![item])],
+                bridge_event_thread_ids: vec!["thread-1".into()],
+                ..FrameInput::default()
+            }),
+        );
+        // Simulate the backend response and TurnEnded arriving before the
+        // queue completion/drain notification.
+        model.threads[0].state = ThreadState::Idle;
+        model.threads[0].agent_content_this_turn = true;
+        update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![queue_event(vec![])],
+                bridge_event_thread_ids: vec!["thread-1".into()],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
     }
 
     #[test]
@@ -5560,6 +5918,8 @@ mod tests {
     #[test]
     fn queue_send_now_while_idle_sends_immediately_with_no_cancel() {
         let mut model = model_with_threads(&["a"]);
+        model.threads[0].server_queue = true;
+        model.threads[0].session_id = Some("remote-session".to_owned());
         // Idle: nothing in flight, so send-now is a plain immediate send.
         model.threads[0]
             .send_queue
@@ -5583,13 +5943,12 @@ mod tests {
                 message_index: last,
             })),
         );
-        assert_eq!(
-            effects,
-            vec![Effect::SendPrompt {
-                thread_id: "thread-0".to_owned(),
-                text: "go now".to_owned(),
-            }]
-        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::MutateQueue { params, .. }]
+                if params["operation"] == "sendNow"
+                    && params["text"] == "go now"
+        ));
         assert!(model.threads[0].send_queue.is_empty());
         assert_eq!(model.threads[0].state, ThreadState::Loading);
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Connection { .. })));
@@ -5598,6 +5957,8 @@ mod tests {
     #[test]
     fn queue_send_now_while_generating_cancels_then_sends_and_arms_absorbing_cancel() {
         let mut model = model_with_threads(&["a"]);
+        model.threads[0].server_queue = true;
+        model.threads[0].session_id = Some("remote-session".to_owned());
         model.threads[0].state = ThreadState::Loading;
         model.threads[0]
             .send_queue
@@ -5626,16 +5987,12 @@ mod tests {
                 message_index: target_index,
             })),
         );
-        assert_eq!(
-            effects,
-            vec![
-                Effect::CancelGeneration { real_index: 0 },
-                Effect::SendPrompt {
-                    thread_id: "thread-0".to_owned(),
-                    text: "steer me".to_owned(),
-                },
-            ]
-        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::MutateQueue { params, .. }]
+                if params["operation"] == "sendNow"
+                    && params["text"] == "steer me"
+        ));
         // "steer me" was pulled out; only "front" remains queued.
         assert_eq!(model.threads[0].send_queue.len(), 1);
         assert_eq!(
@@ -5854,6 +6211,66 @@ mod tests {
     }
 
     #[test]
+    fn queue_stop_on_a_server_queue_thread_emits_cancel_plus_one_pause_mutation() {
+        // Regression for the VNC crash: `dispatch_compose_stop`'s
+        // debug_assert used to only accept a bare `[CancelGeneration]`
+        // slice. A server-owned queue's Stop handling legitimately also
+        // pauses the remote queue (`MutateQueue` "pause"), so a
+        // session-bound server_queue thread always produced a 2-element
+        // effects vec here -- panicking that assert on every Stop click,
+        // unrelated to how many messages happened to be queued. This
+        // pins the reducer's actual (correct) output shape: exactly one
+        // CancelGeneration plus exactly one MutateQueue, never more than
+        // one of either.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0].server_queue = true;
+        model.threads[0].session_id = Some("session-a".to_owned());
+        model.threads[0]
+            .send_queue
+            .enqueue("first".to_owned(), false)
+            .expect("queue");
+        model.threads[0]
+            .send_queue
+            .enqueue("second".to_owned(), false)
+            .expect("queue");
+
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::StopRequested)),
+        );
+
+        let cancel_count = effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::CancelGeneration { .. }))
+            .count();
+        let mutate_count = effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::MutateQueue { .. }))
+            .count();
+        assert_eq!(
+            cancel_count, 1,
+            "expected exactly one CancelGeneration, got {effects:?}"
+        );
+        assert_eq!(
+            mutate_count, 1,
+            "expected exactly one MutateQueue(pause), got {effects:?}"
+        );
+        assert_eq!(
+            effects.len(),
+            2,
+            "no other effect types expected, got {effects:?}"
+        );
+        assert!(
+            effects.iter().all(|effect| matches!(
+                effect,
+                Effect::CancelGeneration { .. } | Effect::MutateQueue { .. }
+            )),
+            "the dispatch.rs debug_assert only tolerates these two effect kinds, got {effects:?}"
+        );
+    }
+
+    #[test]
     fn cancelled_empty_turn_never_fires_the_empty_turn_notice() {
         // Interaction between setup-followups' queue-stop semantics and
         // main's empty-turn notice (adopted during the worktree
@@ -5889,6 +6306,12 @@ mod tests {
         let mut model = model_with_threads(&["target", "other"]);
         model.threads[0].thread_id = "target-id".to_owned();
         model.threads[1].thread_id = "other-id".to_owned();
+        // Local-only queue path: this test is about durable-id routing
+        // across a row shift, not queue-dispatch ownership, so it uses the
+        // client-driven `SendPrompt` effect only as a routing witness --
+        // see `turn_ended_on_a_server_queue_thread_does_not_double_dispatch`
+        // for why a `server_queue` thread must not emit this effect at all.
+        model.threads[0].server_queue = false;
         model.threads[0]
             .send_queue
             .enqueue("queued".to_owned(), false)
@@ -6296,6 +6719,7 @@ mod tests {
                     thread_states: vec![],
                     startup_warnings: vec![],
                     send_queues: vec![],
+                    server_queue: true,
                     onboarding_completed: false,
                 },
             ))),

@@ -304,6 +304,13 @@
           "version": {
             "type": "string"
           },
+          "website": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
           "status": {
             "$ref": "#/components/schemas/AgentStatus"
           },

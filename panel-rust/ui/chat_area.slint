@@ -1140,27 +1140,17 @@ export component ChatArea inherits Rectangle {
                 // class as the full-view popup's tool list below and the
                 // sidebar lists, just not fixed here yet until now.
                 spacing: 0px;
-                // Pure scroll-triggered auto-load: the `flicked` handler
-                // above (real top boundary) is the ONLY way an older-
-                // messages fetch is triggered now -- no clickable
-                // affordance. This row is purely an in-flight indicator,
-                // visible only while `loading-older-messages` is true, and
-                // reuses the same pulsing-text formula as
-                // `root.provider-switching`'s "Switching provider..." line
-                // just below rather than inventing new visual chrome.
-                if has-older-messages && loading-older-messages : VerticalLayout {
+                // Pagination is scroll-triggered only (see the Flickable's
+                // `flicked` handler above) -- this is a passive progress
+                // indicator, never a control.
+                if loading-older-messages : VerticalLayout {
                     spacing: 0px;
-                    height: 22px;
-                    alignment: center;
-                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
-                    Text {
-                        text: "Loading older messages...";
-                        color: Theme.text-secondary;
-                        opacity: blink;
-                        font-size: 10px * Theme.font-scale;
-                        font-italic: true;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                    Rectangle {
+                        height: 22px;
+                        Spinner {
+                            size: 14px;
+                            stroke: Theme.text-muted;
+                        }
                     }
                     // This block is only ever visible alongside real message
                     // rows below it, so it always needs its own trailing gap.
@@ -1868,6 +1858,7 @@ export component ChatArea inherits Rectangle {
             spacing: Metrics.space-1;
             for term in root.terminals : MentionPickRow {
                 title: term.title != "" ? term.title : term.terminal-id;
+                row-accessible-label: "Expand terminal " + term.terminal-id;
                 subtitle: term.started-at != "" ? term.last-command + " · " + term.started-at : term.last-command;
                 status-dot: term.active ? "connected" : (term.exit-code == 0 ? "" : "error");
                 action-label: term.active ? "Kill" : "";

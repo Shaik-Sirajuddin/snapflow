@@ -310,6 +310,185 @@ struct ThreadSlot {
     /// background session. This belongs to the owning chat, not the active
     /// project, so it is kept per slot.
     background: Mutex<bool>,
+    /// Real-user-repro regression (`queue-during-init-multi`): `send_prompt`
+    /// and `mutate_queue` are each their own independent `tokio::spawn`
+    /// task gated on `wait_for_attachment`. Once attachment completes,
+    /// there is no guarantee the FIRST turn's `send_prompt` (spawned when
+    /// the very first message was sent) actually reaches the server before
+    /// a LATER `mutate_queue` "enqueue" call (spawned when a follow-up was
+    /// typed seconds afterward) does -- if the second task's own
+    /// `wait_for_attachment` happens to resolve instantly (attachment
+    /// already complete by the time it starts) while the first task is
+    /// still finishing its own wait, the enqueue's RPC can win the race to
+    /// the transport. ACPX's own `spawn_queue_dispatcher` (`acpx-core/src/
+    /// router.rs`) checks `session_is_in_flight` before auto-draining the
+    /// queue, but that flag is only set once the router actually starts
+    /// processing the `session/prompt` request -- if the enqueue's RPC and
+    /// dispatcher run first, it reads "nothing in flight" and immediately
+    /// jumps the queue, sending the follow-up message *before* the turn it
+    /// was queued behind. The follow-up's local queued row then correctly
+    /// disappears (the server genuinely emptied its queue) -- but out of
+    /// order, which live-reproduced as "the queued message disappeared"
+    /// (`host_e2e_mcp_driver.py`'s `queue-during-init-multi`).
+    ///
+    /// Ticketed, not a plain `tokio::sync::Mutex`: a plain per-thread lock
+    /// only orders whichever task reaches `.lock().await` first, which is
+    /// exactly the same race (the later-created task can still get there
+    /// first if it skips the attachment wait). The ticket is drawn
+    /// *synchronously on the UI thread*, before either task's `tokio::
+    /// spawn`, so it captures the real order the user's actions happened
+    /// in regardless of how attachment/scheduling races afterward.
+    dispatch_order: DispatchOrder,
+}
+
+/// See [`ThreadSlot::dispatch_order`]'s doc comment for the race this
+/// exists to close. `next`/`serving` are plain, not `Mutex`-wrapped:
+/// `fetch_add`/`load`/`store` on an `AtomicU64` are already the only
+/// operations this needs and never require holding a lock across an
+/// `.await`.
+#[derive(Default)]
+struct DispatchOrder {
+    next: std::sync::atomic::AtomicU64,
+    serving: std::sync::atomic::AtomicU64,
+    turn_changed: tokio::sync::Notify,
+}
+
+impl DispatchOrder {
+    /// Draws the next ticket. Must be called synchronously (never inside
+    /// the async task itself) so its value reflects the true order
+    /// `send_prompt`/`mutate_queue` were invoked in, not whatever order
+    /// their tasks happen to reach this point later.
+    fn draw_ticket(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Blocks the caller's task until every earlier-drawn ticket for this
+    /// thread has released its own turn via [`Self::release`].
+    async fn wait_turn(&self, ticket: u64) {
+        loop {
+            if self.serving.load(std::sync::atomic::Ordering::SeqCst) >= ticket {
+                return;
+            }
+            let notified = self.turn_changed.notified();
+            // Re-check between registering the waiter and awaiting it --
+            // `serving` may have already advanced past `ticket` in the
+            // window between the loop's own load above and this
+            // subscription, which would otherwise wait for a notify that
+            // already happened.
+            if self.serving.load(std::sync::atomic::Ordering::SeqCst) >= ticket {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Advances to the next ticket and wakes every task waiting on
+    /// [`Self::wait_turn`] to re-check. Called once this ticket's own RPC
+    /// has actually been issued (dispatched to the transport), so the next
+    /// ticket-holder is only released once this one can no longer lose the
+    /// ordering race -- not merely once this one finished waiting its turn.
+    fn release(&self) {
+        self.serving
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.turn_changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod dispatch_order_tests {
+    //! Regression for a follow-up report after the "queue disappeared
+    //! during session initialization" fix first shipped: "still see
+    //! losing of user message... message going through queue path".
+    //! Live repro (`host_e2e_mcp_driver.py`'s `queue-during-init-multi`)
+    //! traced it to a second, adjacent race: `send_prompt` (the very
+    //! first message's turn) and `mutate_queue` ("enqueue" for a
+    //! follow-up typed moments later) are each their own independent task
+    //! gated on the same attachment signal, with no ordering guarantee
+    //! between them once attachment completes -- so the *later* call
+    //! could still reach ACPX's own queue dispatcher first, which jumps
+    //! the queue whenever it doesn't yet see a turn in flight. `Dispatch
+    //! Order`'s ticket, drawn synchronously before either task spawns,
+    //! is what actually closes this: these tests exercise the ticket
+    //! primitive directly (no live host, no ACP transport) since it's the
+    //! one piece of this fix that's meaningfully unit-testable in
+    //! isolation -- see `dispatch.rs`'s test module doc comment for why
+    //! the full `AgentBridge`/`ThreadSlot` machinery needs headed Slint
+    //! setup this module's tests avoid.
+    use super::DispatchOrder;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn later_drawn_ticket_always_waits_behind_an_earlier_one() {
+        let order = Arc::new(DispatchOrder::default());
+        // Draw both tickets synchronously, in the order the "user actions"
+        // happened -- exactly what `AgentBridge::send_prompt`/
+        // `mutate_queue` do on the UI thread before spawning anything.
+        let first_ticket = order.draw_ticket();
+        let second_ticket = order.draw_ticket();
+        assert!(first_ticket < second_ticket);
+
+        let observed: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Spawn the SECOND ticket's task first and let it run for a bit --
+        // this is the actual race: a later-created task's own async setup
+        // (e.g. its `wait_for_attachment` resolving instantly) can let it
+        // reach the turn-wait line before the earlier one does.
+        let order_b = order.clone();
+        let observed_b = observed.clone();
+        let second_task = tokio::spawn(async move {
+            order_b.wait_turn(second_ticket).await;
+            observed_b.lock().unwrap().push("second");
+            order_b.release();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The second task must still be blocked on its turn -- it has
+        // nothing to wait on except ticket ordering itself.
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "the later ticket ran before the earlier one released its turn"
+        );
+
+        let order_a = order.clone();
+        let observed_a = observed.clone();
+        let first_task = tokio::spawn(async move {
+            order_a.wait_turn(first_ticket).await;
+            observed_a.lock().unwrap().push("first");
+            order_a.release();
+        });
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn three_tickets_release_strictly_in_draw_order_under_concurrency() {
+        let order = Arc::new(DispatchOrder::default());
+        let tickets: Vec<u64> = (0..3).map(|_| order.draw_ticket()).collect();
+        let next_expected = Arc::new(AtomicU64::new(0));
+
+        let mut tasks = Vec::new();
+        // Spawn in REVERSE order -- the whole point is that scheduling/
+        // spawn order must not matter, only the ticket value does.
+        for &ticket in tickets.iter().rev() {
+            let order = order.clone();
+            let next_expected = next_expected.clone();
+            tasks.push(tokio::spawn(async move {
+                order.wait_turn(ticket).await;
+                let expected = next_expected.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    ticket, expected,
+                    "ticket {ticket} ran out of order (expected {expected} next)"
+                );
+                order.release();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
 }
 
 impl ThreadSlot {
@@ -396,14 +575,7 @@ fn mcp_registry_identity(
 )> {
     let mut rows: Vec<_> = servers
         .iter()
-        .map(|s| {
-            (
-                s.name.clone(),
-                s.enabled,
-                s.config.clone(),
-                s.auth_status,
-            )
-        })
+        .map(|s| (s.name.clone(), s.enabled, s.config.clone(), s.auth_status))
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows
@@ -3221,15 +3393,38 @@ fn spawn_event_forwarder(
     slot_for_task: Arc<ThreadSlot>,
     idx: usize,
 ) {
+    // Server-owned mode (no local cache configured, see `store_for_task`'s
+    // own doc comment and `AgentBridge::load_older_page`'s identical
+    // `self.store.is_none()` check) used to window `history` down to a
+    // fixed cap here, evicting already-rendered live messages so that a
+    // very-long-running session could keep re-deriving "there are now more
+    // messages than fit in one page" the same way a cold-start/resume
+    // attach does. That actively truncated the live, currently-rendered
+    // transcript -- reported as "messages truncated to the last few" --
+    // which is strictly worse than the speculative problem it was trying
+    // to solve: no plan doc in this worktree
+    // (`memory/acpx/gen/plans/thread-stream-persistence/*.md`) requires a
+    // live, still-streaming session to expose an older-messages affordance
+    // without a reload, and the real, concrete case -- a thread that *was*
+    // cold-started/resumed with only the first page loaded -- is already
+    // handled correctly and independently by the real `paginate_history`
+    // round trip in `spawn_background_attachment` (see its
+    // `is_fresh_session`/`AgentEvent::HistoryPage` handling below), which
+    // sets `older_available`/`history_cursor` from the server's own real
+    // `next_cursor`, no local simulation needed. So: `history` here just
+    // keeps accumulating every message it receives, exactly as it did
+    // before that windowing was introduced.
     runtime.spawn(async move {
         while let Some(ev) = events_rx.recv().await {
             match &ev {
                 AgentEvent::Message(msg) => {
-                    slot_for_task
-                        .history
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(msg.clone());
+                    {
+                        let mut history = slot_for_task
+                            .history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        history.push(msg.clone());
+                    }
                     refresh_transcript(&slot_for_task);
                     if let Some(store) = &store_for_task {
                         if let Err(e) = store.append(&slot_for_task.thread_id, msg) {
@@ -3244,13 +3439,31 @@ fn spawn_event_forwarder(
                     messages,
                     next_cursor,
                 } => {
-                    let mut history = slot_for_task
-                        .history
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let mut prepended = messages.clone();
-                    prepended.extend(history.drain(..));
-                    *history = prepended;
+                    {
+                        let mut history = slot_for_task
+                            .history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let mut prepended = messages.clone();
+                        prepended.extend(history.drain(..));
+                        *history = prepended;
+                        // Guard must be dropped (end of this inner block)
+                        // before `refresh_transcript` below re-locks
+                        // `slot_for_task.history` itself -- `std::sync::
+                        // Mutex` is not reentrant, and Rust only drops an
+                        // owned binding like this `MutexGuard` at the end
+                        // of its *lexical* scope, not eagerly after its
+                        // last use (NLL affects borrow-checking only, not
+                        // `Drop` timing) -- so without this explicit inner
+                        // scope, the guard stayed alive across the
+                        // `refresh_transcript` call below and self-
+                        // deadlocked this exact thread on every real
+                        // `AgentEvent::HistoryPage` delivery (confirmed
+                        // live: both this event-forwarder task and the
+                        // Slint UI thread parked forever in `FUTEX_WAIT`
+                        // on the same lock word once a real pagination
+                        // page arrived).
+                    }
                     *slot_for_task
                         .history_cursor
                         .lock()
@@ -3282,6 +3495,16 @@ fn spawn_event_forwarder(
                         .push(req.clone());
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
+                AgentEvent::AgentResolution(resolution) => {
+                    if !resolution.selected {
+                        slot_for_task
+                            .pending_requests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(|request| request.relay_id != resolution.relay_id);
+                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    }
+                }
                 AgentEvent::TerminalOutput(term_ev) => {
                     store_terminal_output(&slot_for_task, term_ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
@@ -3290,7 +3513,7 @@ fn spawn_event_forwarder(
                     store_terminal_created(&slot_for_task, created_ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
-                AgentEvent::QueueChanged { .. } => {}
+                AgentEvent::QueueChanged { .. } | AgentEvent::SessionSteer(_) => {}
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_)
@@ -3469,6 +3692,15 @@ fn spawn_background_attachment(
         // "on reconnect, resume the leased/idle session but do not replay
         // session/load history" rule -- a pool-attached thread relies on
         // its own jsonl cache for history, never a live server replay.
+        // Set below, in whichever arm actually performs `session/new` (or a
+        // pool lease the pool itself just created rather than resumed) --
+        // used after a successful attach to tell a genuinely brand-new
+        // session (server-side transcript is provably still empty) from a
+        // resumed/reattached one (may have real prior history), so the
+        // `server_owned_persistence` branch further down can skip the
+        // otherwise-unconditional `paginate_history(None)` network round
+        // trip for the new-thread case, where its answer is already known.
+        let mut is_fresh_session = false;
         let result = if uses_pool {
             let key = acpx_client::pool::PoolKey::new(
                 cwd.to_string_lossy().into_owned(),
@@ -3485,13 +3717,15 @@ fn spawn_background_attachment(
                 )
                 .await
             {
-                // `attached.resumed_from_saved` deliberately unread here --
-                // see `AttachedSession`'s own doc comment: capability
-                // events are already emitted uniformly for both the
-                // resumed and freshly-created cases by
-                // `Command::AcquireAndAttach`'s handler, so no fallback
-                // decision needs it at this layer.
-                Ok(attached) => Ok(attached.session_id),
+                // `attached.resumed_from_saved` was previously unread here
+                // (see `AttachedSession`'s own doc comment on why no
+                // capability-event decision needs it) -- it is now also
+                // consumed for `is_fresh_session`, the pagination-skip
+                // signal above.
+                Ok(attached) => {
+                    is_fresh_session = !attached.resumed_from_saved;
+                    Ok(attached.session_id)
+                }
                 Err(error) => Err(error),
             }
         } else if let Some(session_id) = requested_session_id.clone() {
@@ -3536,6 +3770,7 @@ fn spawn_background_attachment(
                             "panel-rust: cached acpx session resume failed for thread {:?} ({resume_error}); opening a fresh session",
                             slot.thread_id
                         );
+                        is_fresh_session = true;
                         open_session_maybe_profiled(
                             &handle,
                             cwd,
@@ -3547,6 +3782,7 @@ fn spawn_background_attachment(
                 }
             }
         } else {
+            is_fresh_session = true;
             open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
         };
 
@@ -3601,31 +3837,56 @@ fn spawn_background_attachment(
                 }
                 complete_attachment(&slot, None);
                 if server_owned_persistence {
-                    // Attachment readiness must not be held hostage by an
-                    // optional history refresh. Senders can proceed as soon
-                    // as the session is bound; the refresh result is still
-                    // surfaced as an agent error and can be retried by the
-                    // normal pagination path.
-                    let pagination_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        handle.paginate_history(None),
-                    )
-                    .await;
-                    if let Err(error) = match pagination_result {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => Err("timed out".to_owned()),
-                    } {
-                        events_out
+                    if is_fresh_session {
+                        // This attach went through `session/new` (or a pool
+                        // lease the pool itself just created, see
+                        // `is_fresh_session` above), never `session/resume`
+                        // or `session/load` -- no prior history could
+                        // possibly exist yet, so `paginate_history(None)`'s
+                        // answer is already known and the round trip is
+                        // pure waste (and, under host/gateway load, a real
+                        // source of spurious "initial remote history page
+                        // failed ... timed out" errors for a thread that
+                        // was never actually missing anything). Set exactly
+                        // what a real empty-page `AgentEvent::HistoryPage`
+                        // response would have set -- see
+                        // `spawn_event_forwarder`'s `HistoryPage` arm: no
+                        // next cursor, no older page available.
+                        *slot
+                            .history_cursor
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_back(BridgeEvent {
-                                thread_index: idx,
-                                event: AgentEvent::Error(format!(
-                                    "initial remote history page failed for {:?}: {error}",
-                                    slot.thread_id
-                                )),
-                            });
+                            .unwrap_or_else(|e| e.into_inner()) = None;
+                        *slot
+                            .older_available
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = false;
+                    } else {
+                        // Attachment readiness must not be held hostage by
+                        // an optional history refresh. Senders can proceed
+                        // as soon as the session is bound; the refresh
+                        // result is still surfaced as an agent error and
+                        // can be retried by the normal pagination path.
+                        let pagination_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.paginate_history(None),
+                        )
+                        .await;
+                        if let Err(error) = match pagination_result {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => Err("timed out".to_owned()),
+                        } {
+                            events_out
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(BridgeEvent {
+                                    thread_index: idx,
+                                    event: AgentEvent::Error(format!(
+                                        "initial remote history page failed for {:?}: {error}",
+                                        slot.thread_id
+                                    )),
+                                });
+                        }
                     }
                 }
             }
@@ -3979,6 +4240,7 @@ impl AgentBridge {
                 project_path: Mutex::new(spec.project_path.as_deref().map(PathBuf::from)),
                 deferred: false,
                 background: Mutex::new(false),
+                dispatch_order: DispatchOrder::default(),
             });
             slots.push(slot.clone());
 
@@ -4205,14 +4467,36 @@ impl AgentBridge {
             return true;
         };
         let events = self.events.clone();
-        let key = acpx_client::pool::PoolKey::new(project_dir.to_string_lossy().into_owned(), provider.clone(), crate::gateway_actor::provider_profile_key(profile_name.as_deref()));
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            provider.clone(),
+            crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
+        );
         let preview_thread_id = format!("provider-probe:{idx}:{provider}");
         self.runtime.spawn(async move {
-            let result = match pool.acquire(key, preview_thread_id, acpx_client::pool::OpenSpec { saved_session_id: None }).await {
-                Ok(lease) => pool.release(&lease).await.map_err(|error| format!("provider probe cleanup failed: {error}")),
+            let result = match pool
+                .acquire(
+                    key,
+                    preview_thread_id,
+                    acpx_client::pool::OpenSpec {
+                        saved_session_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(lease) => pool
+                    .release(&lease)
+                    .await
+                    .map_err(|error| format!("provider probe cleanup failed: {error}")),
                 Err(error) => Err(error.to_string()),
             };
-            events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result } });
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ProviderProbe { provider, result },
+                });
         });
         true
     }
@@ -4326,23 +4610,13 @@ impl AgentBridge {
     /// (same generation semantics as registry refresh).
     pub fn set_builtin_snapflow_mcp_enabled(&self, enabled: bool) {
         set_snapflow_mcp_enabled_flag(enabled);
-        let inject_addr = if enabled {
-            snapshotd_mcp_addr()
-        } else {
-            None
-        };
+        let inject_addr = if enabled { snapshotd_mcp_addr() } else { None };
         let pools_to_refresh = {
-            let mut pools = self
-                .project_pools
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
             let mut to_refresh = Vec::new();
             for (_key, (pool, last_mcp)) in pools.iter_mut() {
-                let next = apply_snapflow_to_client_mcp_list(
-                    last_mcp,
-                    enabled,
-                    inject_addr.as_deref(),
-                );
+                let next =
+                    apply_snapflow_to_client_mcp_list(last_mcp, enabled, inject_addr.as_deref());
                 if next.as_slice() != last_mcp.as_slice() {
                     pool.opener()
                         .set_mcp_servers(serde_json::Value::Array(next.clone()));
@@ -4753,6 +5027,7 @@ impl AgentBridge {
             project_path: Mutex::new(project_path_for_slot),
             deferred,
             background: Mutex::new(false),
+            dispatch_order: DispatchOrder::default(),
         });
         Ok((
             slot,
@@ -5155,6 +5430,7 @@ impl AgentBridge {
             project_path: Mutex::new(project_path_for_slot),
             deferred: false,
             background: Mutex::new(false),
+            dispatch_order: DispatchOrder::default(),
         });
         self.slots.push(slot.clone());
 
@@ -5476,6 +5752,47 @@ impl AgentBridge {
         self.runtime
             .block_on(handle.list_profiles())
             .unwrap_or_default()
+    }
+
+    /// Gateway-native permission profile catalog for a thread's provider.
+    pub fn list_permission_profiles(
+        &self,
+        idx: usize,
+    ) -> Vec<acpx_proto::gateway::PermissionProfile> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        self.runtime
+            .block_on(slot.handle.clone().list_permission_profiles())
+            .unwrap_or_default()
+    }
+
+    /// Read the effective permission profile attached to a gateway session.
+    pub fn get_permission_profile(
+        &self,
+        idx: usize,
+        session_id: impl Into<String>,
+    ) -> Option<acpx_proto::gateway::SessionPermissionProfileResult> {
+        let Some(slot) = self.slots.get(idx) else {
+            return None;
+        };
+        self.runtime
+            .block_on(slot.handle.clone().get_permission_profile(session_id))
+            .ok()
+    }
+
+    /// Attach/update a gateway-native permission profile for a session.
+    pub fn set_permission_profile(
+        &self,
+        idx: usize,
+        params: acpx_proto::gateway::SessionPermissionProfileParams,
+    ) -> Option<acpx_proto::gateway::SessionPermissionProfileResult> {
+        let Some(slot) = self.slots.get(idx) else {
+            return None;
+        };
+        self.runtime
+            .block_on(slot.handle.clone().set_permission_profile(params))
+            .ok()
     }
 
     /// `profiles/create` against thread `idx`'s bound gateway. Returns
@@ -6115,8 +6432,7 @@ impl AgentBridge {
                 .iter_mut()
                 .find(|entry| entry.name == name)
             {
-                entry.tool_catalog =
-                    Some(crate::protocol_types::McpToolCatalog::Fetching);
+                entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Fetching);
             }
             cache.last_refresh = None;
         }
@@ -6138,9 +6454,7 @@ impl AgentBridge {
                 // short-lived toast disappears. This is also emitted by
                 // the panel process so async errors can be correlated
                 // with acpx/daemon logs.
-                eprintln!(
-                    "panel-rust: mcp_servers/tools_fetch failed for {name}: {error}"
-                );
+                eprintln!("panel-rust: mcp_servers/tools_fetch failed for {name}: {error}");
             }
             if let Ok(mut cache) = catalog.try_lock() {
                 if let Err(error) = &result {
@@ -6149,11 +6463,9 @@ impl AgentBridge {
                         .iter_mut()
                         .find(|entry| entry.name == name)
                     {
-                        entry.tool_catalog = Some(
-                            crate::protocol_types::McpToolCatalog::Error {
-                                message: error.clone(),
-                            },
-                        );
+                        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Error {
+                            message: error.clone(),
+                        });
                     }
                 }
                 cache.last_refresh = None;
@@ -6216,13 +6528,19 @@ impl AgentBridge {
                         }
                     } else {
                         let mut object = serde_json::Map::new();
-                        object.insert("name".to_string(), serde_json::Value::String(tool_name.clone()));
+                        object.insert(
+                            "name".to_string(),
+                            serde_json::Value::String(tool_name.clone()),
+                        );
                         object.insert(field.clone(), serde_json::Value::Bool(value));
                         tools.push(serde_json::Value::Object(object));
                     }
                 } else {
                     let mut object = serde_json::Map::new();
-                    object.insert("name".to_string(), serde_json::Value::String(tool_name.clone()));
+                    object.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(tool_name.clone()),
+                    );
                     object.insert(field.clone(), serde_json::Value::Bool(value));
                     entry.extra.insert(
                         "tools".to_string(),
@@ -6499,10 +6817,7 @@ impl AgentBridge {
             let Ok(cache) = self.gateway_catalog.try_lock() else {
                 return;
             };
-            let ops = self
-                .mcp_operations
-                .try_lock()
-                .ok();
+            let ops = self.mcp_operations.try_lock().ok();
             let any_tools_fetch_op = ops
                 .as_ref()
                 .is_some_and(|set| set.iter().any(|k| k.starts_with("tools_fetch:")));
@@ -6588,18 +6903,10 @@ impl AgentBridge {
             let registry_changed = {
                 if let Ok(mut c) = cache.try_lock() {
                     let had_prior_fill = c.gen > 0;
-                    let ops = operations
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    let merged = merge_mcp_list_with_optimistic(
-                        mcp_servers,
-                        &c.mcp_servers,
-                        &ops,
-                    );
+                    let ops = operations.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let merged = merge_mcp_list_with_optimistic(mcp_servers, &c.mcp_servers, &ops);
                     let changed = had_prior_fill
-                        && mcp_registry_identity(&c.mcp_servers)
-                            != mcp_registry_identity(&merged);
+                        && mcp_registry_identity(&c.mcp_servers) != mcp_registry_identity(&merged);
                     c.profiles = profiles;
                     c.mcp_servers = merged;
                     c.agents = agents;
@@ -6938,11 +7245,20 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
+        // See `ThreadSlot::dispatch_order`'s doc comment: drawn
+        // synchronously, here on the UI thread, so this ticket reflects
+        // the true order this call happened in relative to any other
+        // `send_prompt`/`mutate_queue` call for the same thread -- not
+        // whatever order the two independently-spawned tasks below
+        // happen to reach the transport in.
+        let ticket = slot.dispatch_order.draw_ticket();
         let slot = slot.clone();
         let handle = slot.handle.clone();
         let events = self.events.clone();
+        let runtime = self.runtime.handle().clone();
         self.runtime.spawn(async move {
             if let Err(error) = wait_for_attachment(&slot).await {
+                slot.dispatch_order.release();
                 events
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -6952,15 +7268,39 @@ impl AgentBridge {
                     });
                 return;
             }
-            if let Err(e) = handle.send_prompt(text).await {
-                events
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back(BridgeEvent {
-                        thread_index: idx,
-                        event: AgentEvent::Error(format!("send_prompt failed: {e}")),
-                    });
-            }
+            slot.dispatch_order.wait_turn(ticket).await;
+            // Release as soon as this call has actually joined the actor's
+            // own `cmd_rx` FIFO (`call_signaling_dispatch`'s doc comment),
+            // not after `send_prompt` itself returns -- which for a real
+            // turn only resolves once the *whole turn* ends. Releasing
+            // that late would serialize every subsequent queue mutation
+            // (including "Send now"'s own cancel-and-steer `QueueMutation`)
+            // behind an entire in-flight turn instead of just behind this
+            // one RPC's own dispatch, silently breaking steering. The
+            // actual call runs in its own task so this one can release the
+            // instant it's dispatched without waiting for the turn itself.
+            let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+            let call_events = events.clone();
+            runtime.spawn(async move {
+                let result = handle
+                    .send_prompt_signaling_dispatch(text, dispatched_tx)
+                    .await;
+                if let Err(e) = result {
+                    call_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(format!("send_prompt failed: {e}")),
+                        });
+                }
+            });
+            // If the call task is dropped before sending (actor gone), the
+            // channel closes and this resolves as `Err` -- still correct
+            // to release: a gone actor can never win or lose the ordering
+            // race for real.
+            let _ = dispatched_rx.await;
+            slot.dispatch_order.release();
         });
     }
 
@@ -6972,11 +7312,20 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
+        // See `ThreadSlot::dispatch_order`'s doc comment and `send_prompt`'s
+        // identical ticket draw -- every `send_prompt`/`mutate_queue` call
+        // for one thread shares this same ticket sequence, so a queue
+        // mutation (an "enqueue" jumping the FIFO ahead of the turn it was
+        // queued behind was the live-reproduced bug) can never reach the
+        // actor's `cmd_rx` out of the order the UI issued these calls in.
+        let ticket = slot.dispatch_order.draw_ticket();
         let slot = slot.clone();
         let handle = slot.handle.clone();
         let events = self.events.clone();
+        let runtime = self.runtime.handle().clone();
         self.runtime.spawn(async move {
             if let Err(error) = wait_for_attachment(&slot).await {
+                slot.dispatch_order.release();
                 events
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -6992,16 +7341,17 @@ impl AgentBridge {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
             else {
+                slot.dispatch_order.release();
                 events
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
-                        thread_index: idx,
-                        event: AgentEvent::Error(
-                            "queue mutation skipped: session attachment completed without a session id"
-                                .to_owned(),
-                        ),
-                    });
+                    thread_index: idx,
+                    event: AgentEvent::Error(
+                        "queue mutation skipped: session attachment completed without a session id"
+                            .to_owned(),
+                    ),
+                });
                 return;
             };
             // The reducer may have emitted this effect while a deferred
@@ -7009,15 +7359,29 @@ impl AgentBridge {
             // only after the attachment gate opens; the local thread slug is
             // never sent as an ACPX queue key.
             params["sessionId"] = serde_json::Value::String(session_id);
-            if let Err(error) = handle.mutate_queue(params).await {
-                events
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back(BridgeEvent {
-                        thread_index: idx,
-                        event: AgentEvent::Error(format!("queue mutation failed: {error}")),
-                    });
-            }
+            slot.dispatch_order.wait_turn(ticket).await;
+            // Same split as `send_prompt`: release the instant this joins
+            // the actor's queue, not once the mutation's own response
+            // arrives, so a later-ticketed caller is never stuck behind
+            // this one's full round trip.
+            let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+            let call_events = events.clone();
+            runtime.spawn(async move {
+                if let Err(error) = handle
+                    .mutate_queue_signaling_dispatch(params, dispatched_tx)
+                    .await
+                {
+                    call_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(format!("queue mutation failed: {error}")),
+                        });
+                }
+            });
+            let _ = dispatched_rx.await;
+            slot.dispatch_order.release();
         });
     }
 
@@ -8289,8 +8653,7 @@ mod tests {
     #[test]
     fn resolve_codex_native_auth_method_id_trusts_declared_chatgpt_with_no_token_evidence() {
         let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _auth =
-            TempCodexAuthFile::write(r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": null}"#);
+        let _auth = TempCodexAuthFile::write(r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": null}"#);
 
         assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
     }
@@ -8750,6 +9113,109 @@ mod tests {
             .iter()
             .any(|message| { message.text.contains("HELLO FROM A NEW THREAD") }));
         assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
+    }
+
+    /// paginate-history-skip-for-new-thread: a brand-new, never-resumed
+    /// server-owned thread (`open_session_maybe_profiled`'s `else` arm in
+    /// `spawn_background_attachment`, i.e. `requested_session_id` is
+    /// `None`) sets `is_fresh_session`, so its attach must settle straight
+    /// into "no older messages" (the same state a real empty-page
+    /// `AgentEvent::HistoryPage` response would have produced, see
+    /// `spawn_event_forwarder`'s `HistoryPage` arm) without ever waiting on
+    /// -- or erroring out of -- the `paginate_history(None)` round trip.
+    /// This is a state/outcome check, not a wire-level assertion that the
+    /// RPC was never sent: this module has no seam to intercept
+    /// `acpx/sessions/paginate` client-side without pulling in materially
+    /// more harness weight than this narrow fix warrants.
+    #[test]
+    fn new_thread_attach_settles_no_older_messages_without_a_pagination_wait() {
+        let gateway = TestGateway::spawn();
+        let names = ["Brand New Thread"];
+        // No cache_dir -> `server_owned_persistence` is true, the exact
+        // branch this fix touches.
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+        wait_for_thread_ready(&bridge, 0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !bridge.has_older_page(0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a brand-new thread never settled into has_older_page() == false"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let errors: Vec<_> = bridge
+            .poll()
+            .into_iter()
+            .filter(|event| matches!(&event.event, AgentEvent::Error(_)))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a brand-new thread's attach must not surface any pagination error, got: {errors:?}"
+        );
+    }
+
+    /// Regression test for the "messages truncated to the last few" live
+    /// bug: a now-removed `LIVE_HISTORY_WINDOW` cap in
+    /// `spawn_event_forwarder` used to `history.drain(..)` a server-owned
+    /// thread's live-forwarded messages down to 50 once a session had been
+    /// live long enough, actively evicting already-rendered transcript
+    /// content rather than just capping a disk/server pagination page.
+    /// Drives 20 real `send_prompt`/`TurnEnded` round trips against
+    /// `rui-mock-agent` (3 `ChatMessage`s per turn, see this file's
+    /// `probe_messages_per_turn`-shaped measurement) against a
+    /// `server_owned_persistence` thread (no `cache_dir`, the exact branch
+    /// the removed eviction only ever ran under) -- comfortably past the
+    /// old 50-message window -- and asserts every message is still
+    /// present, in order, starting from the very first turn's own reply.
+    #[test]
+    fn live_session_never_evicts_already_received_messages_from_history() {
+        let gateway = TestGateway::spawn();
+        let names = ["Long Live Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+        wait_for_thread_ready(&bridge, 0);
+
+        const TURNS: usize = 20;
+        for turn in 0..TURNS {
+            bridge.send_prompt(0, format!("live turn {turn}"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut ended = false;
+            while std::time::Instant::now() < deadline && !ended {
+                ended = bridge
+                    .poll()
+                    .into_iter()
+                    .any(|e| matches!(e.event, AgentEvent::TurnEnded(_)));
+                if !ended {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            assert!(ended, "turn {turn} did not finish");
+        }
+
+        let history = bridge.history(0);
+        assert!(
+            history.len() > 50,
+            "test setup must exceed the old 50-message window, got {} messages",
+            history.len()
+        );
+        assert!(
+            history.iter().any(|m| m.text.contains("LIVE TURN 0")),
+            "the very first turn's reply must still be present in a live session's history, \
+             not evicted once later turns pushed the count past the old window: {history:?}"
+        );
+        // The old eviction path also flipped `older_available`/set a
+        // synthetic `history_cursor` purely from local live growth -- a
+        // still-live, never-resumed-from-a-real-page session must not
+        // fabricate a "Load older messages" affordance either.
+        assert!(
+            !bridge.has_older_page(0),
+            "a live session that was never cold-started/resumed from a real paginated page \
+             must not claim older messages are available"
+        );
     }
 
     /// Real, live, billed "click + -> a real reply, rendered" chain,
@@ -10205,8 +10671,9 @@ done
     /// do with the provider itself.
     #[test]
     fn probe_provider_selection_is_a_silent_noop_when_thread_has_no_project() {
-        let mut bridge = AgentBridge::new_with_gateway_url(&["Untitled"], "http://127.0.0.1:1".to_owned())
-            .expect("bridge");
+        let mut bridge =
+            AgentBridge::new_with_gateway_url(&["Untitled"], "http://127.0.0.1:1".to_owned())
+                .expect("bridge");
 
         // stale-provider-switch-pulse fix: the `bool` return is exactly
         // what `effect_executor.rs`'s `Effect::ProbeProvider` arm uses to
@@ -10273,7 +10740,10 @@ done
             Some("codex-acp"),
             "provider is recorded as the raw requested registry id, not normalized"
         );
-        assert_eq!(bridge.thread_provider(claude_idx).as_deref(), Some("claude-acp"));
+        assert_eq!(
+            bridge.thread_provider(claude_idx).as_deref(),
+            Some("claude-acp")
+        );
         assert_eq!(
             bridge.thread_provider(grok_idx).as_deref(),
             Some("grok-build"),
@@ -11401,6 +11871,7 @@ done
         // rather than picking one over the other.
         let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
             command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+            command.env("ACPX_DB_PATH", script_dir.path().join("gateway.sqlite3"));
             test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                 .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
                 .env("RUST_LOG", "error");
@@ -11532,6 +12003,7 @@ done
         let mut command = std::process::Command::new(acpx_server_bin());
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env("ACPX_DB_PATH", script_dir.path().join("gateway.sqlite3"))
             .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
             .env("ACPX_DEFAULT_AGENT_ID", "terminal-cap-agent")
             .env("RUST_LOG", "error")
@@ -11831,7 +12303,9 @@ done
                 },
             )
         };
-        assert!(bridge.create_mcp_server(0, stdio_entry("mcp-bridge-fs")).is_ok());
+        assert!(bridge
+            .create_mcp_server(0, stdio_entry("mcp-bridge-fs"))
+            .is_ok());
         let after_create = bridge.list_mcp_servers(0);
         assert_eq!(after_create.len(), 1);
         assert_eq!(after_create[0].name, "bridge-fs");
@@ -11852,7 +12326,9 @@ done
              \"already exists\"), got: {duplicate_create_err:?}"
         );
 
-        assert!(bridge.update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2")).is_ok());
+        assert!(bridge
+            .update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2"))
+            .is_ok());
         let after_update = bridge.list_mcp_servers(0);
         assert_eq!(after_update.len(), 1);
         assert_eq!(after_update[0].command(), Some("mcp-bridge-fs-v2"));
@@ -11918,7 +12394,9 @@ done
         assert_eq!(before_fetch.tool_catalog, None);
 
         assert!(
-            bridge.fetch_mcp_server_tools(0, "bridge-tools-preview").is_ok(),
+            bridge
+                .fetch_mcp_server_tools(0, "bridge-tools-preview")
+                .is_ok(),
             "fetch_mcp_server_tools kickoff should reach the real gateway"
         );
 
@@ -12502,7 +12980,10 @@ done
             "fs",
             McpServerConfig::Stdio {
                 command: "npx".into(),
-                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-filesystem".into(),
+                ],
                 env: Default::default(),
                 timeout: None,
             },

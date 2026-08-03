@@ -597,7 +597,9 @@ impl Default for ThreadModel {
             rows_synced_with: None,
             #[cfg(test)]
             message_rows: Vec::new(),
-            markdown_render_index: RefCell::new(crate::thread_message_index::ThreadMessageIndex::default()),
+            markdown_render_index: RefCell::new(
+                crate::thread_message_index::ThreadMessageIndex::default(),
+            ),
             markdown_epoch: crate::markdown_worker::EpochCounter::new(),
             markdown_in_flight: crate::markdown_worker::InFlightRegistry::new(),
             has_older_messages: false,

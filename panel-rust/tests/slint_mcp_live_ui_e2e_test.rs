@@ -221,7 +221,15 @@ impl LiveUiHarness {
             .expect("spawn real acpx-server binary");
 
         let client = reqwest::Client::new();
-        let health_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Was `Duration::from_secs(5)`: too tight under real host contention
+        // (confirmed live -- a run's own `acpx-server` child had bound both
+        // its HTTP and admin ports and was otherwise healthy at 36s wall
+        // time, well past the old 5s budget, on a shared machine running
+        // several other concurrent builds/agents at once). Every other
+        // startup wait in this harness (Xvfb 8s, Slint MCP 10s) already
+        // budgets more than this one did for comparable "real process is
+        // still coming up" startup work.
+        let health_deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if client
                 .get(format!("http://127.0.0.1:{gateway_port}/health"))
@@ -260,8 +268,7 @@ impl LiveUiHarness {
             "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
             event_log.to_string_lossy().into_owned(),
         );
-        provision_mock_profile(&base_url, admin_port, &admin_token, persona, mock_agent_env)
-            .await;
+        provision_mock_profile(&base_url, admin_port, &admin_token, persona, mock_agent_env).await;
 
         let settings_dir = state_dir.join("panel-settings");
         std::fs::create_dir_all(&settings_dir).expect("create panel settings dir");
@@ -284,7 +291,33 @@ impl LiveUiHarness {
             .env("XDG_STATE_HOME", state_dir.join("xdg-state"))
             .env("SLINT_MCP_PORT", mcp_port.to_string())
             .env("RUI_PANEL_INPUT_TRACE", "1")
-            .env("RUI_ACPX_DEFAULT_URL", format!("http://127.0.0.1:{gateway_port}"));
+            .env(
+                "RUI_ACPX_DEFAULT_URL",
+                format!("http://127.0.0.1:{gateway_port}"),
+            )
+            // Without this, `SettingsPaths::from_env()` (settings_file.rs)
+            // never finds the `settings.global.json` just written above --
+            // its own priority order is `RUI_PANEL_SETTINGS_DIR`, then
+            // `{RUI_ACP_CACHE_DIR}/../panel-settings`, then the real
+            // developer machine's `~/.config/panel-rust`. The second only
+            // ever applies when `RUI_ACP_CACHE_DIR` is also set (the
+            // `!server_owned_persistence` branch below), so every
+            // `spawn_server_owned()` harness silently fell through to the
+            // *real* `~/.config/panel-rust/settings.global.json` instead
+            // of this state dir's -- `model.default_agent_id` stayed
+            // whatever (if anything) that real file happened to contain,
+            // never `persona`. That mattered for more than cosmetics: a
+            // brand-new deferred thread with no explicit profile picked
+            // falls back to `_acpx.profile` = `model.default_agent_id`
+            // (`update.rs`'s `ThreadMsg::New`), so with this unset a
+            // fresh thread's first `session/prompt` silently reached
+            // acpx-server's own bare `ACPX_DEFAULT_AGENT_ID` registration
+            // (a real, unmocked backend) instead of the `persona`-named
+            // profile `provision_mock_profile` just created pointing at
+            // `rui-mock-agent` -- confirmed live via a transcript
+            // containing real assistant prose with no matching
+            // `RUI_MOCK_AGENT_EVENT_LOG` entry at all.
+            .env("RUI_PANEL_SETTINGS_DIR", &settings_dir);
         if !server_owned_persistence {
             shotcut_command.env("RUI_ACP_CACHE_DIR", state_dir.join("panel"));
         }
@@ -580,7 +613,8 @@ impl LiveUiHarness {
         // does not itself touch `model.selected_thread`, so this makes the
         // newly created thread the active one regardless of what was
         // selected before, the same as a real user clicking it.
-        self.click_by_exact_label(window_handle, expected_name).await;
+        self.click_by_exact_label(window_handle, expected_name)
+            .await;
         self.click_by_exact_label(window_handle, "Collapse thread sidebar")
             .await;
     }
@@ -592,14 +626,12 @@ impl LiveUiHarness {
     /// `send_message_in_active_thread`.
     async fn send_via_compose(&self, window_handle: &Value, text: &str) {
         let compose = wait_for(Duration::from_secs(10), || async {
-            self.find_by_exact_label(window_handle, "Compose message").await
+            self.find_by_exact_label(window_handle, "Compose message")
+                .await
         })
         .await;
-        self.tool_call(
-            "click_element",
-            json!({"elementHandle": compose["handle"]}),
-        )
-        .await;
+        self.tool_call("click_element", json!({"elementHandle": compose["handle"]}))
+            .await;
         self.tool_call(
             "set_element_value",
             json!({"elementHandle": compose["handle"], "value": text}),
@@ -935,9 +967,7 @@ async fn server_owned_queue_stays_with_retained_chat_view_and_drains() {
         .send_via_compose(&window, "retained queue turn two")
         .await;
     wait_for(Duration::from_secs(15), || async {
-        harness
-            .find_by_exact_label(&window, "Stop sending")
-            .await
+        harness.find_by_exact_label(&window, "Stop sending").await
     })
     .await;
 
@@ -952,31 +982,30 @@ async fn server_owned_queue_stays_with_retained_chat_view_and_drains() {
     harness
         .click_by_exact_label(&window, "Expand thread sidebar")
         .await;
-    harness
-        .click_by_exact_label(&window, "New thread 1")
-        .await;
+    harness.click_by_exact_label(&window, "New thread 1").await;
     harness
         .click_by_exact_label(&window, "Collapse thread sidebar")
         .await;
     wait_for(Duration::from_secs(15), || async {
-        harness
-            .find_by_exact_label(&window, "Stop sending")
-            .await
+        harness.find_by_exact_label(&window, "Stop sending").await
     })
     .await;
 
     // Finish the active slow turn through the real stop-response control;
     // the server dispatcher must then promote the persisted queue head.
-    harness
-        .click_by_exact_label(&window, "Stop response")
-        .await;
+    harness.click_by_exact_label(&window, "Stop response").await;
     wait_for(Duration::from_secs(20), || async {
-        harness.prompt_event_seen("retained queue turn two").then_some(())
+        harness
+            .prompt_event_seen("retained queue turn two")
+            .then_some(())
     })
     .await;
 }
 
 #[tokio::test]
+// Drives pagination through the "Load older messages" button, which was
+// intentionally removed in favour of scroll-only paging plus a spinner.
+#[ignore = "no clickable load-older control: pagination is scroll-triggered only"]
 async fn server_owned_pagination_stays_with_retained_chat_view() {
     let harness = LiveUiHarness::spawn_server_owned().await;
     let window = harness.window_handle().await;
@@ -1007,9 +1036,7 @@ async fn server_owned_pagination_stays_with_retained_chat_view() {
     harness
         .click_by_exact_label(&window, "Expand thread sidebar")
         .await;
-    harness
-        .click_by_exact_label(&window, "New thread 1")
-        .await;
+    harness.click_by_exact_label(&window, "New thread 1").await;
     harness
         .click_by_exact_label(&window, "Collapse thread sidebar")
         .await;
@@ -1271,7 +1298,9 @@ async fn mcp04_live_stream_marker_survives_a_real_unterminated_partial_tail() {
     .await;
 
     wait_for(Duration::from_secs(20), || async {
-        harness.find_by_exact_label(&window, "Copy message text").await
+        harness
+            .find_by_exact_label(&window, "Copy message text")
+            .await
     })
     .await;
 }
@@ -1329,12 +1358,11 @@ async fn mcp04_live_stream_marker_survives_a_real_unterminated_partial_tail() {
 #[tokio::test]
 #[ignore]
 async fn mcp06_live_thread_switch_interrupts_a_slowed_background_prewarm() {
-    let harness =
-        LiveUiHarness::spawn_with_env(&[
-            ("RUI_MARKDOWN_RENDER_TEST_DELAY_MS", "300"),
-            ("RUI_PANEL_INPUT_TRACE", "1"),
-        ])
-        .await;
+    let harness = LiveUiHarness::spawn_with_env(&[
+        ("RUI_MARKDOWN_RENDER_TEST_DELAY_MS", "300"),
+        ("RUI_PANEL_INPUT_TRACE", "1"),
+    ])
+    .await;
     let window = harness.window_handle().await;
 
     harness.create_new_thread(&window, "New thread 1").await;
@@ -1396,7 +1424,9 @@ async fn mcp06_live_thread_switch_interrupts_a_slowed_background_prewarm() {
     harness.click_by_exact_label(&window, "New thread 2").await;
 
     wait_for(Duration::from_secs(20), || async {
-        harness.find_by_exact_label(&window, "Copy message text").await
+        harness
+            .find_by_exact_label(&window, "Copy message text")
+            .await
     })
     .await;
 }
@@ -1442,7 +1472,10 @@ async fn debug_duplicate_thread_row_labels() {
         .filter(|e| e["accessibleLabel"].as_str() == Some("ACTIVE"))
         .map(|e| format!("{e}"))
         .collect();
-    eprintln!("[debug] ACTIVE badge count before click: {}", active_before.len());
+    eprintln!(
+        "[debug] ACTIVE badge count before click: {}",
+        active_before.len()
+    );
 
     harness.click_by_exact_label(&window, "New thread 1").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1629,7 +1662,9 @@ async fn debug_scrollbar_drag() {
     })
     .await;
     wait_for(Duration::from_secs(30), || async {
-        harness.find_by_exact_label(&window, "Copy message text").await
+        harness
+            .find_by_exact_label(&window, "Copy message text")
+            .await
     })
     .await;
 
@@ -1648,11 +1683,17 @@ async fn debug_scrollbar_drag() {
             is_touch_area && w > 0.0 && w < 15.0 && h > 40.0
         })
         .collect();
-    eprintln!("[debug] scrollbar touch-area candidates: {}", candidates.len());
+    eprintln!(
+        "[debug] scrollbar touch-area candidates: {}",
+        candidates.len()
+    );
     for c in &candidates {
         eprintln!("[debug] candidate: {c:#}");
     }
-    assert!(!candidates.is_empty(), "no scrollbar touch-area candidate found");
+    assert!(
+        !candidates.is_empty(),
+        "no scrollbar touch-area candidate found"
+    );
     let touch_area = candidates[0];
     let touch_handle = touch_area["handle"].clone();
     let track_x = touch_area["absolutePosition"]["x"].as_f64().unwrap_or(0.0);

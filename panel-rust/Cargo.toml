@@ -33,6 +33,7 @@ textwrap = "0.16"
 # gateway_actor.rs) -- acpx-client is now this crate's only ACP/ACPX SDK
 # dependency, used directly rather than through a second crate boundary.
 acpx-client = { path = "../acpx/acpx-client" }
+acpx-proto = { path = "../acpx/acpx-proto" }
 # Vendor(custom-agent-format)-scoped skill store + symlink/copy sync engine.
 # NOT an acpx crate (no acpx dependency of its own) -- a standalone sibling
 # at lib/skills-manager/, wired in the same path-dependency style as

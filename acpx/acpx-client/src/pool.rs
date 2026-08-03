@@ -313,7 +313,14 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                 .entries
                 .iter()
                 .position(|e| matches!(e.state, EntryState::Idle))
-                .map(|idx| self.lease_entry(&mut key_pool.entries[idx], key.clone(), thread_id.clone(), false))
+                .map(|idx| {
+                    self.lease_entry(
+                        &mut key_pool.entries[idx],
+                        key.clone(),
+                        thread_id.clone(),
+                        false,
+                    )
+                })
         };
         let lease = if let Some(lease) = existing {
             lease
@@ -332,7 +339,9 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
     pub async fn prewarm(self: &Arc<Self>, key: PoolKey) {
         {
             let mut keys = self.keys.lock().await;
-            keys.entry(key.clone()).or_insert_with(KeyPool::new).activated = true;
+            keys.entry(key.clone())
+                .or_insert_with(KeyPool::new)
+                .activated = true;
         }
         self.spawn_warmup_if_needed(key);
     }
@@ -402,7 +411,14 @@ impl<O: SessionOpener> ProjectSessionPool<O> {
                 .entries
                 .iter()
                 .position(|e| matches!(e.state, EntryState::Idle))
-                .map(|idx| self.lease_entry(&mut key_pool.entries[idx], key.clone(), thread_id.clone(), false))
+                .map(|idx| {
+                    self.lease_entry(
+                        &mut key_pool.entries[idx],
+                        key.clone(),
+                        thread_id.clone(),
+                        false,
+                    )
+                })
         };
         if let Some(lease) = racer_spare {
             return Ok(lease);
@@ -1314,7 +1330,11 @@ mod tests {
             .expect("acquire");
         let other_lease = pool
             .clone()
-            .acquire(other_key.clone(), "thread-b".to_string(), OpenSpec::default())
+            .acquire(
+                other_key.clone(),
+                "thread-b".to_string(),
+                OpenSpec::default(),
+            )
             .await
             .expect("acquire other");
         let original_sid = lease.session_id.clone();

@@ -2,8 +2,9 @@
 
 use crate::{raw::ClientError, Gateway};
 use acpx_proto::session_stream::{
-    QueueMutationParams, QueueMutationResult, QueueSubscribeParams, QueueSubscribeResult,
-    SessionPageResult, SessionPaginateParams, SessionSyncParams, SessionSyncResult,
+    QueueItem, QueueMutation, QueueMutationEvent, QueueMutationParams, QueueMutationResult,
+    QueueSubscribeParams, QueueSubscribeResult, SessionPageResult, SessionPaginateParams,
+    SessionSteerParams, SessionSteerResult, SessionSyncParams, SessionSyncResult,
     SessionsSubscribeParams, SessionsSubscribeResult,
 };
 
@@ -49,6 +50,67 @@ pub async fn mutate_queue(
     call_typed(gateway, "session/queue", params).await
 }
 
+pub async fn steer(
+    gateway: &Gateway,
+    params: SessionSteerParams,
+) -> Result<SessionSteerResult, ClientError> {
+    params
+        .validate()
+        .map_err(|error| ClientError::WebSocket(error.to_string()))?;
+    call_typed(gateway, "session/steer", params).await
+}
+
+/// Client-owned latest queue projection. Queue push notifications are
+/// mutation events; consumers can render this projection or derive another
+/// view without requiring ACPX to resend the entire queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueProjection {
+    pub items: Vec<QueueItem>,
+}
+
+impl QueueProjection {
+    pub fn from_snapshot(snapshot: &acpx_proto::session_stream::QueueSnapshot) -> Self {
+        Self {
+            items: snapshot.queue.clone(),
+        }
+    }
+
+    pub fn apply_event(&mut self, event: &QueueMutationEvent) {
+        match event.mutation {
+            QueueMutation::Inserted => {
+                if let Some(existing) = self
+                    .items
+                    .iter_mut()
+                    .find(|item| item.queue_entry_id == event.queue_entry_id)
+                {
+                    if let Some(position) = event.position {
+                        existing.position = position;
+                    }
+                    if let Some(key) = &event.idempotency_key {
+                        existing.idempotency_key = key.clone();
+                    }
+                } else {
+                    self.items.push(QueueItem {
+                        queue_entry_id: event.queue_entry_id.clone(),
+                        idempotency_key: event.idempotency_key.clone().unwrap_or_default(),
+                        text: String::new(),
+                        state: "queued".into(),
+                        position: event.position.unwrap_or(self.items.len() as u32),
+                    });
+                }
+            }
+            QueueMutation::SentPrompt | QueueMutation::Removed => {
+                self.items
+                    .retain(|item| item.queue_entry_id != event.queue_entry_id);
+            }
+        }
+        self.items.sort_by_key(|item| item.position);
+        for (position, item) in self.items.iter_mut().enumerate() {
+            item.position = position as u32;
+        }
+    }
+}
+
 async fn call_typed<P, R>(gateway: &Gateway, method: &str, params: P) -> Result<R, ClientError>
 where
     P: serde::Serialize,
@@ -87,5 +149,26 @@ mod tests {
         .unwrap();
         assert_eq!(queue["idempotencyKey"], "client-1");
         assert_eq!(queue["operation"], "enqueue");
+    }
+
+    #[test]
+    fn queue_projection_applies_mutations_without_snapshot() {
+        let mut projection = QueueProjection::default();
+        projection.apply_event(&QueueMutationEvent {
+            session_id: "s1".into(),
+            queue_entry_id: "q1".into(),
+            mutation: QueueMutation::Inserted,
+            idempotency_key: Some("k1".into()),
+            position: Some(0),
+        });
+        assert_eq!(projection.items.len(), 1);
+        projection.apply_event(&QueueMutationEvent {
+            session_id: "s1".into(),
+            queue_entry_id: "q1".into(),
+            mutation: QueueMutation::SentPrompt,
+            idempotency_key: Some("k1".into()),
+            position: None,
+        });
+        assert!(projection.items.is_empty());
     }
 }

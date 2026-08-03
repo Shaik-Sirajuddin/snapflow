@@ -102,6 +102,93 @@ async fn sync_calls_native_load_and_returns_only_the_unmatched_suffix() {
     );
 }
 
+const PROMPT_TOOL_CALL_BACKEND: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}\n' "$id"
+  elif printf '%s' "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-prompt"}}\n' "$id"
+  elif printf '%s' "$line" | grep -q '"method":"session/prompt"'; then
+    printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-prompt","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Read file","status":"completed"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-prompt","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  fi
+done
+"#;
+
+/// A paginated page must carry the whole turn -- the user's own prompt as
+/// well as the tool call and agent text it produced. The prompt has no
+/// backend `session/update` of its own, so it is only in the transcript if
+/// the gateway persists it at dispatch time.
+#[tokio::test]
+async fn paginated_history_includes_the_user_prompt_and_tool_calls() {
+    let directory = tempdir().unwrap();
+    let mut router =
+        Router::new("prompt-agent").with_transcript_store(TranscriptStore::new(directory.path()));
+    router.register_agent(
+        "prompt-agent",
+        SpawnSpec::new("sh", vec!["-c".into(), PROMPT_TOOL_CALL_BACKEND.into()]),
+    );
+    let router = Arc::new(Mutex::new(router));
+    let tenant = TenantId::default_tenant();
+
+    let created = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"session/new",
+            "params":{"cwd":"/tmp"}
+        }),
+    )
+    .await
+    .unwrap();
+    let session_id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+
+    dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"session/prompt",
+            "params":{"sessionId":session_id,
+                      "prompt":[{"type":"text","text":"hello there"}]}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let page = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":3, "method":"acpx/sessions/paginate",
+            "params":{"sessionId":session_id}
+        }),
+    )
+    .await
+    .unwrap();
+    let messages = page["messages"].as_array().unwrap();
+    let kinds = messages
+        .iter()
+        .map(|message| {
+            message["params"]["update"]["sessionUpdate"]
+                .as_str()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        ["user_message_chunk", "tool_call", "agent_message_chunk"]
+    );
+    assert_eq!(
+        messages[0]["params"]["update"]["content"]["text"],
+        "hello there"
+    );
+    assert_eq!(messages[0]["params"]["sessionId"], session_id);
+}
+
 #[tokio::test]
 async fn queue_endpoint_is_fifo_and_deduplicates_client_retries() {
     let directory = tempdir().unwrap();

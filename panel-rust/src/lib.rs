@@ -43,9 +43,9 @@ pub mod snapshotd_client;
 // of duplicating the SKILL.md front-matter parsing logic.
 mod skills_manager_adapter;
 pub mod skills_state;
+mod snapshotd_lifecycle;
 mod state_store;
 mod sync;
-mod snapshotd_lifecycle;
 mod thread_view;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
 // crates from this one, unable to see anything less than `pub` -- can
@@ -640,10 +640,7 @@ mod scoped_panel_prefs_tests {
                 .iter()
                 .map(|&key| (key, std::env::var_os(key)))
                 .collect();
-            Self {
-                _lock: lock,
-                saved,
-            }
+            Self { _lock: lock, saved }
         }
     }
 
@@ -696,8 +693,8 @@ mod scoped_panel_prefs_tests {
         save_panel_prefs_to_json("global", &defaults_with_background(true), None, true)
             .expect("save global");
         let mut warnings = Vec::new();
-        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
-            .expect("load global");
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(global_prefs.defaults.background_session);
         let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
@@ -751,14 +748,14 @@ mod scoped_panel_prefs_tests {
             .expect("save global default");
 
         let mut warnings = Vec::new();
-        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
-            .expect("load project");
+        let project_prefs =
+            load_scoped_panel_prefs("project", None, &mut warnings).expect("load project");
         assert!(
             project_prefs.defaults.background_session,
             "existing project override must survive an unrelated global write"
         );
-        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
-            .expect("load global");
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
         assert!(!global_prefs.defaults.background_session);
     }
 
@@ -786,8 +783,8 @@ mod scoped_panel_prefs_tests {
         save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
             .expect("save global");
         let mut warnings = Vec::new();
-        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
-            .expect("load global");
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(global_prefs.show_global_skills);
         let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
@@ -846,15 +843,14 @@ mod scoped_panel_prefs_tests {
             .expect("save must fall back to global instead of hard-failing");
 
         let mut warnings = Vec::new();
-        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
-            .expect("load global");
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
         assert!(
             global_prefs.defaults.background_session,
             "the value must have actually been persisted, into the global file"
         );
 
-        let global_doc =
-            settings_file::load_document(&paths.global).expect("read global doc");
+        let global_doc = settings_file::load_document(&paths.global).expect("read global doc");
         assert_eq!(global_doc.background_session_default, Some(true));
     }
 }
@@ -1206,6 +1202,28 @@ impl PanelSingleton {
         bridge.mutate_queue(real_idx, params);
     }
 
+    /// `Effect::RecordLocalMessage`'s executor -- a `server_queue` thread's
+    /// auto-drained entry never reaches `start_send_prompt` (ACPX's own
+    /// `spawn_queue_dispatcher` sends the real `session/prompt` itself, see
+    /// `update.rs`'s `QueueChanged` handler doc comment), so this is the
+    /// queue-drain path's equivalent of `start_send_prompt`'s `push_local`
+    /// call -- records the message into the transcript without also
+    /// issuing a new prompt (one was already sent server-side).
+    pub(crate) fn execute_record_local_message_real(&self, real_idx: usize, text: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        bridge.push_local(
+            real_idx,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: text.to_string(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+    }
+
     fn start_send_prompt(&self, idx: usize, text: &str, bridge: &AgentBridge) {
         if bridge.thread_closed(idx) {
             trace_host_input(format_args!(
@@ -1394,7 +1412,7 @@ impl PanelSingleton {
     ) {
         let Some(bridge) = &self.bridge else {
             crate::effect_executor::report_mcp_server_result(Err(
-                "no gateway connection".to_string(),
+                "no gateway connection".to_string()
             ));
             return;
         };
@@ -1457,7 +1475,11 @@ impl PanelSingleton {
             tool_name,
             "deferred",
             deferred,
-            if deferred { "set to deferred" } else { "set to eager" },
+            if deferred {
+                "set to deferred"
+            } else {
+                "set to eager"
+            },
         )
     }
 
@@ -1603,7 +1625,11 @@ impl PanelSingleton {
     /// OS call, so it still runs synchronously inside the completion
     /// closure -- only the network round-trip that discovers/starts the
     /// OAuth flow moves off the UI thread.
-    pub(crate) fn dispatch_mcp_server_authenticate_async(&self, _component: &ChatPanel, name: &str) {
+    pub(crate) fn dispatch_mcp_server_authenticate_async(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+    ) {
         let Some(bridge) = &self.bridge else {
             crate::effect_executor::report_mcp_server_result(Err(
                 "no gateway connection".to_string()
@@ -2503,9 +2529,10 @@ fn panel_rust_create_with_initial_identity(
         // (what `ThreadMsg::New` reads for a new thread's provider) -- that
         // was previously only set via the Settings "Save" button. Apply it
         // here too so a fresh thread respects the configured default.
-        if let Some(configured_agent_id) = scoped_prefs.as_ref().and_then(|prefs| {
-            settings_file::non_default_sentinel(prefs.default_agent_id.clone())
-        }) {
+        if let Some(configured_agent_id) = scoped_prefs
+            .as_ref()
+            .and_then(|prefs| settings_file::non_default_sentinel(prefs.default_agent_id.clone()))
+        {
             panel.model.borrow_mut().default_agent_id = configured_agent_id;
         }
         for message in post_hydration_warnings {
@@ -4276,8 +4303,11 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // flight`), but without an explicit busy-thread reason here the
         // Attach button's Spinner only got one correct frame at
         // click-time and then froze until unrelated mouse movement.
-        let busy_recover_session_animating =
-            !panel.model.borrow().recover_session_operations_in_flight.is_empty();
+        let busy_recover_session_animating = !panel
+            .model
+            .borrow()
+            .recover_session_operations_in_flight
+            .is_empty();
         let busy_animation = busy_thread_animating
             || busy_mcp_server_animating
             || busy_recover_session_animating
@@ -5090,6 +5120,10 @@ mod keyboard_shortcut_tests {
     fn ctrl_alt_arrows_and_ctrl_k_work_through_the_real_input_key_bridge() {
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         panel.set_threads(vec![
             thread_item("Fix timeline crash"),
@@ -5198,6 +5232,10 @@ mod keyboard_shortcut_tests {
     fn invoke_command_switches_threads_and_opens_search_without_any_focus() {
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         panel.set_threads(vec![
             thread_item("Fix timeline crash"),
@@ -5239,6 +5277,10 @@ mod keyboard_shortcut_tests {
     fn has_text_focus_reflects_real_compose_focus_state() {
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         assert!(
             !panel_rust_has_text_focus(panel.handle),
@@ -5277,6 +5319,10 @@ mod keyboard_shortcut_tests {
 
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
         panel.set_threads(vec![thread_item("Fix timeline crash")]);
         component.set_selected_thread(0);
         component.set_sidebar_expanded(false);
@@ -5334,6 +5380,10 @@ mod keyboard_shortcut_tests {
 
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
         component.set_compose_text("select and copy me".into());
 
         let compose = ElementHandle::find_by_accessible_label(&component, "Compose message")
@@ -5490,6 +5540,9 @@ mod keyboard_shortcut_tests {
         let panel = TestPanel::new();
         let component = panel.component();
         component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         let entries = vec![
             DropdownEntry {
@@ -5528,7 +5581,10 @@ mod keyboard_shortcut_tests {
             let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
                 .next()
                 .is_some();
-            assert!(!opened_before, "popup must be closed before each sweep click");
+            assert!(
+                !opened_before,
+                "popup must be closed before each sweep click"
+            );
 
             let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
             assert!(
@@ -5573,6 +5629,8 @@ mod keyboard_shortcut_tests {
         let panel = TestPanel::new_with_size(800, 400);
         let component = panel.component();
         component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
 
         let entries = vec![
             DropdownEntry {
@@ -5605,7 +5663,10 @@ mod keyboard_shortcut_tests {
             let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
                 .next()
                 .is_some();
-            assert!(!opened_before, "popup must be closed before each sweep click");
+            assert!(
+                !opened_before,
+                "popup must be closed before each sweep click"
+            );
 
             let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
             assert!(

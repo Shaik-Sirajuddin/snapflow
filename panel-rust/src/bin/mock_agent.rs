@@ -23,15 +23,16 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, DeleteSessionRequest,
-    DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionConfigSelectOption,
-    SessionId, SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, CreateTerminalRequest,
+    DeleteSessionRequest, DeleteSessionResponse, InitializeResponse, ListSessionsResponse,
+    LoadSessionResponse, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption,
+    SessionConfigSelectOption, SessionId, SessionInfo, SessionInfoUpdate, SessionNotification,
+    SessionUpdate, StopReason, TerminalOutputRequest, TextContent, ToolCall, ToolCallId,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Handled, Result, Stdio};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -458,14 +459,13 @@ async fn main() -> Result<()> {
                                 end += 1;
                             }
                             let piece = String::from_utf8_lossy(&bytes[sent..end]).into_owned();
-                            let _ = connection_for_stream.send_notification(
-                                SessionNotification::new(
+                            let _ =
+                                connection_for_stream.send_notification(SessionNotification::new(
                                     session_id_for_stream.clone(),
                                     SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                         ContentBlock::Text(TextContent::new(piece)),
                                     )),
-                                ),
-                            );
+                                ));
                             sent = end;
                             if sent < bytes.len() {
                                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -547,6 +547,94 @@ async fn main() -> Result<()> {
                                 ))),
                             )),
                         ));
+                        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    });
+                    return Ok(());
+                }
+                // Real terminal relay coverage: ask the ACP client to create
+                // and read a terminal, then include its output in the live
+                // assistant update. This is opt-in via the `terminal ` prompt
+                // marker so existing deterministic mock-agent scenarios keep
+                // their stable three-update transcript.
+                if let Some(marker_text) = text.strip_prefix("terminal ") {
+                    let marker_text = marker_text.to_string();
+                    let connection_for_terminal = connection.clone();
+                    let session_id_for_terminal = session_id.clone();
+                    tokio::spawn(async move {
+                        // Invoke `echo` directly and pass the complete marker
+                        // as one ACP argument, preserving both the terminal
+                        // and assistant assertions even when the marker has
+                        // spaces.
+                        let command =
+                            CreateTerminalRequest::new(session_id_for_terminal.clone(), "echo")
+                                .args(vec![marker_text.clone()]);
+                        let created = connection_for_terminal
+                            .send_request(command)
+                            .block_task()
+                            .await;
+                        let output = match created {
+                            Ok(created) => {
+                                let terminal_id = created.terminal_id.clone();
+                                let mut output = String::new();
+                                let mut last_error = None;
+                                for _ in 0..40 {
+                                    match connection_for_terminal
+                                        .send_request(TerminalOutputRequest::new(
+                                            session_id_for_terminal.clone(),
+                                            terminal_id.clone(),
+                                        ))
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            output = result.output;
+                                            if !output.is_empty() || result.exit_status.is_some() {
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            last_error = Some(format!("{error:?}"));
+                                            break;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                                if let Some(error) = last_error {
+                                    record_gateway_event(
+                                        "terminal/output_error",
+                                        Some(session_id_for_terminal.0.as_ref()),
+                                        &error,
+                                    );
+                                    "terminal-output-error".to_string()
+                                } else {
+                                    output
+                                }
+                            }
+                            Err(error) => {
+                                record_gateway_event(
+                                    "terminal/create_error",
+                                    Some(session_id_for_terminal.0.as_ref()),
+                                    &format!("{error:?}"),
+                                );
+                                "terminal-create-error".to_string()
+                            }
+                        };
+                        record_gateway_event(
+                            "terminal/output",
+                            Some(session_id_for_terminal.0.as_ref()),
+                            &output,
+                        );
+                        let _ =
+                            connection_for_terminal.send_notification(SessionNotification::new(
+                                session_id_for_terminal,
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!(
+                                        "{}{}",
+                                        persona_prefix(),
+                                        output
+                                    ))),
+                                )),
+                            ));
                         let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                     });
                     return Ok(());
@@ -753,10 +841,25 @@ async fn main() -> Result<()> {
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
+                // Responses belong to the SDK's pending-request router.  A
+                // catch-all dispatch handler must pass them through; claiming
+                // one here turns every typed agent->client response (for
+                // example terminal/create) into an internal "unhandled
+                // message" error before the waiting send_request task sees
+                // it.  Requests/notifications are the only messages this
+                // fallback is meant to reject.
+                if let Dispatch::Response(_, _) = &message {
+                    return Ok(Handled::No {
+                        message,
+                        retry: false,
+                    });
+                }
+                record_gateway_event("unhandled", None, message.method());
                 message.respond_with_error(
                     agent_client_protocol::util::internal_error("unhandled message"),
                     cx,
-                )
+                )?;
+                Ok(Handled::Yes)
             },
             agent_client_protocol::on_receive_dispatch!(),
         )

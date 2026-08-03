@@ -1472,8 +1472,10 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     // rows) -- shown as a summary next to the "MCP Servers" section
     // header, computed here rather than in Slint since it has no
     // array-sum/reduce.
-    let mcp_tools_total_count: i32 =
-        mcp_rows.iter().map(|row| row.tools.row_count() as i32).sum();
+    let mcp_tools_total_count: i32 = mcp_rows
+        .iter()
+        .map(|row| row.tools.row_count() as i32)
+        .sum();
 
     // Settings > Project is an installed-agent view. Filter the UI model at
     // reconciliation time so hidden catalog entries do not consume grid
@@ -1498,7 +1500,10 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         visible_agents.clone(),
         &model.agent_operations_in_flight,
     );
-    let agent_keys: Vec<String> = visible_agents.iter().map(|agent| agent.id.clone()).collect();
+    let agent_keys: Vec<String> = visible_agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect();
     crate::list_model::reconcile(
         &model.agent_catalog_model,
         &mut model.agent_catalog_model_keys.borrow_mut(),
@@ -1797,7 +1802,10 @@ mod tests {
              synthetic row's fetch status, not stay stuck empty"
         );
         assert_eq!(builtin.tools.row_count(), 1);
-        assert_eq!(builtin.tools.row_data(0).unwrap().name.as_str(), "render_frame");
+        assert_eq!(
+            builtin.tools.row_data(0).unwrap().name.as_str(),
+            "render_frame"
+        );
         assert!(builtin.tools_search_blob.as_str().contains("render_frame"));
     }
 

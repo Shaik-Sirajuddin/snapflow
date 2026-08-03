@@ -726,6 +726,11 @@ export component ChatInputLayout inherits Rectangle {
                 // normal cursor placement and text selection remain intact.
                 input-focus-capture := TouchArea {
                     enabled: !compose.has-focus;
+                    // Keep the focus proxy above the Flickable/TextInput
+                    // hit-test surface while the composer is unfocused.
+                    // Layout order alone is not a stable z-order guarantee
+                    // across the software and native Slint backends.
+                    z: 100;
                     x: 0px;
                     y: 0px;
                     width: parent.width;

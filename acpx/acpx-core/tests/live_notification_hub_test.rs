@@ -132,10 +132,17 @@ async fn shared_live_updates_are_persisted_in_the_server_transcript_store() {
     .unwrap();
     let store = { router.lock().await.transcript_store().unwrap() };
     let messages = store.read_all(&session_id).await.unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["params"]["update"]["content"]["text"], "Hello");
+    // The server transcript is authoritative and includes the originating
+    // prompt before the two streamed backend chunks.
+    assert_eq!(messages.len(), 3);
     assert_eq!(
-        messages[1]["params"]["update"]["content"]["text"],
+        messages[0]["params"]["update"]["sessionUpdate"],
+        "user_message_chunk"
+    );
+    assert_eq!(messages[0]["params"]["update"]["content"]["text"], "hi");
+    assert_eq!(messages[1]["params"]["update"]["content"]["text"], "Hello");
+    assert_eq!(
+        messages[2]["params"]["update"]["content"]["text"],
         ", world"
     );
 }

@@ -1,7 +1,8 @@
 //! Durable per-session FIFO prompt queue.
 
 use acpx_proto::session_stream::{
-    QueueItem, QueueMutationParams, QueueMutationResult, QueueOperation, QueueSnapshot,
+    QueueItem, QueueMutation, QueueMutationParams, QueueMutationResult, QueueOperation,
+    QueueSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,7 +13,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::transcripts::{TranscriptError, TranscriptStore};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum QueueRecordOperation {
     Enqueue,
     SendNow,
@@ -52,9 +53,18 @@ struct QueueRecord {
 #[derive(Debug, Clone)]
 pub struct QueueStateEvent {
     pub session_id: String,
-    pub queue: Vec<QueueItem>,
-    pub paused: bool,
-    pub idempotency_key: String,
+    pub queue_entry_id: String,
+    pub mutation: QueueMutation,
+    pub idempotency_key: Option<String>,
+    pub position: Option<u32>,
+    /// Prompt text for an inserted/sent lifecycle delta.  Queue deltas are
+    /// consumed by clients without necessarily having the mutation response
+    /// (observers and reconnecting clients), so an inserted row must carry
+    /// its text rather than forcing the client to manufacture an empty row.
+    pub text: Option<String>,
+    /// True only for the durable completion of a claimed prompt. Cancel and
+    /// release mutations are not turn completion notifications.
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -191,15 +201,36 @@ impl QueueStore {
             session_id: session_id.clone(),
             idempotency_key: params.idempotency_key.clone(),
             accepted: true,
-            queue_entry_id,
+            queue_entry_id: queue_entry_id.clone(),
             queue: queue.clone(),
             paused,
         };
+        let mutation = match params.operation {
+            QueueOperation::Cancel => QueueMutation::Removed,
+            _ => QueueMutation::Inserted,
+        };
+        let position = queue_entry_id.as_ref().and_then(|id| {
+            queue
+                .iter()
+                .find(|item| &item.queue_entry_id == id)
+                .map(|item| item.position)
+        });
         let event = QueueStateEvent {
             session_id,
-            queue,
-            paused,
-            idempotency_key: params.idempotency_key,
+            queue_entry_id: queue_entry_id.clone().unwrap_or_default(),
+            mutation,
+            idempotency_key: Some(params.idempotency_key),
+            position,
+            text: queue_entry_id
+                .as_ref()
+                .and_then(|id| {
+                    queue
+                        .iter()
+                        .find(|item| &item.queue_entry_id == id)
+                        .map(|item| item.text.clone())
+                })
+                .or_else(|| params.text.clone()),
+            completed: false,
         };
         Ok((response, event))
     }
@@ -263,16 +294,19 @@ impl QueueStore {
         })
         .await
         .map_err(|error| TranscriptError::Task(error.to_string()))??;
-        let Some((item, queue, paused)) = result else {
+        let Some((item, _queue, _paused)) = result else {
             return Ok(None);
         };
         Ok(Some((
-            item,
+            item.clone(),
             QueueStateEvent {
                 session_id,
-                queue,
-                paused,
-                idempotency_key: String::new(),
+                queue_entry_id: item.queue_entry_id.clone(),
+                mutation: QueueMutation::SentPrompt,
+                idempotency_key: Some(item.idempotency_key.clone()),
+                position: None,
+                text: Some(item.text.clone()),
+                completed: false,
             },
         )))
     }
@@ -311,7 +345,9 @@ impl QueueStore {
         let root = Arc::clone(&self.root);
         let entry_id = item.queue_entry_id.clone();
         let item = item.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let event_operation = operation.clone();
+        let event_item = item.clone();
+        let _result = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(root.as_path())?;
             append_record(
                 &path,
@@ -326,12 +362,22 @@ impl QueueStore {
         })
         .await
         .map_err(|error| TranscriptError::Task(error.to_string()))??;
-        let state = result;
         Ok(QueueStateEvent {
             session_id,
-            queue: state.queue,
-            paused: state.paused,
-            idempotency_key: String::new(),
+            queue_entry_id: event_item.queue_entry_id.clone(),
+            mutation: if event_operation == QueueRecordOperation::Complete {
+                QueueMutation::Removed
+            } else {
+                QueueMutation::Inserted
+            },
+            idempotency_key: Some(event_item.idempotency_key.clone()),
+            position: if event_operation == QueueRecordOperation::Release {
+                Some(0)
+            } else {
+                None
+            },
+            text: Some(event_item.text.clone()),
+            completed: event_operation == QueueRecordOperation::Complete,
         })
     }
 
@@ -371,12 +417,14 @@ impl QueueStore {
 #[derive(Clone)]
 pub struct QueueHub {
     streams: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
+    steer_streams: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
 }
 
 impl Default for QueueHub {
     fn default() -> Self {
         Self {
             streams: Arc::new(Mutex::new(HashMap::new())),
+            steer_streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -391,18 +439,64 @@ impl QueueHub {
     }
 
     pub async fn publish(&self, event: QueueStateEvent) {
+        self.publish_with_origin(event, None).await;
+    }
+
+    /// Publish a queue lifecycle delta, optionally recording the originating
+    /// websocket client.  Transports can use this marker to suppress the
+    /// duplicate lifecycle frame for the request's origin while preserving
+    /// fan-out to every other subscriber.
+    pub async fn publish_with_origin(
+        &self,
+        event: QueueStateEvent,
+        origin_client_id: Option<&str>,
+    ) {
         let streams = self.streams.lock().await;
         if let Some(sender) = streams.get(&event.session_id) {
-            let _ = sender.send(serde_json::json!({
+            let mut payload = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "acpx/session/queue",
                 "params": {
                     "sessionId": event.session_id,
-                    "queue": event.queue,
-                    "paused": event.paused,
-                    "idempotencyKey": event.idempotency_key
+                    "queueEntryId": event.queue_entry_id,
+                    "mutation": event.mutation,
+                    "idempotencyKey": event.idempotency_key,
+                    "position": event.position,
+                    "text": event.text,
+                    "completed": event.completed
                 }
-            }));
+            });
+            if let Some(origin) = origin_client_id {
+                payload["params"]["originClientId"] = serde_json::Value::String(origin.to_owned());
+            }
+            let _ = sender.send(payload);
+        }
+    }
+
+    pub async fn subscribe_steer(&self, session_id: &str) -> broadcast::Receiver<Value> {
+        let mut streams = self.steer_streams.lock().await;
+        streams
+            .entry(session_id.to_string())
+            .or_insert_with(|| broadcast::channel(128).0)
+            .subscribe()
+    }
+
+    pub async fn publish_steer(
+        &self,
+        event: acpx_proto::session_stream::SessionSteerEvent,
+        origin_client_id: Option<&str>,
+    ) {
+        let streams = self.steer_streams.lock().await;
+        if let Some(sender) = streams.get(&event.session_id) {
+            let mut payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "acpx/session/steer",
+                "params": event,
+            });
+            if let Some(origin) = origin_client_id {
+                payload["_acpxOriginClientId"] = serde_json::Value::String(origin.to_owned());
+            }
+            let _ = sender.send(payload);
         }
     }
 }
@@ -414,7 +508,10 @@ fn read_records(path: &std::path::Path) -> Result<Vec<QueueRecord>, TranscriptEr
         Err(error) => return Err(error.into()),
     };
     let unterminated_tail = !content.ends_with('\n');
-    let lines: Vec<&str> = content.lines().filter(|line| !line.trim().is_empty()).collect();
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     let mut records = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
         match serde_json::from_str(line) {
@@ -882,7 +979,11 @@ mod tests {
             .unwrap();
         let snapshot = store.snapshot("s1").await.unwrap();
         assert_eq!(
-            snapshot.queue.iter().map(|item| item.text.as_str()).collect::<Vec<_>>(),
+            snapshot
+                .queue
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["durable prompt", "after recovery"]
         );
     }
@@ -904,15 +1005,19 @@ mod tests {
         let mut second = hub.subscribe("s1").await;
         hub.publish(QueueStateEvent {
             session_id: "s1".into(),
-            queue: Vec::new(),
-            paused: false,
-            idempotency_key: "client-a".into(),
+            queue_entry_id: "queue-a".into(),
+            mutation: QueueMutation::Inserted,
+            idempotency_key: Some("client-a".into()),
+            position: Some(0),
+            text: Some("queued".into()),
+            completed: false,
         })
         .await;
         for receiver in [&mut first, &mut second] {
             let event = receiver.recv().await.unwrap();
             assert_eq!(event["method"], "acpx/session/queue");
             assert_eq!(event["params"]["idempotencyKey"], "client-a");
+            assert_eq!(event["params"]["queueEntryId"], "queue-a");
         }
     }
 }

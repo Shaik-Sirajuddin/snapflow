@@ -83,6 +83,19 @@ pub enum Effect {
         thread_id: String,
         text: String,
     },
+    /// Records `text` into the thread's transcript as a real, permanent
+    /// user-role message -- `AgentBridge::push_local`'s exact effect, but
+    /// without also issuing a new `session/prompt` the way `SendPrompt`
+    /// does. Exists for a `server_queue` thread's auto-drain: ACPX's own
+    /// `spawn_queue_dispatcher` already sends the real prompt server-side
+    /// once the drained entry's queue row vanishes (see `update.rs`'s
+    /// `QueueChanged` handler), so nothing else ever performs the
+    /// immediate-send path's optimistic local transcript append for that
+    /// message -- this effect is that missing step.
+    RecordLocalMessage {
+        thread_id: String,
+        text: String,
+    },
     /// Mutate the ACPX server-owned FIFO. The server broadcasts the
     /// resulting authoritative queue projection back to every client.
     MutateQueue {

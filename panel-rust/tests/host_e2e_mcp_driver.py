@@ -449,9 +449,99 @@ def scenario_queue_auto_drain(args):
     wait_for_accessible_label_count_at_most(
         client, root_handle, "Cancel queued message", 0, timeout=args.timeout
     )
+    # Regression for "queue message -> agent replies -> message is totally
+    # dropped from UI": `wait_for_prompt_texts` above only proves the mock
+    # backend *received* the drained prompt over the wire -- it says
+    # nothing about whether the user's own queued text ever became a real,
+    # permanent transcript entry the way an immediate (non-queued) send's
+    # message always does. The queue row disappearing (asserted just above)
+    # is necessary but not sufficient: the auto-drain path used to convert
+    # straight from "queued row" to "gone", with nothing in between ever
+    # recording the text into the transcript, because a server-owned
+    # queue's entry is dispatched entirely server-side (ACPX's own
+    # `spawn_queue_dispatcher`) and never goes through the client's own
+    # `Effect::SendPrompt` -> `AgentBridge::push_local` optimistic-append
+    # step that a live send relies on. `user_bubble.slint` sets
+    # `accessible-label: item.text` for every real transcript message, so
+    # this is the direct MCP-visible proof the drained message's own text
+    # now renders as a normal, permanent chat entry (not just its reply).
+    wait_for_accessible_label(
+        client,
+        root_handle,
+        "auto-drain queued turn two",
+        timeout=max(args.timeout, 30),
+    )
     print(
         "PASS queue_auto_drain scenario: queued row appeared in Slint MCP, "
-        "was sent automatically after the active turn, and disappeared"
+        "was sent automatically after the active turn, disappeared, and its "
+        "own text landed as a permanent transcript entry"
+    )
+
+
+def scenario_queue_stop_with_multiple_queued(args):
+    """Regression guard for the dispatch_queue_stop/dispatch_compose_stop
+    debug_assert-abort family (panel-rust/src/dispatch.rs): clicking the
+    main Stop button while MORE THAN ONE message is queued behind an
+    in-flight turn on a server-owned-queue thread used to make update()'s
+    StopRequested/QueueStop reducer arm emit both CancelGeneration and a
+    "pause" MutateQueue effect -- an effect shape the old debug_assert
+    never tolerated, panicking across the Slint/Qt FFI boundary (which
+    can't unwind) and aborting the whole process. The real assertion here
+    is simply that the app is still alive and responsive after the click;
+    a crash manifests as every subsequent MCP call failing/hanging, not a
+    normal RuntimeError.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    ensure_active_thread(client, window_handle, root_handle, timeout=args.timeout)
+
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+
+    compose_handle = wait_for_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose", timeout=args.timeout
+    )
+    click(client, compose_handle)
+
+    # Turn 1: blocks (mock_agent.rs's "slow " marker) so turns 2/3 below
+    # genuinely enqueue instead of sending immediately.
+    set_text(client, compose_handle, "slow queue stop turn one")
+    press_return(client, window_handle)
+    wait_for_prompt_texts(args.event_log, ["slow queue stop turn one"], timeout=args.timeout)
+
+    # Two queued entries behind the in-flight turn -- more than the single
+    # queued row `dispatch_queue_stop`'s narrower ancestor bugs
+    # (`dispatch_compose_stop`) were already caught with; multiple rows is
+    # what the live repro that found this exact gap used.
+    set_text(client, compose_handle, "queue stop turn two")
+    press_return(client, window_handle)
+    set_text(client, compose_handle, "queue stop turn three")
+    press_return(client, window_handle)
+
+    # The front queued row renders "Stop sending" while a turn is
+    # in-flight; every row behind it renders "Cancel queued message" (see
+    # `scenario_queue_auto_drain`'s identical comment).
+    wait_for_accessible_label_count(
+        client, root_handle, "Stop sending", 1, timeout=args.timeout
+    )
+    wait_for_accessible_label_count(
+        client, root_handle, "Cancel queued message", 1, timeout=args.timeout
+    )
+
+    stop_handle = wait_for_accessible_label(client, root_handle, "Stop response")
+    click(client, stop_handle)
+
+    # If the click above aborted the process, this hangs/fails instead of
+    # returning -- that failure mode IS the regression this scenario
+    # exists to catch.
+    window_handle, root_handle = get_root_element(client)
+    wait_for_accessible_label_count_at_most(
+        client, root_handle, "Stop response", 0, timeout=args.timeout
+    )
+    print(
+        "PASS queue_stop_with_multiple_queued scenario: Stop with 2 queued "
+        "messages behind an in-flight turn did not abort the process"
     )
 
 
@@ -1154,10 +1244,205 @@ def scenario_pool_switch_between_threads_preserves_session_routing(args):
     )
 
 
+def scenario_queue_during_init(args):
+    """Regression for the "queue disappeared after session initialization"
+    report: queue a second message immediately behind the very first
+    message ever sent on a brand-new thread, with NO settle/wait between
+    them -- so the second `SendRequested` lands while `attach_deferred_
+    thread`'s `session/new` is still genuinely in flight, not merely while
+    the mock agent's first turn is slow.
+
+    Root cause (see `SendQueue::replace_remote_items`'s own doc comment):
+    `spawn_session_live_forwarder`'s one-time `acpx/sessions/queue/
+    subscribe` snapshot fetch fires the instant a session id is known --
+    *before* `AgentBridge::complete_attachment`, i.e. before the same
+    attachment gate `mutate_queue` itself waits on for its own "enqueue"
+    RPC. That snapshot reports the session's genuinely-empty pre-enqueue
+    queue and used to unconditionally wipe the just-queued row, which
+    stayed gone from the UI until the real confirmation arrived --
+    typically not until the in-flight turn itself ended, since it's
+    delivered via the same buffered `updates` batch. This asserts the
+    QueuedMessageBar row for message two survives that snapshot instead of
+    disappearing, and that message two reaches the backend exactly once
+    (a related double-dispatch this same fix had to avoid re-introducing --
+    see `update.rs`'s `turn_ended_on_a_server_queue_thread_does_not_
+    double_dispatch`).
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+    compose_handle = wait_for_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose", timeout=args.timeout
+    )
+    click(client, compose_handle)
+
+    set_text(client, compose_handle, "slow init race turn one")
+    press_return(client, window_handle)
+    # No wait here -- fire turn two immediately, before session/new can
+    # possibly have returned, landing squarely in the attach-still-pending
+    # window this scenario exists to exercise.
+    set_text(client, compose_handle, "init race turn two queued")
+    press_return(client, window_handle)
+
+    # The queued row must stay visible (as "Stop sending", the front-queued
+    # label while a turn is in flight -- see `scenario_queue_auto_drain`'s
+    # identical comment) across the whole attach-completing window, not
+    # just at the instant it was typed. Poll for several seconds -- the
+    # bug's own window was the buggy snapshot arriving within roughly a
+    # second of enqueue -- refetching window/root each time since a stale
+    # handle across a component-tree recreation would silently look like a
+    # real disappearance (see `get_root_element`'s own doc comment).
+    deadline = time.monotonic() + max(args.timeout, 10)
+    while time.monotonic() < deadline:
+        fresh_window, fresh_root = get_root_element(client)
+        stop_sending = accessible_label_count(client, fresh_root, "Stop sending")
+        if stop_sending == 0:
+            raise RuntimeError(
+                "the queued row for turn two disappeared before its real send -- "
+                "a stale/early queue snapshot wiped the optimistic local entry"
+            )
+        time.sleep(0.3)
+
+    # The slow first turn completes on its own; the queued second message
+    # must then be dispatched -- and dispatched exactly once, not twice
+    # (the server's own `spawn_queue_dispatcher` and a stray client-side
+    # re-send racing each other).
+    wait_for_prompt_texts(
+        args.event_log,
+        ["slow init race turn one", "init race turn two queued"],
+        timeout=max(args.timeout, 30),
+    )
+    sent_texts = [
+        event["detail"]
+        for event in prompt_events(args.event_log)
+        if event["detail"] == "init race turn two queued"
+    ]
+    if len(sent_texts) != 1:
+        raise RuntimeError(
+            f"expected turn two to reach the backend exactly once, saw {len(sent_texts)}: "
+            "a duplicate session/prompt dispatch regressed"
+        )
+    print(
+        "PASS queue_during_init scenario: the queued row survived session "
+        "initialization and turn two reached the backend exactly once"
+    )
+
+
+def scenario_queue_during_init_multi(args):
+    """Regression for a follow-up report after `queue-during-init` first
+    shipped: "still see losing of user message... message going through
+    queue path" -- a real human types at a human pace (not the driver's
+    original zero-delay back-to-back Return presses) and can queue *more
+    than one* follow-up, sometimes repeating themselves near-verbatim,
+    all still inside the same session-still-attaching window. Two distinct
+    gaps this covers that the single-message `queue-during-init` scenario
+    didn't:
+
+    - `SendQueue::replace_remote_items` used to match incoming-vs-local
+      text with a `HashSet` (set membership, not multiset) -- confirming
+      one occurrence of a duplicated text silently also dropped a second,
+      still-genuinely-unconfirmed occurrence with identical text. Message
+      three here duplicates message two's text for exactly this reason.
+    - Human typing has real gaps between keystrokes/sends (this uses small
+      sleeps, not instant back-to-back dispatch), which changes exactly
+      which frame/notification-batch boundaries the race lands on compared
+      to the original zero-delay scenario.
+
+    All three queued messages must stay visible the whole time and each
+    reach the backend exactly once.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    window_handle, root_handle = get_root_element(client)
+    compose_handle = wait_for_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose", timeout=args.timeout
+    )
+    click(client, compose_handle)
+
+    texts = [
+        "slow multi race turn one",
+        "multi race follow up two",
+        "multi race follow up two",  # deliberate duplicate of message two
+    ]
+    for text in texts:
+        set_text(client, compose_handle, text)
+        press_return(client, window_handle)
+        # Human-paced gap between sends -- long enough to land on a
+        # different frame/notification-batch boundary than an instant
+        # back-to-back Return, short enough to still land well inside the
+        # attach-pending window (the mock's "slow " turn blocks ~20s).
+        time.sleep(0.4)
+
+    queued_texts = texts[1:]
+    deadline = time.monotonic() + max(args.timeout, 10)
+    while time.monotonic() < deadline:
+        fresh_window, fresh_root = get_root_element(client)
+        stop_sending = accessible_label_count(client, fresh_root, "Stop sending")
+        cancel_queued = accessible_label_count(client, fresh_root, "Cancel queued message")
+        visible_queued_rows = stop_sending + cancel_queued
+        if visible_queued_rows < len(queued_texts):
+            raise RuntimeError(
+                f"expected {len(queued_texts)} queued rows still visible "
+                f"(one per follow-up message, including the duplicate), saw "
+                f"{visible_queued_rows} -- a queued message disappeared"
+            )
+        time.sleep(0.3)
+
+    wait_for_prompt_texts(args.event_log, texts, timeout=max(args.timeout, 30))
+    # `wait_for_prompt_texts` only waits for each *distinct* text to appear
+    # at least once -- for the duplicated text that's satisfied by its
+    # first occurrence, while its second dispatch (a separate queue drain,
+    # not a duplicate of the same RPC) can still be moments away. Poll for
+    # the real expected *count* per text before asserting, rather than
+    # racing the exact same "checked too early" bug this scenario itself
+    # exists to catch in the product code.
+    counts_deadline = time.monotonic() + max(args.timeout, 30)
+    unique_texts = sorted(set(texts), key=texts.index)
+    while True:
+        expected_by_text = {text: texts.count(text) for text in unique_texts}
+        sent_by_text = {
+            text: sum(
+                1 for event in prompt_events(args.event_log) if event["detail"] == text
+            )
+            for text in unique_texts
+        }
+        if all(sent_by_text[text] >= expected_by_text[text] for text in unique_texts):
+            break
+        if time.monotonic() >= counts_deadline:
+            raise RuntimeError(
+                f"expected counts {expected_by_text!r}, saw {sent_by_text!r} after "
+                "waiting for every dispatch to land"
+            )
+        time.sleep(0.2)
+    for text in unique_texts:
+        expected = expected_by_text[text]
+        sent = [
+            event["detail"] for event in prompt_events(args.event_log) if event["detail"] == text
+        ]
+        if len(sent) != expected:
+            raise RuntimeError(
+                f"expected {text!r} to reach the backend {expected} time(s), saw {len(sent)}: "
+                "a message was lost or double-dispatched"
+            )
+    print(
+        "PASS queue_during_init_multi scenario: three human-paced queued "
+        "messages (including a duplicate-text pair) all survived session "
+        "initialization and each reached the backend the expected number "
+        "of times"
+    )
+
+
 SCENARIOS = {
+    "queue-during-init": scenario_queue_during_init,
+    "queue-during-init-multi": scenario_queue_during_init_multi,
     "send-now": scenario_send_now,
     "fast-track": scenario_fast_track,
     "queue-auto-drain": scenario_queue_auto_drain,
+    "queue-stop-with-multiple-queued": scenario_queue_stop_with_multiple_queued,
     "queue-preload": scenario_queue_preload,
     "queue-after-restart": scenario_queue_after_restart,
     "queue-background": scenario_queue_background,

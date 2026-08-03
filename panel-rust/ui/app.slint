@@ -592,6 +592,7 @@ export component ChatPanel inherits Window {
                 narrow: root.narrow;
                 expanded: sidebar-expanded;
                 skills: available-skills;
+                show-global-skills <=> root.show-global-skills;
                 active-project-path: root.active-project-path;
                 rename-thread-index <=> root.rename-thread-index;
                 rename-thread-draft <=> root.rename-thread-draft;
@@ -623,6 +624,7 @@ export component ChatPanel inherits Window {
                     root.settings-active-section = "skills";
                     root.open-settings();
                 }
+                global-skills-toggled(value) => { root.show-global-skills = value; }
                 search-changed(q) => { search-changed(q); }
                 search-submitted(query, search-skills, show-global) => {
                     root.search-submitted(query, search-skills, show-global);

@@ -637,7 +637,7 @@ export component McpServersView inherits Rectangle {
                     label: "Command";
                     command-field := TextField {
                         text <=> root.form-command;
-                        field-accessible-label: "Command";
+                        field-accessible-label: "MCP command";
                         placeholder: "e.g. npx @modelcontextprotocol/server-filesystem";
                         changed has-focus => {
                             root.stdio-fields-focused = self.has-focus
