@@ -162,7 +162,7 @@ func cmdServe(cfg config.Config, args []string) error {
 	// "connection refused". Binding here, on the main goroutine, before the
 	// log line and before any client could plausibly be told to dial,
 	// closes that race.
-	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
+	sdpServer := &sdp.Server{Endpoint: cfg.ControlSocketPath, Handler: d, Log: logger}
 	if err := sdpServer.Listen(); err != nil {
 		return fmt.Errorf("binding SDP control socket: %w", err)
 	}
