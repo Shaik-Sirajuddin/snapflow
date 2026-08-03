@@ -4661,6 +4661,76 @@ mod lifecycle_tests {
         }
     }
 
+    #[test]
+    fn settings_save_reads_the_live_component_default_agent_id_not_the_stale_model_copy() {
+        // Regression for: Settings' "make default" toggle only ever
+        // mutates the two-way-bound Slint `default-agent-id` property
+        // (agents_view.slint's `set-default` handler assigns
+        // `root.default-agent-id` locally with no callback wired back to
+        // Rust) -- there is no `SettingsMsg`/model-sync path that keeps
+        // `model.default_agent_id` live as the user edits the Settings UI.
+        // `dispatch_settings_save` (dispatch.rs) must therefore read the
+        // *component's* live getter at Save time, not `model.default_agent_id`
+        // (which stays whatever it was hydrated with -- typically empty,
+        // which then falls back to NO_PROVIDER_REQUESTED_FALLBACK/"codex"
+        // at cold start). This was regressed by 0c958f48 ("panel-rust:
+        // close remaining TEA ownership gaps"), which switched this read
+        // from `component.get_default_agent_id()` to `model.default_agent_id`
+        // without ever adding the missing UI->model sync.
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = [
+            (
+                "RUI_ACPX_CODEX_URL",
+                std::env::var("RUI_ACPX_CODEX_URL").ok(),
+            ),
+            (
+                "RUI_ACPX_CLAUDE_URL",
+                std::env::var("RUI_ACPX_CLAUDE_URL").ok(),
+            ),
+            ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+        ];
+        std::env::set_var("RUI_ACPX_CODEX_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let panel = slot.as_ref().expect("panel exists");
+
+            // Simulate the model still holding whatever it was hydrated
+            // with (e.g. empty/stale), while the live Slint component --
+            // the actual source of truth for what the user just toggled
+            // in Settings -- holds a real configured default.
+            assert_ne!(
+                panel.model.borrow().default_agent_id,
+                "claude-acp",
+                "test setup: model must start out disagreeing with the component"
+            );
+            panel.component.set_default_agent_id("claude-acp".into());
+
+            dispatch::dispatch_settings_save(panel, &panel.component);
+
+            assert_eq!(
+                panel.model.borrow().default_agent_id,
+                "claude-acp",
+                "Save must persist the live component's default_agent_id, not a stale model copy"
+            );
+        });
+
+        panel_rust_destroy(handle);
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     fn mock_agent_bin_for_lifecycle_test() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent")
     }

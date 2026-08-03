@@ -1083,7 +1083,7 @@ pub(crate) fn dispatch_settings_scope_changed(
     });
 }
 
-pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPanel) {
+pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
     let model = panel.model.borrow();
     let selected_thread_id = panel.real_index(model.selected_thread).and_then(|idx| {
         panel
@@ -1092,16 +1092,27 @@ pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPa
             .and_then(|bridge| bridge.thread_binding(idx))
             .map(|binding| binding.thread_id)
     });
+    // NOTE: these fields are two-way (`<=>`) bound Slint `in-out` properties
+    // with no `*-changed` callback wired back to Rust (see agents_view.slint's
+    // `set-default` handler, which only assigns `root.default-agent-id`
+    // locally). `model.*` is therefore stale here -- it never observes edits
+    // made in the Settings UI. Read the live component getters instead, as
+    // this function did before 0c958f48 ("panel-rust: close remaining TEA
+    // ownership gaps") regressed it to read the stale model copy, which
+    // caused Save to silently persist whatever `default_agent_id` (etc.) the
+    // model happened to be initialized/hydrated with -- typically empty --
+    // regardless of what the user had just toggled, so cold start always
+    // fell back to NO_PROVIDER_REQUESTED_FALLBACK ("codex").
     let input = crate::msg::SettingsSaveInput {
         scope: model.settings_scope.clone(),
-        default_profile: model.default_profile.clone(),
-        permission_profile: model.permission_profile.clone(),
-        background_default: model.background_default,
-        default_agent_id: model.default_agent_id.clone(),
+        default_profile: component.get_default_profile().to_string(),
+        permission_profile: component.get_permission_profile().to_string(),
+        background_default: component.get_background_default(),
+        default_agent_id: component.get_default_agent_id().to_string(),
         selected_thread_id,
-        background_override_set: model.background_override_set,
-        background_override: model.background_override,
-        show_global_skills: model.show_global_skills,
+        background_override_set: component.get_background_override_set(),
+        background_override: component.get_background_override(),
+        show_global_skills: component.get_show_global_skills(),
     };
     drop(model);
     let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))));
