@@ -406,6 +406,22 @@ pub struct Model {
     /// "keyed off the selected thread's *provider*" contract exactly (see
     /// `sync::selected_provider_unavailable`'s doc comment).
     pub provider_probes_in_flight: HashSet<String>,
+    /// mcp-servers-settings follow-up (chat-view first-attach loading
+    /// indicator): thread ids whose FIRST real ACP session attach --
+    /// deferred to first send, see `dispatch::dispatch_compose_send_
+    /// maybe_attach`'s doc comment -- is currently in flight. Inserted
+    /// right there, in the same synchronous call that kicks off
+    /// `AgentBridge::attach_deferred_thread_with_config_options`
+    /// (`EffectResultMsg::SessionAttachStarted`); removed either on
+    /// success -- `update_frame`'s `frame.thread_list_snapshot` fold,
+    /// the real place a background attach's `session_id` transitions
+    /// `None` -> `Some` today (`SessionAttached`'s `Ok` arm is dead for
+    /// this path, see its own doc comment) -- or on failure, via the
+    /// existing `SessionAttached` `Err` arm (synchronous provisioning
+    /// failure) and `AgentEvent::Error` (async attach failure). Keyed by
+    /// thread_id like `provider_probes_in_flight` is keyed by provider --
+    /// this is inherently a per-thread transition, not a per-provider one.
+    pub first_attach_in_flight: HashSet<String>,
     pub active_skill_name: String,
     pub active_skill_path: String,
     /// PUI-010: the actual SKILL.md file path (active_skill_path is the

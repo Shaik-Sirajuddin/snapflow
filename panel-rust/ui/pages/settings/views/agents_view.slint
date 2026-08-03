@@ -609,33 +609,47 @@ export component AgentsView inherits Rectangle {
         // e2e test's "Attach recovered session" assertion never matching
         // anything). Attaching binds via `session/load`, never
         // `session/new` (`AgentBridge::add_thread_recovering_session`).
-        SettingsSectionHeader { text: Strings.recoverable-sessions; subsection: true; }
-        if root.recoverable-sessions.length == 0 : Text {
-            text: Strings.no-orphaned-sessions;
-            color: Theme.text-muted;
-            font-size: 10px * Theme.font-scale;
-        }
-        for session in root.recoverable-sessions : SettingsRow {
-            label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
-            row-height: 26px;
-            Button {
-                label: Strings.attach;
-                button-accessible-label: Strings.attach + " recovered session " + session.session-id;
-                btn-width: 52px;
-                btn-height: 20px;
-                font-size: 9px;
-                font-weight: 400;
-                bg: Theme.bg-card;
-                fg: Theme.text-secondary;
-                // recoverable-attach-fix: `session.busy` (`AgentBridge::
-                // recover_session_operations_in_flight`) is true for the
-                // whole `session/load` round trip -- Button's own `busy`
-                // prop swaps the label for a Spinner and ignores further
-                // clicks (see button.slint), so this can no longer be
-                // double-clicked into two attach attempts for the same
-                // session while the first is still in flight.
-                busy: session.busy;
-                clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
+        // Additive BETA_MODE gate (see beta-mode-enabled's doc comment
+        // above): the whole Restore Session(s) section -- header, empty
+        // state, and the attach list -- is wrapped in one `if` so it's
+        // fully hidden by default, matching the pattern already used for
+        // the Chat Defaults Profile field (aa452c86) and the profile chip
+        // row (ca44e3d1). Wrapped in a VerticalLayout (rather than adding
+        // the condition to each of the three former top-level children
+        // individually) since a bare `for` can't carry its own `if`
+        // condition in Slint; spacing matches SettingsSection's own
+        // Metrics.space-6 so this reads identically to the always-on case
+        // once BETA_MODE is enabled.
+        if root.beta-mode-enabled : VerticalLayout {
+            spacing: Metrics.space-6;
+            SettingsSectionHeader { text: Strings.recoverable-sessions; subsection: true; }
+            if root.recoverable-sessions.length == 0 : Text {
+                text: Strings.no-orphaned-sessions;
+                color: Theme.text-muted;
+                font-size: 10px * Theme.font-scale;
+            }
+            for session in root.recoverable-sessions : SettingsRow {
+                label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
+                row-height: 26px;
+                Button {
+                    label: Strings.attach;
+                    button-accessible-label: Strings.attach + " recovered session " + session.session-id;
+                    btn-width: 52px;
+                    btn-height: 20px;
+                    font-size: 9px;
+                    font-weight: 400;
+                    bg: Theme.bg-card;
+                    fg: Theme.text-secondary;
+                    // recoverable-attach-fix: `session.busy` (`AgentBridge::
+                    // recover_session_operations_in_flight`) is true for the
+                    // whole `session/load` round trip -- Button's own `busy`
+                    // prop swaps the label for a Spinner and ignores further
+                    // clicks (see button.slint), so this can no longer be
+                    // double-clicked into two attach attempts for the same
+                    // session while the first is still in flight.
+                    busy: session.busy;
+                    clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
+                }
             }
         }
                 }

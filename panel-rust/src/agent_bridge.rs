@@ -4165,8 +4165,23 @@ impl AgentBridge {
         )
     }
 
-    pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) {
-        let Some(slot) = self.slots.get(idx) else { return };
+    /// Returns whether a `ProviderProbe` `BridgeEvent` will eventually be
+    /// pushed for this call (synchronously, on an immediate precondition
+    /// failure below, or asynchronously once the spawned acquire+release
+    /// round-trip finishes) -- `false` only for the deliberate silent
+    /// no-op case (see the "no resolvable project directory" comment
+    /// below). `SettingsMsg::ProfileSelected` inserts `Model::
+    /// provider_probes_in_flight` unconditionally before dispatching
+    /// `Effect::ProbeProvider` (the reducer has no visibility into the
+    /// bridge-side project/gateway/pool state this method resolves), so
+    /// the caller (`effect_executor.rs`'s `Effect::ProbeProvider` arm)
+    /// uses this return value to clear that marker itself when it knows
+    /// no event is ever coming -- otherwise the "Switching provider..."
+    /// pulse stayed stuck forever for exactly the thread state this
+    /// no-op case exists to support (a thread with no project bound and
+    /// no session cwd override).
+    pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) -> bool {
+        let Some(slot) = self.slots.get(idx) else { return false };
         // A thread with no resolvable project directory (no project bound
         // and no session cwd override) is a normal, fully-supported state
         // -- not a provider problem. `PoolKey`/session acquisition require a
@@ -4178,16 +4193,16 @@ impl AgentBridge {
         // stale error from a previous project stays until a probe that can
         // actually run replaces it.
         let Some(project_dir) = thread_project_dir(slot.project_path_snapshot().as_deref(), &self.session_cwd_override) else {
-            return;
+            return false;
         };
         let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
             self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("no gateway is configured for {provider}")) } });
-            return;
+            return true;
         };
         let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
         let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers) else {
             self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("could not initialize the gateway pool for {provider}")) } });
-            return;
+            return true;
         };
         let events = self.events.clone();
         let key = acpx_client::pool::PoolKey::new(project_dir.to_string_lossy().into_owned(), provider.clone(), crate::gateway_actor::provider_profile_key(profile_name.as_deref()));
@@ -4199,6 +4214,7 @@ impl AgentBridge {
             };
             events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result } });
         });
+        true
     }
 
     /// Notify every pool for the settings gateway that its admin-plane MCP
@@ -10192,7 +10208,18 @@ done
         let mut bridge = AgentBridge::new_with_gateway_url(&["Untitled"], "http://127.0.0.1:1".to_owned())
             .expect("bridge");
 
-        bridge.probe_provider_selection(0, "codex".to_owned(), None);
+        // stale-provider-switch-pulse fix: the `bool` return is exactly
+        // what `effect_executor.rs`'s `Effect::ProbeProvider` arm uses to
+        // know no completion event is ever coming, so it can clear
+        // `Model::provider_probes_in_flight` itself instead of leaving the
+        // "Switching provider..." pulse stuck forever. Must be `false`
+        // here -- see this test's own doc comment above for why no event
+        // is pushed for this precondition.
+        let will_complete = bridge.probe_provider_selection(0, "codex".to_owned(), None);
+        assert!(
+            !will_complete,
+            "a no-project probe must report that no completion event is coming"
+        );
 
         // Give any (unexpected) spawned task a chance to land before
         // asserting the queue is empty.

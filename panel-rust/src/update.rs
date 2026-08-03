@@ -458,6 +458,53 @@ fn merge_config_options_preserving_current_value(
         .collect()
 }
 
+/// Fallback-priority chain for a brand-new thread's provider when
+/// `model.default_agent_id` (Settings' configured default, PROF-1/PROF-2)
+/// is empty. Previously this call site (and `cold_start_thread_specs`)
+/// jumped straight to the single hardcoded `NO_PROVIDER_REQUESTED_
+/// FALLBACK` ("codex") string -- fragile by construction, since that id
+/// might not even be installed/available on this machine, and a totally
+/// unrelated agent would silently win just because it happened to be the
+/// hardcoded literal.
+///
+/// Order, cheapest/most-trustworthy first:
+///   1. Already handled by the caller: a real configured default wins.
+///   2. "Last provider actually used" -- panel-rust does not persist any
+///      such value today (checked `state_store.rs`/`settings_file.rs`;
+///      no equivalent of a "most recently used provider" field exists
+///      anywhere), so this tier is a documented gap, not implemented
+///      here. Follow-up: `state_store.rs::PanelDefaults` would be the
+///      natural home for a `last_used_agent_id` column, set wherever a
+///      real `SessionAttached` succeeds (update.rs's
+///      `EffectResultMsg::SessionAttached` handler already has the real,
+///      resolved provider in hand at that exact point).
+///   3. The first real, enabled entry from the live agent catalog
+///      (`model.agent_catalog`, populated by `agents/list` via periodic
+///      frame snapshots -- see `external_snapshot.rs`/update.rs's
+///      `model.agent_catalog = snapshot.agents`) -- an id that is
+///      actually installed and available right now, not a guess.
+///   4. `NO_PROVIDER_REQUESTED_FALLBACK` ("codex") only as the true last
+///      resort, when the catalog hasn't loaded yet either (e.g. the very
+///      first frame snapshot hasn't landed) -- still a real, documented,
+///      single fallback string, just no longer the first thing tried.
+///
+/// Not used by `cold_start_thread_specs` (lib.rs): that call runs
+/// synchronously before `AgentBridge`/the gateway even exists, so there
+/// is no live catalog to consult yet at that specific point -- a
+/// structural ordering constraint distinct from this call site, which
+/// runs after the bridge is already up and has had at least one chance
+/// to collect a frame snapshot.
+fn fallback_provider_for_new_thread(model: &Model) -> String {
+    model
+        .agent_catalog
+        .iter()
+        .find(|entry| {
+            entry.enabled && matches!(entry.status, crate::protocol_types::AgentStatus::Installed)
+        })
+        .map(|entry| entry.id.clone())
+        .unwrap_or_else(|| crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned())
+}
+
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
         ThreadMsg::New => {
@@ -479,11 +526,13 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             // "gemini-acp" would still have been forced onto "codex" at
             // this call site even after agent_bridge.rs itself stopped
             // normalizing). `model.default_agent_id` is used directly when
-            // set; the same documented last-resort fallback
-            // (`NO_PROVIDER_REQUESTED_FALLBACK`) applies when nothing is
-            // configured at all, never an index/contains-based guess.
+            // set; see `fallback_provider_for_new_thread`'s own doc
+            // comment for the priority chain used when nothing is
+            // configured (a bare `NO_PROVIDER_REQUESTED_FALLBACK` used to
+            // be the only fallback here, even when it pointed at an agent
+            // that isn't actually installed/available on this machine).
             let provider = if model.default_agent_id.is_empty() {
-                crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned()
+                fallback_provider_for_new_thread(model)
             } else {
                 model.default_agent_id.clone()
             };
@@ -2244,25 +2293,121 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     // unrelated dirty event to eventually pick it up.
                     thread.state = ThreadState::Error;
                     thread.error = Some(err.message.clone());
-                    (
-                        vec![],
-                        vec![
-                            Dirty::Error {
-                                thread_id: thread.thread_id.clone(),
-                                detail: ErrorDetail {
-                                    message: err.message,
-                                },
+                    let mut dirty = vec![
+                        Dirty::Error {
+                            thread_id: thread.thread_id.clone(),
+                            detail: ErrorDetail {
+                                message: err.message,
                             },
-                            Dirty::ThreadRow {
-                                thread_id: thread.thread_id.clone(),
-                            },
-                            Dirty::Connection {
-                                thread_id: thread.thread_id.clone(),
-                            },
-                        ],
-                    )
+                        },
+                        Dirty::ThreadRow {
+                            thread_id: thread.thread_id.clone(),
+                        },
+                        Dirty::Connection {
+                            thread_id: thread.thread_id.clone(),
+                        },
+                    ];
+                    // mcp-servers-settings follow-up: a failed attach
+                    // still ends the *loading* half of the first-attach
+                    // pulse just like a failed provider probe does (see
+                    // `ProviderProbe`'s handling below) -- this arm is
+                    // exactly where `dispatch_compose_send_maybe_attach`'s
+                    // own synchronous provisioning failure routes (see
+                    // this arm's doc comment above).
+                    if model.first_attach_in_flight.remove(&thread.thread_id) {
+                        dirty.push(Dirty::ThreadAttaching {
+                            thread_id: thread.thread_id.clone(),
+                        });
+                    }
+                    (vec![], dirty)
                 }
             }
+        }
+        EffectResultMsg::SessionAttachStarted { thread_id } => {
+            // mcp-servers-settings follow-up: see `Model::first_attach_
+            // in_flight`'s doc comment for the full start/end contract.
+            // Same shape as `SettingsMsg::ProfileSelected`'s
+            // `provider_probes_in_flight.insert` -- the model mutation
+            // happens right here in the reducer, dispatched synchronously
+            // from `dispatch_compose_send_maybe_attach` before the
+            // background attach has any chance to resolve.
+            model.first_attach_in_flight.insert(thread_id.clone());
+            (vec![], vec![Dirty::ThreadAttaching { thread_id }])
+        }
+        // stale-provider-switch-pulse fix: see `EffectResultMsg::
+        // ProviderProbeSkipped`'s own doc comment for the full mechanism
+        // -- `effect_executor.rs` dispatches this instead of leaving
+        // `Model::provider_probes_in_flight` (inserted unconditionally by
+        // `SettingsMsg::ProfileSelected` above, before the bridge-side
+        // precondition was known) stuck forever when `AgentBridge::
+        // probe_provider_selection` hit its deliberate silent no-op.
+        // Deliberately does NOT touch `provider_errors`/the toast path --
+        // no probe actually ran, so there is nothing to report as failed.
+        EffectResultMsg::ProviderProbeSkipped { real_index, provider } => {
+            if model.provider_probes_in_flight.remove(&provider) {
+                if let Some(thread) = model.threads.get(real_index) {
+                    let thread_id = thread.thread_id.clone();
+                    return (vec![], vec![Dirty::ProviderSwitch { thread_id }]);
+                }
+            }
+            (vec![], vec![])
+        }
+        // mcp-servers-settings plan: the real-user-reported bug where a
+        // thread that is NOT archived nonetheless renders with
+        // `inputs-enabled` gated as if `archived` were true. Root cause:
+        // `Effect::NewThreadDeferred`/`Effect::RecoverSessionAttach`
+        // claim a `model.threads` row (real_index = model.threads.len())
+        // BEFORE the matching `AgentBridge::add_thread_deferred`/
+        // `add_thread_recovering_session` call, but those bridge calls
+        // return `Err` *before* pushing their slot on failure (see their
+        // doc comments) -- so a failed create used to leave that row
+        // sitting in `model.threads` forever (previously folded through
+        // `SessionAttached { result: Err(..) }`, which sets
+        // `ThreadState::Error` but never removes the row -- correct for
+        // an EXISTING slot's failed attach, e.g.
+        // `dispatch_compose_send_maybe_attach`'s reattach failure, but
+        // wrong here since no slot was ever created). From that point on
+        // `model.threads.len() == bridge.slots.len() + 1`, so every
+        // later real_index reads one bridge slot off from the thread it
+        // actually names -- e.g. `Effect::ArchiveThread { real_index }`
+        // (`AgentBridge::set_thread_archived`) lands on a completely
+        // different thread's slot than the one the user archived, and
+        // that OTHER thread's row then reads `archived: true` despite
+        // never having been archived. Removing the orphaned row restores
+        // the `model.threads[i] <-> bridge.slots[i]` alignment instead of
+        // leaving a permanent one-off drift for every thread created
+        // after it.
+        EffectResultMsg::ThreadCreationFailed { real_index, message } => {
+            if real_index >= model.threads.len() {
+                return (vec![], vec![]);
+            }
+            let old_keys = current_visible_keys(model);
+            let thread_id = model
+                .threads
+                .get(real_index)
+                .map(|thread| thread.thread_id.clone())
+                .unwrap_or_default();
+            model.threads.remove(real_index);
+            model.rebuild_thread_indices();
+            let list_dirty = thread_list_dirty_with_keys(model, old_keys);
+            let mut dirty = vec![
+                Dirty::Error {
+                    thread_id,
+                    detail: ErrorDetail { message },
+                },
+                list_dirty,
+            ];
+            // The removed row can never have been the displayed/selected
+            // thread (it had no session yet), but its position may have
+            // been at or before the current filtered selection -- clamp
+            // rather than leave a stale out-of-range index pointing past
+            // the now-shorter visible list.
+            let visible_len = current_visible_indices(model).len();
+            if model.selected_thread >= visible_len {
+                model.selected_thread = visible_len.saturating_sub(1);
+                dirty.push(Dirty::Scalar(ScalarField::SelectedThread));
+            }
+            (vec![], dirty)
         }
         // Skills list is refreshed by effect_executor before this
         // result is folded (see CreateSkill's refresh-before-open
@@ -2841,6 +2986,18 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 dirty.push(Dirty::Connection {
                     thread_id: thread.thread_id.clone(),
                 });
+                // mcp-servers-settings follow-up: the async attach
+                // failure path (`spawn_background_attachment`'s own
+                // `complete_attachment(&slot, Some(message))`) surfaces
+                // here, not through `SessionAttached`'s `Err` arm -- end
+                // the first-attach pulse's loading state the same way
+                // that arm does for the synchronous provisioning-failure
+                // case.
+                if model.first_attach_in_flight.remove(&thread.thread_id) {
+                    dirty.push(Dirty::ThreadAttaching {
+                        thread_id: thread.thread_id.clone(),
+                    });
+                }
             }
             crate::protocol_types::AgentEvent::UsageUpdate { .. } => {
                 // Live usage flows through the per-frame runtime
@@ -2941,6 +3098,39 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                         });
                         dirty.push(thread_row_dirty(model, row.real_index));
                         dirty.push(Dirty::Capabilities {
+                            thread_id: row.thread_id.clone(),
+                        });
+                    }
+                }
+                // stale-first-attach-pulse fix: this used to live INSIDE
+                // the `if thread.session_id.is_none() { .. }` block above,
+                // keyed off the same guard -- but
+                // `ExternalSnapshotSource::hydrate_model_thread_bindings`
+                // (called from `collect_frame_input`, unconditionally,
+                // every poll tick, BEFORE `collect_thread_list_snapshot`
+                // even builds `row.session_id`) already writes
+                // `thread.session_id = Some(..)` straight from the same
+                // bridge binding on this exact frame. By the time this
+                // fold runs, `thread.session_id.is_none()` is therefore
+                // already `false` -- the `None -> Some` transition this
+                // arm was meant to observe already happened one step
+                // earlier in the very same poll, so
+                // `model.first_attach_in_flight.remove(&row.thread_id)`
+                // was dead code: it could never fire on a real successful
+                // first attach, only on the (rare) failure paths elsewhere
+                // in this file. That is the stale "Starting new
+                // thread..." bug -- the marker was inserted on send but
+                // never cleared on success. Keying the clear on
+                // `row.session_id` alone (the same bridge-sourced fact
+                // both this fold and the hydrate pre-pass read) instead of
+                // the already-consumed `thread.session_id.is_none()`
+                // transition makes it fire reliably regardless of which
+                // of the two ran first this tick, and remains a safe
+                // idempotent no-op on every later frame once the marker is
+                // gone.
+                if row.session_id.is_some() {
+                    if model.first_attach_in_flight.remove(&row.thread_id) {
+                        dirty.push(Dirty::ThreadAttaching {
                             thread_id: row.thread_id.clone(),
                         });
                     }
@@ -4117,6 +4307,253 @@ mod tests {
         assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
     }
 
+    // stale-provider-switch-pulse fix: regression for the sibling bug to
+    // the first-attach one below -- `AgentBridge::probe_provider_
+    // selection` deliberately pushes NO `AgentEvent::ProviderProbe` at all
+    // for a thread with no resolvable project directory (see that
+    // method's own doc comment), but `SettingsMsg::ProfileSelected`
+    // already inserted `provider_probes_in_flight` unconditionally before
+    // dispatching the probe. With no event ever coming, the "Switching
+    // provider..." pulse stayed stuck forever for that (normal,
+    // fully-supported) thread state. `effect_executor.rs` now dispatches
+    // `EffectResultMsg::ProviderProbeSkipped` itself in that case; this
+    // covers the reducer arm that actually clears the marker.
+    #[test]
+    fn provider_probe_skipped_clears_in_flight_without_touching_provider_errors() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ProviderProbeSkipped {
+                real_index: 0,
+                provider: "codex-acp".to_owned(),
+            }),
+        );
+
+        assert!(
+            !model.provider_probes_in_flight.contains("codex-acp"),
+            "a skipped (no-project) probe must still clear the in-flight marker so the \
+             pulse stops"
+        );
+        assert!(
+            !model.provider_errors.contains_key("codex-acp"),
+            "a skipped probe never actually ran, so it must not populate provider_errors/\
+             the toast path like a real Err result would"
+        );
+        assert!(dirty.contains(&Dirty::ProviderSwitch {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn provider_probe_skipped_with_no_prior_in_flight_marker_is_a_quiet_no_op() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ProviderProbeSkipped {
+                real_index: 0,
+                provider: "codex-acp".to_owned(),
+            }),
+        );
+
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
+    }
+
+    // mcp-servers-settings follow-up: the chat-view pulsing "Starting new
+    // thread..." indicator's loading-state transition, sibling of the
+    // provider-switch pulse tests just above. Covers the start
+    // (`SessionAttachStarted`, this test) and both ways the loading state
+    // can end -- a successful background attach observed via the frame-poll
+    // thread-list-snapshot fold, and a failed one via `SessionAttached`'s
+    // `Err` arm -- keyed off `Model::first_attach_in_flight` /
+    // `sync::chat_view_first_attach_in_flight`.
+    #[test]
+    fn session_attach_started_marks_the_thread_id_in_flight() {
+        let mut model = model_with_threads(&["a"]);
+        assert!(!model.first_attach_in_flight.contains("thread-0"));
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SessionAttachStarted {
+                thread_id: "thread-0".to_owned(),
+            }),
+        );
+
+        assert!(
+            model.first_attach_in_flight.contains("thread-0"),
+            "dispatching SessionAttachStarted must mark the thread id in flight for the \
+             chat-view pulse"
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            dirty,
+            vec![Dirty::ThreadAttaching {
+                thread_id: "thread-0".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn first_attach_in_flight_marker_clears_on_successful_background_attach() {
+        // The real success path for a deferred thread's first attach never
+        // routes through `SessionAttached`'s `Ok` arm (dead for this case,
+        // see that arm's own doc comment) -- it's observed here, in the
+        // frame-poll thread-list-snapshot fold's `session_id.is_none()`
+        // transition.
+        let mut model = model_with_threads(&["a"]);
+        model.first_attach_in_flight.insert("thread-0".to_owned());
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(true),
+            item: crate::ThreadItem::default(),
+        };
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                    active_project_path: None,
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(
+            !model.first_attach_in_flight.contains("thread-0"),
+            "a successful background attach must clear the in-flight marker so the pulse \
+             stops"
+        );
+        assert!(dirty.contains(&Dirty::ThreadAttaching {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn first_attach_in_flight_marker_clears_even_when_session_id_was_already_hydrated_this_frame() {
+        // Regression for the real stale-pulse bug: `collect_frame_input`
+        // calls `hydrate_model_thread_bindings` (which sets `thread.
+        // session_id = Some(..)` straight from the bridge binding)
+        // BEFORE `collect_thread_list_snapshot` even builds `row.
+        // session_id` -- both run inside the same `panel_rust_poll` tick,
+        // ahead of this `update_frame` fold. So by the time this fold's
+        // old `if thread.session_id.is_none() { .. }` guard ran, it was
+        // already `false` for a real first attach: the transition it was
+        // meant to observe had already happened one step earlier in the
+        // very same poll. The previous version of this test (`..._on_
+        // successful_background_attach` above) never caught this because
+        // it left `thread.session_id` at its default `None`, which is NOT
+        // what a real poll tick looks like by the time this fold runs.
+        // Simulate the real ordering here: `thread.session_id` is already
+        // `Some` (as `hydrate_model_thread_bindings` would have just set
+        // it) when the snapshot fold runs.
+        let mut model = model_with_threads(&["a"]);
+        model.first_attach_in_flight.insert("thread-0".to_owned());
+        model.threads[0].session_id = Some("real-session-id".to_owned());
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(true),
+            item: crate::ThreadItem::default(),
+        };
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                    active_project_path: None,
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(
+            !model.first_attach_in_flight.contains("thread-0"),
+            "the in-flight marker must clear off `row.session_id` alone, not an already-\
+             consumed `thread.session_id.is_none()` transition, so a real first attach's \
+             pulse does not stay stuck forever"
+        );
+        assert!(dirty.contains(&Dirty::ThreadAttaching {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn first_attach_in_flight_marker_clears_on_failed_attach_too() {
+        // The *loading* half of this must end on an error just as much as
+        // on success -- `dispatch_compose_send_maybe_attach`'s synchronous
+        // provisioning-failure path routes here (`SessionAttached`'s `Err`
+        // arm).
+        let mut model = model_with_threads(&["a"]);
+        model.first_attach_in_flight.insert("thread-0".to_owned());
+
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SessionAttached {
+                real_index: 0,
+                thread_id: None,
+                provider: Some("codex-acp".to_owned()),
+                result: Err(crate::effect::EffectError::new("permission denied")),
+            }),
+        );
+
+        assert!(
+            !model.first_attach_in_flight.contains("thread-0"),
+            "a failed attach must still clear the in-flight marker so the pulse stops"
+        );
+        assert!(dirty.contains(&Dirty::ThreadAttaching {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn first_attach_in_flight_marker_with_no_prior_marker_is_a_quiet_no_op() {
+        // Same "stale/duplicate event" contract as
+        // provider_probe_completion_with_no_prior_in_flight_marker_is_a_quiet_no_op
+        // above -- a thread this model never marked in flight must not emit
+        // a spurious ThreadAttaching dirty.
+        let mut model = model_with_threads(&["a"]);
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(true),
+            item: crate::ThreadItem::default(),
+        };
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                    active_project_path: None,
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ThreadAttaching { .. })));
+    }
+
     #[test]
     fn profile_selected_resolves_agent_id_from_catalog_when_ui_omits_it() {
         let mut model = model_with_threads(&["a"]);
@@ -4180,6 +4617,66 @@ mod tests {
                  got: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn new_thread_with_empty_default_agent_id_prefers_first_real_catalog_entry_over_hardcoded_fallback(
+    ) {
+        // fallback_provider_for_new_thread's priority chain, tier 3: with
+        // no configured default_agent_id at all, a live agent catalog
+        // (agents/list, already collected via a prior frame snapshot)
+        // must win over the single hardcoded NO_PROVIDER_REQUESTED_
+        // FALLBACK string -- that string is not guaranteed to correspond
+        // to an agent actually installed on this machine, whereas a
+        // catalog entry is real by construction.
+        let mut model = model_with_threads(&[]);
+        model.agent_catalog = vec![
+            crate::protocol_types::AgentCatalogEntry {
+                id: "not-installed-acp".to_owned(),
+                name: "Not Installed".to_owned(),
+                version: String::new(),
+                website: String::new(),
+                status: crate::protocol_types::AgentStatus::NotInstalled,
+                enabled: true,
+            },
+            crate::protocol_types::AgentCatalogEntry {
+                id: "gemini-acp".to_owned(),
+                name: "Gemini".to_owned(),
+                version: String::new(),
+                website: String::new(),
+                status: crate::protocol_types::AgentStatus::Installed,
+                enabled: true,
+            },
+        ];
+        let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::NewThreadDeferred { provider, .. }] if provider == "gemini-acp"
+            ),
+            "must skip the not-installed entry and use the first real, enabled, installed \
+             catalog entry, not NO_PROVIDER_REQUESTED_FALLBACK; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn new_thread_with_empty_default_agent_id_and_no_catalog_still_uses_the_documented_fallback() {
+        // Tier 4 of the same priority chain: with nothing configured AND
+        // no catalog loaded yet (e.g. cold start's very first frame
+        // snapshot hasn't landed), the single documented last-resort
+        // string is still used -- this must not regress into an empty
+        // provider or a panic.
+        let mut model = model_with_threads(&[]);
+        assert!(model.agent_catalog.is_empty());
+        let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::NewThreadDeferred { provider, .. }]
+                    if provider == crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK
+            ),
+            "got: {effects:?}"
+        );
     }
 
     #[test]
@@ -4321,6 +4818,106 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// mcp-servers-settings plan (real-user-reported bug): a thread that
+    /// is NOT archived was rendering with `inputs-enabled` gated as if it
+    /// WERE archived. Root cause: `Effect::NewThreadDeferred`/
+    /// `Effect::RecoverSessionAttach` claim a `model.threads` row up
+    /// front (real_index = model.threads.len(), BEFORE the matching
+    /// `AgentBridge::add_thread_deferred`/`add_thread_recovering_session`
+    /// call), but those bridge calls return `Err` *before* ever pushing
+    /// their `AgentBridge` slot on failure (see
+    /// `AgentBridge::add_thread_deferred`'s doc comment on the `model.
+    /// threads[i] <-> slots[i]` invariant). The old fold for this failure
+    /// (`SessionAttached { result: Err(..) }`, correct for a DIFFERENT
+    /// case -- an already-slotted thread's reattach failing, see
+    /// `session_attached_failure_sets_error_state_and_dirties_row_and_
+    /// connection` above) only set `ThreadState::Error` and left the row
+    /// in `model.threads` -- so `model.threads.len()` permanently grew
+    /// one past `bridge.slots.len()`, and every thread real_index created
+    /// after the failure read one bridge slot off from the thread it
+    /// actually named. E.g. archiving thread C (whose real_index now
+    /// landed on thread D's actual bridge slot due to the drift) flips
+    /// `archived: true` on D's slot instead -- D. a thread the user never
+    /// archived, then renders as archived. `ThreadCreationFailed` removes
+    /// the orphaned row instead, restoring the parallel-array alignment.
+    #[test]
+    fn thread_creation_failed_removes_the_orphaned_row_restoring_bridge_alignment() {
+        let mut model = model_with_threads(&["a", "b"]);
+        // Simulate `ThreadMsg::AddRequested`'s reducer-side push for a
+        // third thread ("c") whose matching `Effect::NewThreadDeferred`
+        // is about to fail on the bridge side -- i.e. exactly the state
+        // `model.threads` is in immediately after that push, before the
+        // bridge result comes back.
+        model.threads.push(ThreadModel {
+            thread_id: "thread-2".to_owned(),
+            display_name: "c".to_owned(),
+            ..ThreadModel::default()
+        });
+        model.rebuild_thread_indices();
+        assert_eq!(model.threads.len(), 3);
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ThreadCreationFailed {
+                real_index: 2,
+                message: "thread already exists: c".to_owned(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        // The orphaned row is gone -- `model.threads` is back to exactly
+        // the two threads that actually have a bridge slot, restoring
+        // the `model.threads[i] <-> bridge.slots[i]` alignment instead of
+        // leaving a permanent one-off drift for "b" and any thread
+        // created after it.
+        assert_eq!(model.threads.len(), 2);
+        assert_eq!(model.threads[0].thread_id, "thread-0");
+        assert_eq!(model.threads[1].thread_id, "thread-1");
+        assert_eq!(
+            dirty,
+            vec![
+                Dirty::Error {
+                    thread_id: "thread-2".to_owned(),
+                    detail: ErrorDetail {
+                        message: "thread already exists: c".to_owned(),
+                    },
+                },
+                Dirty::ThreadListDiff(crate::dirty::diff_by_id(
+                    &["thread-0".to_owned(), "thread-1".to_owned(), "thread-2".to_owned()],
+                    &["thread-0".to_owned(), "thread-1".to_owned()],
+                    &[visible_row(0, "thread-0"), visible_row(1, "thread-1")],
+                )),
+            ]
+        );
+    }
+
+    /// The removed row's position can sit at or before the current
+    /// filtered selection -- e.g. the user switched away from the
+    /// still-creating thread before its failure resolved. Selection must
+    /// clamp to the shorter list rather than point past the end.
+    #[test]
+    fn thread_creation_failed_clamps_a_selection_left_pointing_past_the_shorter_list() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.threads.push(ThreadModel {
+            thread_id: "thread-2".to_owned(),
+            display_name: "c".to_owned(),
+            ..ThreadModel::default()
+        });
+        model.rebuild_thread_indices();
+        model.selected_thread = 2;
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ThreadCreationFailed {
+                real_index: 2,
+                message: "boom".to_owned(),
+            }),
+        );
+
+        assert_eq!(model.selected_thread, 1);
+        assert!(dirty.contains(&Dirty::Scalar(ScalarField::SelectedThread)));
     }
 
     // -- markdown-render-cache-layer plan Phase 2: EffectResultMsg::
