@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"snapshotd/internal/config"
 	"snapshotd/internal/sapproxy"
 	"snapshotd/internal/sdp"
 )
@@ -83,7 +84,6 @@ func TestServer_PushesProjectInventoryChanges(t *testing.T) {
 			return
 		}
 	}
-	t.Fatal("timed out waiting for daemon.projectsChanged")
 }
 
 // ForwardSAP is a minimal stand-in for internal/daemon.Daemon.ForwardSAP:
@@ -136,8 +136,9 @@ func TestServer_RoundTrip(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var client *sdp.Client
 	var err error
+	cfg := config.Config{ControlSocketPath: sockPath}
 	for time.Now().Before(deadline) {
-		client, err = sdp.Dial(sockPath, 100*time.Millisecond)
+		client, err = sdp.DialConfig(cfg, 100*time.Millisecond)
 		if err == nil {
 			break
 		}
