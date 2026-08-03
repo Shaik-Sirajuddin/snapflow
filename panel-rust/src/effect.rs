@@ -292,6 +292,28 @@ pub enum EffectResultMsg {
     SessionAttachStarted {
         thread_id: String,
     },
+    /// stale-provider-switch-pulse fix: `AgentBridge::probe_provider_
+    /// selection` deliberately pushes NO `AgentEvent::ProviderProbe` at
+    /// all for a thread with no resolvable project directory (a normal,
+    /// fully-supported state -- see that method's own doc comment on why
+    /// treating it as a probe failure would be wrong: a spurious
+    /// "Provider unavailable" toast and a Send block for a reason that
+    /// has nothing to do with the provider). But `SettingsMsg::
+    /// ProfileSelected` already inserted `Model::provider_probes_in_flight`
+    /// before dispatching `Effect::ProbeProvider`, unconditionally --
+    /// the reducer has no visibility into bridge-side project state. With
+    /// no event ever coming for that no-op case, the marker (and the
+    /// "Switching provider..." pulse it drives) stayed stuck forever.
+    /// `effect_executor.rs`'s `Effect::ProbeProvider` arm dispatches this
+    /// the moment `probe_provider_selection` reports (via its bool return)
+    /// that it will never push a completion event, clearing just the
+    /// in-flight marker -- deliberately NOT touching `provider_errors`/
+    /// the toast path, unlike `AgentEvent::ProviderProbe`'s `Ok`/`Err`
+    /// arms, since no probe actually ran.
+    ProviderProbeSkipped {
+        real_index: usize,
+        provider: String,
+    },
     /// mcp-servers-settings plan: unlike `SessionAttached { result: Err(..)
     /// }` (a thread that already claimed a real `AgentBridge` slot failed
     /// to open its ACP session -- the row stays and shows an error, see

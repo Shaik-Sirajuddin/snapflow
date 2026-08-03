@@ -2214,6 +2214,24 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             model.first_attach_in_flight.insert(thread_id.clone());
             (vec![], vec![Dirty::ThreadAttaching { thread_id }])
         }
+        // stale-provider-switch-pulse fix: see `EffectResultMsg::
+        // ProviderProbeSkipped`'s own doc comment for the full mechanism
+        // -- `effect_executor.rs` dispatches this instead of leaving
+        // `Model::provider_probes_in_flight` (inserted unconditionally by
+        // `SettingsMsg::ProfileSelected` above, before the bridge-side
+        // precondition was known) stuck forever when `AgentBridge::
+        // probe_provider_selection` hit its deliberate silent no-op.
+        // Deliberately does NOT touch `provider_errors`/the toast path --
+        // no probe actually ran, so there is nothing to report as failed.
+        EffectResultMsg::ProviderProbeSkipped { real_index, provider } => {
+            if model.provider_probes_in_flight.remove(&provider) {
+                if let Some(thread) = model.threads.get(real_index) {
+                    let thread_id = thread.thread_id.clone();
+                    return (vec![], vec![Dirty::ProviderSwitch { thread_id }]);
+                }
+            }
+            (vec![], vec![])
+        }
         // mcp-servers-settings plan: the real-user-reported bug where a
         // thread that is NOT archived nonetheless renders with
         // `inputs-enabled` gated as if `archived` were true. Root cause:
@@ -2932,22 +2950,39 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                         dirty.push(Dirty::Capabilities {
                             thread_id: row.thread_id.clone(),
                         });
-                        // mcp-servers-settings follow-up: this is the
-                        // real place a deferred thread's first background
-                        // attach (`dispatch_compose_send_maybe_attach` ->
-                        // `AgentBridge::attach_deferred_thread_with_
-                        // config_options`) is observed to have SUCCEEDED
-                        // -- `SessionAttached`'s `Ok` arm is dead for this
-                        // path (see its own doc comment: "no SessionAttached
-                        // fold ever carries the session id" for
-                        // background-attached threads), so the
-                        // first-attach pulse's loading-state must end
-                        // here, not there.
-                        if model.first_attach_in_flight.remove(&row.thread_id) {
-                            dirty.push(Dirty::ThreadAttaching {
-                                thread_id: row.thread_id.clone(),
-                            });
-                        }
+                    }
+                }
+                // stale-first-attach-pulse fix: this used to live INSIDE
+                // the `if thread.session_id.is_none() { .. }` block above,
+                // keyed off the same guard -- but
+                // `ExternalSnapshotSource::hydrate_model_thread_bindings`
+                // (called from `collect_frame_input`, unconditionally,
+                // every poll tick, BEFORE `collect_thread_list_snapshot`
+                // even builds `row.session_id`) already writes
+                // `thread.session_id = Some(..)` straight from the same
+                // bridge binding on this exact frame. By the time this
+                // fold runs, `thread.session_id.is_none()` is therefore
+                // already `false` -- the `None -> Some` transition this
+                // arm was meant to observe already happened one step
+                // earlier in the very same poll, so
+                // `model.first_attach_in_flight.remove(&row.thread_id)`
+                // was dead code: it could never fire on a real successful
+                // first attach, only on the (rare) failure paths elsewhere
+                // in this file. That is the stale "Starting new
+                // thread..." bug -- the marker was inserted on send but
+                // never cleared on success. Keying the clear on
+                // `row.session_id` alone (the same bridge-sourced fact
+                // both this fold and the hydrate pre-pass read) instead of
+                // the already-consumed `thread.session_id.is_none()`
+                // transition makes it fire reliably regardless of which
+                // of the two ran first this tick, and remains a safe
+                // idempotent no-op on every later frame once the marker is
+                // gone.
+                if row.session_id.is_some() {
+                    if model.first_attach_in_flight.remove(&row.thread_id) {
+                        dirty.push(Dirty::ThreadAttaching {
+                            thread_id: row.thread_id.clone(),
+                        });
                     }
                 }
             }
@@ -4128,6 +4163,64 @@ mod tests {
         assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
     }
 
+    // stale-provider-switch-pulse fix: regression for the sibling bug to
+    // the first-attach one below -- `AgentBridge::probe_provider_
+    // selection` deliberately pushes NO `AgentEvent::ProviderProbe` at all
+    // for a thread with no resolvable project directory (see that
+    // method's own doc comment), but `SettingsMsg::ProfileSelected`
+    // already inserted `provider_probes_in_flight` unconditionally before
+    // dispatching the probe. With no event ever coming, the "Switching
+    // provider..." pulse stayed stuck forever for that (normal,
+    // fully-supported) thread state. `effect_executor.rs` now dispatches
+    // `EffectResultMsg::ProviderProbeSkipped` itself in that case; this
+    // covers the reducer arm that actually clears the marker.
+    #[test]
+    fn provider_probe_skipped_clears_in_flight_without_touching_provider_errors() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ProviderProbeSkipped {
+                real_index: 0,
+                provider: "codex-acp".to_owned(),
+            }),
+        );
+
+        assert!(
+            !model.provider_probes_in_flight.contains("codex-acp"),
+            "a skipped (no-project) probe must still clear the in-flight marker so the \
+             pulse stops"
+        );
+        assert!(
+            !model.provider_errors.contains_key("codex-acp"),
+            "a skipped probe never actually ran, so it must not populate provider_errors/\
+             the toast path like a real Err result would"
+        );
+        assert!(dirty.contains(&Dirty::ProviderSwitch {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn provider_probe_skipped_with_no_prior_in_flight_marker_is_a_quiet_no_op() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].provider = "codex-acp".to_owned();
+
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::ProviderProbeSkipped {
+                real_index: 0,
+                provider: "codex-acp".to_owned(),
+            }),
+        );
+
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
+    }
+
     // mcp-servers-settings follow-up: the chat-view pulsing "Starting new
     // thread..." indicator's loading-state transition, sibling of the
     // provider-switch pulse tests just above. Covers the start
@@ -4197,6 +4290,60 @@ mod tests {
             !model.first_attach_in_flight.contains("thread-0"),
             "a successful background attach must clear the in-flight marker so the pulse \
              stops"
+        );
+        assert!(dirty.contains(&Dirty::ThreadAttaching {
+            thread_id: "thread-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn first_attach_in_flight_marker_clears_even_when_session_id_was_already_hydrated_this_frame() {
+        // Regression for the real stale-pulse bug: `collect_frame_input`
+        // calls `hydrate_model_thread_bindings` (which sets `thread.
+        // session_id = Some(..)` straight from the bridge binding)
+        // BEFORE `collect_thread_list_snapshot` even builds `row.
+        // session_id` -- both run inside the same `panel_rust_poll` tick,
+        // ahead of this `update_frame` fold. So by the time this fold's
+        // old `if thread.session_id.is_none() { .. }` guard ran, it was
+        // already `false` for a real first attach: the transition it was
+        // meant to observe had already happened one step earlier in the
+        // very same poll. The previous version of this test (`..._on_
+        // successful_background_attach` above) never caught this because
+        // it left `thread.session_id` at its default `None`, which is NOT
+        // what a real poll tick looks like by the time this fold runs.
+        // Simulate the real ordering here: `thread.session_id` is already
+        // `Some` (as `hydrate_model_thread_bindings` would have just set
+        // it) when the snapshot fold runs.
+        let mut model = model_with_threads(&["a"]);
+        model.first_attach_in_flight.insert("thread-0".to_owned());
+        model.threads[0].session_id = Some("real-session-id".to_owned());
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(true),
+            item: crate::ThreadItem::default(),
+        };
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                    active_project_path: None,
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(
+            !model.first_attach_in_flight.contains("thread-0"),
+            "the in-flight marker must clear off `row.session_id` alone, not an already-\
+             consumed `thread.session_id.is_none()` transition, so a real first attach's \
+             pulse does not stay stuck forever"
         );
         assert!(dirty.contains(&Dirty::ThreadAttaching {
             thread_id: "thread-0".to_owned()
