@@ -337,11 +337,19 @@ async fn probe_http_inner(
     parse_tools_list_result(&tools_response, "tools/list")
 }
 
-/// One JSON-RPC request per POST, direct JSON response -- the non-SSE
-/// half of the MCP streamable-HTTP transport convention. Enough for a
-/// one-shot `tools/list` preview; a server that only replies over
-/// server-sent events is out of scope for this settings-only probe (see
-/// this module's own doc comment).
+/// One JSON-RPC request per POST. `Accept: application/json` asks a
+/// spec-compliant server for the plain (non-SSE) half of the MCP
+/// streamable-HTTP transport convention, but real-world servers do not
+/// all honor that header -- some always reply `Content-Type: text/
+/// event-stream` with the JSON-RPC payload wrapped in a single `data:
+/// {...}` frame even for a one-shot POST. Reading the body as text first
+/// (rather than handing the response straight to `reqwest::Response::
+/// json`, which fails with an opaque "error decoding response body" the
+/// moment the bytes aren't bare JSON) lets this function unwrap that one
+/// common SSE-framing case before giving up, and -- when the body truly
+/// isn't JSON-RPC (an HTTP error page, empty body, garbage) -- report the
+/// response status and a truncated snippet instead of reqwest's generic
+/// decode-error string, which carries none of that context.
 async fn post_json_rpc(
     client: &reqwest::Client,
     spec: &HttpSpec,
@@ -357,13 +365,53 @@ async fn post_json_rpc(
         request = request.header(key.as_str(), value.as_str());
     }
     let response = request.send().await?;
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|err| McpClientError::MalformedHttpResponse {
-            method,
-            detail: err.to_string(),
-        })
+    let status = response.status();
+    let text = response.text().await?;
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+        return Ok(value);
+    }
+    if let Some(value) = extract_sse_json_data(&text) {
+        return Ok(value);
+    }
+
+    let mut snippet: String = text.chars().take(200).collect();
+    if snippet.len() < text.len() {
+        snippet.push('\u{2026}');
+    }
+    if snippet.is_empty() {
+        snippet.push_str("<empty body>");
+    }
+    Err(McpClientError::MalformedHttpResponse {
+        method,
+        detail: format!("HTTP status {status}, body: {snippet}"),
+    })
+}
+
+/// Pulls the JSON-RPC payload out of a single-event `text/event-stream`
+/// body (`data: {...}` lines, blank-line-terminated, per the SSE format
+/// the MCP streamable-HTTP transport layers JSON-RPC over). Only the
+/// first event's `data:` payload(s) are used -- a one-shot `initialize`/
+/// `tools/list` probe expects exactly one JSON-RPC response, not a
+/// stream of them. Returns `None` (letting the caller fall through to
+/// its own malformed-response error) when no line looks like an SSE data
+/// frame at all, so this never masks a genuinely non-JSON, non-SSE body.
+fn extract_sse_json_data(text: &str) -> Option<serde_json::Value> {
+    let mut data_lines = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start());
+        } else if !data_lines.is_empty() && line.trim().is_empty() {
+            // Blank line ends the first event -- stop collecting so a
+            // later, unrelated event in the same body can't get merged
+            // in.
+            break;
+        }
+    }
+    if data_lines.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data_lines.join("\n")).ok()
 }
 
 fn parse_tools_list_result(
@@ -673,5 +721,151 @@ done
             result,
             Err(McpClientError::RpcError { method: "initialize", .. })
         ));
+    }
+
+    #[test]
+    fn extract_sse_json_data_unwraps_a_single_event() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let value = extract_sse_json_data(body).expect("should extract the data payload");
+        assert_eq!(value["id"], 1);
+        assert_eq!(value["result"]["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn extract_sse_json_data_joins_multi_line_data_frames() {
+        // SSE allows a single event's payload to be split across several
+        // `data:` lines, joined with `\n` before parsing.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\ndata: \"result\":{\"tools\":[]}}\n\n";
+        let value = extract_sse_json_data(body).expect("should join and parse multi-line data");
+        assert_eq!(value["id"], 1);
+    }
+
+    #[test]
+    fn extract_sse_json_data_returns_none_for_non_sse_bodies() {
+        assert!(extract_sse_json_data("<html>not json, not sse</html>").is_none());
+        assert!(extract_sse_json_data("").is_none());
+    }
+
+    /// A real-world MCP HTTP server that ignores the client's `Accept:
+    /// application/json` request and always answers with `Content-Type:
+    /// text/event-stream`, wrapping the JSON-RPC response in a `data:`
+    /// frame -- the case this fix's `extract_sse_json_data` fallback
+    /// exists for. Before this fix, `probe_http` would fail every such
+    /// server with reqwest's opaque "error decoding response body".
+    #[tokio::test]
+    async fn probe_http_succeeds_against_a_real_server_that_answers_with_sse() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub http mcp server");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let body: serde_json::Value =
+                        serde_json::from_str(body_str).unwrap_or(serde_json::Value::Null);
+                    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+
+                    let resp_body = if method == "initialize" {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2024-11-05", "capabilities": {}}})
+                    } else if method == "tools/list" {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "read_file", "description": "Reads a file"}]}})
+                    } else {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "unknown method"}})
+                    };
+                    let sse_body = format!("event: message\ndata: {}\n\n", resp_body);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        sse_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(sse_body.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let tools = probe_http(
+            &client,
+            &HttpSpec {
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                headers: HashMap::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("probe_http should succeed against an SSE-only server");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "read_file");
+    }
+
+    /// A server that returns a genuinely non-JSON-RPC body (e.g. a
+    /// reverse-proxy error page) must still fail, but with a message
+    /// carrying the HTTP status and a body snippet -- not reqwest's
+    /// opaque "error decoding response body" that gives the user no way
+    /// to tell what actually went wrong.
+    #[tokio::test]
+    async fn probe_http_surfaces_a_clear_error_for_a_truly_malformed_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub http mcp server");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let body = "<html><body>502 Bad Gateway</body></html>";
+                    let response = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let result = probe_http(
+            &client,
+            &HttpSpec {
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                headers: HashMap::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match result {
+            Err(McpClientError::MalformedHttpResponse { method: "initialize", detail }) => {
+                assert!(detail.contains("502"), "expected status in detail: {detail}");
+                assert!(
+                    detail.contains("Bad Gateway"),
+                    "expected body snippet in detail: {detail}"
+                );
+            }
+            other => panic!("expected a clear MalformedHttpResponse error, got {other:?}"),
+        }
     }
 }
