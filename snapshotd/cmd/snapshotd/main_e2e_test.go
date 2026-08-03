@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"snapshotd/internal/transport"
 )
 
 // buildBinary compiles a package under this module into a temp dir, mirroring
@@ -98,7 +100,7 @@ func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
 		_ = serveCmd.Wait()
 	})
 
-	controlSock := filepath.Join(homeDir, "control.sock")
+	controlSock := transport.DefaultControlEndpoint(homeDir)
 	waitForSocket(t, controlSock, 5*time.Second, &serveOut)
 
 	// list on an empty daemon: no error, no output lines.
@@ -186,7 +188,8 @@ func waitForSocket(t *testing.T, path string, timeout time.Duration, serveOut fm
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
+		if conn, err := transport.DialTimeout(path, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
