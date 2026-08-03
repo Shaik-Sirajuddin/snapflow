@@ -458,6 +458,53 @@ fn merge_config_options_preserving_current_value(
         .collect()
 }
 
+/// Fallback-priority chain for a brand-new thread's provider when
+/// `model.default_agent_id` (Settings' configured default, PROF-1/PROF-2)
+/// is empty. Previously this call site (and `cold_start_thread_specs`)
+/// jumped straight to the single hardcoded `NO_PROVIDER_REQUESTED_
+/// FALLBACK` ("codex") string -- fragile by construction, since that id
+/// might not even be installed/available on this machine, and a totally
+/// unrelated agent would silently win just because it happened to be the
+/// hardcoded literal.
+///
+/// Order, cheapest/most-trustworthy first:
+///   1. Already handled by the caller: a real configured default wins.
+///   2. "Last provider actually used" -- panel-rust does not persist any
+///      such value today (checked `state_store.rs`/`settings_file.rs`;
+///      no equivalent of a "most recently used provider" field exists
+///      anywhere), so this tier is a documented gap, not implemented
+///      here. Follow-up: `state_store.rs::PanelDefaults` would be the
+///      natural home for a `last_used_agent_id` column, set wherever a
+///      real `SessionAttached` succeeds (update.rs's
+///      `EffectResultMsg::SessionAttached` handler already has the real,
+///      resolved provider in hand at that exact point).
+///   3. The first real, enabled entry from the live agent catalog
+///      (`model.agent_catalog`, populated by `agents/list` via periodic
+///      frame snapshots -- see `external_snapshot.rs`/update.rs's
+///      `model.agent_catalog = snapshot.agents`) -- an id that is
+///      actually installed and available right now, not a guess.
+///   4. `NO_PROVIDER_REQUESTED_FALLBACK` ("codex") only as the true last
+///      resort, when the catalog hasn't loaded yet either (e.g. the very
+///      first frame snapshot hasn't landed) -- still a real, documented,
+///      single fallback string, just no longer the first thing tried.
+///
+/// Not used by `cold_start_thread_specs` (lib.rs): that call runs
+/// synchronously before `AgentBridge`/the gateway even exists, so there
+/// is no live catalog to consult yet at that specific point -- a
+/// structural ordering constraint distinct from this call site, which
+/// runs after the bridge is already up and has had at least one chance
+/// to collect a frame snapshot.
+fn fallback_provider_for_new_thread(model: &Model) -> String {
+    model
+        .agent_catalog
+        .iter()
+        .find(|entry| {
+            entry.enabled && matches!(entry.status, crate::protocol_types::AgentStatus::Installed)
+        })
+        .map(|entry| entry.id.clone())
+        .unwrap_or_else(|| crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned())
+}
+
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
         ThreadMsg::New => {
@@ -479,11 +526,13 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             // "gemini-acp" would still have been forced onto "codex" at
             // this call site even after agent_bridge.rs itself stopped
             // normalizing). `model.default_agent_id` is used directly when
-            // set; the same documented last-resort fallback
-            // (`NO_PROVIDER_REQUESTED_FALLBACK`) applies when nothing is
-            // configured at all, never an index/contains-based guess.
+            // set; see `fallback_provider_for_new_thread`'s own doc
+            // comment for the priority chain used when nothing is
+            // configured (a bare `NO_PROVIDER_REQUESTED_FALLBACK` used to
+            // be the only fallback here, even when it pointed at an agent
+            // that isn't actually installed/available on this machine).
             let provider = if model.default_agent_id.is_empty() {
-                crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned()
+                fallback_provider_for_new_thread(model)
             } else {
                 model.default_agent_id.clone()
             };
@@ -4277,6 +4326,66 @@ mod tests {
                  got: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn new_thread_with_empty_default_agent_id_prefers_first_real_catalog_entry_over_hardcoded_fallback(
+    ) {
+        // fallback_provider_for_new_thread's priority chain, tier 3: with
+        // no configured default_agent_id at all, a live agent catalog
+        // (agents/list, already collected via a prior frame snapshot)
+        // must win over the single hardcoded NO_PROVIDER_REQUESTED_
+        // FALLBACK string -- that string is not guaranteed to correspond
+        // to an agent actually installed on this machine, whereas a
+        // catalog entry is real by construction.
+        let mut model = model_with_threads(&[]);
+        model.agent_catalog = vec![
+            crate::protocol_types::AgentCatalogEntry {
+                id: "not-installed-acp".to_owned(),
+                name: "Not Installed".to_owned(),
+                version: String::new(),
+                website: String::new(),
+                status: crate::protocol_types::AgentStatus::NotInstalled,
+                enabled: true,
+            },
+            crate::protocol_types::AgentCatalogEntry {
+                id: "gemini-acp".to_owned(),
+                name: "Gemini".to_owned(),
+                version: String::new(),
+                website: String::new(),
+                status: crate::protocol_types::AgentStatus::Installed,
+                enabled: true,
+            },
+        ];
+        let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::NewThreadDeferred { provider, .. }] if provider == "gemini-acp"
+            ),
+            "must skip the not-installed entry and use the first real, enabled, installed \
+             catalog entry, not NO_PROVIDER_REQUESTED_FALLBACK; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn new_thread_with_empty_default_agent_id_and_no_catalog_still_uses_the_documented_fallback() {
+        // Tier 4 of the same priority chain: with nothing configured AND
+        // no catalog loaded yet (e.g. cold start's very first frame
+        // snapshot hasn't landed), the single documented last-resort
+        // string is still used -- this must not regress into an empty
+        // provider or a panic.
+        let mut model = model_with_threads(&[]);
+        assert!(model.agent_catalog.is_empty());
+        let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::NewThreadDeferred { provider, .. }]
+                    if provider == crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK
+            ),
+            "got: {effects:?}"
+        );
     }
 
     #[test]
