@@ -1593,11 +1593,9 @@ impl PanelSingleton {
         });
     }
 
-    /// Non-blocking Connect. `opener::open` (opening the returned
-    /// authorization URL in the default browser) is a fast, fire-and-forget
-    /// OS call, so it still runs synchronously inside the completion
-    /// closure -- only the network round-trip that discovers/starts the
-    /// OAuth flow moves off the UI thread.
+    /// Non-blocking Connect. Authentication never launches a browser on the
+    /// user's behalf: the returned URL is shown in the action feedback so the
+    /// user can explicitly open it when they choose.
     pub(crate) fn dispatch_mcp_server_authenticate_async(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else {
             crate::effect_executor::report_mcp_server_result(Err(
@@ -1610,12 +1608,9 @@ impl PanelSingleton {
         let callback_name = name.clone();
         bridge.authenticate_mcp_server_async(gw, &name, move |result| {
             let outcome = match result {
-                Ok(authorization_url) => match opener::open(&authorization_url) {
-                    Ok(()) => Ok(format!("Opened browser to connect \"{callback_name}\"")),
-                    Err(error) => Err(format!(
-                        "MCP server \"{callback_name}\": failed to open browser for OAuth: {error}"
-                    )),
-                },
+                Ok(authorization_url) => Ok(format!(
+                    "OAuth URL for MCP server \"{callback_name}\" (open manually): {authorization_url}"
+                )),
                 Err(err) => Err(format!(
                     "Failed to start OAuth flow for MCP server \"{callback_name}\": {err}"
                 )),

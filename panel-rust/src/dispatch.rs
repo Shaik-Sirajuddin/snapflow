@@ -51,7 +51,18 @@ fn execute_thread_lifecycle_effect(
             provider,
         } => {
             if let Some(bridge) = panel.bridge.as_mut() {
-                if let Err(error) = bridge.add_thread_deferred(&display_name, Some(&provider)) {
+                let thread_id = panel
+                    .model
+                    .borrow()
+                    .threads
+                    .get(real_index)
+                    .map(|thread| thread.thread_id.clone())
+                    .unwrap_or_default();
+                if let Err(error) = bridge.add_thread_deferred_with_id(
+                    &thread_id,
+                    &display_name,
+                    Some(&provider),
+                ) {
                     // mcp-servers-settings plan: `add_thread_deferred`
                     // returns Err BEFORE pushing a slot (see its doc
                     // comment), so this real_index's `model.threads` row

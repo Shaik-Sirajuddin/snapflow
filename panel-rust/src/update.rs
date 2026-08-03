@@ -515,7 +515,11 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             model.compose_text.clear();
             model.search_query.clear();
             let real_index = model.threads.len();
-            let thread_id = format!("thread:{real_index}");
+            // Positional IDs are unsafe: archiving/deleting a row can leave
+            // the next new thread reusing an old identity. UUIDs keep
+            // transcripts, settings, and archive state attached to the
+            // logical thread for the lifetime of the installation.
+            let thread_id = uuid::Uuid::new_v4().to_string();
             let display_name = format!("New thread {}", real_index + 1);
             // PROF-1/PROF-2: the agent id flows through as-is now, same
             // as `AgentBridge::resolve_provider_for` -- no more collapsing
@@ -710,7 +714,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let now_archived = !thread.archived;
             thread.archived = now_archived;
             let mut effects = vec![Effect::ArchiveThread {
-                real_index: idx,
+                thread_id: thread.thread_id.clone(),
                 archived: now_archived,
             }];
             let mut dirty = vec![thread_row_dirty(model, idx)];
@@ -2255,7 +2259,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         // wrong here since no slot was ever created). From that point on
         // `model.threads.len() == bridge.slots.len() + 1`, so every
         // later real_index reads one bridge slot off from the thread it
-        // actually names -- e.g. `Effect::ArchiveThread { real_index }`
+        // actually names -- e.g. `Effect::ArchiveThread { thread_id }`
         // (`AgentBridge::set_thread_archived`) lands on a completely
         // different thread's slot than the one the user archived, and
         // that OTHER thread's row then reads `archived: true` despite
@@ -4604,6 +4608,9 @@ mod tests {
             }]
         );
         assert_eq!(model.threads.len(), 2);
+        assert_ne!(model.threads[1].thread_id, "thread:1");
+        assert!(uuid::Uuid::parse_str(&model.threads[1].thread_id).is_ok());
+        assert_ne!(model.threads[0].thread_id, model.threads[1].thread_id);
         assert!(model.threads[1].session_id.is_none());
         assert_eq!(model.threads[1].profile_name.as_deref(), Some("safe"));
         assert_eq!(

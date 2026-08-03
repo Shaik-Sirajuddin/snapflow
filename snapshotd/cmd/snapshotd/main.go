@@ -273,8 +273,11 @@ func cmdStatus(cfg config.Config, args []string) error {
 	if err := c.Call("daemon.listProjects", map[string]any{}, &projects); err != nil {
 		return fmt.Errorf("daemon.listProjects: %w", err)
 	}
-	var instances []map[string]any
-	if err := c.Call("daemon.list", map[string]any{}, &instances); err != nil {
+	var instanceResult struct {
+		Active *bool            `json:"active"`
+		Items  []map[string]any `json:"items"`
+	}
+	if err := c.Call("daemon.list", map[string]any{}, &instanceResult); err != nil {
 		return fmt.Errorf("daemon.list: %w", err)
 	}
 
@@ -284,8 +287,8 @@ func cmdStatus(cfg config.Config, args []string) error {
 		enc, _ := json.Marshal(p)
 		fmt.Printf("  %s\n", enc)
 	}
-	fmt.Printf("process instances: %d\n", len(instances))
-	for _, in := range instances {
+	fmt.Printf("instances: %d (active filter: all)\n", len(instanceResult.Items))
+	for _, in := range instanceResult.Items {
 		enc, _ := json.Marshal(in)
 		fmt.Printf("  %s\n", enc)
 	}
@@ -354,11 +357,14 @@ func cmdList(cfg config.Config, args []string) error {
 	}
 	defer c.Close()
 
-	var instances []map[string]any
-	if err := c.Call("daemon.list", map[string]any{}, &instances); err != nil {
+	var result struct {
+		Active *bool            `json:"active"`
+		Items  []map[string]any `json:"items"`
+	}
+	if err := c.Call("daemon.list", map[string]any{}, &result); err != nil {
 		return fmt.Errorf("daemon.list: %w", err)
 	}
-	for _, in := range instances {
+	for _, in := range result.Items {
 		enc, _ := json.Marshal(in)
 		fmt.Println(string(enc))
 	}

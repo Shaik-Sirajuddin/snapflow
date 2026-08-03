@@ -548,11 +548,17 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .enumerate()
             .map(|(idx, _)| {
-                self.panel
-                    .bridge
-                    .as_ref()
-                    .map(|bridge| bridge.thread_archived(idx))
-                    .unwrap_or(false)
+                let thread_id = self
+                    .panel
+                    .model
+                    .borrow()
+                    .threads
+                    .get(idx)
+                    .map(|thread| thread.thread_id.clone())
+                    .unwrap_or_default();
+                self.panel.bridge.as_ref().map(|bridge| {
+                    bridge.thread_archived_by_id(&thread_id)
+                }).unwrap_or(false)
             })
             .collect();
         let providers: Vec<String> = names

@@ -33,7 +33,15 @@ fn socket_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SNAPSHOTD_CONTROL_SOCKET") {
         if !path.is_empty() { return Some(PathBuf::from(path)); }
     }
-    std::env::var("SNAPSHOTD_HOME").ok().filter(|s| !s.is_empty()).map(|s| PathBuf::from(s).join("control.sock"))
+    if let Ok(home) = std::env::var("SNAPSHOTD_HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home).join("control.sock"));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|home| PathBuf::from(home).join(".snapshotd/control.sock"))
 }
 
 #[cfg(unix)]

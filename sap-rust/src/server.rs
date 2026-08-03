@@ -26,10 +26,10 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ServerOptions;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backend::{Backend, BackendError};
@@ -141,9 +141,7 @@ fn apply_selection_lock(
         let Some(track_index) = current.track_index else {
             return Err(RpcError {
                 code: error_codes::INVALID_PARAMS,
-                message: format!(
-                    "{method} needs a selected track -- call track.enter first"
-                ),
+                message: format!("{method} needs a selected track -- call track.enter first"),
                 data: None,
             });
         };
@@ -186,29 +184,45 @@ struct BackendCallResult {
 }
 
 fn ok_result(v: Value) -> BackendCallResult {
-    BackendCallResult { result: Ok(v), notify: None }
+    BackendCallResult {
+        result: Ok(v),
+        notify: None,
+    }
 }
 
 fn err_result(e: BackendError) -> BackendCallResult {
-    BackendCallResult { result: Err(backend_err_to_rpc(e)), notify: None }
+    BackendCallResult {
+        result: Err(backend_err_to_rpc(e)),
+        notify: None,
+    }
 }
 
 fn backend_err_to_rpc(e: BackendError) -> RpcError {
     match e {
-        BackendError::InvalidParams(msg) => {
-            RpcError { code: error_codes::INVALID_PARAMS, message: msg, data: None }
-        }
-        BackendError::NotFound(msg) => {
-            RpcError { code: error_codes::NOT_FOUND, message: msg, data: None }
-        }
-        BackendError::Unsupported(msg) => {
-            RpcError { code: error_codes::INTERNAL_ERROR, message: msg, data: None }
-        }
+        BackendError::InvalidParams(msg) => RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: msg,
+            data: None,
+        },
+        BackendError::NotFound(msg) => RpcError {
+            code: error_codes::NOT_FOUND,
+            message: msg,
+            data: None,
+        },
+        BackendError::Unsupported(msg) => RpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: msg,
+            data: None,
+        },
     }
 }
 
 fn rpc_error(code: i64) -> RpcError {
-    RpcError { code, message: error_codes::message(code).to_string(), data: None }
+    RpcError {
+        code,
+        message: error_codes::message(code).to_string(),
+        data: None,
+    }
 }
 
 fn invalid_params(e: &serde_json::Error) -> RpcError {
@@ -228,7 +242,11 @@ fn method_not_found(method: &str) -> RpcError {
 }
 
 fn internal_error(msg: &str) -> RpcError {
-    RpcError { code: error_codes::INTERNAL_ERROR, message: msg.to_string(), data: None }
+    RpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: msg.to_string(),
+        data: None,
+    }
 }
 
 /// A single unit of work for the dispatcher: a closure that calls one
@@ -255,7 +273,10 @@ type DispatchSender = mpsc::UnboundedSender<DispatchMsg>;
 /// `Send + Sync`-safe under a short-lived lock.
 type ProjectChannels = Arc<Mutex<HashMap<String, broadcast::Sender<RpcNotification>>>>;
 
-fn channel_for_project(channels: &ProjectChannels, project_id: &str) -> broadcast::Sender<RpcNotification> {
+fn channel_for_project(
+    channels: &ProjectChannels,
+    project_id: &str,
+) -> broadcast::Sender<RpcNotification> {
     let mut map = channels.lock().expect("project channel map poisoned");
     map.entry(project_id.to_string())
         .or_insert_with(|| broadcast::channel(256).0)
@@ -319,7 +340,10 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
         "project.save" => Ok(Box::new(move |b| match b.project_save(&project_id) {
             Ok(()) => BackendCallResult {
                 result: Ok(json!({})),
-                notify: Some(RpcNotification::new("project.dirty", json!({"reason": "save"}))),
+                notify: Some(RpcNotification::new(
+                    "project.dirty",
+                    json!({"reason": "save"}),
+                )),
             },
             Err(e) => err_result(e),
         })),
@@ -327,7 +351,10 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
         "project.undo" => Ok(Box::new(move |b| match b.project_undo(&project_id) {
             Ok(()) => BackendCallResult {
                 result: Ok(json!({})),
-                notify: Some(RpcNotification::new("project.dirty", json!({"reason": "undo"}))),
+                notify: Some(RpcNotification::new(
+                    "project.dirty",
+                    json!({"reason": "undo"}),
+                )),
             },
             Err(e) => err_result(e),
         })),
@@ -335,7 +362,10 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
         "project.redo" => Ok(Box::new(move |b| match b.project_redo(&project_id) {
             Ok(()) => BackendCallResult {
                 result: Ok(json!({})),
-                notify: Some(RpcNotification::new("project.dirty", json!({"reason": "redo"}))),
+                notify: Some(RpcNotification::new(
+                    "project.dirty",
+                    json!({"reason": "redo"}),
+                )),
             },
             Err(e) => err_result(e),
         })),
@@ -347,15 +377,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 kind: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.edit_add_track(&project_id, &p.kind) {
-                Ok(track) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&track).expect("Track serializes")),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "addTrack", "trackIndex": track.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_add_track(&project_id, &p.kind) {
+                    Ok(track) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&track).expect("Track serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "addTrack", "trackIndex": track.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -366,15 +398,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 track_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.edit_remove_track(&project_id, p.track_index) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "removeTrack", "trackIndex": p.track_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_remove_track(&project_id, p.track_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "removeTrack", "trackIndex": p.track_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -391,15 +425,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 to_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.edit_reorder_track(&project_id, p.from_index, p.to_index) {
-                Ok(tracks) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&tracks).expect("tracks serialize")),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "reorderTrack", "fromIndex": p.from_index, "toIndex": p.to_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_reorder_track(&project_id, p.from_index, p.to_index) {
+                    Ok(tracks) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&tracks).expect("tracks serialize")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "reorderTrack", "fromIndex": p.from_index, "toIndex": p.to_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -420,7 +456,14 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             let track_index = p.track_index;
             Ok(Box::new(move |b| {
-                match b.edit_set_track_properties(&project_id, track_index, p.muted, p.hidden, p.locked, p.blend_mode.clone()) {
+                match b.edit_set_track_properties(
+                    &project_id,
+                    track_index,
+                    p.muted,
+                    p.hidden,
+                    p.locked,
+                    p.blend_mode.clone(),
+                ) {
                     Ok(track) => BackendCallResult {
                         result: Ok(serde_json::to_value(&track).expect("Track serializes")),
                         notify: Some(RpcNotification::new(
@@ -439,15 +482,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 height: i64,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.edit_set_track_height(&project_id, p.height) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "setTrackHeight", "height": p.height}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_set_track_height(&project_id, p.height) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "setTrackHeight", "height": p.height}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -459,15 +504,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 clip_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.edit_remove_clip(&project_id, p.track_index, p.clip_index) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "removeClip", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_remove_clip(&project_id, p.track_index, p.clip_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "removeClip", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -482,7 +529,13 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
-                match b.edit_move_clip(&project_id, p.from_track_index, p.from_clip_index, p.to_track_index, p.to_clip_index) {
+                match b.edit_move_clip(
+                    &project_id,
+                    p.from_track_index,
+                    p.from_clip_index,
+                    p.to_track_index,
+                    p.to_clip_index,
+                ) {
                     Ok(clip) => BackendCallResult {
                         result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
                         notify: Some(RpcNotification::new(
@@ -511,15 +564,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             let track_index = p.track_index;
-            Ok(Box::new(move |b| match b.edit_append_clip(&project_id, track_index, p.source) {
-                Ok(clip) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "appendClip", "trackIndex": track_index, "clipIndex": clip.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_append_clip(&project_id, track_index, p.source) {
+                    Ok(clip) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "appendClip", "trackIndex": track_index, "clipIndex": clip.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -534,15 +589,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             let track_index = p.track_index;
             let clip_index = p.clip_index;
-            Ok(Box::new(move |b| match b.edit_insert_clip(&project_id, track_index, clip_index, p.source) {
-                Ok(clip) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "insertClip", "trackIndex": track_index, "clipIndex": clip.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_insert_clip(&project_id, track_index, clip_index, p.source) {
+                    Ok(clip) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "insertClip", "trackIndex": track_index, "clipIndex": clip.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -557,15 +614,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             let track_index = p.track_index;
             let clip_index = p.clip_index;
-            Ok(Box::new(move |b| match b.edit_overwrite_clip(&project_id, track_index, clip_index, p.source) {
-                Ok(clip) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
-                    notify: Some(RpcNotification::new(
-                        "edit.changed",
-                        json!({"reason": "overwriteClip", "trackIndex": track_index, "clipIndex": clip.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_overwrite_clip(&project_id, track_index, clip_index, p.source) {
+                    Ok(clip) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "overwriteClip", "trackIndex": track_index, "clipIndex": clip.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -576,9 +635,11 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 track_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.edit_list_clips(&project_id, p.track_index) {
-                Ok(clips) => ok_result(serde_json::to_value(&clips).expect("clips serialize")),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.edit_list_clips(&project_id, p.track_index) {
+                    Ok(clips) => ok_result(serde_json::to_value(&clips).expect("clips serialize")),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -591,9 +652,11 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 frame: i64,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.playback_seek(&project_id, p.frame) {
-                Ok(()) => ok_result(json!({})),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playback_seek(&project_id, p.frame) {
+                    Ok(()) => ok_result(json!({})),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -608,12 +671,17 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 text: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.notes_set_text(&project_id, &p.text) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new("notes.changed", json!({"reason": "setText"}))),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.notes_set_text(&project_id, &p.text) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "notes.changed",
+                            json!({"reason": "setText"}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -851,7 +919,8 @@ fn build_op_ext(
                 _ => {
                     return Err(RpcError {
                         code: error_codes::INVALID_PARAMS,
-                        message: "audio.setNormalize mode must be \"1pass\" or \"2pass\"".to_string(),
+                        message: "audio.setNormalize mode must be \"1pass\" or \"2pass\""
+                            .to_string(),
                         data: None,
                     });
                 }
@@ -1043,7 +1112,9 @@ fn build_op_ext(
                             let mut removed = 0usize;
                             for f in filters.into_iter().rev() {
                                 if f.mlt_service == "autofade" {
-                                    if let Err(e) = b.filter_remove(&project_id, &p.clip_id, f.index) {
+                                    if let Err(e) =
+                                        b.filter_remove(&project_id, &p.clip_id, f.index)
+                                    {
                                         return err_result(e);
                                     }
                                     removed += 1;
@@ -1072,15 +1143,17 @@ fn build_op_ext(
                 name: Option<String>,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.playlist_append(&project_id, p.source, p.name) {
-                Ok(entry) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
-                    notify: Some(RpcNotification::new(
-                        "playlist.changed",
-                        json!({"reason": "append", "index": entry.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playlist_append(&project_id, p.source, p.name) {
+                    Ok(entry) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
+                        notify: Some(RpcNotification::new(
+                            "playlist.changed",
+                            json!({"reason": "append", "index": entry.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1099,15 +1172,17 @@ fn build_op_ext(
                 name: Option<String>,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.playlist_insert(&project_id, p.index, p.source, p.name) {
-                Ok(entry) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
-                    notify: Some(RpcNotification::new(
-                        "playlist.changed",
-                        json!({"reason": "insert", "index": entry.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playlist_insert(&project_id, p.index, p.source, p.name) {
+                    Ok(entry) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
+                        notify: Some(RpcNotification::new(
+                            "playlist.changed",
+                            json!({"reason": "insert", "index": entry.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1118,12 +1193,17 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             let index = p.index;
-            Ok(Box::new(move |b| match b.playlist_remove(&project_id, index) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new("playlist.changed", json!({"reason": "remove", "index": index}))),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playlist_remove(&project_id, index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "playlist.changed",
+                            json!({"reason": "remove", "index": index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1135,15 +1215,17 @@ fn build_op_ext(
                 to_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.playlist_move(&project_id, p.from_index, p.to_index) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new(
-                        "playlist.changed",
-                        json!({"reason": "move", "fromIndex": p.from_index, "toIndex": p.to_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playlist_move(&project_id, p.from_index, p.to_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "playlist.changed",
+                            json!({"reason": "move", "fromIndex": p.from_index, "toIndex": p.to_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1153,9 +1235,13 @@ fn build_op_ext(
                 index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.playlist_get(&project_id, p.index) {
-                Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntryDetail serializes")),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playlist_get(&project_id, p.index) {
+                    Ok(entry) => ok_result(
+                        serde_json::to_value(&entry).expect("PlaylistEntryDetail serializes"),
+                    ),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1181,7 +1267,11 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
-                match b.edit_append_clip(&project_id, p.track_index, json!({"playlistIndex": p.index})) {
+                match b.edit_append_clip(
+                    &project_id,
+                    p.track_index,
+                    json!({"playlistIndex": p.index}),
+                ) {
                     Ok(clip) => BackendCallResult {
                         result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
                         notify: Some(RpcNotification::new(
@@ -1206,67 +1296,81 @@ fn build_op_ext(
                 path: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.file_import(&project_id, &p.path) {
-                Ok(entry) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
-                    notify: Some(RpcNotification::new(
-                        "playlist.changed",
-                        json!({"reason": "import", "index": entry.index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.file_import(&project_id, &p.path) {
+                    Ok(entry) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
+                        notify: Some(RpcNotification::new(
+                            "playlist.changed",
+                            json!({"reason": "import", "index": entry.index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
-       "edit.trimClipIn" => {
-           #[derive(Deserialize)]
-           #[serde(rename_all = "camelCase")]
-           struct P {
-               track_index: usize,
-               clip_index: usize,
-               new_frame: i64,
+        "edit.trimClipIn" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+                new_frame: i64,
                 #[serde(default)]
                 ripple: bool,
-           }
-           let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-           Ok(Box::new(move |b| {
-                match b.edit_trim_clip_in(&project_id, p.track_index, p.clip_index, p.new_frame, p.ripple) {
-                   Ok(()) => BackendCallResult {
-                       result: Ok(json!({})),
-                       notify: Some(RpcNotification::new(
-                           "edit.changed",
-                           json!({"reason": "trimClipIn", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
-                       )),
-                   },
-                   Err(e) => err_result(e),
-               }
-           }))
-       }
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.edit_trim_clip_in(
+                    &project_id,
+                    p.track_index,
+                    p.clip_index,
+                    p.new_frame,
+                    p.ripple,
+                ) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "trimClipIn", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
 
-       "edit.trimClipOut" => {
-           #[derive(Deserialize)]
-           #[serde(rename_all = "camelCase")]
-           struct P {
-               track_index: usize,
-               clip_index: usize,
-               new_frame: i64,
+        "edit.trimClipOut" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+                new_frame: i64,
                 #[serde(default)]
                 ripple: bool,
-           }
-           let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-           Ok(Box::new(move |b| {
-                match b.edit_trim_clip_out(&project_id, p.track_index, p.clip_index, p.new_frame, p.ripple) {
-                   Ok(()) => BackendCallResult {
-                       result: Ok(json!({})),
-                       notify: Some(RpcNotification::new(
-                           "edit.changed",
-                           json!({"reason": "trimClipOut", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
-                       )),
-                   },
-                   Err(e) => err_result(e),
-               }
-           }))
-       }
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.edit_trim_clip_out(
+                    &project_id,
+                    p.track_index,
+                    p.clip_index,
+                    p.new_frame,
+                    p.ripple,
+                ) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "trimClipOut", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
 
         "edit.splitClip" => {
             #[derive(Deserialize)]
@@ -1308,7 +1412,12 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
-                match b.transitions_add_crossfade(&project_id, p.track_index, p.between_clips, p.duration_frames) {
+                match b.transitions_add_crossfade(
+                    &project_id,
+                    p.track_index,
+                    p.between_clips,
+                    p.duration_frames,
+                ) {
                     Ok(info) => BackendCallResult {
                         result: Ok(serde_json::to_value(&info).expect("TransitionInfo serializes")),
                         notify: Some(RpcNotification::new(
@@ -1331,15 +1440,17 @@ fn build_op_ext(
                 properties: Value,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.filter_add(&project_id, &p.clip_id, &p.mlt_service, p.properties) {
-                Ok(info) => BackendCallResult {
-                    result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
-                    notify: Some(RpcNotification::new(
-                        "filter.changed",
-                        json!({"clipId": p.clip_id, "filterIndex": info.filter_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.filter_add(&project_id, &p.clip_id, &p.mlt_service, p.properties) {
+                    Ok(info) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
+                        notify: Some(RpcNotification::new(
+                            "filter.changed",
+                            json!({"clipId": p.clip_id, "filterIndex": info.filter_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1421,9 +1532,13 @@ fn build_op_ext(
                 clip_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.filter_list(&project_id, &p.clip_id) {
-                Ok(entries) => ok_result(serde_json::to_value(&entries).expect("FilterListEntry serializes")),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.filter_list(&project_id, &p.clip_id) {
+                    Ok(entries) => ok_result(
+                        serde_json::to_value(&entries).expect("FilterListEntry serializes"),
+                    ),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1487,8 +1602,11 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
-                match b.filter_list_keyframes(&project_id, &p.clip_id, p.filter_index, &p.property) {
-                    Ok(kfs) => ok_result(serde_json::to_value(&kfs).expect("KeyframeInfo serializes")),
+                match b.filter_list_keyframes(&project_id, &p.clip_id, p.filter_index, &p.property)
+                {
+                    Ok(kfs) => {
+                        ok_result(serde_json::to_value(&kfs).expect("KeyframeInfo serializes"))
+                    }
                     Err(e) => err_result(e),
                 }
             }))
@@ -1530,22 +1648,35 @@ fn build_op_ext(
             }))
         }
 
-       "generator.createTitle" => Ok(Box::new(move |b| match b.generator_create_title(&project_id, params) {
-           Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
-           Err(e) => err_result(e),
-       })),
-
-        "generator.createColor" => Ok(Box::new(move |b| match b.generator_create_color(&project_id, params) {
-            Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
-            Err(e) => err_result(e),
+        "generator.createTitle" => Ok(Box::new(move |b| {
+            match b.generator_create_title(&project_id, params) {
+                Ok(entry) => {
+                    ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes"))
+                }
+                Err(e) => err_result(e),
+            }
         })),
 
-        "subtitles.addTrack" => Ok(Box::new(move |b| match b.subtitles_add_track(&project_id) {
-            Ok(info) => BackendCallResult {
-                result: Ok(serde_json::to_value(&info).expect("SubtitleTrackInfo serializes")),
-                notify: Some(RpcNotification::new("subtitles.changed", json!({"reason": "addTrack"}))),
-            },
-            Err(e) => err_result(e),
+        "generator.createColor" => Ok(Box::new(move |b| {
+            match b.generator_create_color(&project_id, params) {
+                Ok(entry) => {
+                    ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes"))
+                }
+                Err(e) => err_result(e),
+            }
+        })),
+
+        "subtitles.addTrack" => Ok(Box::new(move |b| {
+            match b.subtitles_add_track(&project_id) {
+                Ok(info) => BackendCallResult {
+                    result: Ok(serde_json::to_value(&info).expect("SubtitleTrackInfo serializes")),
+                    notify: Some(RpcNotification::new(
+                        "subtitles.changed",
+                        json!({"reason": "addTrack"}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }
         })),
 
         "subtitles.appendItem" => {
@@ -1559,7 +1690,13 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
-                match b.subtitles_append_item(&project_id, p.track_index, p.start_frame, p.end_frame, &p.text) {
+                match b.subtitles_append_item(
+                    &project_id,
+                    p.track_index,
+                    p.start_frame,
+                    p.end_frame,
+                    &p.text,
+                ) {
                     Ok(()) => BackendCallResult {
                         result: Ok(json!({})),
                         notify: Some(RpcNotification::new(
@@ -1610,7 +1747,9 @@ fn build_op_ext(
             Ok(Box::new(move |b| {
                 match b.subtitles_import_srt(&project_id, &p.path, p.new_track) {
                     Ok(info) => BackendCallResult {
-                        result: Ok(serde_json::to_value(&info).expect("SubtitleTrackInfo serializes")),
+                        result: Ok(
+                            serde_json::to_value(&info).expect("SubtitleTrackInfo serializes")
+                        ),
                         notify: Some(RpcNotification::new(
                             "subtitles.changed",
                             json!({
@@ -1648,15 +1787,17 @@ fn build_op_ext(
                 track_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.subtitles_burn_in(&project_id, p.track_index) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({"trackIndex": p.track_index})),
-                    notify: Some(RpcNotification::new(
-                        "subtitles.changed",
-                        json!({"reason": "burnIn", "trackIndex": p.track_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.subtitles_burn_in(&project_id, p.track_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({"trackIndex": p.track_index})),
+                        notify: Some(RpcNotification::new(
+                            "subtitles.changed",
+                            json!({"reason": "burnIn", "trackIndex": p.track_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1699,13 +1840,17 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| match b.jobs_get(&p.job_id) {
-                Ok(status) => ok_result(serde_json::to_value(&status).expect("JobStatus serializes")),
+                Ok(status) => {
+                    ok_result(serde_json::to_value(&status).expect("JobStatus serializes"))
+                }
                 Err(e) => err_result(e),
             }))
         }
 
         "jobs.list" => Ok(Box::new(move |b| match b.jobs_list(&project_id) {
-            Ok(statuses) => ok_result(serde_json::to_value(&statuses).expect("job statuses serialize")),
+            Ok(statuses) => {
+                ok_result(serde_json::to_value(&statuses).expect("job statuses serialize"))
+            }
             Err(e) => err_result(e),
         })),
 
@@ -1740,9 +1885,11 @@ fn build_op_ext(
                 "jpeg".to_string()
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.playback_get_frame(&project_id, p.frame, &p.format) {
-                Ok(data_b64) => ok_result(json!({"format": p.format, "data": data_b64})),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.playback_get_frame(&project_id, p.frame, &p.format) {
+                    Ok(data_b64) => ok_result(json!({"format": p.format, "data": data_b64})),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1782,15 +1929,17 @@ fn build_op_ext(
                 marker_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.markers_remove(&project_id, p.marker_index) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new(
-                        "markers.changed",
-                        json!({"reason": "remove", "markerIndex": p.marker_index}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.markers_remove(&project_id, p.marker_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "markers.changed",
+                            json!({"reason": "remove", "markerIndex": p.marker_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1869,7 +2018,10 @@ fn build_op_ext(
         "markers.clear" => Ok(Box::new(move |b| match b.markers_clear(&project_id) {
             Ok(()) => BackendCallResult {
                 result: Ok(json!({})),
-                notify: Some(RpcNotification::new("markers.changed", json!({"reason": "clear"}))),
+                notify: Some(RpcNotification::new(
+                    "markers.changed",
+                    json!({"reason": "clear"}),
+                )),
             },
             Err(e) => err_result(e),
         })),
@@ -1886,9 +2038,13 @@ fn build_op_ext(
                 marker_index: usize,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.markers_get(&project_id, p.marker_index) {
-                Ok(marker) => ok_result(serde_json::to_value(&marker).expect("Marker serializes")),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.markers_get(&project_id, p.marker_index) {
+                    Ok(marker) => {
+                        ok_result(serde_json::to_value(&marker).expect("Marker serializes"))
+                    }
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1899,9 +2055,11 @@ fn build_op_ext(
                 from_frame: i64,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.markers_next(&project_id, p.from_frame) {
-                Ok(frame) => ok_result(json!(frame)),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.markers_next(&project_id, p.from_frame) {
+                    Ok(frame) => ok_result(json!(frame)),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1912,9 +2070,11 @@ fn build_op_ext(
                 from_frame: i64,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.markers_prev(&project_id, p.from_frame) {
-                Ok(frame) => ok_result(json!(frame)),
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.markers_prev(&project_id, p.from_frame) {
+                    Ok(frame) => ok_result(json!(frame)),
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1925,15 +2085,17 @@ fn build_op_ext(
                 path: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.recent_add(&project_id, &p.path) {
-                Ok(()) => BackendCallResult {
-                    result: Ok(json!({})),
-                    notify: Some(RpcNotification::new(
-                        "recent.changed",
-                        json!({"reason": "add", "path": p.path}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.recent_add(&project_id, &p.path) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "recent.changed",
+                            json!({"reason": "add", "path": p.path}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -1943,15 +2105,17 @@ fn build_op_ext(
                 path: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| match b.recent_remove(&project_id, &p.path) {
-                Ok(path) => BackendCallResult {
-                    result: Ok(json!({"path": path})),
-                    notify: Some(RpcNotification::new(
-                        "recent.changed",
-                        json!({"reason": "remove", "path": p.path}),
-                    )),
-                },
-                Err(e) => err_result(e),
+            Ok(Box::new(move |b| {
+                match b.recent_remove(&project_id, &p.path) {
+                    Ok(path) => BackendCallResult {
+                        result: Ok(json!({"path": path})),
+                        notify: Some(RpcNotification::new(
+                            "recent.changed",
+                            json!({"reason": "remove", "path": p.path}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 
@@ -2075,7 +2239,9 @@ async fn handle_request(
         let outcome = dispatch(
             dispatch_tx,
             Box::new(move |b| match b.project_select(&dispatch_project_id) {
-                Ok(state) => ok_result(serde_json::to_value(&state).expect("ProjectState serializes")),
+                Ok(state) => {
+                    ok_result(serde_json::to_value(&state).expect("ProjectState serializes"))
+                }
                 Err(e) => err_result(e),
             }),
         )
@@ -2113,15 +2279,69 @@ async fn handle_request(
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct P {
-            track_index: usize,
+            track_index: Option<usize>,
+            track_name: Option<String>,
         }
-        return match serde_json::from_value::<P>(req.params) {
-            Ok(p) => {
-                session.current.track_index = Some(p.track_index);
-                respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")))
-            }
-            Err(e) => respond(Err(invalid_params(&e))),
+        let p = match serde_json::from_value::<P>(req.params) {
+            Ok(p) => p,
+            Err(e) => return respond(Err(invalid_params(&e))),
         };
+        if p.track_index.is_some() == p.track_name.is_some() {
+            return respond(Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: "track.enter requires exactly one of trackIndex or trackName".into(),
+                data: None,
+            }));
+        }
+        let track_index = if let Some(index) = p.track_index {
+            index
+        } else {
+            let name = p.track_name.expect("validated trackName");
+            let lookup_project_id = project_id.clone();
+            let lookup = dispatch(
+                dispatch_tx,
+                Box::new(move |b| match b.edit_list_tracks(&lookup_project_id) {
+                    Ok(tracks) => ok_result(json!(tracks)),
+                    Err(e) => err_result(e),
+                }),
+            )
+            .await;
+            let tracks = match lookup.result {
+                Ok(value) => match serde_json::from_value::<Vec<crate::backend::Track>>(value) {
+                    Ok(tracks) => tracks,
+                    Err(e) => return respond(Err(invalid_params(&e))),
+                },
+                Err(e) => return respond(Err(e)),
+            };
+            let matches: Vec<_> = tracks
+                .iter()
+                .filter(|track| track.name.as_deref() == Some(name.as_str()))
+                .map(|track| track.index)
+                .collect();
+            match matches.as_slice() {
+                [index] => *index,
+                [] => {
+                    return respond(Err(RpcError {
+                        code: error_codes::INVALID_PARAMS,
+                        message: format!(
+                            "unknown trackName {name:?}; use trackIndex or edit.listTracks"
+                        ),
+                        data: None,
+                    }))
+                }
+                _ => {
+                    return respond(Err(RpcError {
+                        code: error_codes::INVALID_PARAMS,
+                        message: format!("trackName {name:?} is ambiguous"),
+                        data: None,
+                    }))
+                }
+            }
+        };
+        session.current.track_index = Some(track_index);
+        return respond(Ok(
+            serde_json::to_value(&session.current).expect("CurrentSelection serializes")
+        ));
     }
     if req.method == "track.exit" {
         session.current.track_index = None;
@@ -2130,7 +2350,9 @@ async fn handle_request(
         // rather than leaving a clip-id selection dangling with no track.
         session.current.clip_id = None;
         session.current.filter_index = None;
-        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+        return respond(Ok(
+            serde_json::to_value(&session.current).expect("CurrentSelection serializes")
+        ));
     }
     if req.method == "clip.enter" {
         #[derive(Deserialize)]
@@ -2141,7 +2363,9 @@ async fn handle_request(
         return match serde_json::from_value::<P>(req.params) {
             Ok(p) => {
                 session.current.clip_id = Some(p.clip_id);
-                respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")))
+                respond(Ok(
+                    serde_json::to_value(&session.current).expect("CurrentSelection serializes")
+                ))
             }
             Err(e) => respond(Err(invalid_params(&e))),
         };
@@ -2150,10 +2374,14 @@ async fn handle_request(
         session.current.clip_id = None;
         // A filter only makes sense within an entered clip.
         session.current.filter_index = None;
-        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+        return respond(Ok(
+            serde_json::to_value(&session.current).expect("CurrentSelection serializes")
+        ));
     }
     if req.method == "currentView" {
-        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+        return respond(Ok(
+            serde_json::to_value(&session.current).expect("CurrentSelection serializes")
+        ));
     }
 
     // `lock_tools_to_selection` phase: the user decided to drop the
@@ -2275,7 +2503,9 @@ fn remap_selection_after_mutation(method: &str, params: &Value, current: &mut Cu
 /// bound to a project. `tokio::select!` needs an always-pollable,
 /// cancel-safe future to race against incoming requests regardless of
 /// whether a project is currently bound, hence this small wrapper.
-async fn recv_notification(rx: &mut Option<broadcast::Receiver<RpcNotification>>) -> Option<RpcNotification> {
+async fn recv_notification(
+    rx: &mut Option<broadcast::Receiver<RpcNotification>>,
+) -> Option<RpcNotification> {
     match rx {
         Some(r) => match r.recv().await {
             Ok(n) => Some(n),
@@ -2292,9 +2522,15 @@ async fn recv_notification(rx: &mut Option<broadcast::Receiver<RpcNotification>>
 /// Dedicated writer task: owns the write half and serializes all outbound
 /// frames (responses interleaved with notifications) onto the wire for this
 /// one connection.
-async fn writer_loop<W: AsyncWrite + Unpin>(mut write_half: W, mut rx: mpsc::UnboundedReceiver<Value>) {
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut write_half: W,
+    mut rx: mpsc::UnboundedReceiver<Value>,
+) {
     while let Some(value) = rx.recv().await {
-        if framing::write_message(&mut write_half, &value).await.is_err() {
+        if framing::write_message(&mut write_half, &value)
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -2306,7 +2542,10 @@ async fn writer_loop<W: AsyncWrite + Unpin>(mut write_half: W, mut rx: mpsc::Unb
 /// receives — `framing::read_message` itself is not cancel-safe (a
 /// `select!` cancellation mid-read would silently drop already-consumed
 /// bytes), so it must not be raced directly against another future.
-async fn reader_loop<R: AsyncRead + Unpin>(read_half: R, tx: mpsc::UnboundedSender<Result<Value, FramingError>>) {
+async fn reader_loop<R: AsyncRead + Unpin>(
+    read_half: R,
+    tx: mpsc::UnboundedSender<Result<Value, FramingError>>,
+) {
     let mut reader = BufReader::new(read_half);
     loop {
         let msg = framing::read_message(&mut reader).await;
@@ -2412,7 +2651,15 @@ pub async fn serve<B: Backend + 'static>(
         if let Some(parent) = config.socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        UnixListener::bind(&config.socket_path)?
+        let listener = UnixListener::bind(&config.socket_path)?;
+        // SAP carries the per-process token and is intended for the daemon
+        // running as the same user. Keep the endpoint private to that user;
+        // callers needing cross-user access must use an explicit broker.
+        let _ = std::fs::set_permissions(
+            &config.socket_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
+        listener
     };
     #[cfg(windows)]
     let pipe_name = config.socket_path.to_string_lossy().into_owned();
@@ -2428,7 +2675,12 @@ pub async fn serve<B: Backend + 'static>(
         let channels = channels.clone();
         tokio::spawn(async move {
             while let Some(notification) = external_rx.recv().await {
-                let senders: Vec<_> = channels.lock().expect("project channel map poisoned").values().cloned().collect();
+                let senders: Vec<_> = channels
+                    .lock()
+                    .expect("project channel map poisoned")
+                    .values()
+                    .cloned()
+                    .collect();
                 for sender in senders {
                     // Fan-out only; no subscribers on a project yet is a
                     // normal, silent no-op (matches every other notify
@@ -2446,7 +2698,14 @@ pub async fn serve<B: Backend + 'static>(
         let dispatch_tx = dispatch_tx.clone();
         let channels = channels.clone();
         let token = token.clone();
-        tokio::spawn(handle_connection(read_half, write_half, dispatch_tx, channels, token, audio_enabled));
+        tokio::spawn(handle_connection(
+            read_half,
+            write_half,
+            dispatch_tx,
+            channels,
+            token,
+            audio_enabled,
+        ));
     }
 
     // Named pipes have no single long-lived listener object: each waiting
@@ -2459,7 +2718,9 @@ pub async fn serve<B: Backend + 'static>(
     // name from another process.
     #[cfg(windows)]
     {
-        let mut server = ServerOptions::new().first_pipe_instance(true).create(&pipe_name)?;
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
         loop {
             server.connect().await?;
             let connected = server;
@@ -2469,7 +2730,14 @@ pub async fn serve<B: Backend + 'static>(
             let dispatch_tx = dispatch_tx.clone();
             let channels = channels.clone();
             let token = token.clone();
-            tokio::spawn(handle_connection(read_half, write_half, dispatch_tx, channels, token, audio_enabled));
+            tokio::spawn(handle_connection(
+                read_half,
+                write_half,
+                dispatch_tx,
+                channels,
+                token,
+                audio_enabled,
+            ));
         }
     }
 }

@@ -16,25 +16,25 @@
 
 #![cfg(feature = "real_ffi")]
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_longlong, c_void};
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::process::{Child, Command, Stdio};
+use std::io::Read;
+use std::os::raw::{c_char, c_int, c_longlong, c_void};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use serde_json::json;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::backend::{
@@ -171,14 +171,21 @@ fn reset_child_signals(cmd: &mut Command) {
             libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            // Sever every inherited fd above stderr -- in particular the
-            // GPU dma-buf/sync-fence fds the live Qt process holds open
-            // (see doc comment above). `close_range` is a single
-            // async-signal-safe syscall (glibc >= 2.34 wraps it
-            // directly); a negative return here is not fatal to melt
-            // itself (worst case some fd leaks through), so it is
-            // deliberately not treated as a hard error.
-            libc::close_range(3, libc::c_uint::MAX, 0);
+            // Mark every inherited fd above stderr close-on-exec -- in
+            // particular the GPU dma-buf/sync-fence fds the live Qt process
+            // holds open (see doc comment above). Do not close these fds
+            // immediately: Rust's Command implementation keeps its own
+            // exec-error pipe above fd 2 until exec succeeds. Closing that
+            // pipe masks the real exec errno and makes a failed melt
+            // launch abort with `output.write(&bytes).is_ok()` (SIGABRT).
+            // `close_range` is a single async-signal-safe syscall (glibc >=
+            // 2.34 wraps it directly); a negative return is deliberately
+            // non-fatal, so the worst case is that some fd leaks through.
+            libc::close_range(
+                3,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            );
             Ok(())
         });
     }
@@ -388,7 +395,9 @@ impl FfiBackend {
         if raw.is_null() {
             return Err(BackendError::NotFound(not_found_msg.to_string()));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<Marker>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad marker JSON: {e}")))
@@ -449,7 +458,9 @@ impl FfiBackend {
             if raw.is_null() {
                 return Err(BackendError::NotFound(format!("playlist index {index}")));
             }
-            let xml = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+            let xml = unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned();
             unsafe { ffi::sap_free_string(raw) };
             let c_xml = CString::new(xml).map_err(|e| {
                 BackendError::InvalidParams(format!("invalid resolved playlist xml: {e}"))
@@ -597,7 +608,9 @@ impl Backend for FfiBackend {
             "video" => unsafe { ffi::sap_add_video_track(self.main_window) },
             "audio" => unsafe { ffi::sap_add_audio_track(self.main_window) },
             other => {
-                return Err(BackendError::InvalidParams(format!("bad track kind: {other}")));
+                return Err(BackendError::InvalidParams(format!(
+                    "bad track kind: {other}"
+                )));
             }
         };
         if index < 0 {
@@ -606,6 +619,7 @@ impl Backend for FfiBackend {
         Ok(Track {
             index: index as usize,
             kind: kind.to_string(),
+            name: None,
             muted: false,
             hidden: false,
             locked: false,
@@ -622,12 +636,19 @@ impl Backend for FfiBackend {
         }
     }
 
-    fn edit_reorder_track(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<Vec<Track>> {
+    fn edit_reorder_track(
+        &mut self,
+        project_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> BackendResult<Vec<Track>> {
         let rc = unsafe {
             ffi::sap_reorder_track(self.main_window, from_index as c_int, to_index as c_int)
         };
         if rc != 0 {
-            return Err(BackendError::NotFound(format!("track {from_index} or {to_index}")));
+            return Err(BackendError::NotFound(format!(
+                "track {from_index} or {to_index}"
+            )));
         }
         self.edit_list_tracks(project_id)
     }
@@ -648,19 +669,25 @@ impl Backend for FfiBackend {
         // tracks (trackpropertieswidget.cpp), which needs its own
         // transition-lookup C-ABI function not yet added here.
         if let Some(v) = muted {
-            let rc = unsafe { ffi::sap_set_track_muted(self.main_window, track_index as c_int, v as c_int) };
+            let rc = unsafe {
+                ffi::sap_set_track_muted(self.main_window, track_index as c_int, v as c_int)
+            };
             if rc != 0 {
                 return Err(BackendError::NotFound(format!("track {track_index}")));
             }
         }
         if let Some(v) = hidden {
-            let rc = unsafe { ffi::sap_set_track_hidden(self.main_window, track_index as c_int, v as c_int) };
+            let rc = unsafe {
+                ffi::sap_set_track_hidden(self.main_window, track_index as c_int, v as c_int)
+            };
             if rc != 0 {
                 return Err(BackendError::NotFound(format!("track {track_index}")));
             }
         }
         if let Some(v) = locked {
-            let rc = unsafe { ffi::sap_set_track_locked(self.main_window, track_index as c_int, v as c_int) };
+            let rc = unsafe {
+                ffi::sap_set_track_locked(self.main_window, track_index as c_int, v as c_int)
+            };
             if rc != 0 {
                 return Err(BackendError::NotFound(format!("track {track_index}")));
             }
@@ -673,7 +700,11 @@ impl Backend for FfiBackend {
             let c_mode = CString::new(v)
                 .map_err(|e| BackendError::InvalidParams(format!("bad blendMode: {e}")))?;
             let rc = unsafe {
-                ffi::sap_set_track_blend_mode(self.main_window, track_index as c_int, c_mode.as_ptr())
+                ffi::sap_set_track_blend_mode(
+                    self.main_window,
+                    track_index as c_int,
+                    c_mode.as_ptr(),
+                )
             };
             if rc != 0 {
                 return Err(BackendError::NotFound(format!(
@@ -701,12 +732,19 @@ impl Backend for FfiBackend {
         Ok(())
     }
 
-    fn edit_remove_clip(&mut self, _project_id: &str, track_index: usize, clip_index: usize) -> BackendResult<()> {
+    fn edit_remove_clip(
+        &mut self,
+        _project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+    ) -> BackendResult<()> {
         let rc = unsafe {
             ffi::sap_remove_clip(self.main_window, track_index as c_int, clip_index as c_int)
         };
         if rc != 0 {
-            return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+            return Err(BackendError::NotFound(format!(
+                "clip {track_index}/{clip_index}"
+            )));
         }
         Ok(())
     }
@@ -738,7 +776,9 @@ impl Backend for FfiBackend {
                 "moveClip {from_track_index}/{from_clip_index} -> {to_track_index}/{to_clip_index} rejected"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         #[derive(serde::Deserialize)]
         struct MoveClipResult {
@@ -766,7 +806,9 @@ impl Backend for FfiBackend {
         if raw.is_null() {
             return Err(BackendError::NotFound("track list unavailable".into()));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<Vec<Track>>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad track list JSON: {e}")))
@@ -797,7 +839,9 @@ impl Backend for FfiBackend {
                 "failed to append clip from {source} to track {track_index} (invalid track, or source did not resolve to a valid MLT producer)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
 
         #[derive(serde::Deserialize)]
@@ -857,7 +901,9 @@ impl Backend for FfiBackend {
                 "failed to insert clip from {source} at {track_index}/{clip_index} (invalid track/clipIndex, locked track, or source did not resolve to a valid MLT producer)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
 
         #[derive(serde::Deserialize)]
@@ -917,7 +963,9 @@ impl Backend for FfiBackend {
                 "failed to overwrite clip at {track_index}/{clip_index} with {source} (invalid track/clipIndex, locked track, or source did not resolve to a valid MLT producer)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
 
         #[derive(serde::Deserialize)]
@@ -940,12 +988,18 @@ impl Backend for FfiBackend {
         })
     }
 
-    fn edit_list_clips(&mut self, _project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
+    fn edit_list_clips(
+        &mut self,
+        _project_id: &str,
+        track_index: usize,
+    ) -> BackendResult<Vec<Clip>> {
         let raw = unsafe { ffi::sap_list_clips(self.main_window, track_index as c_int) };
         if raw.is_null() {
             return Err(BackendError::NotFound(format!("track {track_index}")));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -982,18 +1036,25 @@ impl Backend for FfiBackend {
     fn notes_get_text(&mut self, _project_id: &str) -> BackendResult<String> {
         let raw = unsafe { ffi::sap_notes_get_text(self.main_window) };
         if raw.is_null() {
-            return Err(BackendError::InvalidParams("notes.getText failed (invalid handle)".into()));
+            return Err(BackendError::InvalidParams(
+                "notes.getText failed (invalid handle)".into(),
+            ));
         }
-        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         Ok(text)
     }
 
     fn notes_set_text(&mut self, _project_id: &str, text: &str) -> BackendResult<()> {
-        let c_text = CString::new(text).map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let c_text = CString::new(text)
+            .map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
         let rc = unsafe { ffi::sap_notes_set_text(self.main_window, c_text.as_ptr()) };
         if rc != 0 {
-            return Err(BackendError::InvalidParams("notes.setText failed (invalid handle)".into()));
+            return Err(BackendError::InvalidParams(
+                "notes.setText failed (invalid handle)".into(),
+            ));
         }
         Ok(())
     }
@@ -1027,7 +1088,9 @@ impl Backend for FfiBackend {
                 "failed to append {path} to playlist (did not open as a valid MLT producer)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         Self::parse_playlist_entry(&json_str, source)
     }
@@ -1037,14 +1100,20 @@ impl Backend for FfiBackend {
         if raw.is_null() {
             return Err(BackendError::NotFound("playlist unavailable".into()));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         let entries: Vec<Value> = serde_json::from_str(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad playlist-list JSON: {e}")))?;
         entries
             .into_iter()
             .map(|entry| {
-                let path = entry.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
+                let path = entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 Self::parse_playlist_entry_value(entry, json!({"path": path}))
             })
             .collect()
@@ -1069,13 +1138,16 @@ impl Backend for FfiBackend {
             .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
         let c_path = CString::new(path)
             .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
-        let raw = unsafe { ffi::sap_playlist_insert(self.main_window, index as c_int, c_path.as_ptr()) };
+        let raw =
+            unsafe { ffi::sap_playlist_insert(self.main_window, index as c_int, c_path.as_ptr()) };
         if raw.is_null() {
             return Err(BackendError::InvalidParams(format!(
                 "failed to insert {path} at playlist index {index} (out of range, or not a valid MLT producer)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         Self::parse_playlist_entry(&json_str, source)
     }
@@ -1088,32 +1160,53 @@ impl Backend for FfiBackend {
         Ok(())
     }
 
-    fn playlist_move(&mut self, _project_id: &str, from_index: usize, to_index: usize) -> BackendResult<()> {
+    fn playlist_move(
+        &mut self,
+        _project_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> BackendResult<()> {
         let rc = unsafe {
             ffi::sap_playlist_move(self.main_window, from_index as c_int, to_index as c_int)
         };
         if rc != 0 {
-            return Err(BackendError::NotFound(format!("playlist index {from_index} or {to_index}")));
+            return Err(BackendError::NotFound(format!(
+                "playlist index {from_index} or {to_index}"
+            )));
         }
         Ok(())
     }
 
-    fn playlist_get(&mut self, _project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail> {
+    fn playlist_get(
+        &mut self,
+        _project_id: &str,
+        index: usize,
+    ) -> BackendResult<PlaylistEntryDetail> {
         let raw = unsafe { ffi::sap_playlist_get(self.main_window, index as c_int) };
         if raw.is_null() {
             return Err(BackendError::NotFound(format!("playlist index {index}")));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         let value: Value = serde_json::from_str(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad playlist-get JSON: {e}")))?;
-        let path = value.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
+        let path = value
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let entry = Self::parse_playlist_entry_value(value, json!({"path": path.clone()}))?;
         // Reuse the same real ffprobe-backed helper file.probe uses -- only
         // meaningful for file-backed sources, same honesty policy as
         // MltBackend::playlist_get (a generator/title/blank-spacer entry
         // has no real file to probe, so `probe` is honestly `None`).
-        let probe = if path.is_empty() { None } else { crate::media_tools::probe_media(&path).ok() };
+        let probe = if path.is_empty() {
+            None
+        } else {
+            crate::media_tools::probe_media(&path).ok()
+        };
         Ok(PlaylistEntryDetail {
             index: entry.index,
             name: entry.name,
@@ -1165,15 +1258,15 @@ impl Backend for FfiBackend {
         self.playlist_append(project_id, json!({"path": canonical_path}), None)
     }
 
-   fn edit_trim_clip_in(
-       &mut self,
-       _project_id: &str,
-       track_index: usize,
-       clip_index: usize,
-       new_frame: i64,
+    fn edit_trim_clip_in(
+        &mut self,
+        _project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
         ripple: bool,
-   ) -> BackendResult<()> {
-       let rc = unsafe {
+    ) -> BackendResult<()> {
+        let rc = unsafe {
             ffi::sap_trim_clip_in(
                 self.main_window,
                 track_index as c_int,
@@ -1181,24 +1274,24 @@ impl Backend for FfiBackend {
                 new_frame as i64,
                 ripple as c_int,
             )
-       };
-       if rc != 0 {
-           return Err(BackendError::NotFound(format!(
-               "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
-           )));
-       }
-       Ok(())
-   }
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
+            )));
+        }
+        Ok(())
+    }
 
-   fn edit_trim_clip_out(
-       &mut self,
-       _project_id: &str,
-       track_index: usize,
-       clip_index: usize,
-       new_frame: i64,
+    fn edit_trim_clip_out(
+        &mut self,
+        _project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
         ripple: bool,
-   ) -> BackendResult<()> {
-       let rc = unsafe {
+    ) -> BackendResult<()> {
+        let rc = unsafe {
             ffi::sap_trim_clip_out(
                 self.main_window,
                 track_index as c_int,
@@ -1206,12 +1299,12 @@ impl Backend for FfiBackend {
                 new_frame as i64,
                 ripple as c_int,
             )
-       };
-       if rc != 0 {
-           return Err(BackendError::NotFound(format!(
-               "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
-           )));
-       }
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
+            )));
+        }
         Ok(())
     }
 
@@ -1223,14 +1316,21 @@ impl Backend for FfiBackend {
         position: i64,
     ) -> BackendResult<SplitClipResult> {
         let raw = unsafe {
-            ffi::sap_split_clip(self.main_window, track_index as c_int, clip_index as c_int, position)
+            ffi::sap_split_clip(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                position,
+            )
         };
         if raw.is_null() {
             return Err(BackendError::InvalidParams(format!(
                 "split of clip {track_index}/{clip_index} at {position} rejected (invalid clip, or position not inside the clip)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -1263,7 +1363,9 @@ impl Backend for FfiBackend {
             ));
         }
         if duration_frames <= 0 {
-            return Err(BackendError::InvalidParams("durationFrames must be positive".into()));
+            return Err(BackendError::InvalidParams(
+                "durationFrames must be positive".into(),
+            ));
         }
         let raw = unsafe {
             ffi::sap_transitions_add_crossfade(
@@ -1281,7 +1383,9 @@ impl Backend for FfiBackend {
                 between_clips.0, between_clips.1
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<TransitionInfo>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad crossfade JSON: {e}")))
@@ -1315,7 +1419,9 @@ impl Backend for FfiBackend {
                 "failed to attach filter {mlt_service} to clip {clip_id}"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<FilterInfo>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad filter-add JSON: {e}")))
@@ -1405,9 +1511,13 @@ impl Backend for FfiBackend {
             ffi::sap_filter_list(self.main_window, track_index as c_int, clip_index as c_int)
         };
         if raw.is_null() {
-            return Err(BackendError::NotFound(format!("clip {clip_id} unavailable")));
+            return Err(BackendError::NotFound(format!(
+                "clip {clip_id} unavailable"
+            )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -1442,10 +1552,17 @@ impl Backend for FfiBackend {
     ) -> BackendResult<()> {
         let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
         let rc = unsafe {
-            ffi::sap_filter_remove(self.main_window, track_index as c_int, clip_index as c_int, filter_index as c_int)
+            ffi::sap_filter_remove(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                filter_index as c_int,
+            )
         };
         if rc != 0 {
-            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id} unavailable")));
+            return Err(BackendError::NotFound(format!(
+                "filter {filter_index} on clip {clip_id} unavailable"
+            )));
         }
         Ok(())
     }
@@ -1499,7 +1616,9 @@ impl Backend for FfiBackend {
                 "filter {filter_index} on clip {clip_id} unavailable"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<Vec<KeyframeInfo>>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad keyframe-list JSON: {e}")))
@@ -1534,30 +1653,49 @@ impl Backend for FfiBackend {
         Ok(())
     }
 
-
     fn clip_length_frames(&mut self, _project_id: &str, clip_id: &str) -> BackendResult<i64> {
         let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
         let frames = unsafe {
             ffi::sap_clip_length_frames(self.main_window, track_index as c_int, clip_index as c_int)
         };
         if frames < 0 {
-            return Err(BackendError::NotFound(format!("clip {clip_id} unavailable")));
+            return Err(BackendError::NotFound(format!(
+                "clip {clip_id} unavailable"
+            )));
         }
         Ok(frames)
     }
 
-    fn generator_create_title(&mut self, _project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
-        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("simple").to_string();
+    fn generator_create_title(
+        &mut self,
+        _project_id: &str,
+        params: Value,
+    ) -> BackendResult<PlaylistEntry> {
+        let mode = params
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("simple")
+            .to_string();
         let text = params
             .get("text")
             .or_else(|| params.get("html"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BackendError::InvalidParams("generator.createTitle requires text (or html)".into()))?
+            .ok_or_else(|| {
+                BackendError::InvalidParams("generator.createTitle requires text (or html)".into())
+            })?
             .to_string();
-        let fg = params.get("fgColour").and_then(|v| v.as_str()).map(str::to_string);
-        let bg = params.get("bgColour").and_then(|v| v.as_str()).map(str::to_string);
-        let c_mode = CString::new(mode).map_err(|e| BackendError::InvalidParams(format!("bad mode: {e}")))?;
-        let c_text = CString::new(text).map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let fg = params
+            .get("fgColour")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let bg = params
+            .get("bgColour")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let c_mode = CString::new(mode)
+            .map_err(|e| BackendError::InvalidParams(format!("bad mode: {e}")))?;
+        let c_text = CString::new(text)
+            .map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
         let c_fg = fg
             .map(CString::new)
             .transpose()
@@ -1571,44 +1709,67 @@ impl Backend for FfiBackend {
                 self.main_window,
                 c_mode.as_ptr(),
                 c_text.as_ptr(),
-                c_fg.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
-                c_bg.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+                c_fg.as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                c_bg.as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
             )
         };
         if raw.is_null() {
-            return Err(BackendError::InvalidParams("generator.createTitle failed (no playlist bin?)".into()));
+            return Err(BackendError::InvalidParams(
+                "generator.createTitle failed (no playlist bin?)".into(),
+            ));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
-       serde_json::from_str::<PlaylistEntry>(&json_str)
-           .map_err(|e| BackendError::InvalidParams(format!("bad generator-create-title JSON: {e}")))
-   }
+        serde_json::from_str::<PlaylistEntry>(&json_str).map_err(|e| {
+            BackendError::InvalidParams(format!("bad generator-create-title JSON: {e}"))
+        })
+    }
 
-    fn generator_create_color(&mut self, _project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+    fn generator_create_color(
+        &mut self,
+        _project_id: &str,
+        params: Value,
+    ) -> BackendResult<PlaylistEntry> {
         let hex = params
             .get("hexColor")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BackendError::InvalidParams("generator.createColor requires hexColor".into()))?
+            .ok_or_else(|| {
+                BackendError::InvalidParams("generator.createColor requires hexColor".into())
+            })?
             .to_string();
-        let c_hex = CString::new(hex).map_err(|e| BackendError::InvalidParams(format!("bad hexColor: {e}")))?;
+        let c_hex = CString::new(hex)
+            .map_err(|e| BackendError::InvalidParams(format!("bad hexColor: {e}")))?;
         let raw = unsafe { ffi::sap_generator_create_color(self.main_window, c_hex.as_ptr()) };
         if raw.is_null() {
-            return Err(BackendError::InvalidParams("generator.createColor failed (no playlist bin?)".into()));
+            return Err(BackendError::InvalidParams(
+                "generator.createColor failed (no playlist bin?)".into(),
+            ));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
-        serde_json::from_str::<PlaylistEntry>(&json_str)
-            .map_err(|e| BackendError::InvalidParams(format!("bad generator-create-color JSON: {e}")))
+        serde_json::from_str::<PlaylistEntry>(&json_str).map_err(|e| {
+            BackendError::InvalidParams(format!("bad generator-create-color JSON: {e}"))
+        })
     }
 
-   fn subtitles_add_track(&mut self, _project_id: &str) -> BackendResult<SubtitleTrackInfo> {
+    fn subtitles_add_track(&mut self, _project_id: &str) -> BackendResult<SubtitleTrackInfo> {
         let raw = unsafe { ffi::sap_subtitles_add_track(self.main_window) };
         if raw.is_null() {
             return Err(BackendError::NotFound(
                 "subtitles.addTrack unavailable (no clip on the timeline yet?)".into(),
             ));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<SubtitleTrackInfo>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad subtitles-add-track JSON: {e}")))
@@ -1622,7 +1783,8 @@ impl Backend for FfiBackend {
         end_frame: i64,
         text: &str,
     ) -> BackendResult<()> {
-        let c_text = CString::new(text).map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let c_text = CString::new(text)
+            .map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
         let rc = unsafe {
             ffi::sap_subtitles_append_item(
                 self.main_window,
@@ -1633,7 +1795,9 @@ impl Backend for FfiBackend {
             )
         };
         if rc != 0 {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index} unavailable")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index} unavailable"
+            )));
         }
         Ok(())
     }
@@ -1649,7 +1813,11 @@ impl Backend for FfiBackend {
         let c_indices = CString::new(indices_json)
             .map_err(|e| BackendError::InvalidParams(format!("bad item_indices: {e}")))?;
         let rc = unsafe {
-            ffi::sap_subtitles_remove_items(self.main_window, track_index as c_int, c_indices.as_ptr())
+            ffi::sap_subtitles_remove_items(
+                self.main_window,
+                track_index as c_int,
+                c_indices.as_ptr(),
+            )
         };
         if rc != 0 {
             return Err(BackendError::InvalidParams(format!(
@@ -1667,7 +1835,8 @@ impl Backend for FfiBackend {
         path: &str,
         new_track: bool,
     ) -> BackendResult<SubtitleTrackInfo> {
-        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
         let raw = unsafe {
             ffi::sap_subtitles_import_srt(self.main_window, c_path.as_ptr(), new_track as c_int)
         };
@@ -1676,7 +1845,9 @@ impl Backend for FfiBackend {
                 "subtitles.importSrt failed for {path} (unreadable, no cues, or no timeline clip yet)"
             )));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<SubtitleTrackInfo>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad subtitles-import-srt JSON: {e}")))
@@ -1688,14 +1859,19 @@ impl Backend for FfiBackend {
         path: &str,
         track_index: usize,
     ) -> BackendResult<String> {
-        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
         let raw = unsafe {
             ffi::sap_subtitles_export_srt(self.main_window, track_index as c_int, c_path.as_ptr())
         };
         if raw.is_null() {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index} unavailable")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index} unavailable"
+            )));
         }
-        let out = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let out = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         Ok(out)
     }
@@ -1703,7 +1879,9 @@ impl Backend for FfiBackend {
     fn subtitles_burn_in(&mut self, _project_id: &str, track_index: usize) -> BackendResult<()> {
         let rc = unsafe { ffi::sap_subtitles_burn_in(self.main_window, track_index as c_int) };
         if rc != 0 {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index} unavailable")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index} unavailable"
+            )));
         }
         Ok(())
     }
@@ -1719,9 +1897,11 @@ impl Backend for FfiBackend {
         // primitive, sap_export_project_xml), written to a scratch dir
         // rather than the project's own file -- exporting must never
         // clobber whatever the user has open.
-        let scratch_dir = std::env::temp_dir().join(format!("sap-ffi-export-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&scratch_dir)
-            .map_err(|e| BackendError::InvalidParams(format!("failed to create export scratch dir: {e}")))?;
+        let scratch_dir =
+            std::env::temp_dir().join(format!("sap-ffi-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch_dir).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to create export scratch dir: {e}"))
+        })?;
         let mlt_path = scratch_dir.join("project.mlt");
         let c_mlt_path = CString::new(mlt_path.to_string_lossy().into_owned())
             .map_err(|e| BackendError::InvalidParams(format!("bad scratch path: {e}")))?;
@@ -1753,18 +1933,24 @@ impl Backend for FfiBackend {
                     .join(output_path)
             };
             if resolved.extension().is_none() {
-                resolved.set_extension(if container.is_empty() { "mp4" } else { container });
+                resolved.set_extension(if container.is_empty() {
+                    "mp4"
+                } else {
+                    container
+                });
             }
             resolved
         };
         if let Some(parent) = resolved_output.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| BackendError::InvalidParams(format!("failed to create export dir: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                BackendError::InvalidParams(format!("failed to create export dir: {e}"))
+            })?;
         }
 
         let vcodec = crate::media_tools::normalize_vcodec(codec);
         let melt_bin = crate::media_tools::resolve_melt_binary();
-        let qt_platform = std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
+        let qt_platform =
+            std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
 
         let mut cmd = Command::new(&melt_bin);
         cmd.arg(&mlt_path)
@@ -1795,8 +1981,11 @@ impl Backend for FfiBackend {
         }
         reset_child_signals(&mut cmd);
 
-        let (child, stderr_buf) = spawn_melt_draining_stderr(cmd)
-            .map_err(|e| BackendError::InvalidParams(format!("failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)")))?;
+        let (child, stderr_buf) = spawn_melt_draining_stderr(cmd).map_err(|e| {
+            BackendError::InvalidParams(format!(
+                "failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)"
+            ))
+        })?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
         let evicted = {
@@ -1877,7 +2066,9 @@ impl Backend for FfiBackend {
             let mut attempt = 1u32;
             let mut current_stderr_buf = stderr_buf;
             let outcome = 'attempts: loop {
-                let mut last_size = fs::metadata(&resolved_output_bg).map(|m| m.len()).unwrap_or(0);
+                let mut last_size = fs::metadata(&resolved_output_bg)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 let mut last_progress_at = Instant::now();
                 let per_attempt_outcome = loop {
                     let mut guard = child_slot.lock().expect("job child mutex poisoned");
@@ -1901,7 +2092,9 @@ impl Backend for FfiBackend {
                                 break Some(Ok((status, stderr)));
                             }
                             Ok(None) => {
-                                let size = fs::metadata(&resolved_output_bg).map(|m| m.len()).unwrap_or(0);
+                                let size = fs::metadata(&resolved_output_bg)
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
                                 if size != last_size {
                                     last_size = size;
                                     last_progress_at = Instant::now();
@@ -1909,7 +2102,8 @@ impl Backend for FfiBackend {
                                 if last_progress_at.elapsed() >= STALL_TIMEOUT {
                                     // Stalled: reclaim and kill this attempt's
                                     // child, then either retry or give up.
-                                    let mut stalled = guard.take().expect("child present while stalled");
+                                    let mut stalled =
+                                        guard.take().expect("child present while stalled");
                                     drop(guard);
                                     let _ = stalled.kill();
                                     let _ = stalled.wait();
@@ -1922,7 +2116,7 @@ impl Backend for FfiBackend {
                                 *guard = None;
                                 break Some(Err(e));
                             }
-                        }
+                        },
                     }
                 };
                 match per_attempt_outcome {
@@ -1938,7 +2132,8 @@ impl Backend for FfiBackend {
                         match spawn_melt_draining_stderr(build_cmd()) {
                             Ok((fresh_child, fresh_stderr_buf)) => {
                                 current_stderr_buf = fresh_stderr_buf;
-                                *child_slot.lock().expect("job child mutex poisoned") = Some(fresh_child);
+                                *child_slot.lock().expect("job child mutex poisoned") =
+                                    Some(fresh_child);
                             }
                             Err(e) => {
                                 break 'attempts Err(e);
@@ -1957,8 +2152,9 @@ impl Backend for FfiBackend {
                     Ok((status, stderr)) if status.success() => {
                         if let Some(bad) = crate::media_tools::detect_unrecognised_codec(&stderr) {
                             job.status = "error".into();
-                            job.error =
-                                Some(format!("melt exited 0 but dropped a stream: {bad} (stderr: {stderr})"));
+                            job.error = Some(format!(
+                                "melt exited 0 but dropped a stream: {bad} (stderr: {stderr})"
+                            ));
                         } else {
                             job.status = "done".into();
                             job.percent = 100.0;
@@ -2000,7 +2196,13 @@ impl Backend for FfiBackend {
         // comment -- the embedded process has exactly one live project),
         // so this returns every job this backend has ever spawned, unlike
         // MltBackend's project-scoped filter.
-        let mut jobs: Vec<JobStatus> = self.jobs.lock().expect("jobs mutex poisoned").values().cloned().collect();
+        let mut jobs: Vec<JobStatus> = self
+            .jobs
+            .lock()
+            .expect("jobs mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
         jobs.sort_by(|a, b| a.job_id.cmp(&b.job_id));
         Ok(jobs)
     }
@@ -2008,7 +2210,9 @@ impl Backend for FfiBackend {
     fn jobs_stop(&mut self, _job_id: &str) -> BackendResult<()> {
         {
             let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
-            let job = jobs.get_mut(_job_id).ok_or_else(|| BackendError::NotFound(format!("job {_job_id}")))?;
+            let job = jobs
+                .get_mut(_job_id)
+                .ok_or_else(|| BackendError::NotFound(format!("job {_job_id}")))?;
             if job.status != "running" {
                 return Ok(()); // Already terminal -- idempotent success.
             }
@@ -2041,7 +2245,12 @@ impl Backend for FfiBackend {
             .map_err(|e| BackendError::InvalidParams(format!("invalid format: {e}")))?;
         let mut out_len: c_int = 0;
         let raw = unsafe {
-            ffi::sap_get_frame(self.main_window, frame, c_format.as_ptr(), &mut out_len as *mut c_int)
+            ffi::sap_get_frame(
+                self.main_window,
+                frame,
+                c_format.as_ptr(),
+                &mut out_len as *mut c_int,
+            )
         };
         if raw.is_null() || out_len <= 0 {
             return Err(BackendError::InvalidParams(format!(
@@ -2136,8 +2345,8 @@ impl Backend for FfiBackend {
         marker_index: usize,
         color: &str,
     ) -> BackendResult<Marker> {
-        let c_color =
-            CString::new(color).map_err(|e| BackendError::InvalidParams(format!("bad color: {e}")))?;
+        let c_color = CString::new(color)
+            .map_err(|e| BackendError::InvalidParams(format!("bad color: {e}")))?;
         let raw = unsafe {
             ffi::sap_markers_set_color(self.main_window, marker_index as c_int, c_color.as_ptr())
         };
@@ -2157,7 +2366,9 @@ impl Backend for FfiBackend {
         if raw.is_null() {
             return Err(BackendError::NotFound("no active project/timeline".into()));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<Vec<Marker>>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad markers-list JSON: {e}")))
@@ -2179,21 +2390,27 @@ impl Backend for FfiBackend {
     }
 
     fn recent_add(&mut self, _project_id: &str, path: &str) -> BackendResult<()> {
-        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
         let rc = unsafe { ffi::sap_recent_add(self.main_window, c_path.as_ptr()) };
         if rc != 0 {
-            return Err(BackendError::InvalidParams("recent.add failed (invalid handle)".into()));
+            return Err(BackendError::InvalidParams(
+                "recent.add failed (invalid handle)".into(),
+            ));
         }
         Ok(())
     }
 
     fn recent_remove(&mut self, _project_id: &str, path: &str) -> BackendResult<String> {
-        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
         let raw = unsafe { ffi::sap_recent_remove(self.main_window, c_path.as_ptr()) };
         if raw.is_null() {
             return Err(BackendError::NotFound(format!("recent path {path}")));
         }
-        let out = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let out = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         Ok(out)
     }
@@ -2201,9 +2418,13 @@ impl Backend for FfiBackend {
     fn recent_list(&mut self, _project_id: &str) -> BackendResult<Vec<String>> {
         let raw = unsafe { ffi::sap_recent_list(self.main_window) };
         if raw.is_null() {
-            return Err(BackendError::InvalidParams("recent.list failed (invalid handle)".into()));
+            return Err(BackendError::InvalidParams(
+                "recent.list failed (invalid handle)".into(),
+            ));
         }
-        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<Vec<String>>(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad recent-list JSON: {e}")))
@@ -2262,9 +2483,14 @@ pub unsafe extern "C" fn sap_start_server(
     // connect() call (main.cpp connects it before spawning this very
     // thread) has somewhere to land rather than racing the mutex init.
     let (notify_tx, notify_rx) = mpsc::unbounded_channel::<RpcNotification>();
-    *NOTIFY_BRIDGE_TX.lock().expect("notify bridge mutex poisoned") = Some(notify_tx);
+    *NOTIFY_BRIDGE_TX
+        .lock()
+        .expect("notify bridge mutex poisoned") = Some(notify_tx);
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("sap-rust: failed to start tokio runtime: {e}");
@@ -2342,8 +2568,16 @@ fn base64_encode(bytes: &[u8]) -> String {
         let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
         out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

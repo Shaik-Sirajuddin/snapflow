@@ -885,20 +885,16 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 }
             }
             Effect::ArchiveThread {
-                real_index,
+                thread_id,
                 archived,
             } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // Keep main's toggle-capable archive (archived=false
                     // resumes) and adopt the audit branch's failure surfacing
                     // into Dirty::Error via StateEffectFailed.
-                    let thread_id = bridge
-                        .thread_binding(real_index)
-                        .map(|binding| binding.thread_id)
-                        .unwrap_or_default();
-                    if !bridge.set_thread_archived(real_index, archived) {
+                    if !bridge.set_thread_archived_by_id(&thread_id, archived) {
                         let message =
-                            format!("failed to set thread {real_index} archived={archived}");
+                            format!("failed to set thread {thread_id} archived={archived}");
                         eprintln!("panel-rust: {message}");
                         let _ = update_persistent(
                             panel,

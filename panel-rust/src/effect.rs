@@ -60,7 +60,7 @@ pub enum Effect {
         real_index: usize,
     },
     ArchiveThread {
-        real_index: usize,
+        thread_id: String,
         archived: bool,
     },
     RenameThread {
@@ -326,7 +326,8 @@ pub enum EffectResultMsg {
     /// call fails, NO slot was ever pushed, so leaving the row in place
     /// (the `SessionAttached` Err pattern) permanently shifts every later
     /// real_index one off from its actual bridge slot -- e.g. a later
-    /// `ArchiveThread { real_index }` effect lands on a DIFFERENT
+    /// `ArchiveThread { thread_id }` effect resolves the durable slot rather
+    /// than a mutable row index, so it cannot land on a DIFFERENT
     /// thread's slot than the one the user archived. The fold for this
     /// variant removes the orphaned row instead, restoring alignment.
     ThreadCreationFailed {

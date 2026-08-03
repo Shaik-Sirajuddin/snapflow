@@ -100,7 +100,10 @@ type Manager struct {
 	// "<instanceID>.log" per launched child), config.Config.LogDir. Empty
 	// means "discard" (kept for callers/tests that don't care about logs),
 	// matching the old nil-Stdout/Stderr behavior.
-	LogDir string
+	// HomeDir is the daemon's resolved runtime home. It is propagated to
+	// managed GUI children because their HOME is intentionally sandboxed.
+	LogDir  string
+	HomeDir string
 
 	// ConnectTimeout bounds the poll-connect health check performed right
 	// after spawning (the v1 simplification described in the package doc).
@@ -362,6 +365,12 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_PROJECT_TYPE="+opts.ProjectType,
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
+	if m.HomeDir != "" {
+		cmd.Env = append(cmd.Env,
+			"SNAPSHOTD_HOME="+m.HomeDir,
+			"SNAPSHOTD_CONTROL_SOCKET="+filepath.Join(m.HomeDir, "control.sock"),
+		)
+	}
 	// The child's own embedded chat panel (panel-rust's agent_bridge.rs)
 	// spawns its own per-provider acpx-server gateways and, for the
 	// "codex" provider, tries to read $HOME/.codex/auth.json for

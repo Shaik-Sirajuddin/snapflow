@@ -473,6 +473,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon: open registry: %w", err)
 	}
 	pm := procmgr.New(reg, cfg.SnapshotBinPath, cfg.RunDir, cfg.LogDir)
+	pm.HomeDir = cfg.HomeDir
 	if cfg.LaunchConnectTimeout > 0 {
 		pm.ConnectTimeout = cfg.LaunchConnectTimeout
 	}
@@ -975,9 +976,104 @@ func (d *Daemon) resolveOrRegisterProjectByPath(path string) (registry.Project, 
 	return proj, nil
 }
 
-// List implements daemon.list (list of running/known process instances).
-func (d *Daemon) List(ctx context.Context) ([]registry.ProcessInstance, error) {
-	return d.Proc.List()
+// InstanceListParams filters the unified daemon.list inventory. A nil Active
+// value means "all"; true/false selects live/active or inactive rows.
+type InstanceListParams struct {
+	Active *bool `json:"active"`
+}
+
+// InstanceListItem is the protocol-level union of a daemon-owned process and
+// an independently launched GUI. External rows deliberately omit SAP tokens:
+// the daemon keeps those credentials in its registry and uses them internally
+// for MCP/SAP proxying.
+type InstanceListItem struct {
+	ID          string    `json:"id"`
+	Kind        string    `json:"kind"` // "daemon" or "external"
+	ProjectID   string    `json:"projectId,omitempty"`
+	ProjectPath string    `json:"projectPath,omitempty"`
+	PID         int       `json:"pid"`
+	SocketPath  string    `json:"socketPath,omitempty"`
+	Status      string    `json:"status"`
+	Active      bool      `json:"active"`
+	Managed     bool      `json:"managed"`
+	Headless    bool      `json:"headless,omitempty"`
+	StartedAt   time.Time `json:"startedAt,omitempty"`
+	LastSeenAt  time.Time `json:"lastSeenAt,omitempty"`
+}
+
+type InstanceListResult struct {
+	Active *bool              `json:"active"`
+	Items  []InstanceListItem `json:"items"`
+}
+
+// List implements daemon.list over both daemon-owned processes and external
+// GUI leases. This is the inventory MCP clients need before selecting a live
+// project for SAP-backed edits.
+func (d *Daemon) List(ctx context.Context, p InstanceListParams) (InstanceListResult, error) {
+	owned, err := d.Proc.List()
+	if err != nil {
+		return InstanceListResult{}, err
+	}
+	external, err := d.Reg.ListExternalInstances()
+	if err != nil {
+		return InstanceListResult{}, err
+	}
+	projects, err := d.Reg.ListProjects()
+	if err != nil {
+		return InstanceListResult{}, err
+	}
+	projectForPath := func(path string) string {
+		if path == "" {
+			return ""
+		}
+		root := filepath.Clean(path)
+		if filepath.Ext(root) == ".mlt" {
+			root = filepath.Dir(root)
+		} else if info, statErr := os.Stat(root); statErr == nil && !info.IsDir() {
+			root = filepath.Dir(root)
+		}
+		for _, project := range projects {
+			if filepath.Clean(project.RootDir) == root {
+				return project.ID
+			}
+		}
+		return ""
+	}
+	items := make([]InstanceListItem, 0, len(owned)+len(external))
+	for _, pi := range owned {
+		items = append(items, InstanceListItem{
+			ID: pi.ID, Kind: "daemon", ProjectID: pi.ProjectID, PID: pi.PID,
+			SocketPath: pi.SocketPath, Status: pi.Status,
+			Active:  pi.Status == registry.StatusReady && health.PIDAlive(pi.PID) && health.SocketResponsive(pi.SocketPath, time.Second),
+			Managed: true, Headless: pi.Headless, StartedAt: pi.StartedAt, LastSeenAt: pi.LastHealthCheckAt,
+		})
+	}
+	now := time.Now().UTC()
+	for _, ext := range external {
+		active := ext.Status == registry.ExternalStatusOpen &&
+			ext.LeaseExpiresAt.After(now) && health.PIDAlive(ext.PID)
+		if active {
+			// An external lease is only active when it exposes a usable SAP
+			// endpoint.  Keep this consistent with resolveProjectInstance,
+			// which rejects registrations without SAPSocketPath.
+			active = ext.SAPSocketPath != "" && health.SocketResponsive(ext.SAPSocketPath, time.Second)
+		}
+		items = append(items, InstanceListItem{
+			ID: ext.ID, Kind: "external", ProjectID: projectForPath(ext.ProjectPath), ProjectPath: ext.ProjectPath, PID: ext.PID,
+			SocketPath: ext.SAPSocketPath, Status: ext.Status, Active: active,
+			Managed: false, LastSeenAt: ext.LastSeenAt,
+		})
+	}
+	if p.Active != nil {
+		filtered := items[:0]
+		for _, item := range items {
+			if item.Active == *p.Active {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
+	}
+	return InstanceListResult{Active: p.Active, Items: items}, nil
 }
 
 // HealthResult is the daemon.health response shape.
@@ -1498,7 +1594,11 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 		return nil, fmt.Errorf("daemon: %s: not implemented", method)
 
 	case "daemon.list":
-		return d.List(ctx)
+		var p InstanceListParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.List(ctx, p)
 
 	case "daemon.health":
 		var p struct {

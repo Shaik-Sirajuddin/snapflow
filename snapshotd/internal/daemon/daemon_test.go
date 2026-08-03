@@ -93,9 +93,9 @@ func TestDaemon_ProjectAndLaunchLifecycle(t *testing.T) {
 		t.Fatalf("expected ready status, got %s", pi.Status)
 	}
 
-	instances, err := d.List(ctx)
-	if err != nil || len(instances) != 1 {
-		t.Fatalf("expected 1 instance, got %d (err=%v)", len(instances), err)
+	instances, err := d.List(ctx, InstanceListParams{})
+	if err != nil || len(instances.Items) != 1 {
+		t.Fatalf("expected 1 instance, got %d (err=%v)", len(instances.Items), err)
 	}
 
 	hr, err := d.Health(ctx, pi.ID)
@@ -232,6 +232,40 @@ func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
 	closed, err := d.Reg.GetExternalInstance(first.Instance.ID)
 	if err != nil || closed.Status != registry.ExternalStatusClosed {
 		t.Fatalf("expected closed external instance: %+v err=%v", closed, err)
+	}
+}
+
+func TestDaemon_ListIncludesExternalProjectIDAndActiveFilter(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "external-list"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	registered, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "list-external",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+	})
+	if err != nil {
+		t.Fatalf("register external: %v", err)
+	}
+	all, err := d.List(ctx, InstanceListParams{})
+	if err != nil || len(all.Items) != 1 {
+		t.Fatalf("list external: %+v err=%v", all, err)
+	}
+	item := all.Items[0]
+	if item.Kind != "external" || item.ProjectID != project.ID || item.Active || item.Managed {
+		t.Fatalf("unexpected external list item: %+v", item)
+	}
+	active := true
+	filtered, err := d.List(ctx, InstanceListParams{Active: &active})
+	if err != nil || len(filtered.Items) != 0 || filtered.Active == nil || !*filtered.Active {
+		t.Fatalf("active filter: %+v err=%v", filtered, err)
+	}
+	if err := d.UnregisterExternalInstance(ctx, registered.Instance.ID); err != nil {
+		t.Fatalf("unregister: %v", err)
 	}
 }
 

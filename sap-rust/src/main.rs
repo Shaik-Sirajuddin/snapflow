@@ -43,7 +43,11 @@ async fn main() {
         std::env::var("SNAPSHOT_AUDIO_ENABLED").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
     );
-    let config = ServerConfig { socket_path: socket_path.clone(), token, audio_enabled };
+    let config = ServerConfig {
+        socket_path: socket_path.clone(),
+        token,
+        audio_enabled,
+    };
     println!("sap-rust: listening on {}", socket_path.display());
 
     // This standalone binary always runs MockBackend now (no real media,
@@ -54,7 +58,9 @@ async fn main() {
     // binary at all -- see 02-rust-embedding.md. This binary remains only
     // for manual/dev testing of the JSON-RPC wire protocol without a full
     // Qt build (e.g. `cargo run -- --socket /tmp/x.sock`).
-    eprintln!("sap-rust: standalone binary, using MockBackend (no real media -- see main.rs doc comment)");
+    eprintln!(
+        "sap-rust: standalone binary, using MockBackend (no real media -- see main.rs doc comment)"
+    );
     let backend = MockBackend::new();
     run(config, backend).await;
 }

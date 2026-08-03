@@ -29,8 +29,9 @@ type CurrentView struct {
 func selectionTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	return []server.ServerTool{
 		sapTool(s, h, "track.enter", "track.enter",
-			"Select a timeline track as the current selection scope. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
-			mcp.WithInteger("trackIndex", mcp.Required(), mcp.Description("Track index to select")),
+			"Select a timeline track by native track name or numeric index as the current selection scope. trackName is optional; omit it and use trackIndex when the backend does not provide a name. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
+			mcp.WithInteger("trackIndex", mcp.Description("Zero-based track index to select")),
+			mcp.WithString("trackName", mcp.Description("Native track name; use edit.listTracks to discover names")),
 			dynamicOutputSchema[EmptyResult](),
 		),
 		sapTool(s, h, "clip.enter", "clip.enter",

@@ -1,0 +1,13 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Shared text primitive. Pages should only override typography when the
+// content has a deliberate semantic variant (for example mono, muted, or a
+// heading size); common theme defaults belong here.
+export component BaseText inherits Text {
+    font-family: Theme.font-sans;
+    font-size: 13px * Theme.font-scale;
+    color: Theme.text-primary;
+    wrap: word-wrap;
+    preferred-width: 0px;
+    min-width: 0px;
+}

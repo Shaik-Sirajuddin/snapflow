@@ -41,23 +41,43 @@ extern "C" {
     /// int trackIndex, int value);` -- real
     /// `MultitrackModel::setTrackMute`/`setTrackHidden`/`setTrackLock`.
     /// Returns 0 on success, -1 on error (invalid handle/index).
-    pub fn sap_set_track_muted(main_window_handle: *mut c_void, track_index: c_int, muted: c_int) -> c_int;
-    pub fn sap_set_track_hidden(main_window_handle: *mut c_void, track_index: c_int, hidden: c_int) -> c_int;
-    pub fn sap_set_track_locked(main_window_handle: *mut c_void, track_index: c_int, locked: c_int) -> c_int;
+    pub fn sap_set_track_muted(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        muted: c_int,
+    ) -> c_int;
+    pub fn sap_set_track_hidden(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        hidden: c_int,
+    ) -> c_int;
+    pub fn sap_set_track_locked(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        locked: c_int,
+    ) -> c_int;
 
     /// C++ side: `int sap_reorder_track(void* mainWindowHandle, int
     /// fromTrackIndex, int toTrackIndex);` -- real
     /// `TimelineDock::moveTrack()`/`Timeline::MoveTrackCommand` (undoable).
     /// Returns 0 on success, -1 on error (invalid handle/index, or
     /// mismatched track types).
-    pub fn sap_reorder_track(main_window_handle: *mut c_void, from_track_index: c_int, to_track_index: c_int) -> c_int;
+    pub fn sap_reorder_track(
+        main_window_handle: *mut c_void,
+        from_track_index: c_int,
+        to_track_index: c_int,
+    ) -> c_int;
 
     /// C++ side: `int sap_remove_clip(void* mainWindowHandle, int
     /// trackIndex, int clipIndex);` -- real
     /// `TimelineDock::remove()`/`Timeline::RemoveCommand` (undoable).
     /// Returns 0 on success, -1 on error (invalid handle/index, locked
     /// track).
-    pub fn sap_remove_clip(main_window_handle: *mut c_void, track_index: c_int, clip_index: c_int) -> c_int;
+    pub fn sap_remove_clip(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+    ) -> c_int;
 
     /// C++ side: `char* sap_move_clip(void* mainWindowHandle, int
     /// fromTrackIndex, int fromClipIndex, int toTrackIndex, int
@@ -80,13 +100,20 @@ extern "C" {
     /// cairoblend transition mode property, read back live. Returns a
     /// heap-allocated string, or NULL if the track has no blend transition
     /// or on error. Caller must free via `sap_free_string`.
-    pub fn sap_get_track_blend_mode(main_window_handle: *mut c_void, track_index: c_int) -> *mut c_char;
+    pub fn sap_get_track_blend_mode(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+    ) -> *mut c_char;
 
     /// C++ side: `int sap_set_track_blend_mode(void* mainWindowHandle, int
     /// trackIndex, const char* mode);` -- real
     /// `Timeline::ChangeBlendModeCommand` (undoable). Returns 0 on success,
     /// -1 on error (invalid handle/index, or no blend transition present).
-    pub fn sap_set_track_blend_mode(main_window_handle: *mut c_void, track_index: c_int, mode: *const c_char) -> c_int;
+    pub fn sap_set_track_blend_mode(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        mode: *const c_char,
+    ) -> c_int;
 
     /// C++ side: `int sap_set_track_height(void* mainWindowHandle, int
     /// height);` -- real `MultitrackModel::setTrackHeight()`, a single
@@ -183,13 +210,13 @@ extern "C" {
     /// `{"index":N,"name":"...","source":{...},"durationFrames":N}`
     /// matching `PlaylistEntry`'s wire shape, or NULL on error. Caller
     /// must free via `sap_free_string`.
-   pub fn sap_generator_create_title(
-       main_window_handle: *mut c_void,
-       mode: *const c_char,
-       text: *const c_char,
-       fg_colour: *const c_char,
-       bg_colour: *const c_char,
-   ) -> *mut c_char;
+    pub fn sap_generator_create_title(
+        main_window_handle: *mut c_void,
+        mode: *const c_char,
+        text: *const c_char,
+        fg_colour: *const c_char,
+        bg_colour: *const c_char,
+    ) -> *mut c_char;
 
     /// C++ side: `char* sap_generator_create_color(void* mainWindowHandle,
     /// const char* hexColor);` -- builds a plain real MLT `color:`
@@ -411,10 +438,21 @@ extern "C" {
     /// JSON object/array of the form `{"index":N,"name":"...","path":"...",
     /// "durationFrames":N}`, or NULL/-1 on error. Caller must free string
     /// results via `sap_free_string`.
-    pub fn sap_playlist_append(main_window_handle: *mut c_void, source_path: *const c_char) -> *mut c_char;
-    pub fn sap_playlist_insert(main_window_handle: *mut c_void, index: c_int, source_path: *const c_char) -> *mut c_char;
+    pub fn sap_playlist_append(
+        main_window_handle: *mut c_void,
+        source_path: *const c_char,
+    ) -> *mut c_char;
+    pub fn sap_playlist_insert(
+        main_window_handle: *mut c_void,
+        index: c_int,
+        source_path: *const c_char,
+    ) -> *mut c_char;
     pub fn sap_playlist_remove(main_window_handle: *mut c_void, index: c_int) -> c_int;
-    pub fn sap_playlist_move(main_window_handle: *mut c_void, from_index: c_int, to_index: c_int) -> c_int;
+    pub fn sap_playlist_move(
+        main_window_handle: *mut c_void,
+        from_index: c_int,
+        to_index: c_int,
+    ) -> c_int;
     pub fn sap_playlist_get(main_window_handle: *mut c_void, index: c_int) -> *mut c_char;
     pub fn sap_playlist_list(main_window_handle: *mut c_void) -> *mut c_char;
 
@@ -495,10 +533,7 @@ extern "C" {
 
     /// C++ side: `int sap_set_project_folder(void* mainWindowHandle, const
     /// char* folder);` — empty/null clears (file-type).
-    pub fn sap_set_project_folder(
-        main_window_handle: *mut c_void,
-        folder: *const c_char,
-    ) -> c_int;
+    pub fn sap_set_project_folder(main_window_handle: *mut c_void, folder: *const c_char) -> c_int;
 
     /// C++ side: `int sap_export_project_xml(void* mainWindowHandle, const
     /// char* outputXmlPath);` -- writes the current project (via the real

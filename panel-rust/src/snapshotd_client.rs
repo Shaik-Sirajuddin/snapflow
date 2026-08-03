@@ -140,6 +140,14 @@ impl DiscoveryEndpoint {
                 return None;
             }
         };
+        // Discovery carries the SAP endpoint/token metadata and is intended
+        // for the same-user daemon only. Restrict the filesystem endpoint to
+        // the creating user (the daemon runs under that user's account).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+        }
         if let Err(error) = listener.set_nonblocking(true) {
             eprintln!("panel-rust: snapshotd discovery nonblocking setup failed: {error}");
             return None;
@@ -170,6 +178,14 @@ impl DiscoveryEndpoint {
                 descriptor.display()
             );
             return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &descriptor,
+                std::fs::Permissions::from_mode(0o600),
+            );
         }
         let (stop, stop_rx) = mpsc::channel();
         let descriptor_for_thread = descriptor.clone();

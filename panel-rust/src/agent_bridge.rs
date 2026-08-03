@@ -1546,6 +1546,11 @@ pub fn is_builtin_snapflow_mcp_name(name: &str) -> bool {
 const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn snapshotd_control_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("SNAPSHOTD_CONTROL_SOCKET") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     admin_token_dir().join("control.sock")
 }
 
@@ -4737,11 +4742,27 @@ impl AgentBridge {
         name: &str,
         preferred_provider: Option<&str>,
     ) -> Result<usize, BridgeError> {
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        self.add_thread_deferred_with_id(&thread_id, name, preferred_provider)
+    }
+
+    /// Create a deferred slot using the caller's durable identity. The UI
+    /// owns this ID so model, bridge, transcript, and archive state cannot
+    /// diverge when rows are inserted or archived.
+    pub fn add_thread_deferred_with_id(
+        &mut self,
+        thread_id: &str,
+        name: &str,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(BridgeError::Gateway("thread name cannot be empty".into()));
         }
-        let thread_id = slug(name);
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(BridgeError::Gateway("thread id cannot be empty".into()));
+        }
         if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
             return Err(BridgeError::Gateway(format!(
                 "thread already exists: {name}"
@@ -4750,7 +4771,7 @@ impl AgentBridge {
         let idx = self.slots.len();
         let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript, _uses_pool) =
-            self.build_slot(&thread_id, &provider, true)?;
+            self.build_slot(thread_id, &provider, true)?;
         self.slots.push(slot);
         Ok(idx)
     }
@@ -5583,12 +5604,32 @@ impl AgentBridge {
         true
     }
 
+    /// Set archive state by durable thread ID, never by a mutable row index.
+    pub fn set_thread_archived_by_id(&self, thread_id: &str, archived: bool) -> bool {
+        let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| slot.thread_id == thread_id)
+        else {
+            return false;
+        };
+        self.set_thread_archived(index, archived)
+    }
+
     /// Whether thread `idx` has been archived via [`Self::archive_
     /// thread`]. `false` for any out-of-range index or a thread that has
     /// never been archived.
     pub fn thread_archived(&self, idx: usize) -> bool {
         self.slots
             .get(idx)
+            .map(|slot| *slot.archived.lock().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or(false)
+    }
+
+    pub fn thread_archived_by_id(&self, thread_id: &str) -> bool {
+        self.slots
+            .iter()
+            .find(|slot| slot.thread_id == thread_id)
             .map(|slot| *slot.archived.lock().unwrap_or_else(|e| e.into_inner()))
             .unwrap_or(false)
     }
