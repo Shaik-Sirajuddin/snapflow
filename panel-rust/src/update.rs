@@ -761,6 +761,12 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 return (vec![], vec![]);
             };
             thread.display_name = name.clone();
+            // mcp-servers-settings, agent-proposed-session-title: a
+            // deliberate user rename permanently opts this thread out of
+            // future agent-pushed `session_info_update` auto-renames (see
+            // `name_user_set`'s doc comment and the `selected_thread_
+            // snapshot` fold below that checks it).
+            thread.name_user_set = true;
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             (
                 vec![Effect::RenameThread {
@@ -3365,6 +3371,34 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.usage = snapshot.usage;
             thread.plan = snapshot.plan;
             thread.session_title = snapshot.session_title;
+            // mcp-servers-settings, agent-proposed-session-title: an
+            // agent-pushed live title (`AgentEvent::SessionInfoUpdate`,
+            // folded into `thread.session_title` just above) auto-renames
+            // the durable, sidebar-visible `display_name` -- but ONLY when
+            // the user has never manually renamed this thread
+            // (`name_user_set`, set exclusively by `ThreadMsg::
+            // RenameRequested`'s handler above). This mirrors that manual
+            // path exactly: mutate `display_name`, persist via the same
+            // `Effect::RenameThread`, and reuse the same `Dirty::ThreadRow`
+            // shape a status-only field change (e.g. `ToggleBackground`)
+            // already uses to refresh one sidebar row. Skipped when the
+            // title is empty/unchanged so an idle thread with a stable
+            // live title does not re-persist on every 60-90fps frame poll.
+            if !thread.name_user_set {
+                if let Some(title) = thread.session_title.as_deref() {
+                    let title = title.trim();
+                    if !title.is_empty() && title != thread.display_name {
+                        thread.display_name = title.to_string();
+                        effects.push(Effect::RenameThread {
+                            real_index: target_index,
+                            name: thread.display_name.clone(),
+                        });
+                        dirty.push(Dirty::ThreadRow {
+                            thread_id: thread_id.clone(),
+                        });
+                    }
+                }
+            }
 
             if transcript_changed {
                 // Every transcript change, including cold hydration and a
@@ -6261,6 +6295,124 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
             "second tick with an unchanged snapshot must not resync: {second_dirty:?}"
+        );
+    }
+
+    #[test]
+    fn agent_pushed_session_title_auto_renames_a_never_renamed_thread() {
+        // mcp-servers-settings, agent-proposed-session-title: a live
+        // `session_info_update`'s title (folded into `ThreadFrameSnapshot::
+        // session_title`) must auto-rename `ThreadModel::display_name`
+        // when the user has never manually renamed the thread, persisting
+        // the change the same way `ThreadMsg::RenameRequested` does.
+        let mut model = model_with_threads(&["New thread 1"]);
+        assert!(!model.threads[0].name_user_set);
+
+        let snapshot = crate::msg::ThreadFrameSnapshot {
+            thread_id: "thread-0".to_owned(),
+            real_index: 0,
+            transcript: vec![],
+            has_older_messages: false,
+            pending_request: crate::PendingRequestItem::default(),
+            terminals: vec![],
+            expanded_terminal: None,
+            open_terminals: vec![],
+            local_terminal: crate::LocalTerminalItem::default(),
+            connection_status: String::new(),
+            session_modes: None,
+            config_options: vec![],
+            available_commands: vec![],
+            plan: vec![],
+            session_title: Some("Fixing the login bug".to_owned()),
+            usage: (0, 0),
+        };
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(snapshot),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.threads[0].display_name, "Fixing the login bug");
+        assert!(
+            !model.threads[0].name_user_set,
+            "an agent-driven auto-rename must not flip the user-set flag"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RenameThread { real_index: 0, name } if name == "Fixing the login bug"
+            )),
+            "auto-rename must persist durably like a manual rename: {effects:?}"
+        );
+        assert!(
+            dirty.iter().any(|item| matches!(
+                item,
+                Dirty::ThreadRow { thread_id } if thread_id == "thread-0"
+            )),
+            "auto-rename must dirty the sidebar row: {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn user_renamed_thread_ignores_a_later_agent_pushed_session_title() {
+        // mcp-servers-settings, agent-proposed-session-title: the whole
+        // point of `name_user_set` -- a deliberate user rename must never
+        // be silently clobbered by a later agent-pushed live title.
+        let mut model = model_with_threads(&["New thread 1"]);
+        let _ = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::RenameRequested(
+                0,
+                "My custom name".to_owned(),
+            ))),
+        );
+        assert_eq!(model.threads[0].display_name, "My custom name");
+        assert!(model.threads[0].name_user_set);
+
+        let snapshot = crate::msg::ThreadFrameSnapshot {
+            thread_id: "thread-0".to_owned(),
+            real_index: 0,
+            transcript: vec![],
+            has_older_messages: false,
+            pending_request: crate::PendingRequestItem::default(),
+            terminals: vec![],
+            expanded_terminal: None,
+            open_terminals: vec![],
+            local_terminal: crate::LocalTerminalItem::default(),
+            connection_status: String::new(),
+            session_modes: None,
+            config_options: vec![],
+            available_commands: vec![],
+            plan: vec![],
+            session_title: Some("Agent proposed title".to_owned()),
+            usage: (0, 0),
+        };
+
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(snapshot),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.threads[0].display_name, "My custom name",
+            "a user rename must never be clobbered by an agent-pushed title"
+        );
+        assert_eq!(
+            model.threads[0].session_title.as_deref(),
+            Some("Agent proposed title"),
+            "the live/ephemeral session_title itself still updates"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RenameThread { .. })),
+            "no rename effect should fire once the thread is user-named: {effects:?}"
         );
     }
 

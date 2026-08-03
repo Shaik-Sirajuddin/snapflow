@@ -79,6 +79,16 @@ pub struct ThreadModel {
     /// may be absent while a new thread is attaching.
     pub thread_id: String,
     pub display_name: String,
+    /// mcp-servers-settings, agent-proposed-session-title: true once the
+    /// user has explicitly renamed this thread via `ThreadMsg::
+    /// RenameRequested` (set alongside `display_name` there). While
+    /// `false`, an agent-pushed `session_info_update` title (see
+    /// `session_title` below) is allowed to auto-rename `display_name`;
+    /// once `true`, a live title must never overwrite what the user
+    /// typed -- see `update.rs`'s `selected_thread_snapshot` fold (the
+    /// site that applies an agent title to `display_name`) for the
+    /// actual gate.
+    pub name_user_set: bool,
     pub provider: String,
     pub profile_name: Option<String>,
     pub permission_profile: Option<String>,
@@ -571,6 +581,7 @@ impl Default for ThreadModel {
         Self {
             thread_id: String::new(),
             display_name: String::new(),
+            name_user_set: false,
             provider: String::new(),
             profile_name: None,
             permission_profile: None,

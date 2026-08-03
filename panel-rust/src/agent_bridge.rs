@@ -7506,6 +7506,7 @@ mod tests {
     // the bridge's shared-gateway pool) -- used directly by tests below
     // that want to talk to a `TestGateway` without going through a full
     // `AgentBridge`.
+    use crate::effect::Effect;
     use crate::gateway_actor::spawn_acpx_thread;
     use crate::protocol_types::MessageKind;
     // row_count()/row_data() on the persistent messages_model VecModel in
@@ -8632,6 +8633,150 @@ mod tests {
             .iter()
             .any(|message| { message.text.contains("HELLO FROM A NEW THREAD") }));
         assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
+    }
+
+    /// mcp-servers-settings, agent-proposed-session-title: a REAL
+    /// protocol round trip (real `acpx-server` + real `rui-mock-agent`
+    /// backend, same `TestGateway` harness every other test in this
+    /// module uses -- not a mocked/hand-built `SessionUpdate` JSON
+    /// fixture) proving two things end to end:
+    ///
+    /// 1. `rui-mock-agent`'s real `session_info_update` (see its own doc
+    ///    comment on the `"plan "`-prefixed marker branch) reaches
+    ///    `AgentBridge::session_title` through the genuine gateway wire,
+    ///    exactly like `plan_and_session_info_update_round_trip_through_
+    ///    a_real_gateway` in `gateway_actor_e2e_test.rs` already proves
+    ///    at the lower `AcpxThreadHandle` layer -- this test additionally
+    ///    drives that real title through the actual `update()` reducer
+    ///    (`crate::update::update`, the same function `dispatch_frame_
+    ///    poll` calls in the live app), the boundary
+    ///    `ThreadModel::display_name`/`name_user_set` actually live at.
+    /// 2. Once a user has manually renamed the thread (`ThreadMsg::
+    ///    RenameRequested`, the exact message the sidebar rename UI
+    ///    dispatches), re-folding that SAME real agent-pushed title
+    ///    through the reducer again must NOT overwrite the user's name.
+    #[test]
+    fn real_agent_pushed_session_title_auto_renames_then_a_user_rename_wins() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
+        let mut bridge =
+            bridge_with_single_gateway(&[], &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
+
+        let index = bridge.add_thread("New thread 1").expect("add thread");
+        let thread_id = bridge
+            .thread_binding(index)
+            .map(|binding| binding.thread_id)
+            .unwrap_or_else(|| format!("thread:{index}"));
+
+        bridge.push_local(
+            index,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: "plan hello title".into(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        // `"plan "`-prefixed: makes `rui-mock-agent` send a real
+        // `session_info_update` titled "Fixing the login bug" before its
+        // usual turn (see `mock_agent.rs`'s own doc comment on this
+        // marker).
+        bridge.send_prompt(index, "plan hello title".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && bridge.session_title(index).is_none() {
+            bridge.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let real_title = bridge.session_title(index).expect(
+            "expected a real AgentEvent::SessionInfoUpdate title to reach AgentBridge via the \
+             real gateway",
+        );
+        assert_eq!(real_title, "Fixing the login bug");
+
+        // --- Part 1: the real title auto-renames a never-renamed thread,
+        // through the exact production reducer. ---
+        let mut model = crate::model::Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: thread_id.clone(),
+            display_name: "New thread 1".to_owned(),
+            provider: "test".to_owned(),
+            ..crate::model::ThreadModel::default()
+        });
+        model.visible_indices = vec![0];
+        model.selected_thread = 0;
+
+        let fold_frame = |model: &mut crate::model::Model, title: Option<String>| {
+            let snapshot = crate::msg::ThreadFrameSnapshot {
+                thread_id: thread_id.clone(),
+                real_index: 0,
+                transcript: bridge.transcript(index),
+                has_older_messages: bridge.has_older_page(index),
+                pending_request: crate::PendingRequestItem::default(),
+                terminals: vec![],
+                expanded_terminal: None,
+                open_terminals: vec![],
+                local_terminal: crate::LocalTerminalItem::default(),
+                connection_status: bridge.transport_status(index),
+                session_modes: bridge.session_modes(index),
+                config_options: bridge.config_options(index),
+                available_commands: bridge.available_commands(index),
+                plan: bridge.plan(index),
+                session_title: title,
+                usage: (0, 0),
+            };
+            crate::update::update(
+                model,
+                crate::msg::Msg::Frame(crate::msg::FrameInput {
+                    selected_thread_snapshot: Some(snapshot),
+                    ..crate::msg::FrameInput::default()
+                }),
+            )
+        };
+
+        let (effects, _dirty) = fold_frame(&mut model, Some(real_title.clone()));
+        assert_eq!(
+            model.threads[0].display_name, real_title,
+            "a real agent-pushed session_info_update title must auto-rename a never-renamed \
+             thread through the production reducer"
+        );
+        assert!(!model.threads[0].name_user_set);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RenameThread { real_index: 0, name } if *name == real_title
+            )),
+            "the auto-rename must persist via the same Effect::RenameThread a manual rename \
+             uses: {effects:?}"
+        );
+
+        // --- Part 2: a deliberate user rename wins over the same real
+        // title being re-applied. ---
+        let (_, _) = crate::update::update(
+            &mut model,
+            crate::msg::Msg::Ui(crate::msg::UiMsg::Thread(
+                crate::msg::ThreadMsg::RenameRequested(0, "My Custom Name".to_owned()),
+            )),
+        );
+        assert_eq!(model.threads[0].display_name, "My Custom Name");
+        assert!(model.threads[0].name_user_set);
+
+        let (effects_after_rename, _) = fold_frame(&mut model, Some(real_title.clone()));
+        assert_eq!(
+            model.threads[0].display_name, "My Custom Name",
+            "a deliberate user rename must survive the exact same real agent-pushed title \
+             being re-applied"
+        );
+        assert!(
+            !effects_after_rename
+                .iter()
+                .any(|effect| matches!(effect, Effect::RenameThread { .. })),
+            "no auto-rename effect should fire once the user has named the thread: \
+             {effects_after_rename:?}"
+        );
     }
 
     /// Real, live, billed "click + -> a real reply, rendered" chain,
