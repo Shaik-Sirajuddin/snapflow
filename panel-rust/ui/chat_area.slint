@@ -23,7 +23,7 @@ import { MentionPickRow } from "./base/mention_pick_row.slint";
 import { ThinScrollbar } from "./base/thin_scrollbar.slint";
 import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
 import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
-import { OnboardingGuideView } from "./chat-view/components/onboarding_guide_view.slint";
+import { Button } from "./base/button.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -1237,36 +1237,32 @@ export component ChatArea inherits Rectangle {
                 }
                 if root.messages.length == 0 && !root.no-project
                     && root.agent-catalog-fetched && root.agent-catalog.length == 0 : VerticalLayout {
-                    height: 160px;
+                    height: 200px;
                     alignment: center;
-                    Rectangle {
-                        border-radius: Theme.radius-md;
-                        background: configure-agent-button.has-hover
-                            ? Theme.bg-primary.with-alpha(0.85)
-                            : Theme.bg-primary;
-                        animate background { duration: 100ms; }
-                        HorizontalLayout {
-                            padding-left: Metrics.pad-lg;
-                            padding-right: Metrics.pad-lg;
-                            padding-top: Metrics.pad-sm;
-                            padding-bottom: Metrics.pad-sm;
-                            alignment: center;
-                            Text {
-                                text: "Configure Agent";
-                                color: Theme.text-on-primary;
-                                font-size: 11px * Theme.font-scale;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                        configure-agent-button := TouchArea {
-                            mouse-cursor: pointer;
-                            accessible-role: button;
-                            accessible-label: "Configure Agent";
+                    spacing: Metrics.space-2;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Button {
+                            label: "Configure Provider";
+                            button-accessible-label: "Configure Provider";
+                            primary: true;
+                            btn-width: 176px;
+                            btn-height: 32px;
+                            font-size: 12px;
                             clicked => { configure-provider-requested(); }
-                            changed has-hover => {
-                                CursorHost.kind = self.has-hover ? "pointer" : "default";
-                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Button {
+                            label: "Getting Started";
+                            button-accessible-label: "Getting Started";
+                            primary: false;
+                            btn-width: 176px;
+                            btn-height: 32px;
+                            font-size: 12px;
+                            clicked => { root.md-link-activated("https://snapflow.zealbase.io"); }
                         }
                     }
                 }
@@ -1892,13 +1888,4 @@ export component ChatArea inherits Rectangle {
         }
     }
     restore-compose-focus => { chat-input.focus-compose(); }
-
-    if !root.onboarding-completed : OnboardingGuideView {
-        width: 100%;
-        height: 100%;
-        z: 9000;
-        start-chat-clicked => {
-            root.complete-onboarding();
-        }
-    }
 }
