@@ -1550,6 +1550,67 @@ pub fn is_backend_requires_authentication_error(message: &str) -> bool {
     message.contains("backend requires authentication before session/new")
 }
 
+/// windows-reliability-audit (panel-rust side): best-effort detector for
+/// "this agent's process couldn't even start because a required external
+/// runtime (Node.js/npm or Python/uv) isn't on PATH" -- the single most
+/// common fresh-Windows-machine failure mode for ACP agents that shell out
+/// to `npx`/`node` or `uv`/`python`. Same caveat as
+/// `is_backend_requires_authentication_error` just above: there is no
+/// structured "missing prerequisite" error code anywhere in the spawn
+/// path (acpx-core, the gateway, and the OS process spawn all just
+/// propagate their own `Display` text), so this is a substring heuristic
+/// over BOTH a runtime-name mention and a process-not-found phrase --
+/// covering the differently-worded Unix (`No such file or directory`),
+/// Windows (`is not recognized as an internal or external command`,
+/// `cannot find the file specified`) and Rust-std (`os error 2`, `Enoent`)
+/// spawn failures -- not a guarantee. Deliberately permissive (any
+/// runtime keyword + any not-found phrase, rather than one exact wording)
+/// because the daemon/backend side of this same audit is concurrently
+/// provisioning Node/Python and adding a `snapflowd doctor`-style
+/// diagnostic, and may still be settling on its own exact error wording;
+/// a future daemon-side structured error code should replace this
+/// heuristic outright rather than trying to keep it in lockstep.
+pub fn is_missing_runtime_prerequisite_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_runtime = ["node", "npm", "npx", "python", "uv"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    let mentions_not_found = [
+        "not found",
+        "not recognized",
+        "no such file or directory",
+        "cannot find the file specified",
+        "enoent",
+        "os error 2",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    mentions_runtime && mentions_not_found
+}
+
+/// Appends an actionable hint pointing at the daemon's diagnostic command
+/// when `is_missing_runtime_prerequisite_error` matches `message`,
+/// otherwise returns it unchanged. Kept as its own pure function (not
+/// inlined at each call site) so it stays independently testable and
+/// every failure arm that surfaces a raw spawn/attach error string
+/// (`update.rs`'s `SessionAttached` `Err` arm and `AgentEvent::Error`
+/// arm) can apply the same wording without copy-pasting it. The hint is
+/// deliberately worded around "your daemon's diagnostic/doctor command"
+/// rather than a hardcoded binary name, since the exact command the
+/// backend-side of this audit ships (`snapflowd doctor` or similar) isn't
+/// this crate's to pin down.
+pub fn annotate_missing_prerequisite_hint(message: &str) -> String {
+    if is_missing_runtime_prerequisite_error(message) {
+        format!(
+            "{message}\n\nThis looks like a missing runtime dependency (Node.js/npm or \
+             Python/uv) rather than an agent bug. Run your daemon's diagnostic/doctor \
+             command (e.g. `snapflowd doctor`) to check what's installed."
+        )
+    } else {
+        message.to_owned()
+    }
+}
+
 /// Builds the sidebar's thread-list items from `names`/`state`
 /// (parallel slices, same convention as `PanelSingleton::thread_state`),
 /// optionally narrowed by a case-insensitive substring `query` --
@@ -4745,5 +4806,61 @@ mod transcript_model_tests {
         assert!(reasoning.row_data(2).unwrap().is_current); // medium
         assert_eq!(current_reasoning_trigger_label(&options), "Medium");
         assert_eq!(current_config_trigger_label(&options), "GPT-5");
+    }
+
+    // windows-reliability-audit: is_missing_runtime_prerequisite_error is a
+    // heuristic (see its doc comment), so these pin the specific cross-
+    // platform wordings it's meant to catch, plus a few "must NOT match"
+    // cases so an unrelated failure never gets mislabeled as a missing
+    // runtime.
+    #[test]
+    fn missing_runtime_prerequisite_error_matches_unix_spawn_failure() {
+        assert!(is_missing_runtime_prerequisite_error(
+            "Failed to spawn \"npx\": No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_prerequisite_error_matches_windows_spawn_failure() {
+        assert!(is_missing_runtime_prerequisite_error(
+            "'node' is not recognized as an internal or external command"
+        ));
+        assert!(is_missing_runtime_prerequisite_error(
+            "program not found: npm: The system cannot find the file specified. (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_prerequisite_error_matches_python_uv() {
+        assert!(is_missing_runtime_prerequisite_error(
+            "uv: command not found"
+        ));
+        assert!(is_missing_runtime_prerequisite_error(
+            "spawn python ENOENT"
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_prerequisite_error_does_not_match_unrelated_failures() {
+        assert!(!is_missing_runtime_prerequisite_error(
+            "backend requires authentication before session/new"
+        ));
+        assert!(!is_missing_runtime_prerequisite_error(
+            "unexpected status 502 Bad Gateway"
+        ));
+        // Mentions a runtime but isn't a not-found failure at all.
+        assert!(!is_missing_runtime_prerequisite_error(
+            "node process exited with code 1"
+        ));
+    }
+
+    #[test]
+    fn annotate_missing_prerequisite_hint_appends_only_when_detected() {
+        let matched = annotate_missing_prerequisite_hint("spawn node ENOENT");
+        assert!(matched.starts_with("spawn node ENOENT"));
+        assert!(matched.contains("snapflowd doctor"));
+
+        let unrelated = "backend requires authentication before session/new";
+        assert_eq!(annotate_missing_prerequisite_hint(unrelated), unrelated);
     }
 }

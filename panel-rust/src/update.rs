@@ -2171,14 +2171,20 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     // arm) gets both surfaces to reflect it on the very
                     // next frame instead of relying on some later,
                     // unrelated dirty event to eventually pick it up.
+                    // windows-reliability-audit: this is exactly the
+                    // "gateway provisioning/EACCES/etc." spawn-failure
+                    // arm described above -- the most likely place a
+                    // missing Node.js/npm or Python/uv error lands, so
+                    // annotate it with an actionable hint before it's
+                    // ever stored/rendered rather than leaving the raw
+                    // OS/process error text as the only signal.
+                    let message = crate::models::annotate_missing_prerequisite_hint(&err.message);
                     thread.state = ThreadState::Error;
-                    thread.error = Some(err.message.clone());
+                    thread.error = Some(message.clone());
                     let mut dirty = vec![
                         Dirty::Error {
                             thread_id: thread.thread_id.clone(),
-                            detail: ErrorDetail {
-                                message: err.message,
-                            },
+                            detail: ErrorDetail { message },
                         },
                         Dirty::ThreadRow {
                             thread_id: thread.thread_id.clone(),
@@ -2814,8 +2820,16 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 });
             }
             crate::protocol_types::AgentEvent::Error(error) => {
+                // windows-reliability-audit: same annotation as the
+                // `SessionAttached` `Err` arm above -- this is the async
+                // counterpart (a spawn/attach failure that surfaces after
+                // the pre-session id already exists), so it needs the
+                // same actionable hint. `thread.unauthenticated` below
+                // still matches against the ORIGINAL text, since the
+                // appended hint can never contain the auth substring.
                 thread.state = ThreadState::Error;
-                thread.error = Some(error.clone());
+                let annotated = crate::models::annotate_missing_prerequisite_hint(error);
+                thread.error = Some(annotated.clone());
                 // PROF-8: same event, a second real per-thread signal --
                 // see `models::is_backend_requires_authentication_error`'s
                 // doc comment for why this is a substring match and what
@@ -2824,9 +2838,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     crate::models::is_backend_requires_authentication_error(error);
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
-                    detail: ErrorDetail {
-                        message: error.clone(),
-                    },
+                    detail: ErrorDetail { message: annotated },
                 });
                 // Mirror PromptSent Err: leave Loading/Cancelling in the
                 // visible send/stop control, not only the error banner.
