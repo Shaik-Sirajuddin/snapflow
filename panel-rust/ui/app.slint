@@ -634,6 +634,7 @@ export component ChatPanel inherits Window {
                 }
             }
             chat-views := ChatViewStack {
+                beta-mode-enabled: root.beta-mode-enabled;
                 views: thread-views;
                 fallback-messages: messages;
                 selected-index: thread-views.length > 0 ? selected-thread : 0;
@@ -770,6 +771,7 @@ export component ChatPanel inherits Window {
                 }
             }
             legacy-chat-area := ChatArea {
+                beta-mode-enabled: root.beta-mode-enabled;
                 no-project: !root.gateway-ready;
                 visible: root.active-pane == "chat" && root.thread-views.length == 0;
                 x: sidebar.width;

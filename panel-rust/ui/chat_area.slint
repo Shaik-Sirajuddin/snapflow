@@ -34,6 +34,9 @@ import { OnboardingGuideView } from "./chat-view/components/onboarding_guide_vie
 // for why tool-call gets the richer timeline-style card instead of the
 // bubble layout's flat text dump.
 export component ChatArea inherits Rectangle {
+    // Threaded down to AgentBubble's Copy/Select/Select all row -- see
+    // beta-mode-enabled's doc comment on AgentBubble.
+    in property <bool> beta-mode-enabled: false;
     in-out property <bool> onboarding-completed: false;
     callback complete-onboarding();
     // Retained-view command generations. A stack host can address the
@@ -1432,6 +1435,7 @@ export component ChatArea inherits Rectangle {
                             min-width: 0px;
                             vertical-stretch: 0;
                             item: msg;
+                            beta-mode-enabled: root.beta-mode-enabled;
                             // Thinking rows reuse MessageItem.expanded + the
                             // shared toggle-expanded round-trip (same as
                             // ToolEventRow / MessageCard log bodies).

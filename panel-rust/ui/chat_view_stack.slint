@@ -6,6 +6,9 @@ import { ThreadViewItem, MessageItem, PendingRequestItem, TerminalItem, PlanEntr
 // by its ThreadViewItem and remains mounted while another delegate is visible.
 export component ChatViewStack inherits Rectangle {
     clip: false;
+    // Threaded down to each retained ChatArea's AgentBubble Copy/Select/
+    // Select all row -- see beta-mode-enabled's doc comment on AgentBubble.
+    in property <bool> beta-mode-enabled: false;
     in property <[ThreadViewItem]> views: [];
     in property <[MessageItem]> fallback-messages: [];
     in property <int> selected-index: 0;
@@ -137,6 +140,7 @@ export component ChatViewStack inherits Rectangle {
     // expose every nested popup/action from a one-item repeater reliably;
     // real retained threads use the repeater below.
     if root.views.length == 0 : ChatArea {
+        beta-mode-enabled: root.beta-mode-enabled;
         x: 0px;
         y: 0px;
         width: root.width;
@@ -249,6 +253,7 @@ export component ChatViewStack inherits Rectangle {
     }
 
     for view[index] in root.views : ChatArea {
+        beta-mode-enabled: root.beta-mode-enabled;
         x: 0px;
         y: 0px;
         width: root.width;
