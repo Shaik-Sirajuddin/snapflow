@@ -296,6 +296,15 @@ export component AgentCard inherits Rectangle {
                     btn-height: 24px;
                     font-size: 10px;
                     font-weight: 400;
+                    // agent_install_spinner_repaint_gap: `root.loading`
+                    // (`AgentBridge::agent_operations_in_flight`, folded per
+                    // -row) was already computed and in scope but never
+                    // wired to this Button -- unlike the Attach button
+                    // above, this one never showed a Spinner at all during
+                    // install, for every agent (not just codex). `busy`
+                    // both swaps the label for a Spinner and blocks further
+                    // clicks while the install is in flight (button.slint).
+                    busy: root.loading;
                     clicked => { root.install-requested(); }
                 }
             }

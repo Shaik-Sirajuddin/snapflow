@@ -25,6 +25,7 @@ import (
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
 	"snapshotd/internal/daemonlock"
+	"snapshotd/internal/health"
 	"snapshotd/internal/mcpsupervisor"
 	"snapshotd/internal/sdp"
 )
@@ -161,10 +162,23 @@ func cmdServe(cfg config.Config, args []string) error {
 		}
 	}
 
+	// Bind the control socket synchronously before announcing "listening":
+	// Listen()/Serve() are split exactly so this ordering is possible. When
+	// the log line was previously printed right after `go
+	// sdpServer.ListenAndServe()` (which does its own Listen internally, on
+	// that goroutine), there was no guarantee the bind had completed before
+	// the line was logged -- a `status`/`stop` client dialing immediately
+	// after seeing "listening" could race the actual net.Listen and get
+	// "connection refused". Binding here, on the main goroutine, before the
+	// log line and before any client could plausibly be told to dial,
+	// closes that race.
 	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
+	if err := sdpServer.Listen(); err != nil {
+		return fmt.Errorf("binding SDP control socket: %w", err)
+	}
 	sdpErrCh := make(chan error, 1)
 	go func() {
-		sdpErrCh <- sdpServer.ListenAndServe()
+		sdpErrCh <- sdpServer.Serve()
 	}()
 	logger.Info("SDP control socket listening", "path", cfg.ControlSocketPath)
 
@@ -533,7 +547,33 @@ func cmdDoctor(cfg config.Config, args []string) error {
 		return fmt.Errorf("usage: %s doctor", progName)
 	}
 	fmt.Print(acpnode.DoctorReport())
+	// The Node/npm report above was the only thing `doctor` checked; it
+	// never told the operator whether the daemon they'd expect this
+	// command to talk to (via `status`/`stop`/`launch`, per this file's
+	// own package doc comment) is actually reachable. `health.
+	// SocketResponsive` already exists and is used pervasively by
+	// `daemon.go`/`procmgr.go` for the exact same unix-socket dial-and-
+	// close probe -- wiring it in here is a diagnostics-surface gap fix,
+	// not new capability. `net.DialTimeout("unix", ...)` underneath is a
+	// single cross-platform Go stdlib call (works the same on Linux/
+	// macOS/modern Windows), so no OS branch is needed for this check
+	// itself.
+	fmt.Print(controlSocketDoctorLine(cfg.ControlSocketPath))
 	return nil
+}
+
+// controlSocketDoctorLine reports whether the daemon's SDP control socket
+// (the one `status`/`stop`/`launch` dial) is currently accepting
+// connections, formatted to match acpnode.DoctorReport()'s plain-text
+// section style.
+func controlSocketDoctorLine(socketPath string) string {
+	if health.SocketResponsive(socketPath, 500*time.Millisecond) {
+		return fmt.Sprintf("control socket: responsive (%s)\n", socketPath)
+	}
+	return fmt.Sprintf(
+		"control socket: not responsive (%s) -- is `%s serve` running?\n",
+		socketPath, progName,
+	)
 }
 
 func cmdRuntime(cfg config.Config, args []string) error {

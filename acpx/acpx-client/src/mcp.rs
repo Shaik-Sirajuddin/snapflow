@@ -177,7 +177,10 @@ impl<'de> serde::Deserialize<'de> for McpServerEntry {
             .remove("name")
             .and_then(|v| v.as_str().map(str::to_string))
             .ok_or_else(|| serde::de::Error::missing_field("name"))?;
-        let enabled = map.remove("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = map
+            .remove("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let auth_status = map
             .remove("auth_status")
             .map(serde_json::from_value)
@@ -189,7 +192,11 @@ impl<'de> serde::Deserialize<'de> for McpServerEntry {
             .transpose()
             .map_err(serde::de::Error::custom)?;
 
-        let transport = map.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let transport = map
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let config_fields: &[&str] = match transport.as_str() {
             "stdio" => &["type", "command", "args", "env", "timeout"],
             "http" => &["type", "url", "headers", "timeout", "oauth"],
@@ -276,7 +283,9 @@ impl Gateway {
     /// provisioning JSON with a typo) should not make every *other*
     /// configured server disappear from the settings UI.
     pub async fn list_mcp_servers(&self) -> Result<Vec<McpServerEntry>, ClientError> {
-        let response = self.call("mcp_servers/list", serde_json::json!({}), None).await?;
+        let response = self
+            .call("mcp_servers/list", serde_json::json!({}), None)
+            .await?;
         let servers = response
             .get("servers")
             .and_then(|v| v.as_array())
@@ -301,8 +310,12 @@ impl Gateway {
     }
 
     pub async fn delete_mcp_server(&self, name: &str) -> Result<(), ClientError> {
-        self.call("mcp_servers/delete", serde_json::json!({ "name": name }), None)
-            .await?;
+        self.call(
+            "mcp_servers/delete",
+            serde_json::json!({ "name": name }),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -331,8 +344,12 @@ impl Gateway {
     }
 
     pub async fn logout_mcp_server(&self, name: &str) -> Result<(), ClientError> {
-        self.call("mcp_servers/logout", serde_json::json!({ "name": name }), None)
-            .await?;
+        self.call(
+            "mcp_servers/logout",
+            serde_json::json!({ "name": name }),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -421,7 +438,10 @@ mod tests {
             "remote",
             McpServerConfig::Http {
                 url: "https://example.com/mcp".to_string(),
-                headers: HashMap::from([("Authorization".to_string(), "Bearer static".to_string())]),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer static".to_string(),
+                )]),
                 timeout: None,
                 oauth: None,
             },
@@ -491,7 +511,10 @@ mod tests {
             },
         );
         entry.tool_catalog = Some(McpToolCatalog::Ready {
-            tools: vec![McpToolInfo { name: "read_file".to_string(), description: None }],
+            tools: vec![McpToolInfo {
+                name: "read_file".to_string(),
+                description: None,
+            }],
         });
         let json = serde_json::to_value(&entry).unwrap();
         assert!(
@@ -515,7 +538,10 @@ mod tests {
             }
         });
         let parsed: McpServerEntry = serde_json::from_value(raw).unwrap();
-        match parsed.tool_catalog.expect("tool_catalog should have parsed") {
+        match parsed
+            .tool_catalog
+            .expect("tool_catalog should have parsed")
+        {
             McpToolCatalog::Ready { tools } => {
                 assert_eq!(tools.len(), 2);
                 assert_eq!(tools[0].name, "read_file");
@@ -547,7 +573,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             errored.tool_catalog,
-            Some(McpToolCatalog::Error { message: "boom".to_string() })
+            Some(McpToolCatalog::Error {
+                message: "boom".to_string()
+            })
         );
     }
 

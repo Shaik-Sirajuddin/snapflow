@@ -73,6 +73,7 @@ export component Sidebar inherits Rectangle {
     callback search-submitted(string, bool, bool);
     callback settings-requested();
     callback skills-settings-requested();
+    callback global-skills-toggled(bool);
 
     // Skill-manager sidebar mode -- `sidebar_skill_tree_and_new_skill_flow`
     // phase. `skill-mode` sibling-swaps the thread list for a skill list
@@ -82,7 +83,7 @@ export component Sidebar inherits Rectangle {
     in property <[SkillOption]> skills: [];
     // Project skills are the primary list. This control adds global skills
     // to the current project view; it is not a mutually-exclusive scope tab.
-    property <bool> show-global-skills: false;
+    in-out property <bool> show-global-skills: false;
     in-out property <string> search-query: "";
     // Fired with the user-entered name and selected scope once the
     // dialog is confirmed; Rust creates the scaffolded SKILL.md and
@@ -438,7 +439,10 @@ export component Sidebar inherits Rectangle {
                     horizontal-stretch: 0;
                     checked: root.show-global-skills;
                     toggle-accessible-label: "Show global skills";
-                    toggled(new-checked) => { root.show-global-skills = new-checked; }
+                    toggled(new-checked) => {
+                        root.show-global-skills = new-checked;
+                        root.global-skills-toggled(new-checked);
+                    }
                 }
             }
         }

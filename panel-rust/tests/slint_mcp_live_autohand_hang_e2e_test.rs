@@ -119,8 +119,7 @@ fn autohand_adapter_entry() -> PathBuf {
             std::env::var("HOME").expect("HOME set")
         )
     });
-    PathBuf::from(adapter_root)
-        .join("node_modules/@autohandai/autohand-acp/dist/index.js")
+    PathBuf::from(adapter_root).join("node_modules/@autohandai/autohand-acp/dist/index.js")
 }
 
 fn free_port() -> u16 {
@@ -191,7 +190,14 @@ impl LiveAutohandHarness {
         let display = free_x_display();
         let display_str = format!(":{display}");
         let xvfb = Command::new("Xvfb")
-            .args([&display_str, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+            .args([
+                &display_str,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -289,7 +295,11 @@ impl LiveAutohandHarness {
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())
-            .args(["--appdata", state_dir.join("shotcut").to_str().unwrap(), "--noupgrade"])
+            .args([
+                "--appdata",
+                state_dir.join("shotcut").to_str().unwrap(),
+                "--noupgrade",
+            ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
             .env("SLINT_MCP_PORT", mcp_port.to_string())
@@ -380,7 +390,10 @@ impl LiveAutohandHarness {
 
     async fn element_tree(&self, window_handle: &Value) -> Vec<Value> {
         let root_handle = self
-            .tool_call("get_window_properties", json!({"windowHandle": window_handle}))
+            .tool_call(
+                "get_window_properties",
+                json!({"windowHandle": window_handle}),
+            )
             .await["rootElementHandle"]
             .clone();
         let tree = self
@@ -461,7 +474,8 @@ impl LiveAutohandHarness {
 
     async fn send_via_compose(&self, window_handle: &Value, text: &str) {
         let compose = wait_for(Duration::from_secs(15), || async {
-            self.find_by_exact_label(window_handle, "Compose message").await
+            self.find_by_exact_label(window_handle, "Compose message")
+                .await
         })
         .await;
         self.tool_call(
@@ -553,7 +567,10 @@ async fn live_autohand_pre_session_auth_failure_renders_a_real_error_not_a_hang(
         harness
             .create_new_thread_with_default_profile(&window)
             .await;
-        eprintln!("[debug] labels after thread create: {:?}", harness.labels(&window).await);
+        eprintln!(
+            "[debug] labels after thread create: {:?}",
+            harness.labels(&window).await
+        );
 
         harness
             .send_via_compose(&window, "diagnostic ping: are you there?")

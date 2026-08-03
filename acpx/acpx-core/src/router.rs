@@ -11,9 +11,11 @@ use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
 use crate::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    PersistenceStore,
+    PersistenceStore, QueueHub, QueueStore, TranscriptStore,
 };
-use crate::profile::{PermissionPolicy, Profile, ProfileStore};
+use crate::profile::{
+    PermissionPolicy, PermissionProfile as CorePermissionProfile, Profile, ProfileStore,
+};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
 use crate::{AgentEnablement, CustomAgentStore, InteractionHub, DEFAULT_INTERACTION_TIMEOUT};
@@ -144,7 +146,19 @@ pub fn classify(method: &str) -> MethodClass {
         // See `MethodClass::SessionFork`'s doc comment for why this is
         // neither `Proxied` nor `Hybrid`.
         "session/fork" => MethodClass::SessionFork,
-        "agents/list" | "agents/install" | "agents/status" | "session/list" => {
+        "agents/list"
+        | "agents/install"
+        | "agents/status"
+        | "session/list"
+        | "acpx/sessions/subscribe"
+        | "acpx/sessions/paginate"
+        | "acpx/sessions/sync"
+        | "acpx/sessions/queue/subscribe"
+        | "session/queue"
+        | "session/steer"
+        | "permission_profiles/list"
+        | "session/permission_profile/get"
+        | "session/permission_profile/set" => {
             MethodClass::GatewayNative
         }
         // `acpx_native_models_list_endpoint` (worktree-consolidation-and-
@@ -326,6 +340,10 @@ pub struct Router {
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
     persistence: Option<PersistenceStore>,
+    transcripts: Option<TranscriptStore>,
+    queue_store: Option<QueueStore>,
+    queue_hub: QueueHub,
+    queue_active: Arc<Mutex<HashSet<String>>>,
     /// Durable admin-plane read stores. They remain absent for
     /// in-memory-only routers, preserving the legacy default behavior.
     agent_enablement: Option<AgentEnablement>,
@@ -767,6 +785,10 @@ pub enum RouterError {
     BackendSessionNewError(serde_json::Value),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
+    #[error("transcript: {0}")]
+    Transcript(#[from] crate::persistence::TranscriptError),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Supervisor(#[from] acpx_conductor::supervisor::SupervisorError),
     #[error(transparent)]
@@ -1064,6 +1086,10 @@ impl Router {
             registry_retry_not_before: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
+            transcripts: None,
+            queue_store: None,
+            queue_hub: QueueHub::default(),
+            queue_active: Arc::new(Mutex::new(HashSet::new())),
             agent_enablement: None,
             custom_agents: None,
             materialized_custom_agents: HashSet::new(),
@@ -1217,8 +1243,9 @@ impl Router {
             match keyring
                 .decrypt(key_version, &nonce, &ciphertext)
                 .ok()
-                .and_then(|plaintext| serde_json::from_slice::<crate::oauth::OAuthTokens>(&plaintext).ok())
-            {
+                .and_then(|plaintext| {
+                    serde_json::from_slice::<crate::oauth::OAuthTokens>(&plaintext).ok()
+                }) {
                 Some(tokens) => self.oauth_tokens.insert(server_name, tokens),
                 None => tracing::warn!(
                     server = %server_name,
@@ -1609,7 +1636,14 @@ impl Router {
                         };
                         let now = now_rfc3339();
                         if let Err(err) = persistence
-                            .upsert_oauth_tokens(name.to_string(), ciphertext, nonce, version, now.clone(), now)
+                            .upsert_oauth_tokens(
+                                name.to_string(),
+                                ciphertext,
+                                nonce,
+                                version,
+                                now.clone(),
+                                now,
+                            )
                             .await
                         {
                             tracing::warn!(%err, server = %name, "failed to persist refreshed oauth tokens");
@@ -1668,15 +1702,16 @@ impl Router {
             return Ok(());
         };
 
-        self.mcp_tool_catalog
-            .insert(name.to_string(), crate::mcp_client::ToolCatalogState::Fetching);
+        self.mcp_tool_catalog.insert(
+            name.to_string(),
+            crate::mcp_client::ToolCatalogState::Fetching,
+        );
 
         let catalog = self.mcp_tool_catalog.clone();
         let http = self.http.clone();
         let name = name.to_string();
         tokio::spawn(async move {
-            let result =
-                crate::mcp_client::probe(&http, spec, Duration::from_secs(15)).await;
+            let result = crate::mcp_client::probe(&http, spec, Duration::from_secs(15)).await;
             let state = match result {
                 Ok(tools) => crate::mcp_client::ToolCatalogState::Ready { tools },
                 Err(err) => {
@@ -1790,12 +1825,18 @@ impl Router {
 
             if let Some(mut entry) = mcp_servers.get(&server_name) {
                 if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("auth_status".to_string(), serde_json::json!("authenticated"));
+                    obj.insert(
+                        "auth_status".to_string(),
+                        serde_json::json!("authenticated"),
+                    );
                     obj.insert("needs_auth".to_string(), serde_json::json!(false));
                 }
                 if mcp_servers.update(entry.clone()).is_ok() {
                     if let Some(persistence) = &persistence {
-                        if let Err(err) = persistence.upsert_mcp_server(server_name.clone(), entry).await {
+                        if let Err(err) = persistence
+                            .upsert_mcp_server(server_name.clone(), entry)
+                            .await
+                        {
                             tracing::warn!(%err, server = %server_name, "failed to persist mcp server auth_status");
                         }
                     }
@@ -1803,8 +1844,7 @@ impl Router {
             }
 
             if let (Some(persistence), Some(keyring_lock)) = (&persistence, &keyring) {
-                let plaintext =
-                    serde_json::to_vec(&tokens).expect("OAuthTokens always serializes");
+                let plaintext = serde_json::to_vec(&tokens).expect("OAuthTokens always serializes");
                 let (version, nonce, ciphertext) = {
                     let keyring = keyring_lock
                         .lock()
@@ -1813,7 +1853,14 @@ impl Router {
                 };
                 let now = now_rfc3339();
                 if let Err(err) = persistence
-                    .upsert_oauth_tokens(server_name.clone(), ciphertext, nonce, version, now.clone(), now)
+                    .upsert_oauth_tokens(
+                        server_name.clone(),
+                        ciphertext,
+                        nonce,
+                        version,
+                        now.clone(),
+                        now,
+                    )
                     .await
                 {
                     tracing::warn!(%err, server = %server_name, "failed to persist oauth tokens");
@@ -1835,7 +1882,10 @@ impl Router {
         self.oauth_tokens.remove(name);
         if let Some(mut entry) = self.mcp_servers.get(name) {
             if let Some(obj) = entry.as_object_mut() {
-                obj.insert("auth_status".to_string(), serde_json::json!("unauthenticated"));
+                obj.insert(
+                    "auth_status".to_string(),
+                    serde_json::json!("unauthenticated"),
+                );
                 obj.insert("needs_auth".to_string(), serde_json::json!(true));
             }
             if self.mcp_servers.update(entry.clone()).is_ok() {
@@ -1901,6 +1951,41 @@ impl Router {
     /// to persist metadata adjacent to a native gateway session.
     pub fn persistence_store(&self) -> Option<PersistenceStore> {
         self.persistence.clone()
+    }
+
+    pub fn transcript_store(&self) -> Option<TranscriptStore> {
+        self.transcripts.clone()
+    }
+
+    pub fn with_queue_store(mut self, queue_store: QueueStore) -> Self {
+        self.queue_store = Some(queue_store);
+        self
+    }
+
+    pub fn queue_store(&self) -> Option<QueueStore> {
+        self.queue_store.clone()
+    }
+
+    pub fn queue_hub(&self) -> QueueHub {
+        self.queue_hub.clone()
+    }
+
+    fn queue_dispatch_active(&self) -> Arc<Mutex<HashSet<String>>> {
+        self.queue_active.clone()
+    }
+
+    fn session_is_in_flight(&self, tenant_id: &TenantId, gateway_session_id: &str) -> bool {
+        self.sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.to_owned()),
+            )
+            .is_some_and(|entry| entry.in_flight != 0)
+    }
+
+    pub fn with_transcript_store(mut self, transcripts: TranscriptStore) -> Self {
+        self.transcripts = Some(transcripts);
+        self
     }
 
     /// Override native session limits. Server configuration should validate
@@ -2032,6 +2117,29 @@ impl Router {
             return self.call_policy(self.profiles.get(name));
         }
         self.call_policy(self.profiles.get(agent_id))
+    }
+
+    /// Resolve the agent profile and then apply the gateway-owned session
+    /// permission profile, when one is attached. Session profiles are an
+    /// independent safety layer and therefore override only capability and
+    /// permission-policy fields; authentication remains agent/profile-owned.
+    async fn call_policy_for_session(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        profile_name: Option<&str>,
+        agent_id: &str,
+    ) -> BackendCallPolicy {
+        let mut policy = self.call_policy_for(profile_name, agent_id).await;
+        if let Some(profile) = self
+            .sessions
+            .permission_profile(tenant_id, gateway_session_id)
+        {
+            policy.permission_policy = profile.permission_policy;
+            policy.allow_fs_access = profile.allow_fs_access;
+            policy.allow_terminal_access = profile.allow_terminal_access;
+        }
+        policy
     }
 
     /// Warm [`ensure_default_profiles_seeded`] once, outside any per-request
@@ -2203,11 +2311,7 @@ impl Router {
     /// Release admission only if this session actually consumed a slot.
     /// Discovery-only list-import rows never called `admit_session`, so
     /// they must not call `release_live` (would underflow the counters).
-    fn release_live_session_if_counted(
-        &self,
-        tenant_id: &TenantId,
-        capacity_counted: bool,
-    ) {
+    fn release_live_session_if_counted(&self, tenant_id: &TenantId, capacity_counted: bool) {
         if capacity_counted {
             self.release_live_session(tenant_id);
         }
@@ -3406,6 +3510,17 @@ impl Router {
             .and_then(|c| c.as_str())
             .map(str::to_string);
 
+        let requested_permission_profile = params
+            .get("permissionProfile")
+            .and_then(|value| value.as_str())
+            .map(|name| match name {
+                "agent_full_access" => Ok(CorePermissionProfile::agent_full_access()),
+                "readonly" => Ok(CorePermissionProfile::readonly()),
+                "not_allowed" => Ok(CorePermissionProfile::not_allowed()),
+                _ => Err(RouterError::MissingParams),
+            })
+            .transpose()?;
+
         // Precedence per 02-architecture.md: an explicit `_acpx.profile`
         // selects managed mode (Phase 3: profile -> agent/provider/key
         // resolution, see `resolve_profile`); omitting it stays
@@ -3535,7 +3650,9 @@ impl Router {
         let call_policy_profile = profile
             .clone()
             .or_else(|| self.profiles.get(&agent_id).cloned());
-        let call_policy = self.call_policy(call_policy_profile.as_ref());
+        let call_policy = self
+            .call_policy(call_policy_profile.as_ref())
+            .with_permission_profile(requested_permission_profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
@@ -3584,12 +3701,27 @@ impl Router {
         };
         self.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
 
+        // `permissionProfile` is gateway-owned session state and is
+        // intentionally independent from the agent-bound `_acpx.profile`.
+        // Accept the built-in profile name on session creation so clients
+        // do not need a racy follow-up mutation before the first prompt.
+        if let Some(profile) = requested_permission_profile {
+            self.sessions
+                .set_permission_profile(tenant_id, gateway_id.0.clone(), profile);
+        }
+
         // Rewrite the backend's own session id into the gateway-issued one
         // before it ever reaches the client -- the client only ever sees
         // gateway session ids, never a raw backend id.
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
+            if let Some(profile) = self
+                .sessions
+                .permission_profile(tenant_id, result["sessionId"].as_str().unwrap_or_default())
+            {
+                result["permissionProfile"] = serde_json::to_value(profile)?;
+            }
         }
         let entry = self
             .sessions
@@ -4267,7 +4399,12 @@ impl Router {
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
         let call_policy = self
-            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .call_policy_for_session(
+                tenant_id,
+                &gateway_session_id,
+                profile_name.as_deref(),
+                &agent_id,
+            )
             .await;
 
         // session/resume + session/load: merge the session's profile
@@ -4275,11 +4412,7 @@ impl Router {
         // (see merge_mcp_into_session_establish_params). Must run before
         // the sessionId rewrite so validation sees the client-shaped
         // request; the rewrite only touches sessionId.
-        self.merge_mcp_into_session_establish_params(
-            &method,
-            params,
-            profile_name.as_deref(),
-        )?;
+        self.merge_mcp_into_session_establish_params(&method, params, profile_name.as_deref())?;
 
         // Promote discovery-only list-import rows to capacity-counted
         // live sessions on first real use (not on close/cancel).
@@ -4296,7 +4429,7 @@ impl Router {
         self.spawn_state_revision_for_event(gateway_session_id.clone());
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let response = {
+        let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             write_backend_value_locked(&mut backend, &request).await?;
@@ -4311,6 +4444,15 @@ impl Router {
                 .await?;
             attach_updates(response, notifications, agent_requests)
         };
+        if matches!(method.as_str(), "session/load" | "session/resume") {
+            enrich_native_session_result(
+                &mut response,
+                serde_json::json!({
+                    "serverPersistence": true,
+                    "queueSubscribeMethod": "acpx/sessions/queue/subscribe"
+                }),
+            );
+        }
         self.sessions.touch(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
@@ -4419,7 +4561,12 @@ impl Router {
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
         let call_policy = self
-            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .call_policy_for_session(
+                tenant_id,
+                &gateway_session_id,
+                profile_name.as_deref(),
+                &agent_id,
+            )
             .await;
 
         params["sessionId"] = serde_json::Value::String(backend_session_id);
@@ -4566,6 +4713,88 @@ impl Router {
         }
 
         Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
+    }
+
+    fn dispatch_permission_profile_request(
+        &mut self,
+        tenant_id: &TenantId,
+        method: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        use acpx_proto::gateway::{
+            PermissionProfileOverrides, PermissionProfileType, SessionPermissionProfileParams,
+        };
+
+        if method == "permission_profiles/list" {
+            return Ok(serde_json::json!({
+                "profiles": CorePermissionProfile::builtins(),
+            }));
+        }
+
+        let params = request
+            .get("params")
+            .cloned()
+            .ok_or(RouterError::MissingParams)?;
+        let typed: SessionPermissionProfileParams =
+            serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+        let gateway_id = acpx_proto::session::GatewaySessionId(typed.session_id.clone());
+        if self.sessions.resolve(tenant_id, &gateway_id).is_none() {
+            return Err(RouterError::UnknownSession(typed.session_id));
+        }
+
+        if method == "session/permission_profile/get" {
+            let profile = self
+                .sessions
+                .permission_profile(tenant_id, &gateway_id.0)
+                .cloned()
+                .unwrap_or_else(CorePermissionProfile::not_allowed);
+            return Ok(serde_json::to_value(
+                acpx_proto::gateway::SessionPermissionProfileResult {
+                    session_id: gateway_id.0,
+                    profile: serde_json::from_value(serde_json::to_value(profile)?)
+                        .map_err(|_| RouterError::MissingParams)?,
+                },
+            )?);
+        }
+
+        let profile_type = typed.profile_type.ok_or(RouterError::MissingParams)?;
+        let mut profile = match profile_type {
+            PermissionProfileType::AgentFullAccess => CorePermissionProfile::agent_full_access(),
+            PermissionProfileType::Readonly => CorePermissionProfile::readonly(),
+            PermissionProfileType::NotAllowed => CorePermissionProfile::not_allowed(),
+        };
+        if let Some(PermissionProfileOverrides {
+            allow_fs_access,
+            allow_terminal_access,
+            permission_policy,
+        }) = typed.overrides
+        {
+            if let Some(value) = allow_fs_access {
+                profile.allow_fs_access = value;
+            }
+            if let Some(value) = allow_terminal_access {
+                profile.allow_terminal_access = value;
+            }
+            if let Some(value) = permission_policy {
+                profile.permission_policy = match value {
+                    acpx_proto::gateway::PermissionPolicySchema::AutoAllow => {
+                        PermissionPolicy::AutoAllow
+                    }
+                    acpx_proto::gateway::PermissionPolicySchema::AutoReject => {
+                        PermissionPolicy::AutoReject
+                    }
+                };
+            }
+        }
+        self.sessions
+            .set_permission_profile(tenant_id, gateway_id.0.clone(), profile.clone());
+        Ok(serde_json::to_value(
+            acpx_proto::gateway::SessionPermissionProfileResult {
+                session_id: gateway_id.0,
+                profile: serde_json::from_value(serde_json::to_value(profile)?)
+                    .map_err(|_| RouterError::MissingParams)?,
+            },
+        )?)
     }
 
     async fn dispatch_native(
@@ -4748,7 +4977,12 @@ impl Router {
                 };
                 let agent_id = entry.agent_id.clone();
                 let call_policy = self
-                    .call_policy_for(entry.profile_name.as_deref(), &agent_id)
+                    .call_policy_for_session(
+                        tenant_id,
+                        &gateway_session_id,
+                        entry.profile_name.as_deref(),
+                        &agent_id,
+                    )
                     .await;
                 if !call_policy.allow_terminal_access {
                     return Err(RouterError::TerminalAccessDisabled(
@@ -4806,6 +5040,178 @@ impl Router {
                         serde_json::json!({ "sessions": sessions })
                     }
                 }
+            }
+            "permission_profiles/list"
+            | "session/permission_profile/get"
+            | "session/permission_profile/set" => {
+                self.dispatch_permission_profile_request(tenant_id, method, &request)?
+            }
+            "session/steer" => {
+                // The shared transport uses the lock-brief dispatch below.
+                // Direct Router callers still get durable admission and a
+                // best-effort cancel; the backend queue dispatcher is a
+                // shared-transport concern.
+                let params = request
+                    .get("params")
+                    .cloned()
+                    .ok_or(RouterError::MissingParams)?;
+                let typed: acpx_proto::session_stream::SessionSteerParams =
+                    serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                typed
+                    .validate()
+                    .map_err(|message| RouterError::NotImplemented(message))?;
+                let store = self
+                    .queue_store
+                    .as_ref()
+                    .ok_or(RouterError::NotImplemented("server queue storage"))?
+                    .clone();
+                let text = typed.prompt.as_deref().and_then(prompt_blocks_to_text);
+                let (result, event) = store
+                    .mutate(
+                        typed.session_id.clone(),
+                        acpx_proto::session_stream::QueueMutationParams {
+                            session_id: typed.session_id.clone(),
+                            idempotency_key: typed.idempotency_key.clone(),
+                            operation: acpx_proto::session_stream::QueueOperation::SendNow,
+                            queue_entry_id: typed.queue_entry_id.clone(),
+                            text,
+                        },
+                    )
+                    .await?;
+                self.queue_hub.publish(event).await;
+                let _ = self
+                    .dispatch_session_cancel(
+                        tenant_id,
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "session/cancel",
+                            "params": {"sessionId": typed.session_id}
+                        }),
+                    )
+                    .await;
+                serde_json::to_value(acpx_proto::session_stream::SessionSteerResult {
+                    session_id: result.session_id,
+                    accepted: result.accepted,
+                    queue_entry_id: result.queue_entry_id,
+                })?
+            }
+            "acpx/sessions/subscribe"
+            | "acpx/sessions/paginate"
+            | "acpx/sessions/sync"
+            | "acpx/sessions/queue/subscribe"
+            | "session/queue" => {
+                if method == "acpx/sessions/paginate" {
+                    let store = self
+                        .transcripts
+                        .as_ref()
+                        .ok_or(RouterError::NotImplemented("server transcript storage"))?
+                        .clone();
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::SessionPaginateParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    let page = store
+                        .paginate(typed.session_id, typed.before.as_deref(), typed.limit)
+                        .await?;
+                    return Ok(serde_json::to_value(page)?);
+                }
+                if method == "acpx/sessions/sync" {
+                    let store = self
+                        .transcripts
+                        .as_ref()
+                        .ok_or(RouterError::NotImplemented("server transcript storage"))?
+                        .clone();
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::SessionSyncParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    let session_id = typed.session_id.clone();
+                    let load_response = self
+                        .dispatch_proxied(
+                            tenant_id,
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request.get("id").cloned().unwrap_or(serde_json::json!(0)),
+                                "method": "session/load",
+                                "params": {"sessionId": session_id}
+                            }),
+                        )
+                        .await?;
+                    let canonical = load_response
+                        .get("_acpx")
+                        .and_then(|extension| extension.get("updates"))
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let patch = store
+                        .patch_against(
+                            &typed.session_id,
+                            typed.known_message_count,
+                            typed.last_matched_message_id.as_deref(),
+                            canonical,
+                        )
+                        .await?;
+                    store.apply_patch(&typed.session_id, &patch).await?;
+                    let result = acpx_proto::session_stream::SessionSyncResult {
+                        session_id: typed.session_id,
+                        patch,
+                        cursor: None,
+                    };
+                    return Ok(serde_json::to_value(result)?);
+                }
+                if method == "acpx/sessions/subscribe" {
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::SessionsSubscribeParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    return Ok(serde_json::to_value(
+                        acpx_proto::session_stream::SessionsSubscribeResult {
+                            session_ids: typed.session_ids,
+                            background: typed.background,
+                            cursor: typed.cursor,
+                        },
+                    )?);
+                }
+                if method == "acpx/sessions/queue/subscribe" {
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::QueueSubscribeParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    return Ok(serde_json::to_value(
+                        acpx_proto::session_stream::QueueSubscribeResult {
+                            session_ids: typed.session_ids,
+                            cursor: typed.cursor,
+                            snapshots: Vec::new(),
+                        },
+                    )?);
+                }
+                if method == "session/queue" {
+                    let store = self
+                        .queue_store
+                        .as_ref()
+                        .ok_or(RouterError::NotImplemented("server queue storage"))?
+                        .clone();
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .ok_or(RouterError::MissingParams)?;
+                    let typed: acpx_proto::session_stream::QueueMutationParams =
+                        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+                    let session_id = typed.session_id.clone();
+                    let (result, event) = store.mutate(session_id, typed).await?;
+                    self.queue_hub.publish(event).await;
+                    return Ok(serde_json::to_value(result)?);
+                }
+                return Err(RouterError::NotImplemented("session stream extensions"));
             }
             "agents/list" => {
                 self.ensure_registry_loaded().await;
@@ -5176,11 +5582,22 @@ impl Router {
             }
             other => return Err(RouterError::UnknownMethod(other.to_string())),
         };
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": result,
-        }))
+        });
+        if method == "session/list" {
+            enrich_native_session_result(
+                &mut response,
+                serde_json::json!({
+                    "background": true,
+                    "subscribeMethod": "acpx/sessions/subscribe",
+                    "queueSubscribeMethod": "acpx/sessions/queue/subscribe"
+                }),
+            );
+        }
+        Ok(response)
     }
 }
 
@@ -5260,6 +5677,19 @@ impl BackendCallPolicy {
             },
             None => Self::default(),
         }
+    }
+
+    /// Overlay the gateway-owned session permission profile on the agent
+    /// profile before the first backend turn. Session profiles deliberately
+    /// control only capability/approval fields; authentication remains owned
+    /// by the selected agent profile.
+    fn with_permission_profile(mut self, profile: Option<&CorePermissionProfile>) -> Self {
+        if let Some(profile) = profile {
+            self.permission_policy = profile.permission_policy;
+            self.allow_fs_access = profile.allow_fs_access;
+            self.allow_terminal_access = profile.allow_terminal_access;
+        }
+        self
     }
 }
 
@@ -5458,9 +5888,7 @@ fn select_auth_method_id(
         .and_then(|r| r.get("_meta"))
         .and_then(|m| m.get("defaultAuthMethodId"))
         .and_then(|v| v.as_str());
-    default_id
-        .filter(|id| advertises(id))
-        .map(str::to_string)
+    default_id.filter(|id| advertises(id)).map(str::to_string)
 }
 
 async fn ensure_backend_initialized(
@@ -6224,6 +6652,15 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
         .and_then(|p| p.get_mut("sessionId"))
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
+    }
+    // The server transcript is authoritative for every live update. Clone
+    // only the already-owned frame while releasing the router lock before
+    // the JSONL append; transport subscribers remain a delivery concern.
+    let transcript_store = { ctx.router.lock().await.transcript_store() };
+    if let Some(store) = transcript_store {
+        if let Err(error) = store.append(&gateway_id.0, vec![translated.clone()]).await {
+            tracing::warn!(session_id = %gateway_id.0, %error, "failed to persist live session update");
+        }
     }
     ctx.notification_hub
         .publish(&tenant_id, &gateway_id.0, translated)
@@ -7565,23 +8002,37 @@ async fn run_recovery_candidate(
         }
     };
 
-    store
-        .update_recovery_status(
-            record.gateway_session_id.clone(),
-            RecoveryStatus::Restored,
-            None,
+    let gateway_session_id = record.gateway_session_id.clone();
+    let (queue_store, tenant_id, gateway_session_id) = {
+        let mut router = router.lock().await;
+        // See `dispatch_session_new`'s identical cancellation.
+        let supervisor_key_for_cancel = job.entry.agent_id.clone();
+        router.sessions.insert(
+            &job.tenant_id,
+            acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            job.entry,
+        );
+        router.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
+        job.admission.commit();
+        (
+            router.queue_store(),
+            job.tenant_id.clone(),
+            gateway_session_id,
         )
+    };
+    if let Some(queue_store) = queue_store {
+        queue_store
+            .recover_inflight(gateway_session_id.clone())
+            .await?;
+        spawn_queue_dispatcher(
+            router.clone(),
+            tenant_id.clone(),
+            gateway_session_id.clone(),
+        );
+    }
+    store
+        .update_recovery_status(gateway_session_id, RecoveryStatus::Restored, None)
         .await?;
-    let mut router = router.lock().await;
-    // See `dispatch_session_new`'s identical cancellation.
-    let supervisor_key_for_cancel = job.entry.agent_id.clone();
-    router.sessions.insert(
-        &job.tenant_id,
-        acpx_proto::session::GatewaySessionId(record.gateway_session_id),
-        job.entry,
-    );
-    router.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
-    job.admission.commit();
     Ok(true)
 }
 
@@ -7758,6 +8209,33 @@ pub async fn dispatch_shared_for_tenant(
         {
             dispatch_session_list_real_shared(router, tenant_id, request).await
         }
+        MethodClass::GatewayNative if method == "acpx/sessions/paginate" => {
+            dispatch_session_paginate_shared(router, tenant_id, request).await
+        }
+        MethodClass::GatewayNative if method == "acpx/sessions/sync" => {
+            dispatch_session_sync_shared(router, tenant_id, request).await
+        }
+        MethodClass::GatewayNative if method == "session/queue" => {
+            dispatch_queue_mutation_shared(router, tenant_id, request).await
+        }
+        MethodClass::GatewayNative if method == "session/steer" => {
+            dispatch_session_steer_shared(router, tenant_id, request).await
+        }
+        MethodClass::GatewayNative
+            if matches!(
+                method.as_str(),
+                "permission_profiles/list"
+                    | "session/permission_profile/get"
+                    | "session/permission_profile/set"
+            ) =>
+        {
+            dispatch_permission_profile_shared(router, tenant_id, &method, request).await
+        }
+        MethodClass::GatewayNative
+            if method == "acpx/sessions/subscribe" || method == "acpx/sessions/queue/subscribe" =>
+        {
+            dispatch_session_stream_subscribe_shared(router, tenant_id, &method, request).await
+        }
         // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
         // plan.** `agents/install` is a genuine (potentially many-second,
         // real network/filesystem) download+extract, not the cheap/local
@@ -7786,6 +8264,379 @@ pub async fn dispatch_shared_for_tenant(
                 .await
         }
     }
+}
+
+async fn dispatch_session_paginate_shared(
+    router: &SharedRouterHandle,
+    _tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let store = router
+        .lock()
+        .await
+        .transcript_store()
+        .ok_or(RouterError::NotImplemented("server transcript storage"))?;
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::SessionPaginateParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let page = store
+        .paginate(typed.session_id, typed.before.as_deref(), typed.limit)
+        .await?;
+    Ok(serde_json::to_value(page)?)
+}
+
+async fn dispatch_session_sync_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let store = router
+        .lock()
+        .await
+        .transcript_store()
+        .ok_or(RouterError::NotImplemented("server transcript storage"))?;
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::SessionSyncParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let session_id = typed.session_id.clone();
+    let load_response = dispatch_proxied_shared(
+        router,
+        tenant_id,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(serde_json::json!(0)),
+            "method": "session/load",
+            "params": {"sessionId": session_id}
+        }),
+    )
+    .await?;
+    let canonical = load_response
+        .get("_acpx")
+        .and_then(|extension| extension.get("updates"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let patch = store
+        .patch_against(
+            &typed.session_id,
+            typed.known_message_count,
+            typed.last_matched_message_id.as_deref(),
+            canonical,
+        )
+        .await?;
+    store.apply_patch(&typed.session_id, &patch).await?;
+    Ok(serde_json::to_value(
+        acpx_proto::session_stream::SessionSyncResult {
+            session_id: typed.session_id,
+            patch,
+            cursor: None,
+        },
+    )?)
+}
+
+async fn dispatch_session_stream_subscribe_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    method: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    if method == "acpx/sessions/subscribe" {
+        let typed: acpx_proto::session_stream::SessionsSubscribeParams =
+            serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+        return Ok(serde_json::to_value(
+            acpx_proto::session_stream::SessionsSubscribeResult {
+                session_ids: typed.session_ids,
+                background: typed.background,
+                cursor: typed.cursor,
+            },
+        )?);
+    }
+    let typed: acpx_proto::session_stream::QueueSubscribeParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let store = router.lock().await.queue_store();
+    let mut snapshots = Vec::with_capacity(typed.session_ids.len());
+    if let Some(store) = store {
+        for session_id in &typed.session_ids {
+            snapshots.push(
+                store
+                    .snapshot(session_id.clone())
+                    .await
+                    .map_err(RouterError::from)?,
+            );
+            // A reconnect is also a liveness signal. Re-arm the dispatcher
+            // so a queue left behind by a transient backend/dispatcher
+            // failure does not wait for another mutation before progressing.
+            spawn_queue_dispatcher(router.clone(), tenant_id.clone(), session_id.clone());
+        }
+    }
+    Ok(serde_json::to_value(
+        acpx_proto::session_stream::QueueSubscribeResult {
+            session_ids: typed.session_ids,
+            cursor: typed.cursor,
+            snapshots,
+        },
+    )?)
+}
+
+async fn dispatch_permission_profile_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    method: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let result = {
+        let mut r = router.lock().await;
+        r.dispatch_permission_profile_request(tenant_id, method, &request)?
+    };
+    if method == "session/permission_profile/set" {
+        if let Some(session_id) = request
+            .pointer("/params/sessionId")
+            .and_then(|value| value.as_str())
+        {
+            let hub = { router.lock().await.notification_hub() };
+            hub.publish(
+                tenant_id,
+                session_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "acpx/session/permission_profile",
+                    "params": result
+                }),
+            )
+            .await;
+        }
+    }
+    Ok(result)
+}
+
+async fn dispatch_session_steer_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    // The websocket transport injects this private marker so the queue
+    // forwarder can omit the lifecycle delta from the initiating client.
+    // It never crosses the public ACP method surface.
+    let origin_client_id = request
+        .pointer("/_acpx/originClientId")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::SessionSteerParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    typed
+        .validate()
+        .map_err(|message| RouterError::NotImplemented(message))?;
+    let text = typed.prompt.as_deref().and_then(prompt_blocks_to_text);
+    let (store, hub) = {
+        let r = router.lock().await;
+        (
+            r.queue_store()
+                .ok_or(RouterError::NotImplemented("server queue storage"))?,
+            r.queue_hub(),
+        )
+    };
+    let (result, event) = store
+        .mutate(
+            typed.session_id.clone(),
+            acpx_proto::session_stream::QueueMutationParams {
+                session_id: typed.session_id.clone(),
+                idempotency_key: typed.idempotency_key.clone(),
+                operation: acpx_proto::session_stream::QueueOperation::SendNow,
+                queue_entry_id: typed.queue_entry_id.clone(),
+                text,
+            },
+        )
+        .await?;
+    hub.publish_with_origin(event.clone(), origin_client_id.as_deref())
+        .await;
+    hub.publish_steer(
+        acpx_proto::session_stream::SessionSteerEvent {
+            session_id: typed.session_id.clone(),
+            state: acpx_proto::session_stream::SessionSteerState::Queued,
+            queue_entry_id: result.queue_entry_id.clone(),
+            idempotency_key: Some(typed.idempotency_key.clone()),
+        },
+        origin_client_id.as_deref(),
+    )
+    .await;
+    let cancel_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": format!("steer-cancel:{}", typed.idempotency_key),
+        "method": "session/cancel",
+        "params": {"sessionId": typed.session_id}
+    });
+    let _ = dispatch_session_cancel_shared(router, tenant_id, cancel_request).await;
+    spawn_queue_dispatcher(router.clone(), tenant_id.clone(), result.session_id.clone());
+    hub.publish_steer(
+        acpx_proto::session_stream::SessionSteerEvent {
+            session_id: typed.session_id.clone(),
+            state: acpx_proto::session_stream::SessionSteerState::Dispatched,
+            queue_entry_id: result.queue_entry_id.clone(),
+            idempotency_key: Some(typed.idempotency_key.clone()),
+        },
+        origin_client_id.as_deref(),
+    )
+    .await;
+    hub.publish_steer(
+        acpx_proto::session_stream::SessionSteerEvent {
+            session_id: typed.session_id.clone(),
+            state: acpx_proto::session_stream::SessionSteerState::Completed,
+            queue_entry_id: result.queue_entry_id.clone(),
+            idempotency_key: Some(typed.idempotency_key.clone()),
+        },
+        origin_client_id.as_deref(),
+    )
+    .await;
+    Ok(serde_json::to_value(
+        acpx_proto::session_stream::SessionSteerResult {
+            session_id: result.session_id,
+            accepted: result.accepted,
+            queue_entry_id: result.queue_entry_id,
+        },
+    )?)
+}
+
+async fn dispatch_queue_mutation_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let store = router
+        .lock()
+        .await
+        .queue_store()
+        .ok_or(RouterError::NotImplemented("server queue storage"))?;
+    let hub = { router.lock().await.queue_hub() };
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let typed: acpx_proto::session_stream::QueueMutationParams =
+        serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let session_id = typed.session_id.clone();
+    let operation = typed.operation;
+    let (result, event) = store.mutate(session_id, typed).await?;
+    hub.publish(event).await;
+    if matches!(
+        operation,
+        acpx_proto::session_stream::QueueOperation::Enqueue
+            | acpx_proto::session_stream::QueueOperation::SendNow
+            | acpx_proto::session_stream::QueueOperation::Resume
+    ) {
+        if operation == acpx_proto::session_stream::QueueOperation::SendNow {
+            // Steering is server-owned: cancel the active backend turn first,
+            // then the single dispatcher promotes the newly-fronted entry.
+            // The dispatcher absorbs the resulting cancelled prompt result,
+            // preventing a second queue drain.
+            let _ = dispatch_session_cancel_shared(
+                router,
+                tenant_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("queue-cancel:{}", result.idempotency_key),
+                    "method": "session/cancel",
+                    "params": {"sessionId": result.session_id}
+                }),
+            )
+            .await;
+        }
+        spawn_queue_dispatcher(router.clone(), tenant_id.clone(), result.session_id.clone());
+    }
+    Ok(serde_json::to_value(result)?)
+}
+
+fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, session_id: String) {
+    tokio::spawn(async move {
+        let active = { router.lock().await.queue_dispatch_active() };
+        {
+            let mut active_sessions = active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !active_sessions.insert(session_id.clone()) {
+                return;
+            }
+        }
+        let mut retry_delay = std::time::Duration::from_millis(250);
+        loop {
+            let (store, hub) = {
+                let router = router.lock().await;
+                if router.session_is_in_flight(&tenant_id, &session_id) {
+                    break;
+                }
+                let Some(store) = router.queue_store() else {
+                    break;
+                };
+                (store, router.queue_hub())
+            };
+            let Some((item, event)) = (match store.take_next(&session_id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "queue dispatch claim failed");
+                    break;
+                }
+            }) else {
+                break;
+            };
+            hub.publish(event).await;
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": format!("queue:{}", item.queue_entry_id),
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": item.text}],
+                    "_acpx": {"queueEntryId": item.queue_entry_id, "idempotencyKey": item.idempotency_key}
+                }
+            });
+            if let Err(error) = dispatch_proxied_shared(&router, &tenant_id, request).await {
+                tracing::warn!(%session_id, %error, queue_entry_id = %item.queue_entry_id, "queued prompt failed; returning entry to FIFO");
+                match store.release(session_id.clone(), &item).await {
+                    Ok(event) => hub.publish(event).await,
+                    Err(release_error) => tracing::error!(
+                        %session_id,
+                        %release_error,
+                        queue_entry_id = %item.queue_entry_id,
+                        "queued prompt failed and durable requeue also failed"
+                    ),
+                }
+                // The claim was released, but no turn-boundary callback will
+                // arrive because dispatch never reached the backend. Keep
+                // this dispatcher alive and retry with bounded backoff so a
+                // transient backend/IPC failure cannot strand the FIFO.
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+                continue;
+            }
+            retry_delay = std::time::Duration::from_millis(250);
+            match store.complete(session_id.clone(), &item).await {
+                Ok(event) => hub.publish(event).await,
+                Err(error) => tracing::error!(
+                    %session_id,
+                    %error,
+                    queue_entry_id = %item.queue_entry_id,
+                    "queued prompt completed but durable completion record failed"
+                ),
+            }
+        }
+        let mut active_sessions = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active_sessions.remove(&session_id);
+    });
 }
 
 /// [`dispatch_shared_for_tenant`]'s `agents/install` path -- resolves the
@@ -8100,6 +8951,56 @@ async fn dispatch_session_list_real_shared(
 /// `Router::dispatch_proxied` exactly (session resolution, sessionId
 /// rewrite, state-revision persistence, `session/close` bookkeeping) but
 /// restructured to release `router`'s lock before the backend round trip.
+/// Append the client's own `session/prompt` text to the server transcript
+/// as a `user_message_chunk` `session/update` frame, addressed by *gateway*
+/// session id (the same translation `try_deliver_live` applies before its
+/// own append). Best effort: a transcript failure must never fail the turn
+/// the client actually asked for.
+async fn persist_prompt_turn(
+    router: &SharedRouterHandle,
+    gateway_session_id: &str,
+    request: &serde_json::Value,
+) {
+    let Some(text) = prompt_request_text(request) else {
+        return;
+    };
+    let store = { router.lock().await.transcript_store() };
+    let Some(store) = store else {
+        return;
+    };
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": gateway_session_id,
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": text}
+            }
+        }
+    });
+    if let Err(error) = store.append(gateway_session_id, vec![frame]).await {
+        tracing::warn!(session_id = %gateway_session_id, %error, "failed to persist user prompt");
+    }
+}
+
+/// Flatten a `session/prompt`'s content blocks into the single text a
+/// `user_message_chunk` carries; non-text blocks (images, resources) have
+/// no representation in that vocabulary and are skipped.
+fn prompt_request_text(request: &serde_json::Value) -> Option<String> {
+    let blocks = request.pointer("/params/prompt")?.as_array()?;
+    prompt_blocks_to_text(blocks)
+}
+
+fn prompt_blocks_to_text(blocks: &[serde_json::Value]) -> Option<String> {
+    let text = blocks
+        .iter()
+        .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
 async fn dispatch_proxied_shared(
     router: &SharedRouterHandle,
     tenant_id: &TenantId,
@@ -8151,11 +9052,7 @@ async fn dispatch_proxied_shared(
         if let Some(params) = request.get_mut("params") {
             // Same resume/load registry merge as dispatch_proxied -- must
             // run before the sessionId rewrite.
-            r.merge_mcp_into_session_establish_params(
-                &method,
-                params,
-                profile_name.as_deref(),
-            )?;
+            r.merge_mcp_into_session_establish_params(&method, params, profile_name.as_deref())?;
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
@@ -8178,7 +9075,14 @@ async fn dispatch_proxied_shared(
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             1,
         );
-        let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        let call_policy = r
+            .call_policy_for_session(
+                tenant_id,
+                &gateway_session_id,
+                profile_name.as_deref(),
+                &agent_id,
+            )
+            .await;
         let process_reader_demux = r.process_reader_demux;
         (
             backend,
@@ -8190,6 +9094,21 @@ async fn dispatch_proxied_shared(
             process_reader_demux,
         )
     };
+
+    // The prompt itself is the one transcript entry no backend
+    // `session/update` ever produces -- backends stream their *replies*,
+    // not the request that caused them (`try_deliver_live` above is the
+    // only other append site, and it only ever sees backend output). A
+    // live panel looks complete anyway because it renders its own
+    // optimistic local copy of what it just sent, but a reloaded or
+    // paginated history is built purely from this transcript, so without
+    // this append the agent's turns come back with the user turns that
+    // caused them missing. Recorded in the same wire vocabulary a
+    // backend replays user turns in on `session/load`, so pagination and
+    // `acpx/sessions/sync` reconciliation both see one shape.
+    if method == "session/prompt" {
+        persist_prompt_turn(router, &gateway_session_id, &request).await;
+    }
 
     spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
 
@@ -8288,12 +9207,32 @@ async fn dispatch_proxied_shared(
             0,
         );
     }
+    if method == "session/prompt" {
+        // A queue mutation that arrived while this prompt was active may
+        // have observed the in-flight guard and left the dispatcher idle.
+        // Re-arm it at the turn boundary so FIFO follow-ups are sent
+        // automatically without allowing concurrent normal turns.
+        spawn_queue_dispatcher(
+            router.clone(),
+            tenant_id.clone(),
+            gateway_session_id.clone(),
+        );
+    }
     if let Some(store) = persistence.clone() {
         store
             .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
             .await?;
     }
-    let response = response_result?;
+    let mut response = response_result?;
+    if matches!(method.as_str(), "session/load" | "session/resume") {
+        enrich_native_session_result(
+            &mut response,
+            serde_json::json!({
+                "serverPersistence": true,
+                "queueSubscribeMethod": "acpx/sessions/queue/subscribe"
+            }),
+        );
+    }
     mark_successful_recovery_retry(persistence.clone(), &gateway_session_id, &method).await?;
 
     spawn_state_revision_fn(persistence.clone(), gateway_session_id.clone());
@@ -8320,6 +9259,31 @@ async fn dispatch_proxied_shared(
         }
     }
     Ok(response)
+}
+
+/// Adds only namespaced ACPX metadata to a native ACP result. Native fields
+/// and method names remain untouched, so an ACP-only client can ignore this
+/// object while ACPX clients learn which background/queue streams to attach.
+fn enrich_native_session_result(response: &mut serde_json::Value, metadata: serde_json::Value) {
+    let Some(result) = response
+        .get_mut("result")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let Some(metadata) = metadata.as_object() else {
+        return;
+    };
+    let extension = result
+        .entry("_acpx")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !extension.is_object() {
+        *extension = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let extension = extension.as_object_mut().expect("just assigned object");
+    for (key, value) in metadata {
+        extension.insert(key.clone(), value.clone());
+    }
 }
 
 /// [`dispatch_shared`]'s `session/fork` path. Mirrors
@@ -8384,7 +9348,14 @@ async fn dispatch_session_fork_shared(
         if !r.process_reader_demux {
             r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
         }
-        let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        let call_policy = r
+            .call_policy_for_session(
+                tenant_id,
+                &gateway_session_id,
+                profile_name.as_deref(),
+                &agent_id,
+            )
+            .await;
         let process_reader_demux = r.process_reader_demux;
         (
             backend,
@@ -8534,6 +9505,7 @@ async fn dispatch_session_new_shared(
         agent_relay,
         notification_hub,
         process_reader_demux,
+        requested_permission_profile,
     ) = {
         let mut r = router.lock().await;
         let params = request
@@ -8543,6 +9515,16 @@ async fn dispatch_session_new_shared(
             .get("cwd")
             .and_then(|c| c.as_str())
             .map(str::to_string);
+        let requested_permission_profile = params
+            .get("permissionProfile")
+            .and_then(|value| value.as_str())
+            .map(|name| match name {
+                "agent_full_access" => Ok(CorePermissionProfile::agent_full_access()),
+                "readonly" => Ok(CorePermissionProfile::readonly()),
+                "not_allowed" => Ok(CorePermissionProfile::not_allowed()),
+                _ => Err(RouterError::MissingParams),
+            })
+            .transpose()?;
         let profile_name = params
             .get("_acpx")
             .and_then(|ext| ext.get("profile"))
@@ -8610,7 +9592,8 @@ async fn dispatch_session_new_shared(
 
         if let Some(profile) = &profile {
             if !profile.mcp_servers.is_empty() {
-                let central = r.inject_oauth_headers(r.mcp_servers.list_named(&profile.mcp_servers));
+                let central =
+                    r.inject_oauth_headers(r.mcp_servers.list_named(&profile.mcp_servers));
                 let params = request
                     .get_mut("params")
                     .ok_or(RouterError::MissingParams)?;
@@ -8652,7 +9635,9 @@ async fn dispatch_session_new_shared(
         let call_policy_profile = profile
             .clone()
             .or_else(|| r.profiles.get(&agent_id).cloned());
-        let call_policy = r.call_policy(call_policy_profile.as_ref());
+        let call_policy = r
+            .call_policy(call_policy_profile.as_ref())
+            .with_permission_profile(requested_permission_profile.as_ref());
         let process_reader_demux = r.process_reader_demux;
         (
             agent_id,
@@ -8666,6 +9651,7 @@ async fn dispatch_session_new_shared(
             r.agent_request_hub.clone(),
             r.notification_hub.clone(),
             process_reader_demux,
+            requested_permission_profile,
         )
     };
 
@@ -8788,9 +9774,19 @@ async fn dispatch_session_new_shared(
             ),
         };
         r.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
+        if let Some(profile) = requested_permission_profile {
+            r.sessions
+                .set_permission_profile(tenant_id, gateway_id.0.clone(), profile);
+        }
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
+            if let Some(profile) = r
+                .sessions
+                .permission_profile(tenant_id, &gateway_session_id_str)
+            {
+                result["permissionProfile"] = serde_json::to_value(profile)?;
+            }
         }
         let entry = r
             .sessions
@@ -8976,6 +9972,25 @@ mod tests {
         assert_eq!(classify("bogus/method"), MethodClass::Unknown);
     }
 
+    #[test]
+    fn native_session_metadata_merges_without_dropping_updates() {
+        let mut response = serde_json::json!({
+            "result": {"_acpx": {"updates": [{"method": "session/update"}]}}
+        });
+        enrich_native_session_result(
+            &mut response,
+            serde_json::json!({"serverPersistence": true}),
+        );
+        assert_eq!(response["result"]["_acpx"]["serverPersistence"], true);
+        assert_eq!(
+            response["result"]["_acpx"]["updates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// **`acpx-connect-loading-feedback`.** `session/load`/`session/resume`
     /// -- the two `Proxied` methods a real client's connect/loading UI
     /// gates on -- get the short `SESSION_ESTABLISH_IDLE_READ_TIMEOUT`;
@@ -9048,7 +10063,10 @@ mod tests {
         assert_eq!(classify("mcp_servers/list"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/update"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/delete"), MethodClass::GatewayNative);
-        assert_eq!(classify("mcp_servers/tools_fetch"), MethodClass::GatewayNative);
+        assert_eq!(
+            classify("mcp_servers/tools_fetch"),
+            MethodClass::GatewayNative
+        );
     }
 
     /// **Phase 9.** `session/delete` and `logout` were entirely
@@ -9408,10 +10426,7 @@ mod tests {
             serde_json::json!({"name": "fs", "command": "mcp-fs"}),
         ];
         let injected = router.inject_oauth_headers(entries);
-        assert_eq!(
-            injected[0]["headers"]["Authorization"],
-            "Bearer tok-123"
-        );
+        assert_eq!(injected[0]["headers"]["Authorization"], "Bearer tok-123");
         assert!(injected[1].get("headers").is_none());
     }
 
@@ -9634,12 +10649,18 @@ done
                 .dispatch(list_request.clone())
                 .await
                 .expect("mcp_servers/list dispatch should succeed");
-            let servers = reply["result"]["servers"].as_array().cloned().unwrap_or_default();
+            let servers = reply["result"]["servers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let stub_entry = servers
                 .iter()
                 .find(|entry| entry.get("name").and_then(|n| n.as_str()) == Some("stub"));
             if let Some(entry) = stub_entry {
-                if entry.get("toolCatalog").and_then(|t| t.get("status")).and_then(|s| s.as_str())
+                if entry
+                    .get("toolCatalog")
+                    .and_then(|t| t.get("status"))
+                    .and_then(|s| s.as_str())
                     == Some("ready")
                 {
                     observed_tools = entry["toolCatalog"]["tools"].as_array().cloned();

@@ -147,13 +147,18 @@ fn daemon_projects_refresh_due() -> bool {
 /// comment for why that constructor requires headed Slint setup).
 /// Returns whether anything changed, so the caller knows whether
 /// `Model::rebuild_thread_indices` is needed.
-pub(crate) fn hydrate_thread_ids_from_bridge(model: &mut crate::model::Model, bridge: &AgentBridge) -> bool {
+pub(crate) fn hydrate_thread_ids_from_bridge(
+    model: &mut crate::model::Model,
+    bridge: &AgentBridge,
+) -> bool {
     let mut changed = false;
     for index in 0..bridge.thread_count() {
         let Some(durable_id) = bridge.thread_id(index) else {
             continue;
         };
-        let session_id = bridge.thread_binding(index).map(|binding| binding.session_id);
+        let session_id = bridge
+            .thread_binding(index)
+            .map(|binding| binding.session_id);
         let Some(thread) = model.threads.get_mut(index) else {
             continue;
         };
@@ -192,7 +197,12 @@ pub(crate) fn hydrate_thread_ids_from_bridge(model: &mut crate::model::Model, br
 /// on "error", this leaves it there; only a fresh attach attempt (which
 /// re-derives `status` from `ThreadState` again, not this function) can
 /// clear it.
-fn shows_starting_thread_loading(closed: bool, status: &str, has_binding: bool, is_deferred: bool) -> bool {
+fn shows_starting_thread_loading(
+    closed: bool,
+    status: &str,
+    has_binding: bool,
+    is_deferred: bool,
+) -> bool {
     !closed && status != "error" && !has_binding && !is_deferred
 }
 
@@ -406,17 +416,21 @@ impl<'a> ExternalSnapshotSource<'a> {
             &mut discarded_warnings,
         );
         let (defaults, default_agent_id, show_global_skills) = prefs
-            .map(|prefs| (prefs.defaults, prefs.default_agent_id, prefs.show_global_skills))
+            .map(|prefs| {
+                (
+                    prefs.defaults,
+                    prefs.default_agent_id,
+                    prefs.show_global_skills,
+                )
+            })
             .unwrap_or_else(|| {
                 let defaults =
                     crate::load_panel_prefs(selected_thread_id.clone(), &mut discarded_warnings);
                 let resolved = crate::settings_file::SettingsPaths::from_env()
                     .load_resolved()
                     .ok();
-                let default_agent_id =
-                    resolved.as_ref().and_then(|r| r.default_agent_id.clone());
-                let show_global_skills =
-                    resolved.map(|r| r.show_global_skills).unwrap_or(true);
+                let default_agent_id = resolved.as_ref().and_then(|r| r.default_agent_id.clone());
+                let show_global_skills = resolved.map(|r| r.show_global_skills).unwrap_or(true);
                 (defaults, default_agent_id, show_global_skills)
             });
         let (background_override_set, background_override) = selected_thread_id
@@ -674,9 +688,10 @@ impl<'a> ExternalSnapshotSource<'a> {
                 if shows_starting_thread_loading(
                     row.closed,
                     row.status.as_str(),
-                    self.panel.bridge.as_ref().is_some_and(|bridge| {
-                        bridge.thread_binding(item.real_index).is_some()
-                    }),
+                    self.panel
+                        .bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.thread_binding(item.real_index).is_some()),
                     self.panel
                         .bridge
                         .as_ref()
@@ -1197,8 +1212,8 @@ mod tests {
     }
 
     #[test]
-    fn autohand_pre_session_failure_is_never_routed_by_the_pre_fix_hydration_but_is_by_the_real_fix()
-    {
+    fn autohand_pre_session_failure_is_never_routed_by_the_pre_fix_hydration_but_is_by_the_real_fix(
+    ) {
         let adapter_entry = autohand_adapter_entry();
         if !adapter_entry.exists() {
             eprintln!(
@@ -1329,7 +1344,10 @@ mod tests {
         // syncs the durable pre-session id unconditionally, so the event
         // resolves.
         let changed = hydrate_thread_ids_from_bridge(&mut model, &bridge);
-        assert!(changed, "the real fix must report a change once a durable id is available");
+        assert!(
+            changed,
+            "the real fix must report a change once a durable id is available"
+        );
         assert_eq!(
             model.threads[idx].thread_id, durable_thread_id,
             "the real fix must replace the synthetic placeholder with the bridge's durable id"

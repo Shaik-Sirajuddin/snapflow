@@ -190,7 +190,11 @@ fn spawn_editor_command(program: &Path, path: &Path) -> std::io::Result<()> {
         .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
         .unwrap_or(false);
     if is_script_launcher {
-        Command::new("cmd").arg("/C").arg(program).arg(path).spawn()?;
+        Command::new("cmd")
+            .arg("/C")
+            .arg(program)
+            .arg(path)
+            .spawn()?;
     } else {
         Command::new(program).arg(path).spawn()?;
     }

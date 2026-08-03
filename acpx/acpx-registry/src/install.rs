@@ -22,6 +22,56 @@ use std::process::{Command, Stdio};
 /// this as "Installed" for runtime-distributed agents.
 pub const READY_MARKER_NAME: &str = ".ready";
 
+/// Build the `Command` for `program`, resolving Windows `.cmd`/`.bat`
+/// launcher stubs the same way `acpx-conductor::process::base_command`
+/// does for the real agent spawn path (see that function's doc comment for
+/// the full `os error 193` background -- `npm`/`npx`/`uvx` ship no bare
+/// `.exe` on Windows PATH, so `Command::new("npm")` there fails the same
+/// way `code` did before `editor_detect.rs`'s `a0cbde2e` fix). Used for
+/// this crate's own pre-fetch/runtime-probe spawns so an install attempt
+/// doesn't fail with an opaque os-error-193 before ever reaching the real
+/// agent spawn in `acpx-conductor`.
+///
+/// Unix is unchanged: returns `Command::new(program)` as before.
+fn runtime_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        if let Some((resolved, is_script_launcher)) = resolve_windows_runtime_program(program) {
+            if is_script_launcher {
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/C").arg(resolved);
+                return cmd;
+            }
+            return Command::new(resolved);
+        }
+    }
+    Command::new(program)
+}
+
+#[cfg(windows)]
+fn resolve_windows_runtime_program(program: &str) -> Option<(PathBuf, bool)> {
+    let path = Path::new(program);
+    let is_script_ext = |ext: &str| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat");
+    if path.extension().is_some() || path.parent().filter(|p| !p.as_os_str().is_empty()).is_some() {
+        let is_script = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(is_script_ext)
+            .unwrap_or(false);
+        return Some((path.to_path_buf(), is_script));
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for ext in ["cmd", "bat", "exe"] {
+            let candidate = dir.join(format!("{program}.{ext}"));
+            if candidate.is_file() {
+                return Some((candidate, is_script_ext(ext)));
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
     #[error("agent {0} declares no supported distribution method")]
@@ -222,7 +272,7 @@ async fn prefetch_npx_package(
     // prefix's bin/ is first on PATH so we never mix global node + bundled npm.
     let path_for_npm = npm_bin_dir_path_prefix(&npm_bin);
     let probe = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(&npm_bin);
+        let mut cmd = runtime_command(&npm_bin);
         cmd.args([
             "install",
             "--no-save",
@@ -264,7 +314,7 @@ async fn prefetch_uvx_package(agent: &Agent, package: &str) -> Result<(), Instal
     let package_owned = package.to_string();
     let agent_id = agent.id.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        Command::new("uvx")
+        runtime_command("uvx")
             .args([&package_owned, "--help"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -356,7 +406,7 @@ async fn check_runtime(
     // Absolute npm still needs its bin/ on PATH for `env node` shebang.
     let path_for_bin = npm_bin_dir_path_prefix(&resolved);
     let probe = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(&resolved);
+        let mut cmd = runtime_command(&resolved);
         cmd.arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null());

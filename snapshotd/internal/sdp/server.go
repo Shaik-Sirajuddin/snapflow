@@ -57,10 +57,21 @@ type Server struct {
 	wg       sync.WaitGroup
 }
 
-// ListenAndServe binds the control socket (removing any stale socket file
-// first) and serves connections until Shutdown is called or an unrecoverable
-// Accept error occurs.
-func (s *Server) ListenAndServe() error {
+// Listen binds the control socket (removing any stale socket file first).
+// It is synchronous and returns once the socket is actually bound and ready
+// to accept connections -- callers that need to announce "listening" (e.g.
+// a log line a `status`/`stop` client might race against) must do so only
+// after this returns nil, not before or concurrently with it. Split out from
+// Serve specifically so callers can do that: previously both steps lived in
+// one ListenAndServe that callers only ever invoked via `go
+// sdpServer.ListenAndServe()`, which meant the bind (net.Listen) itself ran
+// on that goroutine with no happens-before edge back to the caller -- a
+// "SDP control socket listening" log line printed by the caller right after
+// spawning that goroutine could (and, per user reports, did) fire before the
+// listener was actually bound, so a client dialing immediately after seeing
+// that line got "connection refused"/"no such file" even though the daemon
+// was, from the log's perspective, already up.
+func (s *Server) Listen() error {
 	if s.Log == nil {
 		s.Log = slog.Default()
 	}
@@ -75,6 +86,19 @@ func (s *Server) ListenAndServe() error {
 	s.mu.Lock()
 	s.listener = ln
 	s.mu.Unlock()
+	return nil
+}
+
+// Serve accepts and handles connections until Shutdown is called or an
+// unrecoverable Accept error occurs. Listen must have already succeeded
+// (directly, or via ListenAndServe).
+func (s *Server) Serve() error {
+	s.mu.Lock()
+	ln := s.listener
+	s.mu.Unlock()
+	if ln == nil {
+		return fmt.Errorf("sdp: Serve called before a successful Listen")
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -90,6 +114,19 @@ func (s *Server) ListenAndServe() error {
 			s.serveConn(conn)
 		}()
 	}
+}
+
+// ListenAndServe binds the control socket and serves connections until
+// Shutdown is called or an unrecoverable Accept error occurs. Kept for
+// callers (and existing tests) that don't need the bind/serve split that
+// Listen/Serve offers -- new callers that log or otherwise signal readiness
+// around startup should call Listen and Serve separately (see Listen's doc
+// comment) so that signal only fires once the socket is genuinely bound.
+func (s *Server) ListenAndServe() error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve()
 }
 
 // Shutdown stops accepting new connections and waits for in-flight

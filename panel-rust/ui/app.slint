@@ -211,6 +211,11 @@ export component ChatPanel inherits Window {
     // show) and the whole Harness settings tab (left_tabs.slint /
     // settings_page.slint). Off by default.
     in property <bool> beta-mode-enabled: false;
+    // Installed app version -- see settings_page.slint / left_tabs.slint's
+    // own doc comments. Set once from lib.rs (env!("CARGO_PKG_VERSION"))
+    // right after the panel/window is constructed; never changes at
+    // runtime, so no reactive sync.rs wiring is needed.
+    in property <string> app-version: "";
     // `active_pane_and_editor_view` phase: which surface the main content
     // area shows -- "chat" (ChatArea, the default) or "skill" (a live
     // SkillEditorView for the sidebar's currently-selected skill).
@@ -592,6 +597,7 @@ export component ChatPanel inherits Window {
                 narrow: root.narrow;
                 expanded: sidebar-expanded;
                 skills: available-skills;
+                show-global-skills <=> root.show-global-skills;
                 active-project-path: root.active-project-path;
                 rename-thread-index <=> root.rename-thread-index;
                 rename-thread-draft <=> root.rename-thread-draft;
@@ -623,6 +629,7 @@ export component ChatPanel inherits Window {
                     root.settings-active-section = "skills";
                     root.open-settings();
                 }
+                global-skills-toggled(value) => { root.show-global-skills = value; }
                 search-changed(q) => { search-changed(q); }
                 search-submitted(query, search-skills, show-global) => {
                     root.search-submitted(query, search-skills, show-global);
@@ -1048,6 +1055,7 @@ export component ChatPanel inherits Window {
             permission-profile <=> permission-profile;
             profile-wiring-enabled: root.profile-wiring-enabled;
             beta-mode-enabled: root.beta-mode-enabled;
+            app-version: root.app-version;
             background-default <=> background-default;
             default-agent-id <=> root.default-agent-id;
             show-global-skills <=> show-global-skills;

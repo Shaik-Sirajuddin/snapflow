@@ -376,7 +376,9 @@ async fn session_resume_and_load_merge_central_mcp_and_reject_malformed() {
         .expect_err("malformed mcpServers must be rejected");
     let message = err.to_string();
     assert!(
-        message.contains("mcpServers") || message.contains("McpServer") || message.contains("invalid"),
+        message.contains("mcpServers")
+            || message.contains("McpServer")
+            || message.contains("invalid"),
         "error should name the bad field: {message}"
     );
 }

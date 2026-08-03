@@ -1868,6 +1868,7 @@ export component ChatArea inherits Rectangle {
             spacing: Metrics.space-1;
             for term in root.terminals : MentionPickRow {
                 title: term.title != "" ? term.title : term.terminal-id;
+                row-accessible-label: "Expand terminal " + term.terminal-id;
                 subtitle: term.started-at != "" ? term.last-command + " · " + term.started-at : term.last-command;
                 status-dot: term.active ? "connected" : (term.exit-code == 0 ? "" : "error");
                 action-label: term.active ? "Kill" : "";

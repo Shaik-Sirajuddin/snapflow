@@ -204,7 +204,14 @@ impl LiveGrokHarness {
         let display = free_x_display();
         let display_str = format!(":{display}");
         let xvfb = Command::new("Xvfb")
-            .args([&display_str, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+            .args([
+                &display_str,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -309,7 +316,11 @@ impl LiveGrokHarness {
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())
-            .args(["--appdata", state_dir.join("shotcut").to_str().unwrap(), "--noupgrade"])
+            .args([
+                "--appdata",
+                state_dir.join("shotcut").to_str().unwrap(),
+                "--noupgrade",
+            ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
             .env("SLINT_MCP_PORT", mcp_port.to_string())
@@ -400,7 +411,10 @@ impl LiveGrokHarness {
 
     async fn element_tree(&self, window_handle: &Value) -> Vec<Value> {
         let root_handle = self
-            .tool_call("get_window_properties", json!({"windowHandle": window_handle}))
+            .tool_call(
+                "get_window_properties",
+                json!({"windowHandle": window_handle}),
+            )
             .await["rootElementHandle"]
             .clone();
         let tree = self
@@ -496,7 +510,8 @@ impl LiveGrokHarness {
     /// `set_element_value` alone does not submit).
     async fn send_via_compose(&self, window_handle: &Value, text: &str) {
         let compose = wait_for(Duration::from_secs(15), || async {
-            self.find_by_exact_label(window_handle, "Compose message").await
+            self.find_by_exact_label(window_handle, "Compose message")
+                .await
         })
         .await;
         self.click_element(&compose["handle"]).await;
@@ -577,7 +592,10 @@ async fn live_grok_acp_multi_turn_conversation_renders_real_replies() {
         harness
             .create_new_thread_with_default_profile(&window)
             .await;
-        eprintln!("[debug] labels after thread create: {:?}", harness.labels(&window).await);
+        eprintln!(
+            "[debug] labels after thread create: {:?}",
+            harness.labels(&window).await
+        );
 
         let prompts = [
             "diagnostic ping 1: reply with the single word ack",
