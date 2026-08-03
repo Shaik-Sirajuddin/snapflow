@@ -1,5 +1,15 @@
 [package]
 name = "panel-rust"
+# Development placeholder only -- do not read this as the shipped app
+# version. The real, user-facing version (shown in Settings via
+# env!("CARGO_PKG_VERSION"), see src/lib.rs) is stamped here from the
+# release git tag (vX.Y.Z) by each tag-triggered build workflow's own
+# "Stamp Cargo.toml version from release tag" step
+# (.github/workflows/build-linux.yml / build-macos.yml /
+# build-windows.yml), which overwrites this line just before compiling,
+# for both the standalone panel-rust job and the shotcut-rebrand job that
+# actually ships. Bumping this value has no effect on release builds and
+# is unnecessary; it only matters for local `cargo build`/`cargo run`.
 version = "0.1.0"
 edition = "2021"
 description = "Real chat-panel crate. Renders a Slint UI (software renderer, CPU pixel buffer) driven by live ACPX gateway session data (via acpx-client directly, see src/gateway_actor.rs), exposed via a C ABI for a Qt QQuickItem to composite. See src/agent_bridge.rs for how the async agent connections are bridged onto panel-rust's single required OS thread, and its module docs for the jsonl cache / live-reload contract."
