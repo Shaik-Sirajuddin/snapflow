@@ -1,6 +1,12 @@
 //! Integration tests: real client(s) over a real Unix socket, driving the
 //! actual `server::serve` entrypoint end to end (no mocking of the wire
 //! layer) against a `MockBackend`.
+//!
+//! The client below intentionally exercises AF_UNIX only. Windows named-pipe
+//! wire coverage belongs in a platform-specific named-pipe harness; keeping this suite Unix-gated
+//! means `cargo test --target x86_64-pc-windows-gnu --no-run` still compiles
+//! the library and binary without importing Unix-only Tokio types.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::time::Duration;

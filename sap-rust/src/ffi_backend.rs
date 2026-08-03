@@ -2269,11 +2269,7 @@ pub unsafe extern "C" fn sap_start_server(
         std::env::var("SNAPSHOT_AUDIO_ENABLED").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
     );
-    let config = ServerConfig {
-        socket_path: PathBuf::from(&socket_path),
-        token,
-        audio_enabled,
-    };
+    let config = ServerConfig::new(socket_path.clone(), token, audio_enabled);
 
     // Wire the external-notification bridge (real Qt-side edits, via
     // sap_ffi.cpp's sap_emit_event) before the runtime starts, so a

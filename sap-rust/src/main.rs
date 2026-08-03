@@ -19,16 +19,22 @@ fn socket_path_from_args() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() {
-    let socket_path = match std::env::var("SNAPSHOT_SAP_SOCKET") {
+    // `SNAPSHOT_SAP_ENDPOINT` is the transport-neutral name used by the
+    // daemon. Keep `SNAPSHOT_SAP_SOCKET` as a compatibility fallback for
+    // existing launchers and standalone scripts.
+    let socket_path = match std::env::var("SNAPSHOT_SAP_ENDPOINT") {
         Ok(path) => PathBuf::from(path),
-        Err(_) => match socket_path_from_args() {
-            Some(path) => path,
-            None => {
-                eprintln!(
-                    "sap-rust: no socket path given (set SNAPSHOT_SAP_SOCKET, or pass --socket <path>)"
-                );
-                std::process::exit(2);
-            }
+        Err(_) => match std::env::var("SNAPSHOT_SAP_SOCKET") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => match socket_path_from_args() {
+                Some(path) => path,
+                None => {
+                    eprintln!(
+                        "sap-rust: no SAP endpoint given (set SNAPSHOT_SAP_ENDPOINT or SNAPSHOT_SAP_SOCKET, or pass --socket <path>)"
+                    );
+                    std::process::exit(2);
+                }
+            },
         },
     };
 
@@ -43,7 +49,7 @@ async fn main() {
         std::env::var("SNAPSHOT_AUDIO_ENABLED").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
     );
-    let config = ServerConfig { socket_path: socket_path.clone(), token, audio_enabled };
+    let config = ServerConfig::new(socket_path.clone(), token, audio_enabled);
     println!("sap-rust: listening on {}", socket_path.display());
 
     // This standalone binary always runs MockBackend now (no real media,

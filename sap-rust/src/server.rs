@@ -56,6 +56,36 @@ pub struct ServerConfig {
     pub audio_enabled: bool,
 }
 
+impl ServerConfig {
+    /// Build server configuration from the transport-neutral endpoint value
+    /// supplied by the launcher. Unix callers pass a filesystem socket path;
+    /// Windows callers may pass either a canonical `\\.\pipe\...` name or a
+    /// bare logical name. The latter is normalized at compile time on Windows
+    /// so higher layers never need to branch on the host OS.
+    pub fn new(endpoint: impl Into<PathBuf>, token: impl Into<String>, audio_enabled: bool) -> Self {
+        Self {
+            socket_path: normalize_endpoint(endpoint.into()),
+            token: token.into(),
+            audio_enabled,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn normalize_endpoint(endpoint: PathBuf) -> PathBuf {
+    let value = endpoint.to_string_lossy();
+    if value.starts_with(r"\\.\pipe\") {
+        endpoint
+    } else {
+        PathBuf::from(format!(r"\\.\pipe\{}", value.trim_start_matches(['/', '\\'])))
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_endpoint(endpoint: PathBuf) -> PathBuf {
+    endpoint
+}
+
 /// Per-connection session state. Two gates, enforced in order: `sap.hello`
 /// must succeed before anything else is accepted, then `project.select`
 /// must succeed before any project-scoped method is accepted.
