@@ -2489,11 +2489,16 @@ pub async fn serve<B: Backend + 'static>(
     // name from another process.
     #[cfg(windows)]
     {
-        let mut server = ServerOptions::new().first_pipe_instance(true).create(&pipe_name)?;
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&pipe_name)?;
         loop {
             server.connect().await?;
             let connected = server;
-            server = ServerOptions::new().create(&pipe_name)?;
+            server = ServerOptions::new()
+                .reject_remote_clients(true)
+                .create(&pipe_name)?;
 
             let (read_half, write_half) = tokio::io::split(connected);
             let dispatch_tx = dispatch_tx.clone();

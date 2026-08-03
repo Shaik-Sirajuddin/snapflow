@@ -37,7 +37,7 @@ func defaultControlEndpoint(_ string) string {
 }
 
 func defaultSAPEndpoint(_, instanceID string) string {
-	return `\\.\pipe\snapflow-` + windowsUserScope() + `-sap-` + instanceID
+	return `\\.\pipe\snapflow-` + windowsUserScope() + `-sap-` + pipeComponent(instanceID)
 }
 
 func windowsUserScope() string {
@@ -48,8 +48,12 @@ func windowsUserScope() string {
 	if scope == "" {
 		scope = "default"
 	}
+	return pipeComponent(scope)
+}
+
+func pipeComponent(value string) string {
 	var b strings.Builder
-	for _, c := range scope {
+	for _, c := range value {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' {
 			b.WriteRune(c)
 		} else {

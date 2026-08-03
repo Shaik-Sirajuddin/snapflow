@@ -1,4 +1,4 @@
-//! Async client for snapshotd's newline-delimited Unix JSON-RPC control
+//! Async client for snapshotd's newline-delimited JSON-RPC control
 //! socket. This is deliberately separate from both ACPX and MCP transports:
 //! snapshotd control is a local lifecycle plane, not an agent data plane.
 
@@ -77,15 +77,13 @@ pub struct SnapshotdControlClient {
 /// arrays delivered from `daemon.projectsChanged` notifications. Dropping
 /// this value closes the socket-reading task and therefore unregisters the
 /// subscription at the transport boundary.
-#[cfg(unix)]
 pub struct ProjectUpdateSubscription {
     pub initial: Value,
     pub updates: tokio::sync::mpsc::UnboundedReceiver<Value>,
-    _writer: tokio::net::unix::OwnedWriteHalf,
+    _writer: tokio::io::WriteHalf<DaemonStream>,
     reader_task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(unix)]
 impl Drop for ProjectUpdateSubscription {
     fn drop(&mut self) {
         self.reader_task.abort();
@@ -101,7 +99,7 @@ enum RegistrationCommand {
     Stop,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct DiscoveryEndpoint {
     stop: Sender<()>,
     descriptor: PathBuf,
@@ -201,7 +199,8 @@ impl DiscoveryEndpoint {
                                             "pid": std::process::id(),
                                             "processStart": process_start,
                                             "projectPath": project,
-                                            "sapSocketPath": std::env::var("SNAPSHOT_SAP_SOCKET").ok(),
+                                            "sapSocketPath": sap_endpoint_from_env(),
+                                            "sapEndpoint": sap_endpoint_from_env(),
                                             "sapToken": std::env::var("SNAPSHOT_SAP_TOKEN").ok(),
                                             "challenge": challenge,
                                         }
@@ -241,11 +240,110 @@ impl DiscoveryEndpoint {
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+impl DiscoveryEndpoint {
+    fn start(home: &Path, nonce: &str, project_path: Option<String>) -> Option<Self> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let apps = home.join("apps");
+        std::fs::create_dir_all(&apps).ok()?;
+        let socket = std::env::var_os("SNAPSHOTD_DISCOVERY_PIPE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(format!(
+                    "\\\\.\\pipe\\snapflow-discovery-{}",
+                    std::process::id()
+                ))
+            });
+        let descriptor = apps.join(format!("{}.json", std::process::id()));
+        let project_path = Arc::new(Mutex::new(project_path));
+        let project_for_thread = Arc::clone(&project_path);
+        let nonce_for_thread = nonce.to_owned();
+        let process_start = process_start_identity();
+        let descriptor_value = json!({
+            "endpoint": socket,
+            "pid": std::process::id(),
+            "processStart": process_start,
+            "instanceNonce": nonce,
+            "protocolVersion": 1,
+        });
+        std::fs::write(&descriptor, serde_json::to_vec(&descriptor_value).ok()?).ok()?;
+        let (stop, stop_rx) = mpsc::channel();
+        let descriptor_for_thread = descriptor.clone();
+        let socket_for_thread = socket.clone();
+        std::thread::Builder::new()
+            .name("snapshotd-discovery".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                else {
+                    return;
+                };
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let mut server = match ServerOptions::new()
+                        // Discovery is local control-plane traffic; reject
+                        // remote clients even when the host default DACL is
+                        // broader than the current user.
+                        .reject_remote_clients(true)
+                        .create(&socket_for_thread)
+                    {
+                        Ok(server) => server,
+                        Err(_) => break,
+                    };
+                    let connected = runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_millis(50), server.connect()).await
+                    });
+                    if !matches!(connected, Ok(Ok(()))) { continue; }
+                    runtime.block_on(async {
+                        let (read, mut write) = tokio::io::split(&mut server);
+                        let mut line = String::new();
+                        if tokio::time::timeout(Duration::from_secs(2), BufReader::new(read).read_line(&mut line)).await.is_ok() {
+                            if let Ok(request) = serde_json::from_str::<Value>(&line) {
+                                let challenge = request["params"]["challenge"].as_str().unwrap_or_default();
+                                let project = project_for_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                                let response = json!({"jsonrpc":"2.0", "id":request["id"], "result": {
+                                    "instanceNonce": nonce_for_thread, "pid": std::process::id(), "processStart": process_start,
+                                    "projectPath": project,
+                                    "sapSocketPath": sap_endpoint_from_env(),
+                                    "sapEndpoint": sap_endpoint_from_env(),
+                                    "sapToken": std::env::var("SNAPSHOT_SAP_TOKEN").ok(), "challenge": challenge,
+                                }});
+                                let _ = write.write_all(format!("{response}\n").as_bytes()).await;
+                            }
+                        }
+                    });
+                }
+                let _ = std::fs::remove_file(descriptor_for_thread);
+            })
+            .ok()?;
+        Some(Self {
+            stop,
+            descriptor,
+            socket,
+            project_path,
+        })
+    }
+
+    fn update(&self, project_path: Option<String>) {
+        *self
+            .project_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = project_path;
+    }
+}
+
+#[cfg(any(unix, windows))]
 impl Drop for DiscoveryEndpoint {
     fn drop(&mut self) {
         let _ = self.stop.send(());
         let _ = std::fs::remove_file(&self.descriptor);
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -256,7 +354,7 @@ impl Drop for DiscoveryEndpoint {
 pub struct SnapshotdRegistration {
     commands: Sender<RegistrationCommand>,
     instance_id: Arc<Mutex<Option<String>>>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     discovery: DiscoveryEndpoint,
     #[cfg(unix)]
     project_inventory: Arc<Mutex<Option<Value>>>,
@@ -275,12 +373,12 @@ impl SnapshotdRegistration {
         if std::env::var("SNAPSHOTD_MANAGED").ok().as_deref() == Some("1") {
             return None;
         }
-        #[cfg(not(unix))]
+        #[cfg(all(not(unix), not(windows)))]
         {
             let _ = initial_project_path;
             return None;
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let home = std::env::var_os("SNAPSHOTD_HOME")
                 .map(PathBuf::from)
@@ -288,10 +386,21 @@ impl SnapshotdRegistration {
                     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd"))
                 })
                 .or_else(|| {
+                    #[cfg(windows)]
+                    {
+                        std::env::var_os("USERPROFILE")
+                            .map(|home| PathBuf::from(home).join(".snapshotd"))
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        None
+                    }
+                })
+                .or_else(|| {
                     eprintln!("panel-rust: snapshotd registration has no SNAPSHOTD_HOME or HOME");
                     None
                 })?;
-            let client = SnapshotdControlClient::new(home.join("control.sock"));
+            let client = SnapshotdControlClient::from_default_runtime()?;
             let nonce = uuid::Uuid::new_v4().to_string();
             let discovery =
                 match DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone()) {
@@ -381,7 +490,7 @@ impl SnapshotdRegistration {
                         pid: std::process::id(),
                         process_start: process_start_identity(),
                         project_path: initial_project_path.clone(),
-                        sap_socket_path: std::env::var("SNAPSHOT_SAP_SOCKET").ok(),
+                        sap_socket_path: sap_endpoint_from_env(),
                         sap_token: std::env::var("SNAPSHOT_SAP_TOKEN").ok(),
                         capabilities: Some(json!({"lifecycle": true, "mcpContexts": true})),
                     };
@@ -469,15 +578,18 @@ impl SnapshotdRegistration {
                 commands,
                 instance_id,
                 discovery,
+                #[cfg(unix)]
                 project_inventory,
+                #[cfg(unix)]
                 project_inventory_dirty,
+                #[cfg(unix)]
                 inventory_stop,
             })
         }
     }
 
     pub fn update(&self, project_path: Option<String>, reason: impl Into<String>, generation: u64) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.discovery.update(project_path.clone());
         let _ = self.commands.send(RegistrationCommand::Update {
             project_path,
@@ -562,6 +674,17 @@ fn process_start_identity() -> String {
     format!("{}", std::process::id())
 }
 
+fn sap_endpoint_from_env() -> Option<String> {
+    std::env::var("SNAPSHOT_SAP_ENDPOINT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("SNAPSHOT_SAP_SOCKET")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+}
+
 impl SnapshotdControlClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -570,10 +693,35 @@ impl SnapshotdControlClient {
         }
     }
 
-    pub fn socket_path(&self) -> &Path {
+    pub(crate) fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 
+    #[cfg(windows)]
+    pub fn from_default_runtime() -> Option<Self> {
+        let endpoint = std::env::var_os("SNAPSHOTD_CONTROL_ENDPOINT")
+            .or_else(|| std::env::var_os("SNAPSHOTD_CONTROL_SOCKET"))
+            .map(PathBuf::from)
+            .or_else(|| {
+                let scope = std::env::var("USERNAME")
+                    .or_else(|_| std::env::var("USER"))
+                    .unwrap_or_else(|_| "default".into());
+                let scope: String = scope
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                Some(PathBuf::from(format!("\\\\.\\pipe\\snapflow-{scope}-control")))
+            })?;
+        Some(Self::new(endpoint))
+    }
+
+    #[cfg(not(windows))]
     pub fn from_default_runtime() -> Option<Self> {
         let home = std::env::var_os("SNAPSHOTD_HOME")
             .map(PathBuf::from)
@@ -721,21 +869,17 @@ impl SnapshotdControlClient {
     /// updates. Ordinary `call` requests intentionally remain one-shot; this
     /// method is the opt-in long-lived transport used by panel inventory
     /// consumers.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn subscribe_projects_stream(
         &self,
     ) -> Result<ProjectUpdateSubscription, SnapshotdClientError> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixStream;
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request =
             json!({"jsonrpc": "2.0", "id": id, "method": "daemon.subscribeProjects", "params": {}});
-        let stream = tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(&self.socket_path))
-            .await
-            .map_err(|_| SnapshotdClientError::Timeout)?
-            .map_err(|error| SnapshotdClientError::Unavailable(error.to_string()))?;
-        let (read_half, mut write_half) = stream.into_split();
+        let stream = connect_stream(&self.socket_path).await?;
+        let (read_half, mut write_half) = tokio::io::split(stream);
         let mut line = serde_json::to_vec(&request)
             .map_err(|error| SnapshotdClientError::Malformed(error.to_string()))?;
         line.push(b'\n');
@@ -841,16 +985,11 @@ impl SnapshotdControlClient {
         Ok(matched)
     }
 
-    #[cfg(unix)]
     async fn call_once(&self, request: &Value) -> Result<Value, SnapshotdClientError> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixStream;
 
-        let stream = tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(&self.socket_path))
-            .await
-            .map_err(|_| SnapshotdClientError::Timeout)?
-            .map_err(|e| SnapshotdClientError::Unavailable(e.to_string()))?;
-        let (read_half, mut write_half) = stream.into_split();
+        let stream = connect_stream(&self.socket_path).await?;
+        let (read_half, mut write_half) = tokio::io::split(stream);
         let mut line = serde_json::to_vec(request)
             .map_err(|e| SnapshotdClientError::Malformed(e.to_string()))?;
         line.push(b'\n');
@@ -875,10 +1014,34 @@ impl SnapshotdControlClient {
             .ok_or_else(|| SnapshotdClientError::Malformed("response has no result".into()))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     async fn call_once(&self, _request: &Value) -> Result<Value, SnapshotdClientError> {
         Err(SnapshotdClientError::Unsupported)
     }
+}
+
+#[cfg(unix)]
+type DaemonStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type DaemonStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(any(unix, windows))]
+async fn connect_stream(endpoint: &Path) -> Result<DaemonStream, SnapshotdClientError> {
+    #[cfg(unix)]
+    let connect = tokio::net::UnixStream::connect(endpoint);
+    #[cfg(windows)]
+    let connect = async {
+        let endpoint = endpoint.to_owned();
+        tokio::task::spawn_blocking(move || {
+            tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    };
+    tokio::time::timeout(REQUEST_TIMEOUT, connect)
+        .await
+        .map_err(|_| SnapshotdClientError::Timeout)?
+        .map_err(|error| SnapshotdClientError::Unavailable(error.to_string()))
 }
 
 #[cfg(all(test, unix))]

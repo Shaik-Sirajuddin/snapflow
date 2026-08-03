@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"snapshotd/internal/transport"
 )
 
 // Config is the daemon's runtime configuration. Defaults follow the
@@ -127,6 +129,19 @@ func Default() Config {
 	if binPath == "" {
 		binPath = discoverSnapshotBinPath()
 	}
+	controlEndpoint := os.Getenv("SNAPSHOTD_CONTROL_ENDPOINT")
+	if controlEndpoint == "" {
+		controlEndpoint = os.Getenv("SNAPSHOTD_CONTROL_SOCKET")
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = persisted["SNAPSHOTD_CONTROL_ENDPOINT"]
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = persisted["SNAPSHOTD_CONTROL_SOCKET"]
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = transport.DefaultControlEndpoint(home)
+	}
 
 	launchTimeout := 30 * time.Second
 	if v := os.Getenv("SNAPSHOTD_LAUNCH_TIMEOUT"); v != "" {
@@ -179,7 +194,7 @@ func Default() Config {
 	return Config{
 		HomeDir:               home,
 		DBPath:                filepath.Join(home, "registry.db"),
-		ControlSocketPath:     filepath.Join(home, "control.sock"),
+		ControlSocketPath:     controlEndpoint,
 		RunDir:                filepath.Join(home, "run"),
 		LogDir:                filepath.Join(home, "logs"),
 		ProjectsRoot:          filepath.Join(home, "projects"),

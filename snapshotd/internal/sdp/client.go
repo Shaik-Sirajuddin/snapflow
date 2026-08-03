@@ -26,7 +26,7 @@ type Client struct {
 func Dial(socketPath string, timeout time.Duration) (*Client, error) {
 	conn, err := transport.DialTimeout(socketPath, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("sdp: could not connect to daemon control socket %s: %w", socketPath, err)
+		return nil, fmt.Errorf("sdp: could not connect to daemon control endpoint %s: %w", socketPath, err)
 	}
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
