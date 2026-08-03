@@ -30,6 +30,14 @@ export component SettingsLeftTabs inherits Rectangle {
     // entirely, in both scopes, until this is turned on, same
     // conditional-nav-item precedent as MCP Servers' scope gate above.
     in property <bool> beta-mode-enabled: false;
+    // Installed app version (e.g. "0.1.0"), read from Cargo.toml's
+    // `package.version` via `env!("CARGO_PKG_VERSION")` and set once at
+    // startup (lib.rs, right after the panel/window is constructed) -- it
+    // never changes at runtime, so this is a plain one-shot property, not
+    // part of the reactive Model/sync.rs push loop. Empty string (the
+    // default) renders nothing, so a standalone/preview render of this
+    // component with no wiring doesn't show a misleading blank "v".
+    in property <string> app-version: "";
     callback section-selected(string);
     callback collapse-requested();
 
@@ -93,6 +101,25 @@ export component SettingsLeftTabs inherits Rectangle {
             icon-size: 14px;
             clicked => { root.section-selected("skills"); }
             double-clicked => { root.collapse-requested(); }
+        }
+
+        // Version footer -- lowest-friction home for the installed app
+        // version (no existing About/general settings section to attach
+        // it to, and this whole rail already fills the section's full
+        // available height with nothing below the nav items, so a spacer
+        // + one small meta-text row pushes it to the bottom without
+        // disturbing the nav items' own top-packed layout above). Hidden
+        // while collapsed (48px is too narrow for "v0.1.0" plus the
+        // icon-only rail's centered nav items) and while empty (so a
+        // standalone/preview render with no `app-version` wiring stays
+        // silent instead of showing a bare "v").
+        if root.expanded && root.app-version != "" : Rectangle { vertical-stretch: 1; }
+        if root.expanded && root.app-version != "" : Text {
+            text: "v" + root.app-version;
+            color: Theme.text-muted;
+            font-size: 9px * Theme.font-scale;
+            horizontal-alignment: center;
+            height: 20px;
         }
     }
 }

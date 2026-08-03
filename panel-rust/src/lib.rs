@@ -2437,6 +2437,16 @@ fn panel_rust_create_with_initial_identity(
         // Gateway availability is panel-scoped, independent of project-open.
         // This enables the first `+` thread on the empty-project screen.
         panel.component.set_gateway_ready(bridge_available);
+        // Installed app version, shown as a small meta line under the
+        // Settings nav rail (left_tabs.slint) -- a one-shot set, same
+        // shape as gateway_ready above, since this never changes for the
+        // lifetime of the process. Sourced from Cargo.toml's own
+        // `package.version` (currently "0.1.0", not yet threaded to the
+        // repo's release tags, which are ahead at v0.1.8+ -- no build
+        // step stamps the release tag into the binary today).
+        panel
+            .component
+            .set_app_version(env!("CARGO_PKG_VERSION").into());
         if let Some(identity) = initial_identity {
             let saved_path = identity.saved_path().map(str::to_owned);
             let mut model = panel.model.borrow_mut();

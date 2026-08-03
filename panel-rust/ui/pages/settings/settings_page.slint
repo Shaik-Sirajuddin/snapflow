@@ -124,6 +124,10 @@ export component SettingsPage inherits Rectangle {
     // independently gates the whole Harness tab (left-tabs nav item +
     // HarnessView mount below).
     in property <bool> beta-mode-enabled: false;
+    // Installed app version -- see left_tabs.slint's own doc comment on
+    // its `app-version` property (this is a plain pass-through, set once
+    // from lib.rs at startup, same as beta-mode-enabled's shape above).
+    in property <string> app-version: "";
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
     // Genuinely dual-tier like `background-default` -- see
@@ -279,6 +283,7 @@ export component SettingsPage inherits Rectangle {
                 expanded: root.sections-expanded;
                 scope: root.scope;
                 beta-mode-enabled: root.beta-mode-enabled;
+                app-version: root.app-version;
                 section-selected(new-section) => { root.active-section = new-section; }
                 collapse-requested => { root.sections-expanded = false; }
             }
