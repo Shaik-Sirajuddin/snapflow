@@ -551,7 +551,24 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             }
             Effect::ProbeProvider { real_index, provider, profile_name } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
-                    bridge.probe_provider_selection(real_index, provider, profile_name);
+                    // stale-provider-switch-pulse fix: a `false` return
+                    // means `probe_provider_selection` hit its deliberate
+                    // silent no-op (no resolvable project directory) and
+                    // will never push a completion `AgentEvent::
+                    // ProviderProbe` -- clear `provider_probes_in_flight`
+                    // right here instead of leaving the "Switching
+                    // provider..." pulse stuck forever waiting on an
+                    // event that is never coming. See `EffectResultMsg::
+                    // ProviderProbeSkipped`'s doc comment.
+                    if !bridge.probe_provider_selection(real_index, provider.clone(), profile_name) {
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(crate::effect::EffectResultMsg::ProviderProbeSkipped {
+                                real_index,
+                                provider,
+                            }),
+                        );
+                    }
                 }
             }
             Effect::CancelGeneration { real_index } => {

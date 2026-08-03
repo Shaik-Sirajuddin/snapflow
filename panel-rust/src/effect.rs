@@ -279,6 +279,60 @@ pub enum EffectResultMsg {
         provider: Option<String>,
         result: Result<String, EffectError>,
     },
+    /// mcp-servers-settings follow-up: dispatched synchronously from
+    /// `dispatch::dispatch_compose_send_maybe_attach`, in the same call
+    /// that kicks off `AgentBridge::attach_deferred_thread_with_config_
+    /// options` for a deferred thread's first message -- marks
+    /// `Model::first_attach_in_flight` before the background attach has
+    /// any chance to resolve, so the chat-view pulsing indicator can show
+    /// on the very next frame. Not a `Result` wrapper like the other
+    /// variants here (there is nothing to fail synchronously that isn't
+    /// already routed through `SessionAttached { result: Err(..) }`
+    /// immediately after this dispatch) -- purely a "this started" marker.
+    SessionAttachStarted {
+        thread_id: String,
+    },
+    /// stale-provider-switch-pulse fix: `AgentBridge::probe_provider_
+    /// selection` deliberately pushes NO `AgentEvent::ProviderProbe` at
+    /// all for a thread with no resolvable project directory (a normal,
+    /// fully-supported state -- see that method's own doc comment on why
+    /// treating it as a probe failure would be wrong: a spurious
+    /// "Provider unavailable" toast and a Send block for a reason that
+    /// has nothing to do with the provider). But `SettingsMsg::
+    /// ProfileSelected` already inserted `Model::provider_probes_in_flight`
+    /// before dispatching `Effect::ProbeProvider`, unconditionally --
+    /// the reducer has no visibility into bridge-side project state. With
+    /// no event ever coming for that no-op case, the marker (and the
+    /// "Switching provider..." pulse it drives) stayed stuck forever.
+    /// `effect_executor.rs`'s `Effect::ProbeProvider` arm dispatches this
+    /// the moment `probe_provider_selection` reports (via its bool return)
+    /// that it will never push a completion event, clearing just the
+    /// in-flight marker -- deliberately NOT touching `provider_errors`/
+    /// the toast path, unlike `AgentEvent::ProviderProbe`'s `Ok`/`Err`
+    /// arms, since no probe actually ran.
+    ProviderProbeSkipped {
+        real_index: usize,
+        provider: String,
+    },
+    /// mcp-servers-settings plan: unlike `SessionAttached { result: Err(..)
+    /// }` (a thread that already claimed a real `AgentBridge` slot failed
+    /// to open its ACP session -- the row stays and shows an error, see
+    /// that variant's fold), this is for the two lifecycle effects that
+    /// create the slot itself (`Effect::NewThreadDeferred`/
+    /// `Effect::RecoverSessionAttach`, both of which claim a `model.
+    /// threads` row up front but only push an `AgentBridge` slot on
+    /// success -- see `AgentBridge::add_thread_deferred`'s doc comment on
+    /// the `model.threads[i] <-> slots[i]` invariant). When the bridge
+    /// call fails, NO slot was ever pushed, so leaving the row in place
+    /// (the `SessionAttached` Err pattern) permanently shifts every later
+    /// real_index one off from its actual bridge slot -- e.g. a later
+    /// `ArchiveThread { real_index }` effect lands on a DIFFERENT
+    /// thread's slot than the one the user archived. The fold for this
+    /// variant removes the orphaned row instead, restoring alignment.
+    ThreadCreationFailed {
+        real_index: usize,
+        message: String,
+    },
     SkillWritten(Result<(), EffectError>),
     SkillCreated(Result<std::path::PathBuf, EffectError>),
     SkillPromoted(Result<(), EffectError>),

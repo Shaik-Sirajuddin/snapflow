@@ -52,11 +52,15 @@ fn execute_thread_lifecycle_effect(
         } => {
             if let Some(bridge) = panel.bridge.as_mut() {
                 if let Err(error) = bridge.add_thread_deferred(&display_name, Some(&provider)) {
-                    return Some(crate::effect::EffectResultMsg::SessionAttached {
+                    // mcp-servers-settings plan: `add_thread_deferred`
+                    // returns Err BEFORE pushing a slot (see its doc
+                    // comment), so this real_index's `model.threads` row
+                    // has no bridge slot at all -- `ThreadCreationFailed`,
+                    // not `SessionAttached`, so the fold removes the row
+                    // instead of leaving a permanently unaligned one.
+                    return Some(crate::effect::EffectResultMsg::ThreadCreationFailed {
                         real_index,
-                        thread_id: None,
-                        provider: Some(provider),
-                        result: Err(crate::effect::EffectError::new(error.to_string())),
+                        message: error.to_string(),
                     });
                 }
             }
@@ -97,13 +101,14 @@ fn execute_thread_lifecycle_effect(
                 });
             match result {
                 Ok(_real_idx) => None,
-                Err(error) => Some(crate::effect::EffectResultMsg::SessionAttached {
+                // mcp-servers-settings plan: same reasoning as
+                // `NewThreadDeferred`'s Err arm above -- `add_thread_
+                // recovering_session` also returns Err before pushing a
+                // slot, so this row has no bridge slot to fold an attach
+                // failure onto; remove it instead of leaving it unaligned.
+                Err(error) => Some(crate::effect::EffectResultMsg::ThreadCreationFailed {
                     real_index,
-                    thread_id: None,
-                    provider: None,
-                    result: Err(crate::effect::EffectError::new(format!(
-                        "recovery thread {real_index}: {error}"
-                    ))),
+                    message: format!("recovery thread {real_index}: {error}"),
                 }),
             }
         }
@@ -611,10 +616,11 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
             .as_ref()
             .is_some_and(|bridge| bridge.is_deferred(real_idx));
         if is_deferred {
-            let (provider, profile, desired_config_options) = {
+            let (thread_id, provider, profile, desired_config_options) = {
                 let model = panel.model.borrow();
                 match model.threads.get(real_idx) {
                     Some(thread) => (
+                        thread.thread_id.clone(),
                         thread.provider.clone(),
                         thread.profile_name.clone(),
                         thread
@@ -627,9 +633,22 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
                             })
                             .collect(),
                     ),
-                    None => (String::new(), None, Vec::new()),
+                    None => (String::new(), String::new(), None, Vec::new()),
                 }
             };
+            // mcp-servers-settings follow-up: mark the first-attach pulse
+            // in flight *here*, synchronously, before the background
+            // attach below has any chance to resolve -- same "mark it in
+            // the same call that dispatches the real work" convention as
+            // `SettingsMsg::ProfileSelected`'s `provider_probes_in_flight`
+            // insert. See `Model::first_attach_in_flight`'s doc comment
+            // for the full start/end contract.
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(crate::effect::EffectResultMsg::SessionAttachStarted {
+                    thread_id: thread_id.clone(),
+                }),
+            );
             if let Some(bridge) = panel.bridge.as_mut() {
                 let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
                 if let Err(error) = bridge.attach_deferred_thread_with_config_options(
@@ -1064,7 +1083,7 @@ pub(crate) fn dispatch_settings_scope_changed(
     });
 }
 
-pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPanel) {
+pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
     let model = panel.model.borrow();
     let selected_thread_id = panel.real_index(model.selected_thread).and_then(|idx| {
         panel
@@ -1073,16 +1092,27 @@ pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPa
             .and_then(|bridge| bridge.thread_binding(idx))
             .map(|binding| binding.thread_id)
     });
+    // NOTE: these fields are two-way (`<=>`) bound Slint `in-out` properties
+    // with no `*-changed` callback wired back to Rust (see agents_view.slint's
+    // `set-default` handler, which only assigns `root.default-agent-id`
+    // locally). `model.*` is therefore stale here -- it never observes edits
+    // made in the Settings UI. Read the live component getters instead, as
+    // this function did before 0c958f48 ("panel-rust: close remaining TEA
+    // ownership gaps") regressed it to read the stale model copy, which
+    // caused Save to silently persist whatever `default_agent_id` (etc.) the
+    // model happened to be initialized/hydrated with -- typically empty --
+    // regardless of what the user had just toggled, so cold start always
+    // fell back to NO_PROVIDER_REQUESTED_FALLBACK ("codex").
     let input = crate::msg::SettingsSaveInput {
         scope: model.settings_scope.clone(),
-        default_profile: model.default_profile.clone(),
-        permission_profile: model.permission_profile.clone(),
-        background_default: model.background_default,
-        default_agent_id: model.default_agent_id.clone(),
+        default_profile: component.get_default_profile().to_string(),
+        permission_profile: component.get_permission_profile().to_string(),
+        background_default: component.get_background_default(),
+        default_agent_id: component.get_default_agent_id().to_string(),
         selected_thread_id,
-        background_override_set: model.background_override_set,
-        background_override: model.background_override,
-        show_global_skills: model.show_global_skills,
+        background_override_set: component.get_background_override_set(),
+        background_override: component.get_background_override(),
+        show_global_skills: component.get_show_global_skills(),
     };
     drop(model);
     let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))));

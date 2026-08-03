@@ -454,8 +454,17 @@ pub fn rebuild_from_chat_messages(
                     title: (!msg.text.is_empty()).then(|| msg.text.clone()),
                     status: msg.status.clone(),
                     detail: None,
-                    raw_input: msg.raw_input.as_ref().map(|v| v.to_string()),
-                    raw_output: msg.raw_output.as_ref().map(|v| v.to_string()),
+                    // Bounded here as well as at ingestion, because a
+                    // payload cached to jsonl before the ingestion-side
+                    // bound existed replays through this same path.
+                    raw_input: msg
+                        .raw_input
+                        .as_ref()
+                        .map(crate::protocol_types::bounded_payload_display_string),
+                    raw_output: msg
+                        .raw_output
+                        .as_ref()
+                        .map(crate::protocol_types::bounded_payload_display_string),
                 });
             }
         }
