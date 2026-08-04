@@ -1721,8 +1721,6 @@ pub fn is_builtin_snapflow_mcp_name(name: &str) -> bool {
     name == "snapflow" || name == "snapshotd"
 }
 
-const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
 fn snapshotd_control_socket_path() -> PathBuf {
     crate::snapshotd_client::SnapshotdControlClient::from_default_runtime()
         .map(|client| client.socket_path().to_owned())

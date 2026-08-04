@@ -723,6 +723,11 @@ impl SnapshotdControlClient {
 
     #[cfg(not(windows))]
     pub fn from_default_runtime() -> Option<Self> {
+        if let Some(endpoint) = std::env::var_os("SNAPSHOTD_CONTROL_ENDPOINT")
+            .or_else(|| std::env::var_os("SNAPSHOTD_CONTROL_SOCKET"))
+        {
+            return Some(Self::new(PathBuf::from(endpoint)));
+        }
         let home = std::env::var_os("SNAPSHOTD_HOME")
             .map(PathBuf::from)
             .or_else(|| {
