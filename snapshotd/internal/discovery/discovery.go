@@ -109,7 +109,15 @@ func removeDeadDescriptor(runtimeDir, descriptorPath string, descriptor Descript
 	// filesystem entry, so transport.RemoveStale is intentionally a no-op.
 	endpoint := filepath.Clean(descriptor.Endpoint)
 	root := filepath.Clean(runtimeDir)
-	if filepath.Dir(endpoint) != root || !strings.HasSuffix(filepath.Base(endpoint), ".sock") {
+	allowedRoots := []string{root, filepath.Join(filepath.Dir(root), "run")}
+	allowed := false
+	for _, allowedRoot := range allowedRoots {
+		if filepath.Dir(endpoint) == allowedRoot {
+			allowed = true
+			break
+		}
+	}
+	if !allowed || !strings.HasSuffix(filepath.Base(endpoint), ".sock") {
 		return
 	}
 	_ = transport.RemoveStale(endpoint)
