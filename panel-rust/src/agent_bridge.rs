@@ -1044,14 +1044,23 @@ fn persist_runtime_snapshot(
         match serde_json::to_string(&snapshot) {
             Ok(json) => {
                 if let Err(error) = panel_state.save_runtime_snapshot(&slot.thread_id, &json) {
-                    eprintln!("panel-rust: interaction snapshot persist failed for {}: {error}", slot.thread_id);
+                    eprintln!(
+                        "panel-rust: interaction snapshot persist failed for {}: {error}",
+                        slot.thread_id
+                    );
                 }
             }
-            Err(error) => eprintln!("panel-rust: interaction snapshot serialization failed for {}: {error}", slot.thread_id),
+            Err(error) => eprintln!(
+                "panel-rust: interaction snapshot serialization failed for {}: {error}",
+                slot.thread_id
+            ),
         }
     } else if let Some(store) = store {
         if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
-            eprintln!("panel-rust: interaction snapshot persist failed for {}: {error}", slot.thread_id);
+            eprintln!(
+                "panel-rust: interaction snapshot persist failed for {}: {error}",
+                slot.thread_id
+            );
         }
     }
 }
@@ -1090,19 +1099,37 @@ fn seed_thread_from_cache(
     usize,
     ThreadRuntimeSnapshot,
 ) {
-    let (messages, cached_session_id, older_available, oldest_loaded_index) = if let Some(store) = store {
+    let (messages, cached_session_id, older_available, oldest_loaded_index) = if let Some(store) =
+        store
+    {
         let page = match store.tail(thread_id, page_size) {
             Ok(page) => page,
             Err(e) => {
                 eprintln!("panel-rust: jsonl cache tail load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge");
-                MessagePage { messages: Vec::new(), older_available: false, oldest_loaded_index: 0 }
+                MessagePage {
+                    messages: Vec::new(),
+                    older_available: false,
+                    oldest_loaded_index: 0,
+                }
             }
         };
         let cached_session_id = match store.trailer(thread_id) {
-            Ok(trailer) => trailer.as_ref().map(|t| t.acp_session_id.trim()).filter(|id| !id.is_empty()).map(str::to_owned),
-            Err(e) => { eprintln!("panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session"); None }
+            Ok(trailer) => trailer
+                .as_ref()
+                .map(|t| t.acp_session_id.trim())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+            Err(e) => {
+                eprintln!("panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session");
+                None
+            }
         };
-        (page.messages, cached_session_id, page.older_available, page.oldest_loaded_index)
+        (
+            page.messages,
+            cached_session_id,
+            page.older_available,
+            page.oldest_loaded_index,
+        )
     } else {
         (Vec::new(), None, false, 0)
     };
@@ -1118,12 +1145,21 @@ fn seed_thread_from_cache(
     } else if let Some(store) = store {
         match store.runtime_snapshot(thread_id) {
             Ok(snapshot) => snapshot,
-            Err(error) => { eprintln!("panel-rust: interaction snapshot load failed for thread {thread_id:?} ({error}); restoring transcript only"); ThreadRuntimeSnapshot::default() }
+            Err(error) => {
+                eprintln!("panel-rust: interaction snapshot load failed for thread {thread_id:?} ({error}); restoring transcript only");
+                ThreadRuntimeSnapshot::default()
+            }
         }
     } else {
         ThreadRuntimeSnapshot::default()
     };
-    (messages, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot)
+    (
+        messages,
+        cached_session_id,
+        older_available,
+        oldest_loaded_index,
+        runtime_snapshot,
+    )
 }
 
 /// One-time compatibility migration for Panel-owned runtime state.  Older
@@ -1136,20 +1172,34 @@ fn migrate_legacy_runtime_snapshots(
     legacy_dir: Option<&Path>,
     thread_ids: &[String],
 ) {
-    let Some(panel_state) = panel_state else { return };
-    let Some(legacy_dir) = legacy_dir.filter(|path| path.is_dir()) else { return };
-    let Ok(store) = JsonlStore::open(legacy_dir.to_path_buf()) else { return };
+    let Some(panel_state) = panel_state else {
+        return;
+    };
+    let Some(legacy_dir) = legacy_dir.filter(|path| path.is_dir()) else {
+        return;
+    };
+    let Ok(store) = JsonlStore::open(legacy_dir.to_path_buf()) else {
+        return;
+    };
     for thread_id in thread_ids {
         let already_present = panel_state
             .runtime_snapshot(thread_id)
             .ok()
             .flatten()
             .is_some();
-        if already_present { continue; }
-        let Ok(snapshot) = store.runtime_snapshot(thread_id) else { continue; };
-        let Ok(json) = serde_json::to_string(&snapshot) else { continue; };
+        if already_present {
+            continue;
+        }
+        let Ok(snapshot) = store.runtime_snapshot(thread_id) else {
+            continue;
+        };
+        let Ok(json) = serde_json::to_string(&snapshot) else {
+            continue;
+        };
         if let Err(error) = panel_state.save_runtime_snapshot(thread_id, &json) {
-            eprintln!("panel-rust: legacy runtime snapshot migration failed for {thread_id}: {error}");
+            eprintln!(
+                "panel-rust: legacy runtime snapshot migration failed for {thread_id}: {error}"
+            );
         }
     }
 }
@@ -3442,13 +3492,17 @@ fn spawn_event_forwarder(
                             Ok(Err(error)) => Err(error.to_string()),
                             Err(_) => Err("timed out".to_owned()),
                         } {
-                            events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
-                                thread_index,
-                                event: AgentEvent::Error(format!("history refresh after reconnect failed: {error}")),
-                            });
+                            events_out
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(BridgeEvent {
+                                    thread_index,
+                                    event: AgentEvent::Error(format!(
+                                        "history refresh after reconnect failed: {error}"
+                                    )),
+                                });
                         }
-                        slot
-                            .history_page_in_flight
+                        slot.history_page_in_flight
                             .store(false, std::sync::atomic::Ordering::Release);
                         for terminal_id in terminal_ids {
                             let result = tokio::time::timeout(
@@ -3458,11 +3512,18 @@ fn spawn_event_forwarder(
                             .await;
                             if let Ok(Ok(output)) = result {
                                 store_terminal_output(&slot, &output);
-                                persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
-                                events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
-                                    thread_index,
-                                    event: AgentEvent::TerminalOutput(output),
-                                });
+                                persist_runtime_snapshot(
+                                    store.as_ref(),
+                                    panel_state.as_deref(),
+                                    &slot,
+                                );
+                                events_out
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push_back(BridgeEvent {
+                                        thread_index,
+                                        event: AgentEvent::TerminalOutput(output),
+                                    });
                             }
                         }
                     });
@@ -3543,7 +3604,11 @@ fn spawn_event_forwarder(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(req.clone());
-                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
                 AgentEvent::AgentResolution(resolution) => {
                     if !resolution.selected {
@@ -3552,16 +3617,28 @@ fn spawn_event_forwarder(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .retain(|request| request.relay_id != resolution.relay_id);
-                        persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
+                        persist_runtime_snapshot(
+                            store_for_task.as_ref(),
+                            panel_state_for_task.as_deref(),
+                            &slot_for_task,
+                        );
                     }
                 }
                 AgentEvent::TerminalOutput(term_ev) => {
                     store_terminal_output(&slot_for_task, term_ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
                 AgentEvent::TerminalCreated(created_ev) => {
                     store_terminal_created(&slot_for_task, created_ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
                 AgentEvent::QueueChanged { .. } | AgentEvent::SessionSteer(_) => {}
                 AgentEvent::SessionModes(_)
@@ -3571,7 +3648,11 @@ fn spawn_event_forwarder(
                 | AgentEvent::PlanUpdate(_)
                 | AgentEvent::SessionInfoUpdate { .. } => {
                     store_capability_event(&slot_for_task, &ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
             }
             events_out
@@ -4205,7 +4286,8 @@ impl AgentBridge {
             gateway_setters.entry(url.clone()).or_default();
         }
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
-        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial_cwd.clone()));
+        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> =
+            Arc::new(Mutex::new(initial_cwd.clone()));
         let session_project_path_override = Arc::new(Mutex::new(initial_project_path));
 
         // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
@@ -4219,9 +4301,14 @@ impl AgentBridge {
             .iter()
             .map(|spec| slug(&spec.display_name))
             .collect();
+        // Project-scoped panels read the legacy sidecar from that project's
+        // cache.  Projectless panels historically used the global cache
+        // fallback, so keep that upgrade path instead of silently skipping
+        // their runtime snapshots.
+        let legacy_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
         migrate_legacy_runtime_snapshots(
             panel_state.as_deref(),
-            initial_cwd.as_deref(),
+            Some(legacy_dir.as_path()),
             &legacy_thread_ids,
         );
         for (idx, spec) in thread_specs.iter().enumerate() {
@@ -4244,7 +4331,12 @@ impl AgentBridge {
             // empty scrollback for *that thread only*, same as any other
             // cache miss.
             let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-                seed_thread_from_cache(store.as_ref(), panel_state.as_deref(), &thread_id, HISTORY_PAGE_SIZE);
+                seed_thread_from_cache(
+                    store.as_ref(),
+                    panel_state.as_deref(),
+                    &thread_id,
+                    HISTORY_PAGE_SIZE,
+                );
             let has_cached_transcript = !seeded.is_empty();
 
             let provider = spec.provider.as_str();
@@ -5025,7 +5117,12 @@ impl AgentBridge {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
         let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-            seed_thread_from_cache(self.store.as_ref(), self.panel_state.as_deref(), thread_id, HISTORY_PAGE_SIZE);
+            seed_thread_from_cache(
+                self.store.as_ref(),
+                self.panel_state.as_deref(),
+                thread_id,
+                HISTORY_PAGE_SIZE,
+            );
         let has_cached_transcript = !seeded.is_empty();
 
         let project_path_for_slot = self
@@ -7204,17 +7301,12 @@ impl AgentBridge {
     }
 
     /// Answers a pending interactive request (identified by `relay_id`)
-    /// with `response` and removes it from the thread's pending queue --
-    /// called from the Slint approve/reject button callbacks via
-    /// `lib.rs`. Fire-and-forget on the background runtime, same as
-    /// [`Self::send_prompt`]: the caller is the synchronous UI thread,
-    /// and any failure (gateway gone, relay already timed out) surfaces
-    /// as a queued `AgentEvent::Error` rather than a return value this
-    /// call site couldn't usefully act on. Removing the entry from
-    /// `pending_requests` happens synchronously, before the async
-    /// response is even sent -- the UI should stop showing this
-    /// request's card immediately on click, regardless of whether the
-    /// gateway round trip that follows succeeds.
+    /// with `response`, called from the Slint approve/reject button callbacks
+    /// via `lib.rs`. This is fire-and-forget on the background runtime, same
+    /// as [`Self::send_prompt`]. The card remains pending until ACPX accepts
+    /// the response (`Ok(true)`), so a transient gateway failure can be
+    /// replayed after reconnect. A stale/expired relay (`Ok(false)`) is
+    /// terminal and dismisses the card; transport errors retain it.
     pub fn respond_to_request(&self, idx: usize, relay_id: &str, response: serde_json::Value) {
         let Some(slot) = self.slots.get(idx) else {
             return;
@@ -7232,9 +7324,11 @@ impl AgentBridge {
                     persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
                 }
                 Ok(false) => {
+                    slot.pending_requests.lock().unwrap_or_else(|e| e.into_inner()).retain(|req| req.relay_id != relay_id);
+                    persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
                     events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
                         thread_index: idx,
-                        event: AgentEvent::Error("agent request was no longer pending; keeping the card for reconnect replay".to_owned()),
+                        event: AgentEvent::Error("agent request expired or was already handled; dismissing the approval card".to_owned()),
                     });
                 }
                 Err(e) => {
@@ -11816,9 +11910,13 @@ done
             }
         }
         assert!(answered, "permission request never surfaced on the bridge");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !bridge.pending_requests(0).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             bridge.pending_requests(0).is_empty(),
-            "pending_requests should be cleared synchronously by respond_to_request"
+            "pending_requests should clear after ACPX accepts respond_to_request"
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
