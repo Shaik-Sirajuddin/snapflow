@@ -7135,26 +7135,33 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
-        {
-            let mut pending = slot
-                .pending_requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.retain(|req| req.relay_id != relay_id);
-        }
-        persist_runtime_snapshot(self.store.as_ref(), self.panel_state.as_deref(), slot);
+        let slot = slot.clone();
+        let panel_state = self.panel_state.clone();
+        let store = self.store.clone();
         let handle = slot.handle.clone();
         let events_out = self.events.clone();
         let relay_id = relay_id.to_string();
         self.runtime.spawn(async move {
-            if let Err(e) = handle.respond_agent_request(relay_id, response).await {
-                events_out
+            match handle.respond_agent_request(relay_id.clone(), response).await {
+                Ok(true) => {
+                    slot.pending_requests.lock().unwrap_or_else(|e| e.into_inner()).retain(|req| req.relay_id != relay_id);
+                    persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
+                }
+                Ok(false) => {
+                    events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error("agent request was no longer pending; keeping the card for reconnect replay".to_owned()),
+                    });
+                }
+                Err(e) => {
+                    events_out
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("respond_agent_request failed: {e}")),
                     });
+                }
             }
         });
     }
