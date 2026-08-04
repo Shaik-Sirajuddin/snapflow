@@ -317,6 +317,15 @@ jobs:
           cp dist/snapflowd-linux-x86_64/snapflowd "$OUT/bin/snapflowd"
           chmod +x "$OUT/bin/snapflowd"
           tar -xJf dist/shotcut-rebrand-linux-x86_64/snapflow-linux-x86_64-*.txz -C "$OUT"
+          # snapshotd launch --gui must have the real production
+          # FfiBackend-linked child in the shipped bundle. The installer
+          # persists this wrapper as SNAPSHOT_BIN_PATH; fail packaging rather
+          # than publishing a daemon that can never launch a project.
+          test -x "$OUT/Snapflow.app/snapflow" || {
+            echo "production snapshot child missing from Snapflow bundle" >&2
+            find "$OUT" -maxdepth 4 -type f -name 'snapflow*' -print >&2 || true
+            exit 1
+          }
           cp dist/panel-rust-staticlib/libpanel_rust.a "$OUT/bin/libpanel_rust.a"
           cp shotcut-rebrand/packaging/linux/org.snapflow.Snapflow.desktop "$OUT/share/applications/"
           cp shotcut-rebrand/packaging/linux/icons/128x128/org.snapflow.Snapflow.png "$OUT/share/icons/"

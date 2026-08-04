@@ -401,6 +401,14 @@ jobs:
           cp dist/snapflowd-windows/snapflowd.exe "$OUT/bin/snapflowd.exe"
           cp dist/panel-rust-staticlib-windows/panel_rust.lib "$OUT/bin/panel_rust.lib"
           unzip -q dist/shotcut-rebrand-windows/snapflow-win64-*.zip -d "$OUT"
+          # snapshotd launch --gui must have the real production
+          # FfiBackend-linked child in the shipped bundle. The Windows
+          # installer persists this executable as SNAPSHOT_BIN_PATH.
+          test -f "$OUT/Snapflow/snapflow.exe" || {
+            echo "production snapshot child missing from Snapflow bundle" >&2
+            find "$OUT" -maxdepth 4 -type f -iname 'snapflow*.exe' -print >&2 || true
+            exit 1
+          }
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null
           sha256sum "$OUT.zip" > "$OUT.zip.sha256"
 
