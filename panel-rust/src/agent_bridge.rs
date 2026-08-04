@@ -3414,6 +3414,12 @@ fn spawn_event_forwarder(
         while let Some(ev) = events_rx.recv().await {
             match &ev {
                 AgentEvent::ConnectionRestored => {
+                    if slot_for_task
+                        .history_page_in_flight
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        continue;
+                    }
                     let handle = slot_for_task.handle.clone();
                     let events_out = events_out.clone();
                     let thread_index = idx;
@@ -3441,6 +3447,9 @@ fn spawn_event_forwarder(
                                 event: AgentEvent::Error(format!("history refresh after reconnect failed: {error}")),
                             });
                         }
+                        slot
+                            .history_page_in_flight
+                            .store(false, std::sync::atomic::Ordering::Release);
                         for terminal_id in terminal_ids {
                             let result = tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
