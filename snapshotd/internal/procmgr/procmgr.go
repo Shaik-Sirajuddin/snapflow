@@ -357,7 +357,13 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// appending our own: glibc's getenv returns the *first* match in
 	// envp, so simply appending a second "HOME=..." after os.Environ()'s
 	// original one would silently lose to it.
-	cmd.Env = append(filterEnvKeys(os.Environ(), "HOME"),
+	cmd.Env = append(filterEnvKeys(os.Environ(),
+		"HOME",
+		"SNAPSHOT_SAP_ENDPOINT",
+		"SNAPSHOT_SAP_SOCKET",
+		"SNAPSHOT_SAP_TOKEN",
+		"SNAPSHOTD_MANAGED",
+	),
 		"HOME="+qtHomeDir,
 		"SNAPSHOT_SAP_ENDPOINT="+sockPath,
 		"SNAPSHOT_SAP_SOCKET="+sockPath,

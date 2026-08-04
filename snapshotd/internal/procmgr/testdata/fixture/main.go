@@ -23,6 +23,7 @@ import (
 
 func main() {
 	sock := os.Getenv("SNAPSHOT_SAP_SOCKET")
+	endpoint := os.Getenv("SNAPSHOT_SAP_ENDPOINT")
 	token := os.Getenv("SNAPSHOT_SAP_TOKEN")
 	headless := os.Getenv("SNAPSHOT_HEADLESS")
 	outPath := os.Getenv("SNAPSHOT_FIXTURE_OUT")
@@ -30,7 +31,7 @@ func main() {
 	if outPath != "" {
 		f, err := os.Create(outPath)
 		if err == nil {
-			fmt.Fprintf(f, "socket=%s\ntoken=%s\nheadless=%s\n", sock, token, headless)
+			fmt.Fprintf(f, "socket=%s\nendpoint=%s\ntoken=%s\nheadless=%s\n", sock, endpoint, token, headless)
 			f.Close()
 		}
 	}

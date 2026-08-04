@@ -70,6 +70,11 @@ func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	// SNAPSHOT_FIXTURE_OUT in via the process's own environment so the
 	// fixture picks it up too.
 	t.Setenv("SNAPSHOT_FIXTURE_OUT", fixtureOut)
+	// A stale parent value must never win over the per-instance endpoint
+	// exported by Manager.Launch.
+	t.Setenv("SNAPSHOT_SAP_ENDPOINT", filepath.Join(t.TempDir(), "stale.sock"))
+	t.Setenv("SNAPSHOT_SAP_SOCKET", filepath.Join(t.TempDir(), "stale.sock"))
+	t.Setenv("SNAPSHOT_SAP_TOKEN", "stale-token")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -100,6 +105,12 @@ func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	content := string(data)
 	if !strings.Contains(content, "socket="+pi.SocketPath) {
 		t.Fatalf("fixture did not see expected socket path, got: %s", content)
+	}
+	if !strings.Contains(content, "endpoint="+pi.SocketPath) {
+		t.Fatalf("fixture did not see transport-neutral SAP endpoint, got: %s", content)
+	}
+	if strings.Contains(content, "stale-token") {
+		t.Fatalf("fixture inherited stale SAP token, got: %s", content)
 	}
 	if !strings.Contains(content, "headless=1") {
 		t.Fatalf("fixture did not see SNAPSHOT_HEADLESS=1, got: %s", content)
