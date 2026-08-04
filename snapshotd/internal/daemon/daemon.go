@@ -68,6 +68,11 @@ type Daemon struct {
 	// so a PID+signal-based `stop` command can never work there.
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// projectLocks serializes lifecycle operations for the same project. The
+	// lock registry is keyed by canonical project root and is intentionally
+	// process-local; registry persistence remains the source of truth across
+	// daemon restarts.
+	projectLocks sync.Map
 }
 
 type RegisterExternalInstanceParams struct {

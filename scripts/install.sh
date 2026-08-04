@@ -245,6 +245,14 @@ case "$platform" in
       ln -sf "$app_dir/snapflow" "$BIN_DIR/snapflow"
       info "Linked snapflow -> $BIN_DIR/snapflow"
     fi
+    # The daemon discovers its packaged ACPX gateway beside snapflowd, while
+    # the GUI discovers the same binary beside its own executable. Expose one
+    # installer-owned symlink in BIN_DIR so both production paths converge on
+    # the exact ACPX binary shipped in this bundle.
+    if [ -n "$app_dir" ] && [ -x "$app_dir/bin/acpx-server" ]; then
+      ln -sf "$app_dir/bin/acpx-server" "$BIN_DIR/acpx-server"
+      info "Linked acpx-server -> $BIN_DIR/acpx-server"
+    fi
 
     # Desktop-menu launcher (Applications grid / app search), not just a
     # CLI symlink. share/applications/*.desktop and share/icons/*.png are
@@ -378,6 +386,8 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=$BIN_DIR/snapflowd serve
+Environment="PATH=$PATH"
+Environment="SNAPFLOW_INSTALL_DIR=$INSTALL_DIR"
 Restart=on-failure
 RestartSec=3s
 
@@ -422,6 +432,13 @@ setup_macos_service() {
         <string>$BIN_DIR/snapflowd</string>
         <string>serve</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$PATH</string>
+        <key>SNAPFLOW_INSTALL_DIR</key>
+        <string>$INSTALL_DIR</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
