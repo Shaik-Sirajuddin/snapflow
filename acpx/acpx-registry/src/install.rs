@@ -247,10 +247,26 @@ async fn install_uvx(agent: &Agent, adapters_root: &Path) -> Result<InstallOutco
     })
 }
 
-/// Hard ceiling on one package pre-fetch (`npx -y …` / `uvx …`). Network +
-/// first-time cache populate can be slow; still fail closed rather than hang
-/// the gateway forever.
-const PACKAGE_PREFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Default hard ceiling on one package pre-fetch (`npm install` / `uvx`).
+/// Network + first-time cache populate can be slow (especially the Codex ACP
+/// package on a cold npm cache), so the production default is five minutes;
+/// the operation still fails closed rather than hanging the gateway forever.
+const DEFAULT_PACKAGE_PREFETCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// Allow operators/tests to tune the cold-cache ceiling without rebuilding.
+/// Keep the range bounded so an accidental environment value cannot turn a
+/// settings click into an unbounded task. Values below 30s are clamped up;
+/// values above 15m are clamped down.
+fn package_prefetch_timeout() -> std::time::Duration {
+    let seconds = std::env::var("ACPX_PACKAGE_PREFETCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| seconds.clamp(30, 900));
+    seconds
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_PACKAGE_PREFETCH_TIMEOUT)
+}
 
 /// Pre-fetch an npm package into `adapters_root/<agent_id>/` via
 /// `npm install --prefix …`. We deliberately do **not** run
@@ -294,7 +310,7 @@ async fn prefetch_npx_package(
     // Nested Result: timeout Elapsed vs join/panic vs exit status — all
     // collapse to PackageFetchFailed (operator re-runs install; no retry
     // policy here). spawn_blocking work is NOT cancelled on timeout.
-    let ok = match tokio::time::timeout(PACKAGE_PREFETCH_TIMEOUT, probe).await {
+    let ok = match tokio::time::timeout(package_prefetch_timeout(), probe).await {
         Ok(Ok(success)) => success,
         Ok(Err(_)) | Err(_) => false,
     };
@@ -322,7 +338,7 @@ async fn prefetch_uvx_package(agent: &Agent, package: &str) -> Result<(), Instal
             .map(|status| status.success())
             .unwrap_or(false)
     });
-    let ok = tokio::time::timeout(PACKAGE_PREFETCH_TIMEOUT, probe)
+    let ok = tokio::time::timeout(package_prefetch_timeout(), probe)
         .await
         .ok()
         .and_then(|joined| joined.ok())

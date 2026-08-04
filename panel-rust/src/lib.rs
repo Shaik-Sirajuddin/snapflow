@@ -1757,7 +1757,18 @@ impl PanelSingleton {
         let gw = self.settings_gateway_index();
         // PUI-013: fire-and-forget so the agents/install round-trip does not
         // block the Slint UI thread (the Settings>Agents Install freeze).
-        bridge.install_agent_async(gw, agent_id);
+        let agent_name = agent_id.to_owned();
+        bridge.install_agent_async(gw, agent_id, move |result| {
+            crate::effect_executor::report_agent_result(
+                result
+                    .map(|_| format!("Agent {agent_name} is ready; try connecting again"))
+                    .map_err(|err| {
+                        format!(
+                            "Agent {agent_name} installation failed. The first run may need more time or a working npm cache: {err}"
+                        )
+                    }),
+            );
+        });
     }
 
     /// setup-followups plan, agent_settings_ordering_and_install_enable_

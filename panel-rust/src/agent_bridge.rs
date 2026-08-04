@@ -7076,8 +7076,14 @@ impl AgentBridge {
     /// the installed status still refreshes on its own. Kept separate from
     /// `install_agent` so the synchronous, bool-returning method still
     /// backs the unit tests.
-    pub fn install_agent_async(&self, idx: usize, agent_id: &str) {
+    pub fn install_agent_async(
+        &self,
+        idx: usize,
+        agent_id: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
         let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active gateway for agent installation".to_owned()));
             return;
         };
         let handle = slot.handle.clone();
@@ -7092,8 +7098,13 @@ impl AgentBridge {
         // We can't call methods on self from the spawned task after move;
         // invalidate last_refresh so the next UI request_gateway_catalog_refresh runs.
         self.runtime.spawn(async move {
-            if handle.install_agent(agent_id.clone()).await.is_err() {
-                eprintln!("panel-rust: install_agent({agent_id}) failed (async)");
+            let result = handle
+                .install_agent(agent_id.clone())
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                eprintln!("panel-rust: install_agent({agent_id}) failed (async): {error}");
             }
             if let Ok(mut c) = cache.try_lock() {
                 c.last_refresh = None;
@@ -7103,6 +7114,7 @@ impl AgentBridge {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&agent_id);
             let _ = refresh_idx; // catalog refresh is UI-driven next frame
+            on_complete(result);
         });
     }
 

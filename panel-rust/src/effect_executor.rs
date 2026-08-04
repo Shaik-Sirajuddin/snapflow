@@ -214,6 +214,27 @@ pub(crate) fn report_mcp_server_result(result: Result<String, String>) {
     });
 }
 
+/// Feeds an asynchronous agent install/enablement outcome back through the
+/// reducer.  The operation runs outside the Slint thread because a first-use
+/// `npm install` can be a long network operation; dropping the result would
+/// leave users with no indication whether the card action succeeded.
+pub(crate) fn report_agent_result(result: Result<String, String>) {
+    let _ = slint::invoke_from_event_loop(move || {
+        crate::PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let Some(panel) = slot.as_ref() else {
+                return;
+            };
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(EffectResultMsg::AgentOperationCompleted(
+                    result.map_err(EffectError::new),
+                )),
+            );
+        });
+    });
+}
+
 fn execute_skill_effects(effects: Vec<Effect>) {
     for effect in effects {
         match effect {

@@ -2745,6 +2745,14 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let toast = show_toast(model, "error", err.message);
             (vec![], vec![toast])
         }
+        EffectResultMsg::AgentOperationCompleted(Ok(message)) => {
+            let toast = show_toast(model, "status", message);
+            (vec![], vec![toast])
+        }
+        EffectResultMsg::AgentOperationCompleted(Err(err)) => {
+            let toast = show_toast(model, "error", err.message);
+            (vec![], vec![toast])
+        }
         EffectResultMsg::GatewayCallCompleted { real_index, result } => match result {
             Ok(()) => (
                 vec![],
@@ -8199,6 +8207,33 @@ mod tests {
         assert_eq!(model.toast_kind, "status");
         assert_eq!(model.toast_message, "MCP server \"fs\" created");
         assert_ne!(model.toast_seq, seq_after_error, "seq bumps every show");
+    }
+
+    #[test]
+    fn agent_install_result_arms_the_shared_feedback_toast() {
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::AgentOperationCompleted(Err(
+                crate::effect::EffectError::new("npm install timed out"),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "error");
+        assert_eq!(model.toast_message, "npm install timed out");
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::AgentOperationCompleted(Ok(
+                "Agent codex-acp is ready; try connecting again".to_string(),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "status");
+        assert_eq!(
+            model.toast_message,
+            "Agent codex-acp is ready; try connecting again"
+        );
     }
 
     #[test]

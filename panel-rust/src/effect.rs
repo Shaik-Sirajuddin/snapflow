@@ -435,6 +435,11 @@ pub enum EffectResultMsg {
     /// used to only `eprintln!` on failure, with nothing shown in the UI
     /// at all).
     McpServerOperationCompleted(Result<String, EffectError>),
+    /// Agent registry installation/enablement finished. Agent actions run
+    /// asynchronously because an `npx`/npm first-use warmup can take minutes;
+    /// completion must re-enter the reducer so the card spinner stops and a
+    /// terminal success/error message is visible to the user.
+    AgentOperationCompleted(Result<String, EffectError>),
     /// PISO-8: result of `Effect::RefreshDaemonProjectInstances`. `Err`
     /// (daemon unreachable, `snapshotd` binary missing, malformed
     /// output, ...) is a best-effort miss, not a user-facing error --
