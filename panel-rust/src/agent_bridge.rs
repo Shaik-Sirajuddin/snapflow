@@ -13007,6 +13007,113 @@ done
         assert_eq!(bridge.transcript(0).len(), total_messages);
     }
 
+    /// Server-owned persistence integration: a resumed ACPX session starts
+    /// with the gateway's newest page, then `load_older_page` must dispatch
+    /// the returned continuation cursor and prepend the older page through
+    /// the normal event-forwarder path. This deliberately constructs the
+    /// second bridge without a local cache so the test cannot accidentally
+    /// pass through `JsonlStore::predecessor_page`.
+    #[test]
+    fn server_owned_load_older_page_prepends_remote_history_page() {
+        if !mock_agent_bin().exists() {
+            eprintln!(
+                "skipping: real rui-mock-agent binary is not built at {}",
+                mock_agent_bin().display()
+            );
+            return;
+        }
+        let gateway = TestGateway::spawn();
+        let thread_id = "remote-page-thread".to_owned();
+        let first_specs = [ThreadSpec {
+            thread_id: Some(thread_id.clone()),
+            display_name: "Remote page thread".to_owned(),
+            provider: "test".to_owned(),
+            session_id: None,
+            profile_name: None,
+            project_path: None,
+        }];
+        let base_url = gateway.base_url.clone();
+        let first = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &first_specs,
+            move |_provider| Ok(base_url.clone()),
+            None,
+        )
+        .expect("initial server-owned bridge");
+        wait_for_thread_ready(&first, 0);
+
+        // The mock backend contributes multiple transcript updates per turn;
+        // enough turns ensure the server's first page (50 updates) has an
+        // older continuation page to return.
+        for turn in 0..30 {
+            first.send_prompt(0, format!("remote page turn {turn}"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut ended = false;
+            while std::time::Instant::now() < deadline && !ended {
+                ended = first
+                    .poll()
+                    .into_iter()
+                    .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+                if !ended {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            assert!(ended, "remote seed turn {turn} did not complete");
+        }
+        let session_id = first
+            .thread_binding(0)
+            .expect("seed session binding")
+            .session_id;
+        drop(first);
+
+        let second_specs = [ThreadSpec {
+            thread_id: Some(thread_id),
+            display_name: "Remote page thread".to_owned(),
+            provider: "test".to_owned(),
+            session_id: Some(session_id),
+            profile_name: None,
+            project_path: None,
+        }];
+        let base_url = gateway.base_url.clone();
+        let second = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &second_specs,
+            move |_provider| Ok(base_url.clone()),
+            None,
+        )
+        .expect("resumed server-owned bridge");
+        wait_for_thread_ready(&second, 0);
+
+        let initial_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < initial_deadline
+            && (!second.has_older_page(0) || second.history(0).is_empty())
+        {
+            let _ = second.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(second.has_older_page(0), "initial remote page had no continuation");
+        let newest_page = second.history(0);
+        assert!(!newest_page.is_empty(), "initial remote page was empty");
+        let newest_first = newest_page[0].text.clone();
+        let newest_len = newest_page.len();
+
+        assert!(second.load_older_page(0), "remote pagination dispatch was rejected");
+        let older_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < older_deadline
+            && second.has_older_page(0)
+            && second.history(0).len() == newest_len
+        {
+            let _ = second.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let full_history = second.history(0);
+        assert!(
+            full_history.len() > newest_len,
+            "remote older page did not prepend history (initial={newest_len}, final={})",
+            full_history.len()
+        );
+        assert_ne!(full_history[0].text, newest_first);
+        assert!(!second.has_older_page(0), "remote continuation cursor was not exhausted");
+    }
+
     /// `skill_injection_verification` phase: `snapflowd_mcp_servers_entry`'s
     /// output shape -- the actual client-supplied `mcpServers` entry every
     /// `session/new`/`session/load` now sends (see `Command::OpenSession`/
