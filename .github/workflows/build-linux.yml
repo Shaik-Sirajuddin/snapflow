@@ -260,17 +260,38 @@ jobs:
             echo "SOURCE_DIR=/tmp/shotcut/src"
           } > build-snapflow.conf
           mkdir -p "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/.cargo/registry" "$GITHUB_WORKSPACE/.cargo/git"
+          # Bind-mounting the git-checkout-populated multi-media-main
+          # subdirectories directly (sap-rust/panel-rust/acpx/lib) has been
+          # observed to silently fail on hosted runners -- the mount target
+          # ends up missing entirely inside the container ("cp: cannot stat
+          # '/tmp/sap-rust-src': No such file or directory"), even though
+          # freshly `mkdir -p`'d host dirs (.ccache, .cargo/*) mount fine.
+          # Stage plain copies into fresh, non-checkout host directories
+          # first so every source mount below has the same "just mkdir'd"
+          # shape that's proven to mount reliably.
+          mkdir -p "$GITHUB_WORKSPACE/.build-src"
+          rm -rf "$GITHUB_WORKSPACE/.build-src/sap-rust" "$GITHUB_WORKSPACE/.build-src/panel-rust" "$GITHUB_WORKSPACE/.build-src/acpx" "$GITHUB_WORKSPACE/.build-src/lib"
+          cp -r "$GITHUB_WORKSPACE/multi-media-main/sap-rust" "$GITHUB_WORKSPACE/.build-src/sap-rust"
+          cp -r "$GITHUB_WORKSPACE/multi-media-main/panel-rust" "$GITHUB_WORKSPACE/.build-src/panel-rust"
+          cp -r "$GITHUB_WORKSPACE/multi-media-main/acpx" "$GITHUB_WORKSPACE/.build-src/acpx"
+          cp -r "$GITHUB_WORKSPACE/multi-media-main/lib" "$GITHUB_WORKSPACE/.build-src/lib"
+          # $PWD (shotcut-rebrand/scripts) is git-checkout-populated too --
+          # stage it the same way so the main read-write work mount is just
+          # as reliable as the read-only source mounts above.
+          rm -rf "$GITHUB_WORKSPACE/.build-work"
+          mkdir -p "$GITHUB_WORKSPACE/.build-work"
+          cp -r "$PWD/." "$GITHUB_WORKSPACE/.build-work/"
           docker run \
             --workdir /tmp/shotcut \
-            -v "$PWD:/tmp/shotcut" \
+            -v "$GITHUB_WORKSPACE/.build-work:/tmp/shotcut" \
             -v "$GITHUB_WORKSPACE/.ccache:/tmp/ccache" \
             -v "$GITHUB_WORKSPACE/.cargo/registry:/tmp/cargo/registry" \
             -v "$GITHUB_WORKSPACE/.cargo/git:/tmp/cargo/git" \
             -v "$(command -v ccache):/tmp/ccache-host-bin:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/tmp/sap-rust-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/tmp/panel-rust-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/tmp/acpx-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/lib:/tmp/lib-src:ro" \
+            -v "$GITHUB_WORKSPACE/.build-src/sap-rust:/tmp/sap-rust-src:ro" \
+            -v "$GITHUB_WORKSPACE/.build-src/panel-rust:/tmp/panel-rust-src:ro" \
+            -v "$GITHUB_WORKSPACE/.build-src/acpx:/tmp/acpx-src:ro" \
+            -v "$GITHUB_WORKSPACE/.build-src/lib:/tmp/lib-src:ro" \
             -e "DEPS_CACHE_HIT=$DEPS_CACHE_HIT" \
             "$IMAGE_NAME" \
             -c '
@@ -340,7 +361,7 @@ jobs:
               SNAPFLOW_ONLY=1 /root/shotcut/build-shotcut.sh
               ccache --show-stats || true
             '
-          mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
+          mv "$GITHUB_WORKSPACE/.build-work/snapflow.txz" "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
 
       - uses: actions/upload-artifact@v4
         with:
