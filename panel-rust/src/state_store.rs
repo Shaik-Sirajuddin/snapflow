@@ -94,6 +94,14 @@ pub struct PoolBindingRecord {
     pub updated_at: String,
 }
 
+/// Opaque JSON representation of Panel-owned runtime state.  Transcript
+/// messages are deliberately not included; ACPX remains their sole owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeSnapshotRecord {
+    pub thread_id: String,
+    pub snapshot_json: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateStoreError {
     #[error("SQLite panel-state error: {0}")]
@@ -151,6 +159,11 @@ impl PanelStateStore {
                 background_session INTEGER CHECK (background_session IN (0, 1)),
                 display_name TEXT,
                 provider TEXT
+            );
+            CREATE TABLE IF NOT EXISTS thread_runtime_snapshots (
+                thread_id TEXT PRIMARY KEY NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             ",
         )?;
@@ -260,6 +273,43 @@ impl PanelStateStore {
             .optional()
             .map(|stored| stored.unwrap_or_default())
             .map_err(Into::into)
+    }
+
+    pub fn runtime_snapshot(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<RuntimeSnapshotRecord>, StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection
+            .query_row(
+                "SELECT thread_id, snapshot_json FROM thread_runtime_snapshots WHERE thread_id = ?1",
+                [thread_id],
+                |row| {
+                    Ok(RuntimeSnapshotRecord {
+                        thread_id: row.get(0)?,
+                        snapshot_json: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_runtime_snapshot(
+        &self,
+        thread_id: &str,
+        snapshot_json: &str,
+    ) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "INSERT INTO thread_runtime_snapshots (thread_id, snapshot_json, updated_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(thread_id) DO UPDATE SET
+                snapshot_json = excluded.snapshot_json,
+                updated_at = excluded.updated_at",
+            params![thread_id, snapshot_json],
+        )?;
+        Ok(())
     }
 
     pub fn save_defaults(&self, defaults: &PanelDefaults) -> Result<(), StateStoreError> {
@@ -1164,6 +1214,21 @@ mod tests {
                 .project_path
                 .as_deref(),
             Some("/projects/pre-migration.mlt")
+        );
+    }
+
+    #[test]
+    fn runtime_snapshot_round_trips_in_panel_state_store() {
+        let store = PanelStateStore::in_memory().unwrap();
+        store
+            .save_runtime_snapshot("thread-runtime", r#"{"pendingRequests":[],"archived":true}"#)
+            .unwrap();
+        assert_eq!(
+            store.runtime_snapshot("thread-runtime").unwrap(),
+            Some(RuntimeSnapshotRecord {
+                thread_id: "thread-runtime".to_owned(),
+                snapshot_json: r#"{"pendingRequests":[],"archived":true}"#.to_owned(),
+            })
         );
     }
 }

@@ -2087,6 +2087,7 @@ fn spawn_session_live_forwarder(
     client: Arc<Gateway>,
     mut session_rx: watch::Receiver<Option<String>>,
     live_tx: mpsc::UnboundedSender<serde_json::Value>,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
     tokio::spawn(async move {
         let mut rehydrate_after_connect = false;
@@ -2128,6 +2129,8 @@ fn spawn_session_live_forwarder(
             if rehydrate_after_connect {
                 if let Err(error) = client.rehydrate_session(&session_id).await {
                     eprintln!("panel-rust: session rehydration failed for {session_id}: {error}");
+                } else {
+                    let _ = event_tx.send(AgentEvent::ConnectionRestored);
                 }
                 rehydrate_after_connect = false;
             }
@@ -2176,7 +2179,12 @@ async fn run_thread_actor(
         event_tx.clone(),
     );
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
-    spawn_session_live_forwarder(Arc::clone(&client), session_tx.subscribe(), live_tx);
+    spawn_session_live_forwarder(
+        Arc::clone(&client),
+        session_tx.subscribe(),
+        live_tx,
+        event_tx.clone(),
+    );
     let mut session_id: Option<String> = None;
     // acpx-client-session-lease-pool: set only by `Command::
     // AcquireAndAttach`, and only meaningful when `pool.is_some()`. Turn

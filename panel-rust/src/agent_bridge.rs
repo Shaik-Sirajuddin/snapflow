@@ -63,12 +63,13 @@ use crate::gateway_actor::{
     AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
-    JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
+    JsonlStore, MessagePage, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
 };
 use crate::protocol_types::{
     AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
     TerminalCreatedEvent, TerminalOutputEvent,
 };
+use crate::state_store::PanelStateStore;
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -707,6 +708,9 @@ pub struct AgentBridge {
     server_owned_persistence: bool,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
+    /// Mandatory production panel state store; unlike `store`, this owns
+    /// only Panel runtime/UI state and never transcript messages.
+    panel_state: Option<Arc<PanelStateStore>>,
     // Client-local PTY terminals -- v1 keeps this to at most one per
     // thread (keyed by thread `idx`), matching the settings-sheet's own
     // "one bound choice per scope" simplicity; a future increment could
@@ -984,10 +988,11 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
 /// transition because those state updates are sparse compared with message
 /// chunks and a restart must be able to reconstruct the visible cards before
 /// the gateway attachment finishes.
-fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
-    let Some(store) = store else {
-        return;
-    };
+fn persist_runtime_snapshot(
+    store: Option<&JsonlStore>,
+    panel_state: Option<&PanelStateStore>,
+    slot: &ThreadSlot,
+) {
     let terminal_order = slot
         .terminal_order
         .lock()
@@ -1032,11 +1037,19 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
             .clone(),
         archived: *slot.archived.lock().unwrap_or_else(|e| e.into_inner()),
     };
-    if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
-        eprintln!(
-            "panel-rust: interaction snapshot persist failed for {}: {error}",
-            slot.thread_id
-        );
+    if let Some(panel_state) = panel_state {
+        match serde_json::to_string(&snapshot) {
+            Ok(json) => {
+                if let Err(error) = panel_state.save_runtime_snapshot(&slot.thread_id, &json) {
+                    eprintln!("panel-rust: interaction snapshot persist failed for {}: {error}", slot.thread_id);
+                }
+            }
+            Err(error) => eprintln!("panel-rust: interaction snapshot serialization failed for {}: {error}", slot.thread_id),
+        }
+    } else if let Some(store) = store {
+        if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
+            eprintln!("panel-rust: interaction snapshot persist failed for {}: {error}", slot.thread_id);
+        }
     }
 }
 
@@ -1064,6 +1077,7 @@ const HISTORY_PAGE_SIZE: usize = 20;
 /// than propagating a fatal `BridgeError`.
 fn seed_thread_from_cache(
     store: Option<&JsonlStore>,
+    panel_state: Option<&PanelStateStore>,
     thread_id: &str,
     page_size: usize,
 ) -> (
@@ -1073,47 +1087,40 @@ fn seed_thread_from_cache(
     usize,
     ThreadRuntimeSnapshot,
 ) {
-    let Some(store) = store else {
-        return (Vec::new(), None, false, 0, ThreadRuntimeSnapshot::default());
+    let (messages, cached_session_id, older_available, oldest_loaded_index) = if let Some(store) = store {
+        let page = match store.tail(thread_id, page_size) {
+            Ok(page) => page,
+            Err(e) => {
+                eprintln!("panel-rust: jsonl cache tail load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge");
+                MessagePage { messages: Vec::new(), older_available: false, oldest_loaded_index: 0 }
+            }
+        };
+        let cached_session_id = match store.trailer(thread_id) {
+            Ok(trailer) => trailer.as_ref().map(|t| t.acp_session_id.trim()).filter(|id| !id.is_empty()).map(str::to_owned),
+            Err(e) => { eprintln!("panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session"); None }
+        };
+        (page.messages, cached_session_id, page.older_available, page.oldest_loaded_index)
+    } else {
+        (Vec::new(), None, false, 0)
     };
-    let page = match store.tail(thread_id, page_size) {
-        Ok(page) => page,
-        Err(e) => {
-            eprintln!(
-                "panel-rust: jsonl cache tail load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge"
-            );
-            return (Vec::new(), None, false, 0, ThreadRuntimeSnapshot::default());
+    let runtime_snapshot = if let Some(state) = panel_state {
+        match state.runtime_snapshot(thread_id) {
+            Ok(Some(record)) => serde_json::from_str(&record.snapshot_json).unwrap_or_else(|error| {
+                eprintln!("panel-rust: panel-state interaction snapshot decode failed for {thread_id:?} ({error}); restoring defaults");
+                ThreadRuntimeSnapshot::default()
+            }),
+            Ok(None) => ThreadRuntimeSnapshot::default(),
+            Err(error) => { eprintln!("panel-rust: panel-state interaction snapshot load failed for {thread_id:?} ({error}); restoring defaults"); ThreadRuntimeSnapshot::default() }
         }
-    };
-    let cached_session_id = match store.trailer(thread_id) {
-        Ok(trailer) => trailer
-            .as_ref()
-            .map(|t| t.acp_session_id.trim())
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned),
-        Err(e) => {
-            eprintln!(
-                "panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session"
-            );
-            None
+    } else if let Some(store) = store {
+        match store.runtime_snapshot(thread_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => { eprintln!("panel-rust: interaction snapshot load failed for thread {thread_id:?} ({error}); restoring transcript only"); ThreadRuntimeSnapshot::default() }
         }
+    } else {
+        ThreadRuntimeSnapshot::default()
     };
-    let runtime_snapshot = match store.runtime_snapshot(thread_id) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!(
-                "panel-rust: interaction snapshot load failed for thread {thread_id:?} ({error}); restoring transcript only"
-            );
-            ThreadRuntimeSnapshot::default()
-        }
-    };
-    (
-        page.messages,
-        cached_session_id,
-        page.older_available,
-        page.oldest_loaded_index,
-        runtime_snapshot,
-    )
+    (messages, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot)
 }
 
 /// Compares a local cache trailer with metadata from the backend-selected
@@ -3347,6 +3354,7 @@ fn spawn_event_forwarder(
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     events_out: Arc<Mutex<VecDeque<BridgeEvent>>>,
     store_for_task: Option<JsonlStore>,
+    panel_state_for_task: Option<Arc<PanelStateStore>>,
     slot_for_task: Arc<ThreadSlot>,
     idx: usize,
 ) {
@@ -3374,6 +3382,19 @@ fn spawn_event_forwarder(
     runtime.spawn(async move {
         while let Some(ev) = events_rx.recv().await {
             match &ev {
+                AgentEvent::ConnectionRestored => {
+                    let handle = slot_for_task.handle.clone();
+                    let events_out = events_out.clone();
+                    let thread_index = idx;
+                    tokio::spawn(async move {
+                        if let Err(error) = handle.paginate_history(None).await {
+                            events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
+                                thread_index,
+                                event: AgentEvent::Error(format!("history refresh after reconnect failed: {error}")),
+                            });
+                        }
+                    });
+                }
                 AgentEvent::Message(msg) => {
                     {
                         let mut history = slot_for_task
@@ -3450,7 +3471,7 @@ fn spawn_event_forwarder(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(req.clone());
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
                 }
                 AgentEvent::AgentResolution(resolution) => {
                     if !resolution.selected {
@@ -3459,16 +3480,16 @@ fn spawn_event_forwarder(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .retain(|request| request.relay_id != resolution.relay_id);
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                        persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
                     }
                 }
                 AgentEvent::TerminalOutput(term_ev) => {
                     store_terminal_output(&slot_for_task, term_ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
                 }
                 AgentEvent::TerminalCreated(created_ev) => {
                     store_terminal_created(&slot_for_task, created_ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
                 }
                 AgentEvent::QueueChanged { .. } | AgentEvent::SessionSteer(_) => {}
                 AgentEvent::SessionModes(_)
@@ -3478,7 +3499,7 @@ fn spawn_event_forwarder(
                 | AgentEvent::PlanUpdate(_)
                 | AgentEvent::SessionInfoUpdate { .. } => {
                     store_capability_event(&slot_for_task, &ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(store_for_task.as_ref(), panel_state_for_task.as_deref(), &slot_for_task);
                 }
             }
             events_out
@@ -3541,6 +3562,7 @@ fn spawn_background_attachment(
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     events_out: Arc<Mutex<VecDeque<BridgeEvent>>>,
     store: Option<JsonlStore>,
+    panel_state: Option<Arc<PanelStateStore>>,
     idx: usize,
     requested_session_id: Option<String>,
     has_cached_transcript: bool,
@@ -3867,6 +3889,7 @@ fn spawn_background_attachment(
             events_rx,
             events_out,
             store,
+            panel_state,
             slot,
             idx,
         );
@@ -3960,6 +3983,30 @@ impl AgentBridge {
             None,
             initial_cwd,
             initial_project_path,
+            None,
+        )
+    }
+
+    /// Production constructor with the mandatory PanelStateStore. ACPX owns
+    /// transcript/history; this store owns only Panel runtime/UI state.
+    pub fn new_with_thread_specs_and_initial_identity_and_panel_state(
+        thread_specs: &[ThreadSpec],
+        initial_cwd: Option<PathBuf>,
+        initial_project_path: Option<PathBuf>,
+        panel_state: Arc<PanelStateStore>,
+    ) -> Result<Self, BridgeError> {
+        let gateway_cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
+        let cache_dir_for_resolver = gateway_cache_dir.clone();
+        Self::new_with_thread_specs_and_gateway_resolver_and_cache_dir_and_initial_cwd(
+            thread_specs,
+            move |provider| {
+                provision_gateway(provider, Some(&cache_dir_for_resolver))
+                    .map_err(BridgeError::Gateway)
+            },
+            None,
+            initial_cwd,
+            initial_project_path,
+            Some(panel_state),
         )
     }
 
@@ -3997,6 +4044,7 @@ impl AgentBridge {
             cache_dir,
             None,
             None,
+            None,
         )
     }
 
@@ -4006,6 +4054,7 @@ impl AgentBridge {
         cache_dir: Option<PathBuf>,
         initial_cwd: Option<PathBuf>,
         initial_project_path: Option<PathBuf>,
+        panel_state: Option<Arc<PanelStateStore>>,
     ) -> Result<Self, BridgeError> {
         // Boxed immediately so the same resolver this constructor uses to
         // seed `gateway_urls` up front can also be kept on the struct for
@@ -4114,7 +4163,7 @@ impl AgentBridge {
             // empty scrollback for *that thread only*, same as any other
             // cache miss.
             let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-                seed_thread_from_cache(store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
+                seed_thread_from_cache(store.as_ref(), panel_state.as_deref(), &thread_id, HISTORY_PAGE_SIZE);
             let has_cached_transcript = !seeded.is_empty();
 
             let provider = spec.provider.as_str();
@@ -4208,6 +4257,7 @@ impl AgentBridge {
                 events_rx,
                 events.clone(),
                 store.clone(),
+                panel_state.clone(),
                 idx,
                 spec.session_id.clone().or(cached_session_id),
                 has_cached_transcript,
@@ -4286,6 +4336,7 @@ impl AgentBridge {
             default_provider,
             server_owned_persistence: cache_dir.is_none(),
             store,
+            panel_state,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_cwd_override,
             session_project_path_override,
@@ -4892,7 +4943,7 @@ impl AgentBridge {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
         let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-            seed_thread_from_cache(self.store.as_ref(), thread_id, HISTORY_PAGE_SIZE);
+            seed_thread_from_cache(self.store.as_ref(), self.panel_state.as_deref(), thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
         let project_path_for_slot = self
@@ -5154,6 +5205,7 @@ impl AgentBridge {
             events_rx,
             self.events.clone(),
             self.store.clone(),
+            self.panel_state.clone(),
             idx,
             cached_session_id,
             has_cached_transcript,
@@ -5205,6 +5257,7 @@ impl AgentBridge {
             events_rx,
             self.events.clone(),
             self.store.clone(),
+            self.panel_state.clone(),
             idx,
             cached_session_id,
             has_cached_transcript,
@@ -5439,6 +5492,7 @@ impl AgentBridge {
 
         let session_id = session_id.to_string();
         let store = self.store.clone();
+        let panel_state = self.panel_state.clone();
         let session_cwd_override = self.session_cwd_override.clone();
         let events_out = self.events.clone();
         let recover_session_operations = self.recover_session_operations.clone();
@@ -5541,6 +5595,7 @@ impl AgentBridge {
                 events_rx,
                 events_out,
                 store,
+                panel_state,
                 slot,
                 idx,
             );
@@ -5974,7 +6029,7 @@ impl AgentBridge {
             return false;
         };
         *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = archived;
-        persist_runtime_snapshot(self.store.as_ref(), slot);
+        persist_runtime_snapshot(self.store.as_ref(), self.panel_state.as_deref(), slot);
         true
     }
 
@@ -7087,7 +7142,7 @@ impl AgentBridge {
                 .unwrap_or_else(|e| e.into_inner());
             pending.retain(|req| req.relay_id != relay_id);
         }
-        persist_runtime_snapshot(self.store.as_ref(), slot);
+        persist_runtime_snapshot(self.store.as_ref(), self.panel_state.as_deref(), slot);
         let handle = slot.handle.clone();
         let events_out = self.events.clone();
         let relay_id = relay_id.to_string();

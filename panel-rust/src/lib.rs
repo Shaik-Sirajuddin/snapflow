@@ -2348,12 +2348,16 @@ fn panel_rust_create_with_initial_identity(
             crate::agent_bridge::set_snapflow_mcp_enabled_flag(paths.snapflow_mcp_enabled());
         }
         let (bridge, bridge_available) =
-            match AgentBridge::new_with_thread_specs_and_initial_identity(
+            match AgentBridge::new_with_thread_specs_and_initial_identity_and_panel_state(
                 &initial_specs,
                 initial_cwd,
                 initial_identity
                     .as_ref()
                     .and_then(|identity| identity.saved_path().map(std::path::PathBuf::from)),
+                panel_state
+                    .as_ref()
+                    .expect("mandatory panel state store")
+                    .clone(),
             ) {
                 Ok(b) => (Some(b), true),
                 Err(e) => {

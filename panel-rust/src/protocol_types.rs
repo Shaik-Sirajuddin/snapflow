@@ -143,9 +143,7 @@ pub fn elide_large_payload_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => truncate_with_marker(s, MAX_RAW_PAYLOAD_STRING_BYTES),
         serde_json::Value::Array(items) => items.iter_mut().for_each(elide_large_payload_strings),
-        serde_json::Value::Object(map) => {
-            map.values_mut().for_each(elide_large_payload_strings)
-        }
+        serde_json::Value::Object(map) => map.values_mut().for_each(elide_large_payload_strings),
         _ => {}
     }
 }
@@ -183,6 +181,10 @@ fn has_oversized_string(value: &serde_json::Value) -> bool {
 /// `AcpxThreadHandle::take_events`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    /// The gateway re-established this session after a transport reconnect.
+    /// Panel-Rust uses this edge to request a fresh first history page from
+    /// ACPX before accepting further UI interactions.
+    ConnectionRestored,
     Message(ChatMessage),
     HistoryPage {
         messages: Vec<ChatMessage>,
@@ -421,8 +423,7 @@ pub struct AgentRequestEvent {
 /// settings-gear list view happens to render today, which is what this
 /// type used to do (and is exactly the "incomplete data" this replaced).
 pub use acpx_client::mcp::{
-    McpAuthStatus, McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo,
-    OAuthClientConfig,
+    McpAuthStatus, McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo, OAuthClientConfig,
 };
 
 /// Registry-reported install/detection status for one agent catalog
@@ -598,7 +599,10 @@ mod raw_payload_bound_tests {
         elide_large_payload_strings(&mut value);
         // Round-tripping proves the truncated string is still valid UTF-8
         // (a `String` that split a char boundary could not exist).
-        assert!(value.as_str().expect("string").contains("more bytes elided"));
+        assert!(value
+            .as_str()
+            .expect("string")
+            .contains("more bytes elided"));
     }
 }
 

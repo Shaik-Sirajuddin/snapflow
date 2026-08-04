@@ -2350,7 +2350,10 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         // probe_provider_selection` hit its deliberate silent no-op.
         // Deliberately does NOT touch `provider_errors`/the toast path --
         // no probe actually ran, so there is nothing to report as failed.
-        EffectResultMsg::ProviderProbeSkipped { real_index, provider } => {
+        EffectResultMsg::ProviderProbeSkipped {
+            real_index,
+            provider,
+        } => {
             if model.provider_probes_in_flight.remove(&provider) {
                 if let Some(thread) = model.threads.get(real_index) {
                     let thread_id = thread.thread_id.clone();
@@ -2384,7 +2387,10 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         // the `model.threads[i] <-> bridge.slots[i]` alignment instead of
         // leaving a permanent one-off drift for every thread created
         // after it.
-        EffectResultMsg::ThreadCreationFailed { real_index, message } => {
+        EffectResultMsg::ThreadCreationFailed {
+            real_index,
+            message,
+        } => {
             if real_index >= model.threads.len() {
                 return (vec![], vec![]);
             }
@@ -2826,6 +2832,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             continue;
         };
         match &bridge_event.event {
+            crate::protocol_types::AgentEvent::ConnectionRestored => {
+                // The bridge forwarder requests the fresh ACPX history page;
+                // this transport edge itself has no direct UI payload.
+            }
             crate::protocol_types::AgentEvent::Message(message) => {
                 if matches!(message.kind, crate::protocol_types::MessageKind::User)
                     && thread.server_queue
@@ -4484,7 +4494,9 @@ mod tests {
             }),
         );
 
-        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
+        assert!(!dirty
+            .iter()
+            .any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
     }
 
     // mcp-servers-settings follow-up: the chat-view pulsing "Starting new
@@ -4673,7 +4685,9 @@ mod tests {
             }),
         );
 
-        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ThreadAttaching { .. })));
+        assert!(!dirty
+            .iter()
+            .any(|d| matches!(d, Dirty::ThreadAttaching { .. })));
     }
 
     #[test]
@@ -5009,7 +5023,11 @@ mod tests {
                     },
                 },
                 Dirty::ThreadListDiff(crate::dirty::diff_by_id(
-                    &["thread-0".to_owned(), "thread-1".to_owned(), "thread-2".to_owned()],
+                    &[
+                        "thread-0".to_owned(),
+                        "thread-1".to_owned(),
+                        "thread-2".to_owned()
+                    ],
                     &["thread-0".to_owned(), "thread-1".to_owned()],
                     &[visible_row(0, "thread-0"), visible_row(1, "thread-1")],
                 )),
