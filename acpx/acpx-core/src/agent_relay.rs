@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// One relayed agent-initiated request pushed out to a subscribed
@@ -76,6 +76,13 @@ struct Subscriber {
 struct PendingRelay {
     gateway_session_id: String,
     client_ids: HashSet<String>,
+    /// Original request, retained so a client which connects after the
+    /// initial delivery can be offered the same approval without changing
+    /// its relay id or backend request id.
+    request: serde_json::Value,
+    /// Absolute expiry for this relay.  Reconnect replay is allowed only
+    /// until this deadline; it never extends the backend's wait forever.
+    deadline: Instant,
     reply_tx: oneshot::Sender<serde_json::Value>,
 }
 
@@ -155,18 +162,46 @@ impl AgentRequestHub {
     ) -> AgentRequestSubscription {
         let (tx, rx) = mpsc::channel(AGENT_REQUEST_QUEUE_CAPACITY);
         let (resolution_tx, resolution_rx) = mpsc::channel(AGENT_REQUEST_QUEUE_CAPACITY);
+        let gateway_session_id = gateway_session_id.into();
+        let client_id = client_id.into();
         self.subscribers
             .lock()
             .await
-            .entry(gateway_session_id.into())
+            .entry(gateway_session_id.clone())
             .or_default()
-            .insert(
-                client_id.into(),
-                Subscriber {
-                    request_tx: tx,
-                    resolution_tx,
-                },
-            );
+            .insert(client_id.clone(), Subscriber {
+                request_tx: tx.clone(),
+                resolution_tx,
+            });
+
+        // Replay unresolved requests after registering the subscriber.  The
+        // pending lock makes this race-safe with a concurrent response: a
+        // relay removed before this scan is never replayed.
+        let now = Instant::now();
+        let replay = {
+            let mut pending = self.pending.lock().await;
+            pending
+                .retain(|_, entry| entry.deadline > now);
+            pending
+                .iter_mut()
+                .filter(|(_, entry)| entry.gateway_session_id == gateway_session_id)
+                .map(|(relay_id, entry)| {
+                    entry.client_ids.insert(client_id.clone());
+                    AgentRequestEnvelope {
+                        relay_id: relay_id.clone(),
+                        gateway_session_id: gateway_session_id.clone(),
+                        client_id: client_id.clone(),
+                        request: entry.request.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for envelope in replay {
+            // The subscription receiver has just been created, so this is a
+            // non-blocking handoff; a full/closed channel simply means this
+            // client cannot participate in the relay.
+            let _ = tx.try_send(envelope);
+        }
         AgentRequestSubscription {
             requests: rx,
             resolutions: resolution_rx,
@@ -181,6 +216,18 @@ impl AgentRequestHub {
 
     /// Remove one connection without disturbing other subscribers.
     pub async fn unsubscribe_client(&self, gateway_session_id: &str, client_id: &str) {
+        // Revoke this connection's claim before removing its subscription.
+        // Taking the pending lock first makes a concurrent response either
+        // win before disconnect or be rejected after disconnect; it cannot
+        // race with the removal and resolve an already-stale relay.
+        {
+            let mut pending = self.pending.lock().await;
+            for entry in pending.values_mut() {
+                if entry.gateway_session_id == gateway_session_id {
+                    entry.client_ids.remove(client_id);
+                }
+            }
+        }
         let mut subscribers = self.subscribers.lock().await;
         if let Some(session) = subscribers.get_mut(gateway_session_id) {
             session.remove(client_id);
@@ -210,12 +257,15 @@ impl AgentRequestHub {
         };
         let relay_id = fresh_relay_id();
         let (reply_tx, reply_rx) = oneshot::channel();
+        let deadline = Instant::now() + timeout;
         let client_ids = targets.iter().map(|(id, _)| id.clone()).collect();
         self.pending.lock().await.insert(
             relay_id.clone(),
             PendingRelay {
                 gateway_session_id: gateway_session_id.to_string(),
                 client_ids,
+                request: request.clone(),
+                deadline,
                 reply_tx,
             },
         );
@@ -227,7 +277,8 @@ impl AgentRequestHub {
                 client_id,
                 request: request.clone(),
             };
-            if tokio::time::timeout(timeout, sender.send(envelope))
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(remaining, sender.send(envelope))
                 .await
                 .map(|result| result.is_ok())
                 .unwrap_or(false)
@@ -239,7 +290,8 @@ impl AgentRequestHub {
             self.pending.lock().await.remove(&relay_id);
             return None;
         }
-        let outcome = tokio::time::timeout(timeout, reply_rx).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let outcome = tokio::time::timeout(remaining, reply_rx).await;
         self.pending.lock().await.remove(&relay_id);
         match outcome {
             Ok(Ok(value)) => Some(value),
@@ -406,6 +458,46 @@ mod tests {
             .resolve(&envelope.relay_id, serde_json::json!({"late": true}))
             .await;
         assert!(!delivered);
+    }
+
+    #[tokio::test]
+    async fn reconnecting_client_receives_unresolved_relay_before_deadline() {
+        let hub = AgentRequestHub::new();
+        let mut first = hub.subscribe_with_client("gw-1", "client-a").await;
+        let relay_hub = hub.clone();
+        let relay_task = tokio::spawn(async move {
+            relay_hub
+                .relay(
+                    "gw-1",
+                    serde_json::json!({"id": 9, "method": "session/request_permission"}),
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+        let original = first.requests.recv().await.expect("original request");
+        hub.unsubscribe_client("gw-1", "client-a").await;
+        assert!(!hub
+            .resolve_from_client(
+                &original.relay_id,
+                Some("client-a"),
+                serde_json::json!({"stale": true}),
+            )
+            .await);
+
+        let mut replacement = hub.subscribe_with_client("gw-1", "client-b").await;
+        let replay = replacement.requests.recv().await.expect("replayed request");
+        assert_eq!(replay.relay_id, original.relay_id);
+        assert_eq!(replay.request, original.request);
+        assert_eq!(replay.client_id, "client-b");
+
+        assert!(hub
+            .resolve_from_client(
+                &replay.relay_id,
+                Some("client-b"),
+                serde_json::json!({"approved": true}),
+            )
+            .await);
+        assert_eq!(relay_task.await.unwrap(), Some(serde_json::json!({"approved": true})));
     }
 
     #[tokio::test]
