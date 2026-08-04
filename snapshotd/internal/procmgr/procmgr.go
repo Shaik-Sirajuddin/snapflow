@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -338,6 +339,13 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// request that spawned it -- explicit cleanup (Close, or the
 	// ConnectTimeout failure path below) is the only thing that should kill
 	// it.
+	preopened := false
+	if opts.ProjectRoot != "" && opts.MltFileName != "" {
+		projectPath := filepath.Join(opts.ProjectRoot, opts.MltFileName)
+		if info, statErr := os.Stat(projectPath); statErr == nil && !info.IsDir() {
+			preopened = true
+		}
+	}
 	cmd := exec.Command(m.BinPath)
 	headlessVal := "0"
 	if opts.Headless {
@@ -360,6 +368,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_PROJECT_ROOT="+opts.ProjectRoot,
 		"SNAPSHOT_PROJECT_MLT_FILENAME="+opts.MltFileName,
 		"SNAPSHOT_PROJECT_TYPE="+opts.ProjectType,
+		"SNAPSHOT_PROJECT_PREOPENED="+strconv.FormatBool(preopened),
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
 	// The child's own embedded chat panel (panel-rust's agent_bridge.rs)

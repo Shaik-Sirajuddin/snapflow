@@ -314,35 +314,20 @@ impl FfiBackend {
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        // Bind this session's "current file" to the real project's MLT
-        // path (default filename "project.mlt", per
-        // 09-project-folder-layout.md/registry.DefaultMltFileName,
-        // overridable via SNAPSHOT_PROJECT_MLT_FILENAME for legacy
-        // custom-named projects opened via project.open) *before* any
-        // edit happens, so `project.save` (sap_save_project ->
-        // saveXML(mw->fileName())) writes to `<projectRoot>/project.mlt`
-        // rather than MainWindow::untitledFileName()'s scratch default.
-        // A no-op (skipped) for manual dev launches with no
-        // SNAPSHOT_PROJECT_ROOT set, matching file_import's sandbox-check
-        // skip in that same case.
-        if let Some(root) = project_root.as_ref() {
-            let mlt_file_name = std::env::var("SNAPSHOT_PROJECT_MLT_FILENAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "project.mlt".to_string());
-            let mlt_path = root.join(mlt_file_name);
-            if let Some(path_str) = mlt_path.to_str() {
-                if let Ok(c_path) = CString::new(path_str) {
-                    unsafe { ffi::sap_set_project_file(main_window, c_path.as_ptr()) };
-                }
-            }
-        }
+        // Do not call Qt with BlockingQueuedConnection from this constructor:
+        // it runs on the detached SAP thread while the GUI is still entering
+        // its event loop. Bind-only projects set their target path in the
+        // first project_select instead; pre-opened projects already have the
+        // correct MainWindow filename from the positional GUI argument.
         Self {
             main_window,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             job_children: HashMap::new(),
             project_root,
-            opened: false,
+            opened: matches!(
+                std::env::var("SNAPSHOT_PROJECT_PREOPENED").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+            ),
         }
     }
 

@@ -285,8 +285,13 @@ async fn dispatch(tx: &DispatchSender, op: BackendOp) -> BackendCallResult {
 /// funnel through `rx` in strict arrival order (FIFO across all
 /// connections, per `05-multi-client-concurrency.md`'s "explicit FIFO queue"
 /// requirement) and are applied one at a time.
-async fn run_dispatcher<B: Backend>(mut backend: B, mut rx: mpsc::UnboundedReceiver<DispatchMsg>) {
-    while let Some(msg) = rx.recv().await {
+fn run_dispatcher<B: Backend>(mut backend: B, mut rx: mpsc::UnboundedReceiver<DispatchMsg>) {
+    // Backend calls may synchronously cross into Qt with a
+    // BlockingQueuedConnection. Keep this FIFO owner off the Tokio runtime;
+    // otherwise a single-worker runtime can stall accept/read tasks while a
+    // Qt call is waiting for the GUI thread, leaving new SAP clients queued
+    // even though the Unix socket is listening.
+    while let Some(msg) = rx.blocking_recv() {
         // See `ffi_backend::SUPPRESS_QT_BRIDGE_NOTIFICATION`'s doc comment:
         // marks this op's call into `backend` as "already RPC-attributed"
         // so `FfiBackend`'s Qt-signal bridge doesn't also publish a
@@ -2418,7 +2423,7 @@ pub async fn serve<B: Backend + 'static>(
     let pipe_name = config.socket_path.to_string_lossy().into_owned();
 
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchMsg>();
-    tokio::spawn(run_dispatcher(backend, dispatch_rx));
+    tokio::task::spawn_blocking(move || run_dispatcher(backend, dispatch_rx));
 
     let channels: ProjectChannels = Arc::new(Mutex::new(HashMap::new()));
     let token = config.token;
