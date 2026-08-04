@@ -294,8 +294,14 @@ esac
 # PATH; only materializes $INSTALL_DIR/runtime/node for ACP/acpx children.
 # Failures are non-fatal so a Node CDN outage does not block snapflow
 # install (doctor / `runtime install node` can retry later).
-ACP_NODE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/acp-node-runtime.sh"
-if [ ! -f "$ACP_NODE_LIB" ]; then
+ACP_NODE_LIB=""
+if [ -n "${BASH_SOURCE[0]-}" ]; then
+  ACP_NODE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/acp-node-runtime.sh"
+fi
+# When this file is streamed through `curl | bash`, Bash does not always
+# populate BASH_SOURCE[0]. Prefer the copy in the extracted bundle in that
+# case; direct execution still resolves the repository-adjacent library.
+if [ -z "${BASH_SOURCE[0]-}" ] || [ ! -f "$ACP_NODE_LIB" ]; then
   # install.sh may be curl'd alone; try next to INSTALL_DIR copy if present.
   ACP_NODE_LIB="$INSTALL_DIR/scripts/lib/acp-node-runtime.sh"
 fi
