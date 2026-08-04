@@ -8,14 +8,15 @@
 
 use crate::gateway_actor::classify_raw_update;
 use crate::gateway_actor::session_opener::GatewaySessionOpener;
-use crate::protocol_types::AgentEvent;
+use crate::protocol_types::{AgentEvent, QueueItemInfo};
 use crate::protocol_types::{
-    AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
-    TerminalCreatedEvent, TerminalOutputEvent,
+    AgentRequestEvent, AgentResolutionEvent, ConfigOptionInfo, ConfigOptionValue, MessageKind,
+    SessionModeInfo, SessionModesEvent, TerminalCreatedEvent, TerminalOutputEvent,
 };
 use acpx_client::pool::{OpenSpec, PoolKey, ProjectSessionPool, SessionLease};
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -64,12 +65,17 @@ fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
 }
 
 /// Result of [`AcpxThreadHandle::acquire_and_attach`]. `resumed_from_saved`
-/// distinguishes a session the pool resumed from a persisted id (which
-/// already carries capability/config info from its `session/resume`
-/// response, emitted as the usual capability events) from one the pool
-/// freshly created (whose capabilities are not yet known to this actor --
-/// callers should fall back to `models/list` per the plan's capability-
-/// loading precedence rather than expect capability events for that case).
+/// distinguishes a session the pool resumed from a persisted id from one
+/// the pool freshly created. Not currently consumed by any caller --
+/// `Command::AcquireAndAttach`'s own handler already emits capability
+/// events uniformly for both cases (resumed: from the `session/resume`
+/// response; freshly created: from `SessionLease::capabilities`, which
+/// `ProjectSessionPool` populates from `session/new`'s response and
+/// carries through even a warm-pool reuse, see `pool.rs`'s
+/// `reusing an idle entry must not drop its captured capabilities` test)
+/// -- so no caller-side models/list fallback decision needs this flag.
+/// Kept for now as a cheap diagnostic signal (e.g. logging) rather than
+/// removed outright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedSession {
     pub session_id: String,
@@ -122,10 +128,13 @@ enum Command {
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// ACP's lighter `session/resume` reattachment path. Unlike
-    /// `session/load`, it does not replay prior history.
+    /// `session/load`, it does not replay prior history. Clients are
+    /// expected to resupply `mcpServers` on resume (same list as
+    /// `session/new`); see mcp-registry-live-propagation plan.
     ReattachSession {
         session_id: String,
         cwd: PathBuf,
+        mcp_servers: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// acpx-client-session-lease-pool: acquires an exclusive lease from
@@ -150,6 +159,14 @@ enum Command {
         text: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    PaginateHistory {
+        before: Option<String>,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    QueueMutation {
+        params: serde_json::Value,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     ListSessions {
         agent_id: Option<String>,
         resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
@@ -160,6 +177,21 @@ enum Command {
     /// run on this handle.
     ListProfiles {
         resp: oneshot::Sender<Result<Vec<ProfileSummary>, AcpxThreadError>>,
+    },
+    ListPermissionProfiles {
+        resp: oneshot::Sender<Result<Vec<acpx_proto::gateway::PermissionProfile>, AcpxThreadError>>,
+    },
+    GetPermissionProfile {
+        session_id: String,
+        resp: oneshot::Sender<
+            Result<acpx_proto::gateway::SessionPermissionProfileResult, AcpxThreadError>,
+        >,
+    },
+    SetPermissionProfile {
+        params: acpx_proto::gateway::SessionPermissionProfileParams,
+        resp: oneshot::Sender<
+            Result<acpx_proto::gateway::SessionPermissionProfileResult, AcpxThreadError>,
+        >,
     },
     /// Explicit, opt-in-only `session/close`. Deliberately **never**
     /// sent by `shutdown()`/`Drop` -- see this crate's module doc and
@@ -207,6 +239,13 @@ enum Command {
         terminal_id: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    /// Re-fetch a terminal's whole output snapshot after reconnect so a
+    /// client does not depend on a notification that may have occurred while
+    /// its WebSocket was down.
+    RefreshTerminalOutput {
+        terminal_id: String,
+        resp: oneshot::Sender<Result<TerminalOutputEvent, AcpxThreadError>>,
+    },
     /// `session/set_config_option` -- see [`AcpxThreadHandle::
     /// set_config_option`]'s doc comment.
     SetConfigOption {
@@ -221,19 +260,41 @@ enum Command {
     ListMcpServers {
         resp: oneshot::Sender<Result<Vec<crate::protocol_types::McpServerEntry>, AcpxThreadError>>,
     },
-    /// `mcp_servers/create`. `entry` must include a `"name"` field (the
-    /// merge key `acpx-core::mcp_servers::McpServerStore` uses).
+    /// `mcp_servers/create`.
     CreateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/update` -- same payload shape as create.
     UpdateMcpServer {
-        entry: serde_json::Value,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        entry: crate::protocol_types::McpServerEntry,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `mcp_servers/delete`.
     DeleteMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/authenticate` -- begins the MCP OAuth 2.1 flow server
+    /// side (see `acpx_core::router::Router::authenticate_mcp_server`'s
+    /// doc comment) and returns the `authorizationUrl` the caller must
+    /// open in a browser.
+    AuthenticateMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<String, AcpxThreadError>>,
+    },
+    /// `mcp_servers/logout`.
+    LogoutMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe (see `acpx_core::router::Router::spawn_mcp_
+    /// tools_fetch`'s doc comment). The real tool list is not this
+    /// command's result -- it comes back through a later `ListMcpServers`
+    /// call's `tool_catalog` field, once the gateway's detached probe
+    /// finishes.
+    FetchMcpServerTools {
         name: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
@@ -265,8 +326,21 @@ enum Command {
             oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
     },
     /// `models/list` for one agent, safe before a session exists.
+    ///
+    /// pre-send-config-options-visibility: `cwd` is forwarded verbatim to
+    /// the `models/list` RPC. It must be `Some(_)` with an *absolute*
+    /// path whenever the caller has one -- `acpx-core::router`'s
+    /// `probe_adapter_capabilities` defaults a missing `cwd` to `"."` and
+    /// then rejects it outright ("cwd must be an absolute path"),
+    /// confirmed live: this is exactly why a not-yet-attached thread's
+    /// config dropdown went silently empty for any provider whose
+    /// capability lookup fell through to this command (the RPC error was
+    /// swallowed by the caller's own `unwrap_or_default()`, so nothing
+    /// ever surfaced). `None` only when the caller genuinely has no known
+    /// project directory yet (e.g. no project open at all).
     ListModels {
         agent_id: String,
+        cwd: Option<std::path::PathBuf>,
         resp: oneshot::Sender<Result<Vec<ConfigOptionInfo>, AcpxThreadError>>,
     },
     /// `agents/status` for one agent id.
@@ -331,10 +405,35 @@ impl AcpxThreadHandle {
         &self,
         make_cmd: impl FnOnce(oneshot::Sender<Result<T, AcpxThreadError>>) -> Command,
     ) -> Result<T, AcpxThreadError> {
+        self.call_signaling_dispatch(make_cmd, None).await
+    }
+
+    /// Same as [`Self::call`], but -- if `dispatched` is given -- fires it
+    /// the instant `cmd_tx.send` succeeds, i.e. the moment this command has
+    /// actually joined this thread's own single-consumer `cmd_rx` FIFO,
+    /// *not* once the actor has finished processing it (which for
+    /// `Command::SendPrompt` means the whole turn, per that method's own
+    /// doc comment). `AgentBridge::send_prompt`/`mutate_queue` (`agent_
+    /// bridge.rs`) use this to release their per-thread dispatch ticket
+    /// (see `ThreadSlot::dispatch_order`'s doc comment) as soon as this
+    /// call can no longer lose the ordering race against a later one --
+    /// releasing only after the full `resp_rx.await` below would instead
+    /// serialize every subsequent queue mutation (including the
+    /// independent-connection-free "Send now"/cancel path's own
+    /// `QueueMutation`) behind an entire in-flight turn, which would
+    /// silently break steering, not merely delay it.
+    async fn call_signaling_dispatch<T>(
+        &self,
+        make_cmd: impl FnOnce(oneshot::Sender<Result<T, AcpxThreadError>>) -> Command,
+        dispatched: Option<oneshot::Sender<()>>,
+    ) -> Result<T, AcpxThreadError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
             .send(make_cmd(resp_tx))
             .map_err(|_| AcpxThreadError::ActorGone)?;
+        if let Some(dispatched) = dispatched {
+            let _ = dispatched.send(());
+        }
         resp_rx.await.map_err(|_| AcpxThreadError::ActorGone)?
     }
 
@@ -402,17 +501,22 @@ impl AcpxThreadHandle {
     }
 
     /// Attaches this client connection to an existing session with ACP's
-    /// no-history-replay `session/resume` operation.
+    /// no-history-replay `session/resume` operation. `mcp_servers` is the
+    /// same client-computed list `session/new` would send -- required by
+    /// the protocol so a resumed session can reconnect MCP clients under
+    /// the current registry.
     pub async fn reattach_session(
         &self,
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<(), AcpxThreadError> {
         let session_id = session_id.into();
         let cwd = cwd.into();
         self.call(|resp| Command::ReattachSession {
             session_id,
             cwd,
+            mcp_servers,
             resp,
         })
         .await
@@ -452,6 +556,57 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::SendPrompt { text, resp }).await
     }
 
+    /// Same as [`Self::send_prompt`], but fires `dispatched` once this
+    /// `Command::SendPrompt` has actually joined the actor's `cmd_rx`
+    /// queue -- see [`Self::call_signaling_dispatch`]'s doc comment.
+    pub async fn send_prompt_signaling_dispatch(
+        &self,
+        text: impl Into<String>,
+        dispatched: oneshot::Sender<()>,
+    ) -> Result<(), AcpxThreadError> {
+        let text = text.into();
+        self.call_signaling_dispatch(|resp| Command::SendPrompt { text, resp }, Some(dispatched))
+            .await
+    }
+
+    /// Fetch one server-owned transcript page and emit it through the normal
+    /// actor event stream. The first page is server-bounded to 50 and older
+    /// pages to 40; callers pass only the continuation cursor they received.
+    pub async fn paginate_history(&self, before: Option<String>) -> Result<(), AcpxThreadError> {
+        self.call(|resp| Command::PaginateHistory { before, resp })
+            .await
+    }
+
+    pub async fn mutate_queue(&self, mut params: serde_json::Value) -> Result<(), AcpxThreadError> {
+        self.call(|resp| {
+            if !params.get("sessionId").is_some() {
+                params["sessionId"] = serde_json::Value::Null;
+            }
+            Command::QueueMutation { params, resp }
+        })
+        .await
+    }
+
+    /// Same as [`Self::mutate_queue`], but fires `dispatched` once this
+    /// `Command::QueueMutation` has actually joined the actor's `cmd_rx`
+    /// queue -- see [`Self::call_signaling_dispatch`]'s doc comment.
+    pub async fn mutate_queue_signaling_dispatch(
+        &self,
+        mut params: serde_json::Value,
+        dispatched: oneshot::Sender<()>,
+    ) -> Result<(), AcpxThreadError> {
+        self.call_signaling_dispatch(
+            |resp| {
+                if !params.get("sessionId").is_some() {
+                    params["sessionId"] = serde_json::Value::Null;
+                }
+                Command::QueueMutation { params, resp }
+            },
+            Some(dispatched),
+        )
+        .await
+    }
+
     /// Gateway-aggregated `session/list` -- every session across every
     /// backend *this gateway* currently supervises, not just this
     /// thread's own.
@@ -480,6 +635,32 @@ impl AcpxThreadHandle {
     /// state involved).
     pub async fn list_profiles(&self) -> Result<Vec<ProfileSummary>, AcpxThreadError> {
         self.call(|resp| Command::ListProfiles { resp }).await
+    }
+
+    pub async fn list_permission_profiles(
+        &self,
+    ) -> Result<Vec<acpx_proto::gateway::PermissionProfile>, AcpxThreadError> {
+        self.call(|resp| Command::ListPermissionProfiles { resp })
+            .await
+    }
+
+    pub async fn get_permission_profile(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<acpx_proto::gateway::SessionPermissionProfileResult, AcpxThreadError> {
+        self.call(|resp| Command::GetPermissionProfile {
+            session_id: session_id.into(),
+            resp,
+        })
+        .await
+    }
+
+    pub async fn set_permission_profile(
+        &self,
+        params: acpx_proto::gateway::SessionPermissionProfileParams,
+    ) -> Result<acpx_proto::gateway::SessionPermissionProfileResult, AcpxThreadError> {
+        self.call(|resp| Command::SetPermissionProfile { params, resp })
+            .await
     }
 
     /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
@@ -520,6 +701,15 @@ impl AcpxThreadHandle {
     ) -> Result<(), AcpxThreadError> {
         let terminal_id = terminal_id.into();
         self.call(|resp| Command::KillTerminal { terminal_id, resp })
+            .await
+    }
+
+    pub async fn refresh_terminal_output(
+        &self,
+        terminal_id: impl Into<String>,
+    ) -> Result<TerminalOutputEvent, AcpxThreadError> {
+        let terminal_id = terminal_id.into();
+        self.call(|resp| Command::RefreshTerminalOutput { terminal_id, resp })
             .await
     }
 
@@ -564,11 +754,11 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListMcpServers { resp }).await
     }
 
-    /// `mcp_servers/create`. `entry` must include a `"name"` field.
+    /// `mcp_servers/create`.
     pub async fn create_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::CreateMcpServer { entry, resp })
             .await
     }
@@ -576,8 +766,8 @@ impl AcpxThreadHandle {
     /// `mcp_servers/update` -- same payload shape as `create_mcp_server`.
     pub async fn update_mcp_server(
         &self,
-        entry: serde_json::Value,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::UpdateMcpServer { entry, resp })
             .await
     }
@@ -586,6 +776,36 @@ impl AcpxThreadHandle {
     pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
         self.call(|resp| Command::DeleteMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/authenticate` -- returns the authorization URL to open
+    /// in a browser. See `Command::AuthenticateMcpServer`'s doc comment.
+    pub async fn authenticate_mcp_server(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<String, AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::AuthenticateMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/logout`.
+    pub async fn logout_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::LogoutMcpServer { name, resp })
+            .await
+    }
+
+    /// `mcp_servers/tools_fetch`. See `Command::FetchMcpServerTools`'s
+    /// doc comment -- returns once the gateway has scheduled the
+    /// background probe, not once it finishes.
+    pub async fn fetch_mcp_server_tools(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::FetchMcpServerTools { name, resp })
             .await
     }
 
@@ -629,12 +849,20 @@ impl AcpxThreadHandle {
     }
 
     /// `models/list` for an agent-scoped pre-session model catalog.
+    /// `cwd` must be an absolute path when `Some` -- see `Command::
+    /// ListModels`'s own doc comment for why a relative/missing one
+    /// makes the backend reject the probe outright.
     pub async fn list_models(
         &self,
         agent_id: String,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<Vec<ConfigOptionInfo>, AcpxThreadError> {
-        self.call(|resp| Command::ListModels { agent_id, resp })
-            .await
+        self.call(|resp| Command::ListModels {
+            agent_id,
+            cwd,
+            resp,
+        })
+        .await
     }
 
     /// `agents/status` for one agent id. Typed `AgentCatalogEntry`, same
@@ -901,10 +1129,33 @@ async fn run_respond_worker(
 /// [`spawn_out_of_band_notification_forwarder`]'s job now (see that
 /// function's doc comment for why they were split out of this
 /// function).
+///
+/// `suppress_user_echo`: some ACP backends (observed live with
+/// `grok-build`) emit a `user_message_chunk` notification that simply
+/// echoes the prompt the client itself just sent as part of the very
+/// `session/prompt` turn currently in flight. `panel-rust/src/lib.rs`'s
+/// `start_send_prompt` already appends that exact text as a local
+/// `MessageKind::User` row (`AgentBridge::push_local`) *before* the
+/// `session/prompt` call goes out, so forwarding this echo too used to
+/// double the row up as a second, indistinguishable `AgentEvent::Message`
+/// (see `spawn_event_forwarder`'s unconditional push in
+/// `agent_bridge.rs` -- it has no way to tell "this is the same message
+/// I already have" from "this is new", especially since
+/// `classify_raw_update` never attaches an id to `user_message_chunk`
+/// entries). Callers draining updates that belong to the turn *this
+/// actor itself just started* (i.e. `Command::SendPrompt`'s own
+/// `session/prompt` round trip) pass `true` here to drop that echo at
+/// the source, since the local optimistic copy already covers it.
+/// Callers replaying a backend's own history independent of any local
+/// echo -- `session/load`/`session/resume` attachment and the idle
+/// out-of-turn `live_rx` listener -- pass `false`, so genuine past user
+/// turns replayed from the backend (which have no local counterpart at
+/// all) still render.
 fn forward_updates(
     updates: &[serde_json::Value],
     active_session_id: Option<&str>,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    suppress_user_echo: bool,
 ) {
     for update in updates {
         let Some(active_session_id) = active_session_id else {
@@ -918,11 +1169,292 @@ fn forward_updates(
         {
             continue;
         }
-        if let Some(msg) = classify_raw_update(update) {
+        if update.get("method").and_then(|method| method.as_str()) == Some("acpx/session/queue") {
+            let completed = update
+                .get("params")
+                .and_then(|params| params.get("completed"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let mut projections = QUEUE_PROJECTIONS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .expect("queue projection lock");
+            let projection = projections.entry(active_session_id.to_owned()).or_default();
+            if let Some((items, paused)) = projection.apply(update.get("params")) {
+                let _ = event_tx.send(AgentEvent::QueueChanged { items, paused });
+            }
+            // Server-owned queue prompts bypass Command::SendPrompt in this
+            // actor, so they have no prompt-response path that emits the
+            // usual TurnEnded event. ACPX marks the durable claim completion
+            // explicitly; feed that marker through the same reducer path so
+            // Loading is cleared after the final queued prompt.
+            if completed {
+                let _ = event_tx.send(AgentEvent::TurnEnded("end_turn".to_owned()));
+            }
+            continue;
+        }
+        if let Some(steer) = parse_session_steer(update) {
+            let _ = event_tx.send(AgentEvent::SessionSteer(steer));
+            continue;
+        }
+        if let Some(resolution) = parse_agent_resolution(update) {
+            let _ = event_tx.send(AgentEvent::AgentResolution(resolution));
+        } else if let Some(msg) = classify_raw_update(update) {
+            if suppress_user_echo && msg.kind == MessageKind::User {
+                continue;
+            }
             let _ = event_tx.send(AgentEvent::Message(msg));
         } else if let Some(event) = parse_capability_update(update) {
             let _ = event_tx.send(event);
         }
+    }
+}
+
+/// Forward turn updates while suppressing exact duplicate wire frames.  A
+/// subscribed WS receives the normal live stream, but a reconnect race can
+/// also leave the same frame in the RPC response's `_acpx.updates` bundle.
+/// The set is scoped to one prompt turn, so identical text in two legitimate
+/// turns is never collapsed.
+fn forward_updates_dedup(
+    updates: &[serde_json::Value],
+    active_session_id: Option<&str>,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    suppress_user_echo: bool,
+    seen: &mut HashSet<String>,
+) {
+    let mut unique = Vec::with_capacity(updates.len());
+    for update in updates {
+        let Ok(key) = serde_json::to_string(update) else {
+            unique.push(update.clone());
+            continue;
+        };
+        if seen.insert(key) {
+            unique.push(update.clone());
+        }
+    }
+    forward_updates(&unique, active_session_id, event_tx, suppress_user_echo);
+}
+
+fn parse_session_steer(
+    value: &serde_json::Value,
+) -> Option<crate::protocol_types::SessionSteerEvent> {
+    if value.get("method").and_then(|m| m.as_str()) != Some("acpx/session/steer") {
+        return None;
+    }
+    let params = value.get("params")?;
+    Some(crate::protocol_types::SessionSteerEvent {
+        session_id: params.get("sessionId")?.as_str()?.to_owned(),
+        state: params.get("state")?.as_str()?.to_owned(),
+        queue_entry_id: params
+            .get("queueEntryId")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    })
+}
+
+static QUEUE_PROJECTIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, QueueProjection>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct QueueProjection {
+    items: Vec<QueueItemInfo>,
+    paused: bool,
+}
+
+impl QueueProjection {
+    /// Full queue snapshots are only authoritative during subscribe/reconnect.
+    /// Subsequent notifications are deltas and mutate this client-owned view.
+    fn apply(&mut self, params: Option<&serde_json::Value>) -> Option<(Vec<QueueItemInfo>, bool)> {
+        let params = params?;
+        if let Some(queue) = params.get("queue").and_then(|v| v.as_array()) {
+            self.items = queue.iter().filter_map(parse_queue_item).collect();
+            self.paused = params
+                .get("paused")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            return Some((self.items.clone(), self.paused));
+        }
+        let id = params.get("queueEntryId")?.as_str()?;
+        match params.get("mutation").and_then(|v| v.as_str()) {
+            Some("Removed") | Some("removed") => {
+                self.items.retain(|item| item.queue_entry_id != id)
+            }
+            Some("SentPrompt") | Some("sent_prompt") => {
+                self.items.retain(|item| item.queue_entry_id != id)
+            }
+            Some("Inserted") | Some("inserted") => {
+                // An inserted delta must carry the prompt text. Older
+                // gateways emitted only the id/position; manufacturing a
+                // blank row here makes the UI show an empty "last queued"
+                // message and can preserve it through the next snapshot.
+                let Some(text) = params.get("text").and_then(|v| v.as_str()) else {
+                    return None;
+                };
+                if !self.items.iter().any(|item| item.queue_entry_id == id) {
+                    let position = params
+                        .get("position")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(self.items.len() as u64)
+                        as u32;
+                    let item = QueueItemInfo {
+                        queue_entry_id: id.to_owned(),
+                        idempotency_key: params
+                            .get("idempotencyKey")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                        text: text.to_owned(),
+                        state: "queued".to_owned(),
+                        position,
+                    };
+                    self.items.push(item);
+                    self.items.sort_by_key(|item| item.position);
+                }
+            }
+            _ => return None,
+        }
+        Some((self.items.clone(), self.paused))
+    }
+}
+
+fn parse_queue_item(item: &serde_json::Value) -> Option<QueueItemInfo> {
+    Some(QueueItemInfo {
+        queue_entry_id: item.get("queueEntryId")?.as_str()?.to_owned(),
+        idempotency_key: item
+            .get("idempotencyKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        text: item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        state: item
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("queued")
+            .to_owned(),
+        position: item.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+    })
+}
+
+#[cfg(test)]
+mod forward_updates_user_echo_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_message_chunk_update(session_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    fn agent_message_chunk_update(session_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    /// Reproduces the live grok-build bug: a backend echoing the user's
+    /// own prompt back as a `user_message_chunk` during the very
+    /// `session/prompt` turn the client just started must NOT become a
+    /// second rendered `AgentEvent::Message(User)` -- `lib.rs`'s
+    /// `start_send_prompt` already pushed a local optimistic copy before
+    /// this update ever arrives. Without `suppress_user_echo` (i.e. the
+    /// pre-fix `forward_updates(updates, session, event_tx)` two-arg
+    /// call this test would use), this update forwards unconditionally
+    /// and the send-a-message-once/see-it-twice bug reproduces.
+    #[test]
+    fn suppress_user_echo_drops_user_message_chunk_during_own_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![user_message_chunk_update("s1", "hello")];
+        forward_updates(&updates, Some("s1"), &tx, true);
+        drop(tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a user_message_chunk echo for the in-flight turn must be suppressed, \
+             not forwarded as a duplicate AgentEvent::Message"
+        );
+    }
+
+    /// Non-user updates (the real agent reply) must still forward
+    /// normally even with the echo suppressed -- this isn't a blanket
+    /// "ignore everything" flag, only the user-role echo is dropped.
+    #[test]
+    fn suppress_user_echo_still_forwards_agent_message_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![agent_message_chunk_update("s1", "hi there")];
+        forward_updates(&updates, Some("s1"), &tx, true);
+        drop(tx);
+        let event = rx.try_recv().expect("agent message should forward");
+        match event {
+            AgentEvent::Message(msg) => {
+                assert_eq!(msg.kind, MessageKind::Agent);
+                assert_eq!(msg.text, "hi there");
+            }
+            _ => panic!("expected AgentEvent::Message"),
+        }
+    }
+
+    /// Replayed history (`session/load`/`session/resume` attachment,
+    /// where there is no local optimistic echo at all -- the message
+    /// never went through this client's own `push_local`) must still
+    /// render: `suppress_user_echo: false` is the path those call sites
+    /// use, and a `user_message_chunk` there is genuine, unseen-before
+    /// content, not a duplicate of anything.
+    #[test]
+    fn suppress_user_echo_false_still_forwards_user_message_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let updates = vec![user_message_chunk_update("s1", "past turn")];
+        forward_updates(&updates, Some("s1"), &tx, false);
+        drop(tx);
+        let event = rx.try_recv().expect("replayed user message should forward");
+        match event {
+            AgentEvent::Message(msg) => {
+                assert_eq!(msg.kind, MessageKind::User);
+                assert_eq!(msg.text, "past turn");
+            }
+            _ => panic!("expected AgentEvent::Message"),
+        }
+    }
+
+    #[test]
+    fn prompt_update_dedup_drops_live_and_bundle_duplicate() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let update = agent_message_chunk_update("s1", "reply");
+        let mut seen = HashSet::new();
+        forward_updates_dedup(
+            std::slice::from_ref(&update),
+            Some("s1"),
+            &tx,
+            true,
+            &mut seen,
+        );
+        // The same wire frame arriving from `_acpx.updates` after the live
+        // subscription must not append the chunk a second time.
+        forward_updates_dedup(&[update], Some("s1"), &tx, true, &mut seen);
+        drop(tx);
+        let event = rx.try_recv().expect("first chunk should forward");
+        assert!(matches!(event, AgentEvent::Message(message) if message.text == "reply"));
+        assert!(rx.try_recv().is_err(), "duplicate frame must be suppressed");
     }
 }
 
@@ -1207,6 +1739,148 @@ fn parse_model_catalog(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
     }]
 }
 
+/// grok-build's real vendor extension to `session/new`'s result: no
+/// top-level `configOptions`/`modes` key at all (verified against the
+/// real `grok agent stdio` binary -- its `session/new` result has
+/// exactly three top-level keys: `sessionId`, `models`, `_meta`).
+/// Instead the model catalog lives at `models: {currentModelId,
+/// availableModels: [{modelId, name, description?, _meta: {
+/// supportsReasoningEffort, reasoningEffort, reasoningEfforts: [{id,
+/// value, label, description?, default}]}}]}`. This maps that shape into
+/// this crate's `ConfigOptionInfo` vocabulary exactly like
+/// `parse_model_catalog` does for its own vendor shape: one `{id:
+/// "model", category: "model"}` entry (picked up by
+/// `to_config_dropdown_entries`/`model_name_from_config`/the sidebar's
+/// provider·model label, all keyed on that `id`), plus -- when any
+/// model reports reasoning-effort choices -- one `{id: "reasoning_
+/// effort", category: "reasoning"}` entry (picked up by the existing
+/// `to_reasoning_dropdown_entries`/`is_reasoning_option_id`, which
+/// already accepts that id). Without this, grok's real model/reasoning
+/// data was silently dropped: `parse_config_options` only ever looks at
+/// `configOptions`, which grok never sends.
+fn parse_grok_model_config(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let models = value.get("models");
+    let current_model_id = models
+        .and_then(|m| m.get("currentModelId"))
+        .and_then(|v| v.as_str());
+    let Some(available) = models
+        .and_then(|m| m.get("availableModels"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let model_options: Vec<ConfigOptionValue> = available
+        .iter()
+        .filter_map(|model| {
+            Some(ConfigOptionValue {
+                value: model.get("modelId")?.as_str()?.to_owned(),
+                name: model
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: model
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    if model_options.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = vec![ConfigOptionInfo {
+        id: "model".to_owned(),
+        name: "Model".to_owned(),
+        description: None,
+        category: Some("model".to_owned()),
+        kind: "select".to_owned(),
+        current_value: current_model_id.map(str::to_owned),
+        options: model_options,
+    }];
+
+    // Reasoning effort lives per-model (`_meta.reasoningEfforts`), keyed
+    // to whichever model is currently selected -- fall back to the first
+    // model that advertises any efforts at all if `currentModelId` is
+    // absent or doesn't match (still better than silently dropping the
+    // reasoning-effort picker).
+    let reasoning_model = current_model_id
+        .and_then(|id| {
+            available
+                .iter()
+                .find(|m| m.get("modelId").and_then(|v| v.as_str()) == Some(id))
+        })
+        .or_else(|| available.first());
+    if let Some(model) = reasoning_model {
+        let meta = model.get("_meta");
+        let reasoning_options: Vec<ConfigOptionValue> = meta
+            .and_then(|m| m.get("reasoningEfforts"))
+            .and_then(|v| v.as_array())
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(|effort| {
+                        let value = effort
+                            .get("value")
+                            .or_else(|| effort.get("id"))
+                            .and_then(|v| v.as_str())?
+                            .to_owned();
+                        Some(ConfigOptionValue {
+                            value,
+                            name: effort
+                                .get("label")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            description: effort
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .map(str::to_owned),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !reasoning_options.is_empty() {
+            entries.push(ConfigOptionInfo {
+                id: "reasoning_effort".to_owned(),
+                name: "Reasoning Effort".to_owned(),
+                description: None,
+                category: Some("reasoning".to_owned()),
+                kind: "select".to_owned(),
+                current_value: meta
+                    .and_then(|m| m.get("reasoningEffort"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                options: reasoning_options,
+            });
+        }
+    }
+
+    entries
+}
+
+/// Extracts a `session/new`/`session/load`/`session/resume` response's
+/// selectable config options, tolerating both the standard ACP
+/// `configOptions[]` shape and grok-build's real vendor extension (see
+/// [`parse_grok_model_config`]'s doc comment) -- grok's real response has
+/// no top-level `configOptions` at all, so the standard parse always
+/// comes back empty for it and this falls back to the vendor shape
+/// instead of leaving the compose bar's Model dropdown and the sidebar's
+/// model label empty for every grok-build thread.
+fn extract_config_options(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let standard = value
+        .get("configOptions")
+        .and_then(parse_config_options)
+        .unwrap_or_default();
+    if !standard.is_empty() {
+        return standard;
+    }
+    parse_grok_model_config(value)
+}
+
 /// Emits [`AgentEvent::SessionModes`]/[`AgentEvent::ConfigOptions`] for
 /// whichever of a `session/new`/`session/load`/`session/resume`
 /// response's `modes`/`configOptions` fields are actually present --
@@ -1217,7 +1891,8 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
     if let Some(modes) = value.get("modes").and_then(parse_session_modes) {
         let _ = event_tx.send(AgentEvent::SessionModes(modes));
     }
-    if let Some(options) = value.get("configOptions").and_then(parse_config_options) {
+    let options = extract_config_options(value);
+    if !options.is_empty() {
         let _ = event_tx.send(AgentEvent::ConfigOptions(options));
     }
 }
@@ -1341,6 +2016,8 @@ fn spawn_out_of_band_notification_forwarder(
                                         method,
                                         raw_request: request.request,
                                     }));
+                                } else if let Some(resolution) = parse_agent_resolution(&update) {
+                                    let _ = event_tx.send(AgentEvent::AgentResolution(resolution));
                                 } else if let Some(term_ev) = parse_terminal_output(&update) {
                                     let _ = event_tx.send(AgentEvent::TerminalOutput(term_ev));
                                 } else if let Some(created_ev) = parse_terminal_created(&update) {
@@ -1413,6 +2090,24 @@ fn parse_terminal_output(value: &serde_json::Value) -> Option<TerminalOutputEven
     })
 }
 
+fn parse_agent_resolution(value: &serde_json::Value) -> Option<AgentResolutionEvent> {
+    if value.get("method").and_then(|m| m.as_str()) != Some("acpx/agent_resolution") {
+        return None;
+    }
+    let params = value.get("params")?;
+    Some(AgentResolutionEvent {
+        relay_id: params.get("relayId")?.as_str()?.to_owned(),
+        selected: params
+            .get("selected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        late: params
+            .get("late")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
 /// Parses a bare `acpx/terminal_created` notification (see
 /// `acpx_core::router`'s `terminal/create` handler, the one-shot publish
 /// right before it starts `spawn_terminal_output_stream`) into this
@@ -1455,6 +2150,7 @@ fn spawn_session_live_forwarder(
     client: Arc<Gateway>,
     mut session_rx: watch::Receiver<Option<String>>,
     live_tx: mpsc::UnboundedSender<serde_json::Value>,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
     tokio::spawn(async move {
         let mut rehydrate_after_connect = false;
@@ -1473,9 +2169,31 @@ fn spawn_session_live_forwarder(
                 }
                 continue;
             };
+            // Keep queue state on its own server stream. Session updates and
+            // queue notifications share the local demultiplexer, but the
+            // server watch is explicitly established through the queue
+            // extension rather than piggybacking on session/resume.
+            let queue_subscription = client
+                .subscribe_queue_sessions(std::slice::from_ref(&session_id), None)
+                .await;
+            if let Ok(response) = queue_subscription {
+                if let Some(snapshots) =
+                    response.get("snapshots").and_then(|value| value.as_array())
+                {
+                    for snapshot in snapshots {
+                        let _ = live_tx.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "acpx/session/queue",
+                            "params": snapshot,
+                        }));
+                    }
+                }
+            }
             if rehydrate_after_connect {
                 if let Err(error) = client.rehydrate_session(&session_id).await {
                     eprintln!("panel-rust: session rehydration failed for {session_id}: {error}");
+                } else {
+                    let _ = event_tx.send(AgentEvent::ConnectionRestored);
                 }
                 rehydrate_after_connect = false;
             }
@@ -1524,7 +2242,12 @@ async fn run_thread_actor(
         event_tx.clone(),
     );
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
-    spawn_session_live_forwarder(Arc::clone(&client), session_tx.subscribe(), live_tx);
+    spawn_session_live_forwarder(
+        Arc::clone(&client),
+        session_tx.subscribe(),
+        live_tx,
+        event_tx.clone(),
+    );
     let mut session_id: Option<String> = None;
     // acpx-client-session-lease-pool: set only by `Command::
     // AcquireAndAttach`, and only meaningful when `pool.is_some()`. Turn
@@ -1553,7 +2276,7 @@ async fn run_thread_actor(
     loop {
         let cmd = tokio::select! {
             Some(update) = live_rx.recv() => {
-                forward_updates(&[update], session_id.as_deref(), &event_tx);
+                forward_updates(&[update], session_id.as_deref(), &event_tx, false);
                 continue;
             }
             command = cmd_rx.recv() => match command {
@@ -1646,7 +2369,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, Some(&sid), &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx, false);
                             // A session/load replay is allowed to start
                             // before its RPC response, but a busy real
                             // host can schedule the WS reader just after
@@ -1659,10 +2382,10 @@ async fn run_thread_actor(
                             )
                             .await
                             {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, false);
                             }
                             while let Ok(update) = live_rx.try_recv() {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx, false);
                             }
                             if let Some(notifications) = early_notifications.as_mut() {
                                 if let Ok(Ok(update)) = tokio::time::timeout(
@@ -1671,10 +2394,10 @@ async fn run_thread_actor(
                                 )
                                 .await
                                 {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                                 while let Ok(update) = notifications.try_recv() {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                             }
                             session_id = Some(sid.clone());
@@ -1702,12 +2425,17 @@ async fn run_thread_actor(
             Command::ReattachSession {
                 session_id: sid,
                 cwd,
+                mcp_servers,
                 resp,
             } => {
-                let params = serde_json::json!({
-                    "sessionId": sid,
-                    "cwd": cwd.to_string_lossy(),
-                });
+                let params =
+                    match acpx_client::build_resume_session_params(&sid, &cwd, &mcp_servers) {
+                        Ok(params) => params,
+                        Err(err) => {
+                            let _ = resp.send(Err(err.into()));
+                            continue;
+                        }
+                    };
                 client.register_session_replay(&sid, "session/resume", params.clone(), None);
                 let mut early_notifications = client.subscribe_session(&sid);
                 let mut result = Err(AcpxThreadError::ActorGone);
@@ -1718,7 +2446,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, Some(&sid), &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx, false);
                             if let Some(notifications) = early_notifications.as_mut() {
                                 if let Ok(Ok(update)) = tokio::time::timeout(
                                     std::time::Duration::from_millis(250),
@@ -1726,10 +2454,10 @@ async fn run_thread_actor(
                                 )
                                 .await
                                 {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                                 while let Ok(update) = notifications.try_recv() {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx, false);
                                 }
                             }
                             session_id = Some(sid.clone());
@@ -1789,11 +2517,16 @@ async fn run_thread_actor(
                     // shares this loop's local `live_rx`/`session_id`/
                     // `session_tx` state, which a standalone helper fn
                     // can't borrow across this `select!`-driven loop as
-                    // cleanly as an inline arm can.
-                    let params = serde_json::json!({
-                        "sessionId": sid,
-                        "cwd": cwd.to_string_lossy(),
-                    });
+                    // cleanly as an inline arm can. Carries the same
+                    // client-computed mcpServers list as session/new.
+                    let params =
+                        match acpx_client::build_resume_session_params(&sid, &cwd, &mcp_servers) {
+                            Ok(params) => params,
+                            Err(err) => {
+                                let _ = resp.send(Err(err.into()));
+                                continue;
+                            }
+                        };
                     client.register_session_replay(&sid, "session/resume", params.clone(), None);
                     let mut early_notifications = client.subscribe_session(&sid);
                     let mut attempt_result = Err(AcpxThreadError::ActorGone);
@@ -1804,8 +2537,8 @@ async fn run_thread_actor(
                         {
                             Ok((value, updates)) => {
                                 emit_capability_events(&value, &event_tx);
-                                attach_config_options_raw = value.get("configOptions").cloned();
-                                forward_updates(&updates, Some(&sid), &event_tx);
+                                attach_config_options_raw = Some(value.clone());
+                                forward_updates(&updates, Some(&sid), &event_tx, false);
                                 if let Some(notifications) = early_notifications.as_mut() {
                                     if let Ok(Ok(update)) = tokio::time::timeout(
                                         std::time::Duration::from_millis(250),
@@ -1813,10 +2546,10 @@ async fn run_thread_actor(
                                     )
                                     .await
                                     {
-                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                        forward_updates(&[update], Some(&sid), &event_tx, false);
                                     }
                                     while let Ok(update) = notifications.try_recv() {
-                                        forward_updates(&[update], Some(&sid), &event_tx);
+                                        forward_updates(&[update], Some(&sid), &event_tx, false);
                                     }
                                 }
                                 Ok(())
@@ -1860,7 +2593,7 @@ async fn run_thread_actor(
                     // the opener genuinely didn't report a response.
                     if let Some(value) = lease.capabilities.as_ref() {
                         emit_capability_events(value, &event_tx);
-                        attach_config_options_raw = value.get("configOptions").cloned();
+                        attach_config_options_raw = Some(value.clone());
                     }
                     client.register_session_replay(
                         &sid,
@@ -1885,7 +2618,7 @@ async fn run_thread_actor(
                         current_lease = Some(lease);
                         baseline_config_options = attach_config_options_raw
                             .as_ref()
-                            .and_then(parse_config_options)
+                            .map(extract_config_options)
                             .unwrap_or_default();
                         config_overrides.clear();
                     }
@@ -1902,6 +2635,76 @@ async fn run_thread_actor(
                 let _ = resp.send(result);
             }
             Command::SendPrompt { text, resp } => {
+                if session_id.is_none() {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                }
+                // mcp-registry-live-propagation: if the pool generation
+                // bumped (registry change) while we held a lease but had
+                // not yet started a turn, release+reacquire so the first
+                // prompt lands on a session opened under the current
+                // registry merge. Safe because turn is still NotStarted
+                // (ActiveTurnNotReleasable cannot fire). Prefer
+                // session/new (saved_session_id: None) so backends that
+                // ignore mcpServers on resume still get a real reconnect.
+                let stale = match (pool.as_ref(), current_lease.as_ref()) {
+                    (Some(pool), Some(lease)) => pool.is_lease_stale(lease).await,
+                    _ => false,
+                };
+                if stale {
+                    if let (Some(pool), Some(lease)) = (pool.as_ref(), current_lease.take()) {
+                        let key = lease.key.clone();
+                        let thread_id = lease.thread_id.clone();
+                        match pool.release(&lease).await {
+                            Ok(()) => match pool
+                                .acquire(
+                                    key,
+                                    thread_id,
+                                    OpenSpec {
+                                        saved_session_id: None,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(new_lease) => {
+                                    let new_sid = new_lease.session_id.clone();
+                                    if let Some(value) = new_lease.capabilities.as_ref() {
+                                        emit_capability_events(value, &event_tx);
+                                        baseline_config_options = extract_config_options(value);
+                                        config_overrides.clear();
+                                    }
+                                    client.register_session_replay(
+                                        &new_sid,
+                                        "session/load",
+                                        serde_json::json!({
+                                            "sessionId": new_sid,
+                                            "cwd": new_lease.key.project_dir,
+                                            "mcpServers": [],
+                                        }),
+                                        None,
+                                    );
+                                    let _ = client.subscribe_session(&new_sid);
+                                    session_id = Some(new_sid.clone());
+                                    let _ = session_tx.send(Some(new_sid));
+                                    current_lease = Some(new_lease);
+                                }
+                                Err(err) => {
+                                    session_id = None;
+                                    let _ = session_tx.send(None);
+                                    let _ = resp.send(Err(AcpxThreadError::Pool(err.to_string())));
+                                    continue;
+                                }
+                            },
+                            Err(err) => {
+                                // Put the lease back; still try the prompt.
+                                current_lease = Some(lease);
+                                eprintln!(
+                                    "panel-rust: pool.release of stale lease before prompt failed ({err}) -- sending on original session"
+                                );
+                            }
+                        }
+                    }
+                }
                 let Some(sid) = session_id.clone() else {
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
@@ -1930,11 +2733,18 @@ async fn run_thread_actor(
                 });
                 let prompt = client.call_with_updates("session/prompt", params, None);
                 tokio::pin!(prompt);
+                // A subscribed WebSocket normally receives turn updates live,
+                // while HTTP/degraded mode returns them in `_acpx.updates`.
+                // During reconnect/subscription races a frame can appear in
+                // both paths; suppress exact duplicate frames before they
+                // reach conversation::merge_text, where duplicate chunks
+                // would otherwise become `texttext`.
+                let mut seen_prompt_updates = HashSet::new();
                 let outcome = loop {
                     tokio::select! {
                         update = live_rx.recv() => {
                             if let Some(update) = update {
-                                forward_updates(&[update], Some(&sid), &event_tx);
+                                forward_updates_dedup(&[update], Some(&sid), &event_tx, true, &mut seen_prompt_updates);
                             }
                         }
                         result = &mut prompt => break result,
@@ -1942,7 +2752,13 @@ async fn run_thread_actor(
                 };
                 match outcome {
                     Ok((result, updates)) => {
-                        forward_updates(&updates, Some(&sid), &event_tx);
+                        forward_updates_dedup(
+                            &updates,
+                            Some(&sid),
+                            &event_tx,
+                            true,
+                            &mut seen_prompt_updates,
+                        );
                         // A resumed WS subscription can receive a burst of
                         // final notifications just after the prompt response.
                         // Keep draining until the stream is briefly quiet,
@@ -1956,7 +2772,13 @@ async fn run_thread_actor(
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
                                 Ok(Some(update)) => {
-                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                    forward_updates_dedup(
+                                        &[update],
+                                        Some(&sid),
+                                        &event_tx,
+                                        true,
+                                        &mut seen_prompt_updates,
+                                    );
                                     wait = std::time::Duration::from_millis(75);
                                 }
                                 Ok(None) | Err(_) => break,
@@ -1989,6 +2811,60 @@ async fn run_thread_actor(
                         let _ = resp.send(Err(e.into()));
                     }
                 }
+            }
+            Command::PaginateHistory { before, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let request_limit = before.as_ref().map(|_| 40);
+                let result = client
+                    .call(
+                        "acpx/sessions/paginate",
+                        serde_json::json!({
+                            "sessionId": sid,
+                            "before": before,
+                            "limit": request_limit
+                        }),
+                        None,
+                    )
+                    .await
+                    .map_err(AcpxThreadError::from)
+                    .and_then(|page| {
+                        let messages = page
+                            .get("messages")
+                            .and_then(|messages| messages.as_array())
+                            .map(|messages| {
+                                messages
+                                    .iter()
+                                    .filter_map(classify_raw_update)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let next_cursor = page
+                            .get("nextCursor")
+                            .and_then(|cursor| cursor.as_str())
+                            .map(str::to_owned);
+                        let _ = event_tx.send(AgentEvent::HistoryPage {
+                            messages,
+                            next_cursor,
+                        });
+                        Ok(())
+                    });
+                let _ = resp.send(result);
+            }
+            Command::QueueMutation { mut params, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                params["sessionId"] = serde_json::Value::String(sid);
+                let result = client
+                    .call("session/queue", params, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(AcpxThreadError::from);
+                let _ = resp.send(result);
             }
             Command::ListSessions { agent_id, resp } => {
                 let result = match agent_id {
@@ -2039,6 +2915,56 @@ async fn run_thread_actor(
                                 })
                             })
                             .collect()
+                    });
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::ListPermissionProfiles { resp } => {
+                let result = client
+                    .call("permission_profiles/list", serde_json::json!({}), None)
+                    .await
+                    .and_then(|v| {
+                        serde_json::from_value::<acpx_proto::gateway::PermissionProfilesListResult>(
+                            v,
+                        )
+                        .map_err(|e| ClientError::InvalidParams(e.to_string()))
+                    })
+                    .map(|v| v.profiles);
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::GetPermissionProfile { session_id, resp } => {
+                let result = client
+                    .call(
+                        "session/permission_profile/get",
+                        serde_json::json!({"sessionId": session_id}),
+                        None,
+                    )
+                    .await
+                    .and_then(|v| {
+                        serde_json::from_value::<
+                                acpx_proto::gateway::SessionPermissionProfileResult,
+                            >(v)
+                            .map_err(|e| ClientError::InvalidParams(e.to_string()))
+                    });
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::SetPermissionProfile { params, resp } => {
+                let payload = match serde_json::to_value(params) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = resp.send(Err(AcpxThreadError::Gateway(
+                            ClientError::InvalidParams(error.to_string()),
+                        )));
+                        continue;
+                    }
+                };
+                let result = client
+                    .call("session/permission_profile/set", payload, None)
+                    .await
+                    .and_then(|v| {
+                        serde_json::from_value::<
+                                acpx_proto::gateway::SessionPermissionProfileResult,
+                            >(v)
+                            .map_err(|e| ClientError::InvalidParams(e.to_string()))
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
@@ -2139,6 +3065,46 @@ async fn run_thread_actor(
                 let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
+            Command::RefreshTerminalOutput { terminal_id, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let result = client
+                    .call(
+                        "terminal/output",
+                        serde_json::json!({"sessionId": sid, "terminalId": terminal_id}),
+                        None,
+                    )
+                    .await
+                    .map(|value| {
+                        let output = value
+                            .get("output")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let truncated = value
+                            .get("truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let exit_status = value
+                            .get("exitStatus")
+                            .filter(|v| !v.is_null())
+                            .map(|status| {
+                                (
+                                    status.get("exitCode").and_then(|v| v.as_i64()).map(|v| v as i32),
+                                    status.get("signal").and_then(|v| v.as_i64()).map(|v| v as i32),
+                                )
+                            });
+                        TerminalOutputEvent {
+                            terminal_id: terminal_id.clone(),
+                            output,
+                            truncated,
+                            exit_status,
+                        }
+                    });
+                let _ = resp.send(result.map_err(Into::into));
+            }
             Command::SetConfigOption {
                 config_id,
                 value,
@@ -2218,47 +3184,39 @@ async fn run_thread_actor(
                 break;
             }
             Command::ListMcpServers { resp } => {
-                // Deliberately `client.call(...)` (the transport-neutral
-                // `Gateway` facade this actor already holds), not
-                // `acpx_client::ext::mcp_servers::list` -- that helper is
-                // typed against the raw HTTP-only `GatewayClient`, which
-                // would silently drop this actor onto HTTP even in a live
-                // WS session. Same reasoning `ListProfiles`/`ListSessions`
-                // above already follow.
-                let result = client
-                    .call("mcp_servers/list", serde_json::json!({}), None)
-                    .await
-                    .map(|value| {
-                        value
-                            .get("servers")
-                            .and_then(|s| s.as_array())
-                            .map(|entries| {
-                                entries
-                                    .iter()
-                                    .filter_map(crate::protocol_types::McpServerEntry::from_json)
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    });
+                // Deliberately `client.list_mcp_servers()` (a typed method
+                // on the transport-neutral `Gateway` facade this actor
+                // already holds, `acpx_client::mcp`), not `acpx_client::
+                // ext::mcp_servers::list` -- that helper is typed against
+                // the raw HTTP-only `GatewayClient`, which would silently
+                // drop this actor onto HTTP even in a live WS session.
+                // Same reasoning `ListProfiles`/`ListSessions` above
+                // already follow.
+                let result = client.list_mcp_servers().await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/create", entry, None).await;
+                let result = client.create_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::UpdateMcpServer { entry, resp } => {
-                let result = client.call("mcp_servers/update", entry, None).await;
+                let result = client.update_mcp_server(&entry).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::DeleteMcpServer { name, resp } => {
-                let result = client
-                    .call(
-                        "mcp_servers/delete",
-                        serde_json::json!({ "name": name }),
-                        None,
-                    )
-                    .await
-                    .map(|_| ());
+                let result = client.delete_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::AuthenticateMcpServer { name, resp } => {
+                let result = client.authenticate_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::LogoutMcpServer { name, resp } => {
+                let result = client.logout_mcp_server(&name).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::FetchMcpServerTools { name, resp } => {
+                let result = client.fetch_mcp_server_tools(&name).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CreateProfile { entry, resp } => {
@@ -2294,13 +3252,17 @@ async fn run_thread_actor(
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
-            Command::ListModels { agent_id, resp } => {
+            Command::ListModels {
+                agent_id,
+                cwd,
+                resp,
+            } => {
+                let mut params = serde_json::json!({ "agentId": agent_id });
+                if let Some(cwd) = cwd {
+                    params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+                }
                 let result = client
-                    .call(
-                        "models/list",
-                        serde_json::json!({ "agentId": agent_id }),
-                        None,
-                    )
+                    .call("models/list", params, None)
                     .await
                     .map(|value| parse_model_catalog(&value));
                 let _ = resp.send(result.map_err(Into::into));
@@ -2373,6 +3335,184 @@ mod capability_parsing_tests {
     use serde_json::json;
 
     #[test]
+    fn queue_notifications_are_forwarded_as_typed_callbacks() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0",
+                "method": "acpx/session/queue",
+                "params": {
+                    "sessionId": "s1",
+                    "paused": false,
+                    "queue": [{
+                        "queueEntryId": "q1",
+                        "idempotencyKey": "k1",
+                        "text": "follow up",
+                        "state": "queued",
+                        "position": 0
+                    }]
+                }
+            })],
+            Some("s1"),
+            &events_tx,
+            false,
+        );
+        match events_rx.try_recv().expect("queue callback") {
+            AgentEvent::QueueChanged { items, paused } => {
+                assert!(!paused);
+                assert_eq!(items[0].queue_entry_id, "q1");
+                assert_eq!(items[0].text, "follow up");
+            }
+            other => panic!("expected queue callback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_resolution_dismisses_losing_client_request() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        forward_updates(
+            &[
+                json!({"method":"acpx/agent_resolution","params":{"sessionId":"s1","relayId":"r1","selected":false,"late":false}}),
+            ],
+            Some("s1"),
+            &events_tx,
+            false,
+        );
+        assert_eq!(
+            events_rx.try_recv().unwrap(),
+            AgentEvent::AgentResolution(AgentResolutionEvent {
+                relay_id: "r1".into(),
+                selected: false,
+                late: false
+            })
+        );
+    }
+
+    #[test]
+    fn dedicated_session_steer_lifecycle_is_forwarded_with_state_and_entry() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0",
+                "method": "acpx/session/steer",
+                "params": {
+                    "sessionId": "s1",
+                    "queueEntryId": "q7",
+                    "state": "dispatched"
+                }
+            })],
+            Some("s1"),
+            &events_tx,
+            false,
+        );
+        assert_eq!(
+            events_rx.try_recv().unwrap(),
+            AgentEvent::SessionSteer(crate::protocol_types::SessionSteerEvent {
+                session_id: "s1".into(),
+                state: "dispatched".into(),
+                queue_entry_id: Some("q7".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn queue_delta_mutates_existing_projection_instead_of_replacing_it() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let snapshot = |id: &str, text: &str, position: u64| {
+            json!({
+                "jsonrpc": "2.0", "method": "acpx/session/queue", "params": {
+                    "sessionId": "delta", "paused": false, "queue": [{
+                        "queueEntryId": id, "idempotencyKey": format!("k-{id}"),
+                        "text": text, "state": "queued", "position": position
+                    }]
+                }
+            })
+        };
+        forward_updates(
+            &[snapshot("q1", "one", 0)],
+            Some("delta"),
+            &events_tx,
+            false,
+        );
+        let _ = events_rx.try_recv();
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0", "method": "acpx/session/queue", "params": {
+                    "sessionId": "delta", "queueEntryId": "q2", "mutation": "inserted",
+                    "idempotencyKey": "k-q2", "position": 1, "text": "two"
+                }
+            })],
+            Some("delta"),
+            &events_tx,
+            false,
+        );
+        match events_rx.try_recv().expect("delta callback") {
+            AgentEvent::QueueChanged { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].text, "one");
+                assert_eq!(items[1].queue_entry_id, "q2");
+                assert_eq!(items[1].text, "two");
+            }
+            other => panic!("expected queue callback, got {other:?}"),
+        }
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0", "method": "acpx/session/queue", "params": {
+                    "sessionId": "delta", "queueEntryId": "q1", "mutation": "sent_prompt"
+                }
+            })],
+            Some("delta"),
+            &events_tx,
+            false,
+        );
+        match events_rx.try_recv().expect("remove callback") {
+            AgentEvent::QueueChanged { items, .. } => assert_eq!(items.len(), 1),
+            other => panic!("expected queue callback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn textless_insert_delta_is_ignored_instead_of_rendering_blank_row() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0", "method": "acpx/session/queue", "params": {
+                    "sessionId": "textless", "queueEntryId": "q1",
+                    "mutation": "inserted", "position": 0
+                }
+            })],
+            Some("textless"),
+            &events_tx,
+            false,
+        );
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn completed_queue_delta_emits_turn_ended_for_server_owned_prompt() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        forward_updates(
+            &[json!({
+                "jsonrpc": "2.0", "method": "acpx/session/queue", "params": {
+                    "sessionId": "complete", "queueEntryId": "q1",
+                    "mutation": "removed", "completed": true
+                }
+            })],
+            Some("complete"),
+            &events_tx,
+            false,
+        );
+        assert!(matches!(
+            events_rx.try_recv().unwrap(),
+            AgentEvent::QueueChanged { .. }
+        ));
+        assert_eq!(
+            events_rx.try_recv().unwrap(),
+            AgentEvent::TurnEnded("end_turn".into())
+        );
+    }
+
+    #[test]
     fn parse_session_modes_reads_current_and_available() {
         let modes = json!({
             "currentModeId": "ask",
@@ -2427,6 +3567,118 @@ mod capability_parsing_tests {
         assert_eq!(parsed[0].current_value.as_deref(), Some("gpt-5"));
         assert_eq!(parsed[0].options.len(), 2);
         assert_eq!(parsed[0].options[1].description.as_deref(), Some("Cheaper"));
+    }
+
+    /// Real `session/new` result shape captured from a live
+    /// `grok agent stdio` (`~/.grok/bin/grok`) subprocess -- grok has no
+    /// top-level `configOptions`/`modes` at all; this is exactly what
+    /// `parse_grok_model_config`/`extract_config_options` must handle.
+    fn real_grok_session_new_result() -> serde_json::Value {
+        json!({
+            "sessionId": "019fbc0e-55b2-7f42-97eb-0a59bed5f63b",
+            "models": {
+                "currentModelId": "grok-4.5",
+                "availableModels": [{
+                    "modelId": "grok-4.5",
+                    "name": "Grok 4.5",
+                    "description": "SpaceXAI's new frontier model",
+                    "_meta": {
+                        "totalContextTokens": 500000,
+                        "agentType": "grok-build-plan",
+                        "supportsReasoningEffort": true,
+                        "reasoningEffort": "medium",
+                        "reasoningEfforts": [
+                            {"id": "high", "value": "high", "label": "High Effort", "default": true},
+                            {"id": "medium", "value": "medium", "label": "Medium Effort", "default": false},
+                            {"id": "low", "value": "low", "label": "Low Effort", "default": false}
+                        ]
+                    }
+                }]
+            },
+            "_meta": {
+                "x.ai/sessionConfig": {
+                    "options": [
+                        {"id": "grok-4.5", "category": "model", "label": "Grok 4.5", "selected": true},
+                        {"id": "high", "category": "mode", "label": "High Effort", "selected": false},
+                        {"id": "medium", "category": "mode", "label": "Medium Effort", "selected": true},
+                        {"id": "low", "category": "mode", "label": "Low Effort", "selected": false}
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn extract_config_options_is_empty_for_grok_with_only_the_standard_acp_parse() {
+        // Regression guard: confirms the bug this fix addresses actually
+        // exists in the standard-shape-only parse -- grok's real
+        // response genuinely has no top-level `configOptions`, so the
+        // plain ACP parse must come back empty (this is what left the
+        // compose bar's Model dropdown and sidebar model label blank for
+        // grok-build before `parse_grok_model_config` existed).
+        let value = real_grok_session_new_result();
+        assert!(value
+            .get("configOptions")
+            .and_then(parse_config_options)
+            .is_none());
+    }
+
+    #[test]
+    fn parse_grok_model_config_reads_real_grok_model_and_reasoning_shape() {
+        let value = real_grok_session_new_result();
+        let parsed = parse_grok_model_config(&value);
+        assert_eq!(
+            parsed.len(),
+            2,
+            "expected a model entry and a reasoning_effort entry"
+        );
+
+        let model = parsed
+            .iter()
+            .find(|o| o.id == "model")
+            .expect("model entry");
+        assert_eq!(model.category.as_deref(), Some("model"));
+        assert_eq!(model.current_value.as_deref(), Some("grok-4.5"));
+        assert_eq!(model.options.len(), 1);
+        assert_eq!(model.options[0].value, "grok-4.5");
+        assert_eq!(model.options[0].name, "Grok 4.5");
+
+        let reasoning = parsed
+            .iter()
+            .find(|o| o.id == "reasoning_effort")
+            .expect("reasoning_effort entry");
+        assert_eq!(reasoning.current_value.as_deref(), Some("medium"));
+        assert_eq!(reasoning.options.len(), 3);
+        assert!(reasoning
+            .options
+            .iter()
+            .any(|o| o.value == "high" && o.name == "High Effort"));
+    }
+
+    #[test]
+    fn extract_config_options_falls_back_to_grok_shape_when_configoptions_is_absent() {
+        let value = real_grok_session_new_result();
+        let extracted = extract_config_options(&value);
+        assert!(
+            extracted.iter().any(|o| o.id == "model" && o.current_value.as_deref() == Some("grok-4.5")),
+            "extract_config_options must recover grok's real model catalog via the vendor-shape fallback, got {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn extract_config_options_prefers_the_standard_shape_when_both_are_present() {
+        let mut value = real_grok_session_new_result();
+        value["configOptions"] = json!([{
+            "id": "model",
+            "currentValue": "standard-shape-model",
+            "options": [{"value": "standard-shape-model", "name": "Standard"}]
+        }]);
+        let extracted = extract_config_options(&value);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            extracted[0].current_value.as_deref(),
+            Some("standard-shape-model")
+        );
     }
 
     #[test]

@@ -70,8 +70,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
-use acpx_core::{InteractionBinding, StreamResumeState, TenantId, INTERACTION_QUEUE_CAPACITY};
+use acpx_core::router::{
+    classify, dispatch_shared_for_tenant, stream_resume_state_shared, MethodClass,
+};
+use acpx_core::{
+    fresh_client_id, InteractionBinding, StreamResumeState, TenantId, INTERACTION_QUEUE_CAPACITY,
+};
 
 use super::http::{
     json_rpc_error, json_rpc_subscribe_error, resolve_authorized_tenant, AppState, SharedRouter,
@@ -149,6 +153,44 @@ async fn send_frame_bounded(sink: &Arc<AsyncMutex<WsSink>>, message: Message) ->
             false
         }
     }
+}
+
+/// A handful of `dispatch_shared_for_tenant` fast paths (`acpx/sessions/
+/// paginate`, `acpx/sessions/sync`, `session/queue`, `acpx/sessions/
+/// subscribe`/`acpx/sessions/queue/subscribe`, `agents/install`, and the
+/// selector form of `session/list`) return their bare result value --
+/// not a full `{"jsonrpc","id","result"}` envelope -- because this
+/// module's own in-band post-processing (the `response.get("sessionIds")`/
+/// `response.get("background")` checks a few lines below, and this
+/// crate's HTTP transport, which round-trips synchronously and never
+/// needed id correlation) all read that bare shape directly. The WS
+/// transport is the one consumer that *does* need the wire frame's `id`
+/// to match the request: this connection's `acpx-client`'s `pending`
+/// map (`acpx-client/src/ws.rs`) is keyed by id, and a response with no
+/// `id` field is indistinguishable from an unsolicited notification --
+/// silently orphaning the caller's `oneshot` for up to
+/// `WS_RESPONSE_TIMEOUT` (30 minutes), discovered live as a
+/// deferred-attach thread's first `session/prompt` command queuing
+/// forever behind a `paginate` call whose reply nothing ever claimed
+/// (a single thread actor drains its command channel strictly one at a
+/// time, so one permanently unresolved call wedges every later one).
+/// Applied only at this wire-serialization boundary, right before a
+/// dispatch result goes out as a frame, so the bare shape every other
+/// consumer already relies on is untouched. A no-op for responses that
+/// already carry `jsonrpc` (session/new, session/prompt, and everything
+/// else routed through the mature `Router::dispatch_for_tenant` path).
+fn ensure_json_rpc_envelope(
+    request: &serde_json::Value,
+    response: serde_json::Value,
+) -> serde_json::Value {
+    if response.get("jsonrpc").is_some() {
+        return response;
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "result": response,
+    })
 }
 
 /// Write `value` out as one standalone frame. Serialization failure is
@@ -317,6 +359,7 @@ async fn handle_acp_socket(
         // exactly as `subscribe_resuming` already accepts for every other
         // ordinary (non-resuming) first subscribe elsewhere in this file.
         let resume_cursor = take_resume_cursor(&mut request);
+
         {
             let virtual_id = request
                 .pointer("/params/sessionId")
@@ -679,7 +722,9 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
+    let queue_hub = { router.lock().await.queue_hub() };
     let agent_relay = { router.lock().await.agent_request_hub() };
+    let client_id = fresh_client_id();
     let interaction_hub = { router.lock().await.interaction_hub() };
     let (interaction_tx, mut interaction_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
     let interaction_sink = Arc::clone(&sink);
@@ -707,6 +752,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     });
     background_tasks.lock().await.push(handle);
     let mut watched: HashSet<String> = HashSet::new();
+    let mut queue_watched: HashSet<String> = HashSet::new();
     let interaction_bindings =
         Arc::new(AsyncMutex::new(HashMap::<String, InteractionBinding>::new()));
     let deferred_watches = Arc::new(AsyncMutex::new(HashSet::<String>::new()));
@@ -781,7 +827,9 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                 .and_then(|p| p.get("response"))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let delivered = agent_relay.resolve(&relay_id, response_value).await;
+            let delivered = agent_relay
+                .resolve_from_client(&relay_id, Some(client_id.as_str()), response_value)
+                .await;
             let ack = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
@@ -792,6 +840,20 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
         }
 
         let resume_cursor = take_resume_cursor(&mut request);
+
+        // Keep the initiating websocket identity private to the gateway
+        // dispatch. `session/steer` lifecycle deltas carry this marker so
+        // the queue forwarder can suppress the duplicate frame for this
+        // connection while still broadcasting to all other subscribers.
+        if request.get("method").and_then(|m| m.as_str()) == Some("session/steer") {
+            if !request
+                .get("_acpx")
+                .map_or(false, serde_json::Value::is_object)
+            {
+                request["_acpx"] = serde_json::json!({});
+            }
+            request["_acpx"]["originClientId"] = serde_json::Value::String(client_id.clone());
+        }
 
         // A response with no method can only be the client's answer to an
         // agent-initiated request sent by InteractionHub. It must not enter
@@ -807,10 +869,48 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
         // independently so this read loop remains available for the
         // correlated response above (and for the `acpx/agent_response`
         // relay-answer frames handled above it).
-        if let Some(session_id) = request
-            .pointer("/params/sessionId")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
+        //
+        // Gated on `MethodClass::Proxied` (real session/backend round
+        // trips: `session/prompt`, `session/resume`, ...), not merely on
+        // `params.sessionId`'s presence -- `acpx/sessions/paginate`,
+        // `acpx/sessions/sync`, and `acpx/sessions/subscribe`/`acpx/
+        // sessions/queue/subscribe` are `GatewayNative` but *also* carry a
+        // `sessionId` param, and were wrongly falling into this branch
+        // too. That mattered for two independent reasons: their
+        // `dispatch_shared_for_tenant` responses (unlike `Proxied`/
+        // `Hybrid` methods) never carry the request's own `id` back out
+        // (the `_shared` paginate/sync handlers return the bare result
+        // value, not a full `{"jsonrpc","id","result"}` envelope), so the
+        // WS client's id-keyed `pending` map (`acpx-client/src/ws.rs`)
+        // silently misclassified the reply as an id-less notification and
+        // left the request's `oneshot` waiting for up to
+        // `WS_RESPONSE_TIMEOUT` (30 minutes) -- observed live as a
+        // deferred-attach thread's very next command (its first
+        // `session/prompt`) queuing forever behind a paginate call that
+        // could never resolve, since a thread actor drains its command
+        // channel strictly one at a time. Second, `acpx/sessions/queue/
+        // subscribe` taking this branch instead of the generic path
+        // below skipped that path's own post-response `queue_hub.
+        // subscribe` wiring entirely, silently breaking background queue
+        // callbacks for any session whose first subscribe request
+        // happened to race this branch.
+        let is_proxied_method = matches!(
+            classify(
+                request
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default()
+            ),
+            MethodClass::Proxied
+        );
+        if let Some(session_id) = is_proxied_method
+            .then(|| {
+                request
+                    .pointer("/params/sessionId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .flatten()
         {
             // Subscribing before dispatch (not only on an explicit resume
             // cursor) closes the same gap `acp_bridge`'s identical fix
@@ -889,7 +989,11 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             // the notification-hub subscription above, so an
             // agent-initiated `session/request_permission` relay reaches
             // this connection for the duration it owns this session.
-            let mut relay_rx = agent_relay.subscribe(session_id.clone()).await;
+            let subscription = agent_relay
+                .subscribe_with_client(session_id.clone(), client_id.clone())
+                .await;
+            let mut relay_rx = subscription.requests;
+            let mut resolution_rx = subscription.resolutions;
             let relay_sink = Arc::clone(&sink);
             let handle = tokio::spawn(async move {
                 while let Some(envelope) = relay_rx.recv().await {
@@ -899,10 +1003,29 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                         "params": {
                             "relayId": envelope.relay_id,
                             "sessionId": envelope.gateway_session_id,
+                            "clientId": envelope.client_id,
                             "request": envelope.request,
                         }
                     });
                     write_frame(&relay_sink, &frame).await;
+                }
+            });
+            background_tasks.lock().await.push(handle);
+            let resolution_sink = Arc::clone(&sink);
+            let handle = tokio::spawn(async move {
+                while let Some(resolution) = resolution_rx.recv().await {
+                    let frame = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "acpx/agent_resolution",
+                        "params": {
+                            "relayId": resolution.relay_id,
+                            "sessionId": resolution.gateway_session_id,
+                            "winnerClientId": resolution.winner_client_id,
+                            "selected": resolution.selected,
+                            "late": resolution.late,
+                        }
+                    });
+                    write_frame(&resolution_sink, &frame).await;
                 }
             });
             background_tasks.lock().await.push(handle);
@@ -985,6 +1108,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                 } else if subscribe_after_response {
                     deferred_watches.lock().await.remove(&session_id);
                 }
+                let response = ensure_json_rpc_envelope(&request, response);
                 let Ok(payload) = serde_json::to_string(&response) else {
                     return;
                 };
@@ -1005,10 +1129,153 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             .get("method")
             .and_then(|m| m.as_str())
             .unwrap_or_default();
-        if let Some(forget) = session_id_to_forget(&request, &response, method) {
+        if method == "acpx/sessions/queue/subscribe" && response.get("error").is_none() {
+            if let Some(session_ids) = response.get("sessionIds").and_then(|v| v.as_array()) {
+                for session_id in session_ids.iter().filter_map(|v| v.as_str()) {
+                    let session_id = session_id.to_string();
+                    if !queue_watched.insert(session_id.clone()) {
+                        continue;
+                    }
+                    let mut rx = queue_hub.subscribe(&session_id).await;
+                    let forwarder_sink = Arc::clone(&sink);
+                    let forwarder_client_id = client_id.clone();
+                    let handle = tokio::spawn(async move {
+                        loop {
+                            let mut update = match rx.recv().await {
+                                Ok(update) => update,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    tracing::warn!(%skipped, "ACPX queue subscriber lagged");
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            if update
+                                .pointer("/params/originClientId")
+                                .and_then(|value| value.as_str())
+                                == Some(forwarder_client_id.as_str())
+                            {
+                                continue;
+                            }
+                            // The origin marker is transport-private; do
+                            // not expose another client's server-managed id
+                            // to observers.
+                            if let Some(params) = update
+                                .get_mut("params")
+                                .and_then(|value| value.as_object_mut())
+                            {
+                                params.remove("originClientId");
+                            }
+                            let Ok(payload) = serde_json::to_string(&update) else {
+                                continue;
+                            };
+                            if !send_frame_bounded(&forwarder_sink, Message::Text(payload)).await {
+                                break;
+                            }
+                        }
+                    });
+                    background_tasks.lock().await.push(handle);
+                    let mut steer_rx = queue_hub.subscribe_steer(&session_id).await;
+                    let steer_sink = Arc::clone(&sink);
+                    let steer_client_id = client_id.clone();
+                    let steer_handle = tokio::spawn(async move {
+                        loop {
+                            let mut update = match steer_rx.recv().await {
+                                Ok(update) => update,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            if update.get("_acpxOriginClientId").and_then(|v| v.as_str())
+                                == Some(steer_client_id.as_str())
+                            {
+                                continue;
+                            }
+                            if let Some(obj) = update.as_object_mut() {
+                                obj.remove("_acpxOriginClientId");
+                            }
+                            let Ok(payload) = serde_json::to_string(&update) else {
+                                continue;
+                            };
+                            if !send_frame_bounded(&steer_sink, Message::Text(payload)).await {
+                                break;
+                            }
+                        }
+                    });
+                    background_tasks.lock().await.push(steer_handle);
+                }
+            }
+        } else if method == "acpx/sessions/subscribe" && response.get("error").is_none() {
+            let background = response
+                .get("background")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            if background {
+                if let Some(session_ids) = response.get("sessionIds").and_then(|v| v.as_array()) {
+                    for session_id in session_ids.iter().filter_map(|v| v.as_str()) {
+                        let session_id = session_id.to_string();
+                        if !watched.insert(session_id.clone()) {
+                            continue;
+                        }
+                        let state =
+                            stream_resume_state_shared(&router, &tenant_id, &session_id).await;
+                        match hub
+                            .subscribe_resuming(
+                                &tenant_id,
+                                session_id.clone(),
+                                None,
+                                StreamResumeState {
+                                    backend_session_id: state.backend_session_id,
+                                    durable_state_changed: state.durable_state_changed,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(mut rx) => {
+                                let forwarder_sink = Arc::clone(&sink);
+                                let handle = tokio::spawn(async move {
+                                    loop {
+                                        let update = match rx.recv().await {
+                                            Ok(update) => update.into_value(),
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Lagged(
+                                                    skipped,
+                                                ),
+                                            ) => {
+                                                tracing::warn!(%skipped, "ACPX session subscription lagged");
+                                                continue;
+                                            }
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Closed,
+                                            ) => break,
+                                        };
+                                        let Ok(payload) = serde_json::to_string(&update) else {
+                                            continue;
+                                        };
+                                        if !send_frame_bounded(
+                                            &forwarder_sink,
+                                            Message::Text(payload),
+                                        )
+                                        .await
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+                                background_tasks.lock().await.push(handle);
+                            }
+                            Err(error) => {
+                                watched.remove(&session_id);
+                                tracing::warn!(%error, %session_id, "failed to attach explicit session subscription");
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(forget) = session_id_to_forget(&request, &response, method) {
             if watched.remove(&forget) {
                 hub.remove_stream(&tenant_id, &forget).await;
-                agent_relay.unsubscribe(&forget).await;
+                agent_relay.unsubscribe_client(&forget, &client_id).await;
             }
             deferred_watches.lock().await.remove(&forget);
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
@@ -1052,7 +1319,11 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                             }
                         });
                         background_tasks.lock().await.push(handle);
-                        let mut relay_rx = agent_relay.subscribe(watch.clone()).await;
+                        let subscription = agent_relay
+                            .subscribe_with_client(watch.clone(), client_id.clone())
+                            .await;
+                        let mut relay_rx = subscription.requests;
+                        let mut resolution_rx = subscription.resolutions;
                         let relay_sink = Arc::clone(&sink);
                         let handle = tokio::spawn(async move {
                             while let Some(envelope) = relay_rx.recv().await {
@@ -1062,10 +1333,29 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                     "params": {
                                         "relayId": envelope.relay_id,
                                         "sessionId": envelope.gateway_session_id,
+                                        "clientId": envelope.client_id,
                                         "request": envelope.request,
                                     }
                                 });
                                 write_frame(&relay_sink, &frame).await;
+                            }
+                        });
+                        background_tasks.lock().await.push(handle);
+                        let resolution_sink = Arc::clone(&sink);
+                        let handle = tokio::spawn(async move {
+                            while let Some(resolution) = resolution_rx.recv().await {
+                                let frame = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "acpx/agent_resolution",
+                                    "params": {
+                                        "relayId": resolution.relay_id,
+                                        "sessionId": resolution.gateway_session_id,
+                                        "winnerClientId": resolution.winner_client_id,
+                                        "selected": resolution.selected,
+                                        "late": resolution.late,
+                                    }
+                                });
+                                write_frame(&resolution_sink, &frame).await;
                             }
                         });
                         background_tasks.lock().await.push(handle);
@@ -1078,12 +1368,13 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             }
         }
 
+        let response = ensure_json_rpc_envelope(&request, response);
         send_frame!(response);
     }
 
     for session_id in watched.iter() {
         hub.remove_stream(&tenant_id, session_id).await;
-        agent_relay.unsubscribe(session_id).await;
+        agent_relay.unsubscribe_client(session_id, &client_id).await;
     }
     drop(watched);
     // See `background_tasks`'s doc comment at the top of this function:

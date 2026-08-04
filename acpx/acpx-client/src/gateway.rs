@@ -7,10 +7,46 @@
 
 use crate::raw::{ClientError, GatewayClient};
 use crate::ws::{GatewayNotification, GatewayWsClient, SessionSubscription};
-use std::collections::HashMap;
+use agent_client_protocol::schema::v1::{McpServer, ResumeSessionRequest, SessionId};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+
+/// Build typed `session/resume` params carrying the current client-computed
+/// MCP server list.
+///
+/// Uses the real ACP `ResumeSessionRequest` builder (not a hand-rolled
+/// `json!({...})` literal) so the wire shape stays aligned with the
+/// protocol schema. `mcp_servers` is the same `Vec<Value>` panel-rust
+/// already computes for `session/new` (`snapflowd_mcp_servers_entry`);
+/// each entry is deserialized into `McpServer` at this boundary -- a
+/// shape mismatch is a real bug and is surfaced via
+/// [`ClientError::InvalidParams`], never silently dropped to empty.
+pub fn build_resume_session_params(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    mcp_servers: &[serde_json::Value],
+) -> Result<serde_json::Value, ClientError> {
+    let typed_servers = mcp_servers
+        .iter()
+        .cloned()
+        .map(|entry| {
+            serde_json::from_value::<McpServer>(entry).map_err(|err| {
+                ClientError::InvalidParams(format!(
+                    "mcpServers entry failed to deserialize as ACP McpServer: {err}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let request =
+        ResumeSessionRequest::new(SessionId::new(session_id), PathBuf::from(cwd.as_ref()))
+            .mcp_servers(typed_servers);
+    serde_json::to_value(&request).map_err(|err| {
+        ClientError::InvalidParams(format!("failed to serialize ResumeSessionRequest: {err}"))
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportMode {
@@ -48,7 +84,12 @@ pub struct Gateway {
     // runtime -- and it lets `mode()`/`subscribe()` stay synchronous
     // (matching their existing signatures; no ripple to every caller).
     websocket: RwLock<Option<Arc<GatewayWsClient>>>,
+    /// Serializes reconnect attempts from the session and out-of-band
+    /// forwarders. Without this, both observers can create independent fresh
+    /// sockets for one disconnect and continue receiving duplicate updates.
+    reconnect_lock: tokio::sync::Mutex<()>,
     session_replays: Mutex<HashMap<String, SessionReplay>>,
+    queue_subscriptions: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -117,7 +158,9 @@ impl Gateway {
             base_url,
             http,
             websocket: RwLock::new(websocket),
+            reconnect_lock: tokio::sync::Mutex::new(()),
             session_replays: Mutex::new(HashMap::new()),
+            queue_subscriptions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -127,7 +170,9 @@ impl Gateway {
             http: GatewayClient::new(base_url.clone()),
             base_url,
             websocket: RwLock::new(None),
+            reconnect_lock: tokio::sync::Mutex::new(()),
             session_replays: Mutex::new(HashMap::new()),
+            queue_subscriptions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -166,6 +211,16 @@ impl Gateway {
     /// afterward (`false` leaves this `Gateway` in HTTP-degraded mode,
     /// same as a fresh `connect()` whose initial handshake failed).
     pub async fn reconnect(&self) -> bool {
+        let _reconnect_guard = self.reconnect_lock.lock().await;
+        // Another observer may have completed the reconnect while this
+        // caller was waiting for the single-flight gate. Reuse that socket
+        // instead of opening a second live subscription.
+        if self
+            .current_websocket()
+            .is_some_and(|client| !client.is_disconnected())
+        {
+            return true;
+        }
         for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
             let attempt_result = tokio::time::timeout(
                 RECONNECT_ATTEMPT_TIMEOUT,
@@ -177,6 +232,23 @@ impl Gateway {
                     .websocket
                     .write()
                     .expect("gateway websocket lock poisoned") = Some(client);
+                let session_ids = self
+                    .queue_subscriptions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(client) = self.current_websocket() {
+                    if !session_ids.is_empty() {
+                        let _ = client
+                            .call(
+                                "acpx/sessions/queue/subscribe",
+                                serde_json::json!({ "sessionIds": session_ids }),
+                            )
+                            .await;
+                    }
+                }
                 return true;
             }
             if attempt < RECONNECT_MAX_ATTEMPTS {
@@ -200,6 +272,30 @@ impl Gateway {
     pub fn subscribe_session(&self, session_id: &str) -> Option<SessionSubscription> {
         self.current_websocket()
             .map(|client| client.subscribe_session(session_id))
+    }
+
+    /// Registers and establishes the separate server-owned queue stream for
+    /// explicit session ids. The registry is replayed on every WebSocket
+    /// reconnect, so queue callbacks cannot silently stop after a gateway
+    /// restart while the panel still holds the same session actors.
+    pub async fn subscribe_queue_sessions(
+        &self,
+        session_ids: &[String],
+        cursor: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        {
+            let mut subscriptions = self
+                .queue_subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            subscriptions.extend(session_ids.iter().cloned());
+        }
+        self.call(
+            "acpx/sessions/queue/subscribe",
+            serde_json::json!({ "sessionIds": session_ids, "cursor": cursor }),
+            None,
+        )
+        .await
     }
 
     /// Records the idempotent session operation needed to re-establish the
@@ -249,15 +345,31 @@ impl Gateway {
         let Some(replay) = replay else {
             return Ok(());
         };
+        // Re-establish the independent queue watch before resuming the ACP
+        // session so queued-state notifications cannot be missed during the
+        // reconnect window. Queue events intentionally do not ride through
+        // native session/resume.
+        self.subscribe_queue_sessions(&[session_id.to_owned()], None)
+            .await?;
         let Some(client) = self.current_websocket() else {
             return Err(ClientError::WebSocket(
                 "no WebSocket available for session rehydration".to_owned(),
             ));
         };
-        let params = serde_json::json!({
-            "sessionId": session_id,
-            "cwd": replay.params.get("cwd").cloned().unwrap_or_default(),
-        });
+        // Prefer the cwd/mcpServers recorded when the session was first
+        // bound (OpenSession registers them on the load replay contract;
+        // create/resume paths should too). Fall back to empty cwd / empty
+        // mcp list only when the registered params genuinely lack them.
+        let cwd = replay
+            .params
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mcp_servers = match replay.params.get("mcpServers") {
+            Some(serde_json::Value::Array(entries)) => entries.as_slice(),
+            _ => &[],
+        };
+        let params = build_resume_session_params(session_id, cwd, mcp_servers)?;
         client
             .call(
                 "session/resume",
@@ -597,5 +709,46 @@ mod tests {
             .lock()
             .expect("replay registry lock")
             .contains_key("failed-session"));
+    }
+
+    /// Broad coverage for typed session/resume request construction:
+    /// happy-path mcpServers round-trip, empty list allowed, malformed
+    /// entry rejected (not silently dropped).
+    #[test]
+    fn build_resume_session_params_covers_shape_and_validation() {
+        let mcp = vec![serde_json::json!({
+            "name": "skills",
+            "command": "/usr/bin/snapflowd-mcp",
+            "args": ["--global-dir", "/tmp/skills"],
+            "env": [],
+        })];
+        let params = build_resume_session_params("sess-1", "/tmp/project", &mcp)
+            .expect("well-formed mcpServers must serialize");
+        assert_eq!(params["sessionId"], "sess-1");
+        assert_eq!(params["cwd"], "/tmp/project");
+        let servers = params["mcpServers"]
+            .as_array()
+            .expect("mcpServers key must be present");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], "skills");
+        assert_eq!(servers[0]["command"], "/usr/bin/snapflowd-mcp");
+
+        let empty = build_resume_session_params("sess-2", "/home/me", &[])
+            .expect("empty mcp list is valid");
+        assert_eq!(empty["sessionId"], "sess-2");
+        if let Some(servers) = empty.get("mcpServers") {
+            assert_eq!(servers, &serde_json::json!([]));
+        }
+
+        let err = build_resume_session_params(
+            "sess-3",
+            "/tmp",
+            &[serde_json::json!({"name": "broken", "notARealField": true})],
+        )
+        .expect_err("malformed entry must not be silently dropped");
+        assert!(
+            matches!(err, ClientError::InvalidParams(ref m) if m.contains("mcpServers")),
+            "expected InvalidParams naming mcpServers, got {err:?}"
+        );
     }
 }

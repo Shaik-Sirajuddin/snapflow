@@ -29,11 +29,21 @@ pub struct RpcResponse {
 
 impl RpcResponse {
     pub fn ok(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn err(id: Value, error: RpcError) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: None, error: Some(error) }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(error),
+        }
     }
 }
 
@@ -104,7 +114,11 @@ pub struct RpcNotification {
 
 impl RpcNotification {
     pub fn new(method: impl Into<String>, params: Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), method: method.into(), params }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            method: method.into(),
+            params,
+        }
     }
 }
 

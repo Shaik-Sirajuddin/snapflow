@@ -365,6 +365,44 @@ export component DevRoot inherits ChatPanel {
             kind: "agent",
             text: "### Markdown renderer checklist\n\nBold **works**, italic *works*, and `inline code` works.\n\n1. ordered item\n2. second item\n\n| Col A | Col B |\n| --- | --- |\n| left | right |\n\nSee also [Slint docs](https://docs.slint.dev).",
             markdown-lines: [],
+            // Architecture v2 (markdown-thread-freeze-fix): mirrors what
+            // the real segment_blocks/markdown_blocks_for pipeline in
+            // models.rs actually produces for this same source text --
+            // one "text" block per heading/paragraph/list-item (heading
+            // level expressed via default-font-size, not a literal `#`
+            // prefix, since StyledText doesn't support heading syntax
+            // itself -- see the plan doc's Architecture v2 section), one
+            // "table" block with a flat row-major cell list, so this dev
+            // fixture actually exercises the new StyledText rendering
+            // path instead of falling through to MarkdownView's plain-
+            // text fallback (both markdown-lines and markdown-blocks
+            // empty was the bug -- this was rendering as literal
+            // unstyled text before, not real markdown, despite looking
+            // plausible at a glance).
+            // Block-for-block, this must match the REAL output of
+            // markdown::segment_blocks() for this exact source string --
+            // proven by panel-rust/src/markdown.rs's
+            // segment_blocks_matches_dev_fixture_checklist_shape test.
+            // That test caught a real bug while authoring this fixture:
+            // ordered-list items ("1. ordered item\n2. second item")
+            // segment into two SEPARATE indented text spans with their
+            // "1."/"2." numbering stripped entirely (MarkdownBlockSpan
+            // has no ordinal field, unlike the old LineKind::
+            // OrderedListItem path) -- so the real app currently renders
+            // ordered lists with no visible numbers. Reflected here
+            // as-is (not silently "corrected" to what it should look
+            // like) since this fixture's job is to mirror real behavior,
+            // bug included; the missing-ordinal gap itself is tracked in
+            // meta.json's follow_ups, not fixed by this phase.
+            markdown-blocks: [
+                { kind: "text", text: @markdown("Markdown renderer checklist"), default-font-size: 18px, indent: 0, table-cells: [], table-col-count: 0, code-text: "" },
+                { kind: "text", text: @markdown("Bold **works**, italic *works*, and `inline code` works."), default-font-size: 0px, indent: 0, table-cells: [], table-col-count: 0, code-text: "" },
+                { kind: "text", text: @markdown("ordered item"), default-font-size: 0px, indent: 1, table-cells: [], table-col-count: 0, code-text: "" },
+                { kind: "text", text: @markdown("second item"), default-font-size: 0px, indent: 1, table-cells: [], table-col-count: 0, code-text: "" },
+                { kind: "table", text: @markdown(""), default-font-size: 0px, indent: 0, table-cells: [@markdown("Col A"), @markdown("Col B"), @markdown("left"), @markdown("right")], table-col-count: 2, code-text: "" },
+                { kind: "text", text: @markdown("See also [Slint docs](https://docs.slint.dev)."), default-font-size: 0px, indent: 0, table-cells: [], table-col-count: 0, code-text: "" },
+                { kind: "code", text: @markdown(""), default-font-size: 0px, indent: 0, table-cells: [], table-col-count: 0, code-text: "fn wait_for_upload(client: &Client, id: Uuid) -> Result<()> {\n    poll_row(client, id)?;\n    poll_blob(client, id)\n}" },
+            ],
             status: "",
             expanded: false,
             index: 12,

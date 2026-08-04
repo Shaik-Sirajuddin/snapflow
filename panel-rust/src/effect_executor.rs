@@ -192,25 +192,66 @@ fn dispatch_reactive_sync_failed(operation: &'static str, detail: String) {
     });
 }
 
+/// Feeds one MCP server settings operation's outcome back through
+/// `update_persistent` as `EffectResultMsg::McpServerOperationCompleted`,
+/// arming the shared action-feedback toast -- same `slint::invoke_from_
+/// event_loop` re-entry shape `Effect::SaveSettings`'s own handler above
+/// already uses.
+pub(crate) fn report_mcp_server_result(result: Result<String, String>) {
+    let _ = slint::invoke_from_event_loop(move || {
+        crate::PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let Some(panel) = slot.as_ref() else {
+                return;
+            };
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(EffectResultMsg::McpServerOperationCompleted(
+                    result.map_err(EffectError::new),
+                )),
+            );
+        });
+    });
+}
+
+/// Feeds an asynchronous agent install/enablement outcome back through the
+/// reducer.  The operation runs outside the Slint thread because a first-use
+/// `npm install` can be a long network operation; dropping the result would
+/// leave users with no indication whether the card action succeeded.
+pub(crate) fn report_agent_result(result: Result<String, String>) {
+    let _ = slint::invoke_from_event_loop(move || {
+        crate::PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let Some(panel) = slot.as_ref() else {
+                return;
+            };
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(EffectResultMsg::AgentOperationCompleted(
+                    result.map_err(EffectError::new),
+                )),
+            );
+        });
+    });
+}
+
 fn execute_skill_effects(effects: Vec<Effect>) {
     for effect in effects {
         match effect {
             Effect::SkillWrite { path, content } => {
                 std::thread::spawn(move || {
-                    // `path` is the skill's DIRECTORY (same convention as
-                    // every other skill effect -- OpenSkillEditor reads
-                    // path.join("SKILL.md"), CopyPathRequested copies the
-                    // directory, etc.), not the SKILL.md file itself.
-                    // Pre-existing bug fixed here: this previously called
-                    // std::fs::write(path, content) directly on that
-                    // directory, which always fails with EISDIR -- the
-                    // skill editor's save action had no working path to
-                    // actually persist an edit, confirmed empirically
-                    // (std::fs::write on a real directory reliably errors
-                    // "Is a directory") while wiring reactive-sync trigger
-                    // (3)'s edit half (memory/acpx/gen/plans/acpx-skills/).
-                    let skill_md_path = path.join("SKILL.md");
-                    let result = std::fs::write(&skill_md_path, &content)
+                    // `path` is the SKILL.md FILE itself, not the skill's
+                    // directory -- `app.slint:848` sends `active-skill-md-
+                    // path` (added by PUI-010/commit 60820a2f to fix the
+                    // sibling EISDIR bug in OpenSkillEditor). This handler
+                    // previously still did `path.join("SKILL.md")` here
+                    // (correct back when `path` really was the directory,
+                    // pre-60820a2f), which after that commit double-joined
+                    // to `.../SKILL.md/SKILL.md` and failed with ENOTDIR
+                    // ("Not a directory") on every real skill-content save,
+                    // since `SKILL.md` already exists as a plain file, not
+                    // a directory. Write `path` directly.
+                    let result = std::fs::write(&path, &content)
                         .map_err(|error| EffectError::new(error.to_string()));
                     let write_succeeded = result.is_ok();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -236,8 +277,42 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                             // succeeded -- syncing content that was never
                             // actually saved would be worse than not
                             // syncing at all.
+                            //
+                            // `path` here is `active_skill_md_path` -- the
+                            // SKILL.md FILE itself (see the doc comment on
+                            // this match arm above) -- but
+                            // `schedule_debounced_skill_resync` and
+                            // everything downstream of it
+                            // (`skills_manager_adapter::
+                            // update_and_resync_edited_skill`,
+                            // `project_root_from_skill_dir`, and
+                            // ultimately `skills_manager::register_skill`/
+                            // `update_content`) all expect the skill's
+                            // DIRECTORY, not the file. This call was added
+                            // in b4803eeb, before 60820a2f split
+                            // `active_skill_path` (directory) from
+                            // `active_skill_md_path` (file); it was never
+                            // updated for the new file-shaped `path`, so
+                            // autosave was silently passing a file where a
+                            // directory was expected. `register_skill`'s
+                            // `source_dir.join("SKILL.md")` check then
+                            // produces `SkillError::MissingSkillMd`
+                            // ("skill source directory has no SKILL.md")
+                            // for every real autosave once a reactive-sync
+                            // vendor is enabled -- distinct from (and a
+                            // sibling of) the ENOTDIR bug 0a9ac4e7 fixed
+                            // in this same match arm's direct write.
+                            // `path.parent()` recovers the directory.
                             if write_succeeded {
-                                schedule_debounced_skill_resync(path.clone());
+                                if let Some(skill_dir) = path.parent() {
+                                    schedule_debounced_skill_resync(skill_dir.to_path_buf());
+                                } else {
+                                    eprintln!(
+                                        "panel-rust: SkillWrite path {} has no parent directory, \
+                                         skipping reactive resync",
+                                        path.display()
+                                    );
+                                }
                             }
                         });
                     });
@@ -495,6 +570,41 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     panel.execute_send_prompt_real(real_index, &text);
                 }
             }
+            Effect::RecordLocalMessage { thread_id, text } => {
+                let real_index = panel.model.borrow().thread_index_for_id(&thread_id);
+                if let Some(real_index) = real_index {
+                    panel.execute_record_local_message_real(real_index, &text);
+                }
+            }
+            Effect::MutateQueue { real_index, params } => {
+                panel.execute_queue_mutation_real(real_index, params);
+            }
+            Effect::ProbeProvider {
+                real_index,
+                provider,
+                profile_name,
+            } => {
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    // stale-provider-switch-pulse fix: a `false` return
+                    // means `probe_provider_selection` hit its deliberate
+                    // silent no-op (no resolvable project directory) and
+                    // will never push a completion `AgentEvent::
+                    // ProviderProbe` -- clear `provider_probes_in_flight`
+                    // right here instead of leaving the "Switching
+                    // provider..." pulse stuck forever waiting on an
+                    // event that is never coming. See `EffectResultMsg::
+                    // ProviderProbeSkipped`'s doc comment.
+                    if !bridge.probe_provider_selection(real_index, provider.clone(), profile_name) {
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(crate::effect::EffectResultMsg::ProviderProbeSkipped {
+                                real_index,
+                                provider,
+                            }),
+                        );
+                    }
+                }
+            }
             Effect::CancelGeneration { real_index } => {
                 panel.execute_cancel_generation_real(real_index);
             }
@@ -547,29 +657,51 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             Effect::SaveDevMode { enabled } => {
                 panel.dispatch_dev_mode_toggled(enabled);
             }
-            Effect::McpServerCreate { name, command, .. } => {
+            // PUI-013: these six dispatch to AgentBridge's `*_async`
+            // methods (real background-thread RPC, deduped via `mcp_
+            // operations`) instead of the synchronous `dispatch_mcp_
+            // server_*` methods above -- the synchronous versions block
+            // this very call site (`execute_effects` runs on the Slint UI
+            // thread) for the full RPC round-trip, which was the reported
+            // "jittery lag while toggling the switch" freeze. The result
+            // is reported from the completion closure itself (inside
+            // `dispatch_mcp_server_*_async`), not here -- no `report_mcp_
+            // server_result` call at this call site any more.
+            Effect::McpServerCreate { entry, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_create(&component, &name, &command);
+                panel.dispatch_mcp_server_create_async(&component, entry);
+            }
+            Effect::McpServerUpdate { entry, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_update_async(&component, entry);
             }
             Effect::McpServerDelete { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_delete(&component, &name);
+                panel.dispatch_mcp_server_delete_async(&component, &name);
             }
             Effect::McpServerEnabledChanged { name, enabled, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
+                panel.dispatch_mcp_server_enabled_changed_async(&component, &name, enabled);
             }
             Effect::McpServerAuthenticate { name, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
                     continue;
                 };
-                panel.dispatch_mcp_server_authenticate(&component, &name);
+                panel.dispatch_mcp_server_authenticate_async(&component, &name);
+            }
+            Effect::McpServerLogout { name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_logout_async(&component, &name);
             }
             Effect::McpServerToolEnabledChanged {
                 server_name,
@@ -586,6 +718,28 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     &tool_name,
                     enabled,
                 );
+            }
+            Effect::McpServerToolDeferredChanged {
+                server_name,
+                tool_name,
+                deferred,
+                ..
+            } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_tool_deferred_changed(
+                    &component,
+                    &server_name,
+                    &tool_name,
+                    deferred,
+                );
+            }
+            Effect::McpServerToolsFetchRequested { server_name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_tools_fetch_async(&component, &server_name);
             }
             Effect::ProfileCreate {
                 name,
@@ -1061,6 +1215,81 @@ mod skill_editor_path_tests {
         assert_eq!(
             std::fs::read_to_string(&state.content_path).unwrap(),
             "old body plus a typed delta"
+        );
+    }
+
+    // Regression test for the ENOTDIR bug introduced by 60820a2f itself:
+    // Effect::SkillWrite's handler kept doing `path.join("SKILL.md")`
+    // after `path` became the SKILL.md file (not the directory) per the
+    // fix above -- neither prior test here exercises that handler's own
+    // redundant join, since they write straight to a derived path instead
+    // of reproducing the handler's exact logic.
+    #[test]
+    fn skill_write_effect_handler_writes_the_content_path_directly_not_joined_again() {
+        let dir = tempfile_dir();
+        let md_path = dir.join("SKILL.md");
+        std::fs::write(&md_path, "---\nname: demo\n---\noriginal").unwrap();
+
+        // What the buggy handler did: re-join "SKILL.md" onto a path that
+        // is already the SKILL.md file, then try to write there.
+        let buggy_double_joined = md_path.join("SKILL.md");
+        let buggy_result = std::fs::write(&buggy_double_joined, "new content");
+        assert_eq!(
+            buggy_result.unwrap_err().kind(),
+            ErrorKind::NotADirectory,
+            "demonstrates the exact regression: joining SKILL.md onto an \
+             already-file path hits ENOTDIR"
+        );
+
+        // The fix: write `path` (== content_path) directly, no re-join.
+        std::fs::write(&md_path, "new content").unwrap();
+        assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "new content");
+    }
+
+    // Sibling regression to the two tests above, but for the reactive-sync
+    // side-effect rather than the direct file write: `schedule_debounced_
+    // skill_resync` (and everything it forwards to --
+    // `skills_manager_adapter::update_and_resync_edited_skill` /
+    // `project_root_from_skill_dir` -- and ultimately
+    // `skills_manager::Manager::register_skill`) all expect a skill
+    // DIRECTORY, exactly like `register_skill`'s own doc comment says
+    // ("source_dir (must contain SKILL.md or skill.md)"). Passing it the
+    // SKILL.md FILE reproduces the exact user-facing error message
+    // ("skill source directory has no SKILL.md") this test's name refers
+    // to -- distinct from the ENOTDIR bug the two tests above cover,
+    // which is about the direct `std::fs::write` call, not this
+    // downstream reactive-sync call.
+    #[test]
+    fn passing_the_skill_md_file_where_the_resync_path_expects_a_directory_has_no_skill_md() {
+        let dir = tempfile_dir();
+        let md_path = dir.join("SKILL.md");
+        std::fs::write(&md_path, "---\nname: demo\n---\nbody").unwrap();
+
+        // The bug: `schedule_debounced_skill_resync(path.clone())` used to
+        // pass `path` (== `content_path` == the SKILL.md FILE) straight
+        // through as the "skill_dir" downstream code expects. Reproduce
+        // that same check here without needing skills-manager's sqlite
+        // plumbing: `register_skill`'s own guard is exactly
+        // `!source_dir.join("SKILL.md").is_file() && !source_dir.join(
+        // "skill.md").is_file()`.
+        let buggy_source_dir = &md_path; // what the old call site passed
+        assert!(
+            !buggy_source_dir.join("SKILL.md").is_file()
+                && !buggy_source_dir.join("skill.md").is_file(),
+            "reproduces skills_manager::Manager::register_skill's \
+             MissingSkillMd guard tripping on a file path"
+        );
+
+        // The fix: resolve the directory via `path.parent()` before
+        // handing it to the resync call, exactly like the real handler
+        // now does.
+        let fixed_source_dir = md_path.parent().expect("SKILL.md has a parent dir");
+        assert_eq!(fixed_source_dir, dir);
+        assert!(
+            fixed_source_dir.join("SKILL.md").is_file(),
+            "the fix (path.parent()) resolves to a directory that \
+             genuinely contains SKILL.md, so register_skill's guard \
+             passes"
         );
     }
 

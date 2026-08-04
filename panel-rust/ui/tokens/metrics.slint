@@ -3,6 +3,15 @@
 // Raw scale only -- resolving which preset is active (`Theme.radius-preset`,
 // an FFI-set `in` property) stays in `theme.slint`.
 export global Metrics {
+    // Shared base period for every `animation-tick()`-driven pulse/spin
+    // loader in the app (pending-row dots, live-rail flow, tool-group
+    // pulse, header/sidebar/composer spinners, empty-state blink). Base
+    // taken from the pending-message pulse's own original 1200ms period,
+    // then halved in speed (2x period) app-wide by request so every
+    // loader animates at one consistent, slower cadence instead of each
+    // call site picking its own literal duration.
+    out property <duration> pulse-period: 2400ms;
+
     out property <length> radius-sm-classic: 4px;
     out property <length> radius-md-classic: 6px;
     out property <length> radius-lg-classic: 8px;

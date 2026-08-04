@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"snapshotd/internal/transport"
 )
 
 // Config is the daemon's runtime configuration. Defaults follow the
@@ -90,6 +92,10 @@ type Config struct {
 	// AcpxConfigPath is the generated ACPX_CONFIG_FILE path.
 	AcpxConfigPath string
 
+	// AcpxAdminBind is the loopback address for acpx-server's admin plane.
+	// Defaults to acpxmgr.AdminBind; worktree instances may override it.
+	AcpxAdminBind string
+
 	// AcpxDefaultAcpCommand is optional ACPX_DEFAULT_ACP_COMMAND for the
 	// bundled acpx-server native-mode default agent
 	// (SNAPSHOTD_ACPX_DEFAULT_ACP_COMMAND; legacy alias
@@ -123,6 +129,19 @@ func Default() Config {
 	if binPath == "" {
 		binPath = discoverSnapshotBinPath()
 	}
+	controlEndpoint := os.Getenv("SNAPSHOTD_CONTROL_ENDPOINT")
+	if controlEndpoint == "" {
+		controlEndpoint = os.Getenv("SNAPSHOTD_CONTROL_SOCKET")
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = persisted["SNAPSHOTD_CONTROL_ENDPOINT"]
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = persisted["SNAPSHOTD_CONTROL_SOCKET"]
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = transport.DefaultControlEndpoint(home)
+	}
 
 	launchTimeout := 30 * time.Second
 	if v := os.Getenv("SNAPSHOTD_LAUNCH_TIMEOUT"); v != "" {
@@ -155,6 +174,10 @@ func Default() Config {
 	if acpxConfig == "" {
 		acpxConfig = filepath.Join(home, "acpx-config.json")
 	}
+	acpxAdminBind := os.Getenv("SNAPSHOTD_ACPX_ADMIN_BIND")
+	if acpxAdminBind == "" {
+		acpxAdminBind = "127.0.0.1:8791"
+	}
 	acpxEnabled := false
 	if v, ok := os.LookupEnv("SNAPSHOTD_ACPX_ENABLED"); ok {
 		acpxEnabled, _ = strconv.ParseBool(v)
@@ -171,7 +194,7 @@ func Default() Config {
 	return Config{
 		HomeDir:               home,
 		DBPath:                filepath.Join(home, "registry.db"),
-		ControlSocketPath:     filepath.Join(home, "control.sock"),
+		ControlSocketPath:     controlEndpoint,
 		RunDir:                filepath.Join(home, "run"),
 		LogDir:                filepath.Join(home, "logs"),
 		ProjectsRoot:          filepath.Join(home, "projects"),
@@ -183,6 +206,7 @@ func Default() Config {
 		AcpxBinPath:           acpxBin,
 		AcpxHttpBind:          acpxBind,
 		AcpxConfigPath:        acpxConfig,
+		AcpxAdminBind:         acpxAdminBind,
 		AcpxDefaultAcpCommand: acpxDefaultAcpCommand,
 	}
 }
@@ -296,15 +320,6 @@ func discoverAcpxServerBinPath() string {
 	return fallback
 }
 
-// discoverShotcutBinPath is the primary lookup: the real, production
-// FfiBackend-linked Qt binary (`shotcut`, built by
-// `cmake -S shotcut -B <builddir> && ninja` per shotcut/CMakeLists.txt's
-// corrosion_import_crate(... FEATURES real_ffi) integration -- see
-// sap-rust/README.md's "Real FFI" section). Searches a small set of
-// `shotcut/build*/src/shotcut` glob candidates under each ancestor root,
-// preferring a build dir name containing "release" over any other match,
-// so a plain `cmake -B shotcut/build-real-ffi` (or similarly named)
-// checkout is found without extra configuration.
 // exeSuffix is the platform executable suffix used by packaged binaries.
 func exeSuffix() string {
 	if runtime.GOOS == "windows" {
@@ -313,6 +328,9 @@ func exeSuffix() string {
 	return ""
 }
 
+// discoverShotcutBinPath locates the real production Snapflow executable,
+// including the Linux packaged layout: bin/snapflowd alongside
+// Snapflow.app/snapflow (the environment-setting wrapper).
 func discoverShotcutBinPath(roots []string) string {
 	suffix := exeSuffix()
 	if execPath, err := os.Executable(); err == nil {
@@ -354,6 +372,26 @@ func discoverShotcutBinPath(roots []string) string {
 			}
 		}
 	}
+	// Installed release bundles keep the production real_ffi GUI beside
+	// snapflowd rather than under a repository's shotcut/build*/ tree.  Prefer
+	// the Linux wrapper (it establishes the bundled loader/plugin environment)
+	// over the raw binary; on macOS and Windows use the app's executable.
+	for _, root := range roots {
+		candidates := []string{
+			filepath.Join(root, "Snapflow.app", "snapflow"),
+			filepath.Join(root, "Snapflow.app", "Contents", "MacOS", "Snapflow"),
+			filepath.Join(root, "Snapflow.app", "Contents", "MacOS", "snapflow"),
+			filepath.Join(root, "Snapflow", "snapflow.exe"),
+			filepath.Join(root, "Snapflow", "snapflow"),
+		}
+		for _, candidate := range candidates {
+			info, err := os.Stat(candidate)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			return candidate
+		}
+	}
 	return fallback
 }
 
@@ -367,9 +405,9 @@ func fileExists(path string) bool {
 // directories derived from both the current working directory and the
 // running executable's own location (each walked a few levels up).
 //
-// Preference order: the real Qt/`real_ffi` `shotcut` binary
+// Preference order: the real Qt/`real_ffi` `snapflow` binary
 // (discoverShotcutBinPath) first -- that is the one production backend
-// (FfiBackend, calling into a real live Shotcut process; see
+// (FfiBackend, calling into a real live Snapflow process; see
 // sap-rust/README.md). Only if no such build is found does this fall back
 // to the standalone `sap-rust/target/{release,debug}/sap-rust` binary,
 // which as of the MltBackend removal only runs MockBackend (no real

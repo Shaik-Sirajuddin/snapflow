@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Registry {
@@ -89,6 +90,16 @@ pub const REGISTRY_URL: &str =
 /// target regardless of checkout layout.
 const FALLBACK_JSON: &str = include_str!("../registry.fallback.json");
 
+/// Per-request deadline for [`fetch_registry`], overriding whatever the
+/// shared [`reqwest::Client`] was built with. The CDN routinely takes
+/// 5-30s from some networks, and the router's shared client uses a 5s
+/// blanket timeout sized for adapter-local HTTP -- under that budget the
+/// live fetch loses often enough that callers silently ran on the 3-agent
+/// bundled fallback (no `grok-build`, no `opencode`, ...) for a whole
+/// process lifetime. This is a catalog read on a background refresh path,
+/// so waiting longer is strictly better than answering wrongly.
+pub const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error("failed to reach registry at {url}: {source}")]
@@ -112,15 +123,15 @@ pub enum RegistryError {
 /// should use [`fetch_registry_or_fallback`] or [`fallback_registry`]
 /// instead.
 pub async fn fetch_registry(client: &reqwest::Client) -> Result<Registry, RegistryError> {
-    let response =
-        client
-            .get(REGISTRY_URL)
-            .send()
-            .await
-            .map_err(|source| RegistryError::Request {
-                url: REGISTRY_URL.to_string(),
-                source,
-            })?;
+    let response = client
+        .get(REGISTRY_URL)
+        .timeout(REGISTRY_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|source| RegistryError::Request {
+            url: REGISTRY_URL.to_string(),
+            source,
+        })?;
 
     let status = response.status();
     if !status.is_success() {

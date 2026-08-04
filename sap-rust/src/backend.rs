@@ -28,6 +28,9 @@ pub type BackendResult<T> = Result<T, BackendError>;
 pub struct Track {
     pub index: usize,
     pub kind: String, // "video" | "audio"
+    /// Native C++/Shotcut track name, when supplied by the FFI bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Audio muted -- bit 2 (value 2) of the real MLT `<track hide=".."/>`
     /// bitmask (see `multitrackmodel.cpp::setTrackMute`). Defaulted so
     /// existing `Track { index, kind }` struct literals / wire payloads
@@ -237,7 +240,8 @@ pub trait Backend: Send {
         track_index: usize,
         source: Value,
     ) -> BackendResult<Clip>;
-    fn edit_list_clips(&mut self, project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>>;
+    fn edit_list_clips(&mut self, project_id: &str, track_index: usize)
+        -> BackendResult<Vec<Clip>>;
 
     fn playback_seek(&mut self, project_id: &str, frame: i64) -> BackendResult<()>;
 
@@ -289,7 +293,11 @@ pub trait Backend: Send {
 
     /// `playlist.get` -- full metadata for one playlist bin entry,
     /// including probe data where available (see `PlaylistEntryDetail`).
-    fn playlist_get(&mut self, project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail>;
+    fn playlist_get(
+        &mut self,
+        project_id: &str,
+        index: usize,
+    ) -> BackendResult<PlaylistEntryDetail>;
 
     // Note: `playlist.addToTimeline` has no dedicated trait method -- per
     // 01-jsonrpc-spec.md it's a pure convenience wrapper equivalent to
@@ -300,23 +308,23 @@ pub trait Backend: Send {
     /// `file.import` -- import a local file into the project's playlist bin.
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry>;
 
-   /// `edit.trimClipIn` / `edit.trimClipOut`.
-   fn edit_trim_clip_in(
-       &mut self,
-       project_id: &str,
-       track_index: usize,
-       clip_index: usize,
-       new_frame: i64,
+    /// `edit.trimClipIn` / `edit.trimClipOut`.
+    fn edit_trim_clip_in(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
         ripple: bool,
-   ) -> BackendResult<()>;
-   fn edit_trim_clip_out(
-       &mut self,
-       project_id: &str,
-       track_index: usize,
-       clip_index: usize,
-       new_frame: i64,
+    ) -> BackendResult<()>;
+    fn edit_trim_clip_out(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
         ripple: bool,
-   ) -> BackendResult<()>;
+    ) -> BackendResult<()>;
 
     /// `edit.splitClip` -- split a clip at a source frame strictly between
     /// `in_frame` and `out_frame`. Left keeps the original `clip_id` with
@@ -508,17 +516,20 @@ pub trait Backend: Send {
         position: i64,
     ) -> BackendResult<()>;
 
-
     /// Inclusive clip length in frames (`out - in + 1`), used by
     /// `audio.setFadeInOut` to place the fade-out level envelope relative
     /// to the clip end.
     fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64>;
 
-   /// `generator.createTitle` -- constructs a title-card producer (color
-   /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
-   /// namespace) and adds it to the Playlist bin, ready for
-   /// `edit.appendClip({source:{playlistIndex}})` like any other source.
-   fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
+    /// `generator.createTitle` -- constructs a title-card producer (color
+    /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
+    /// namespace) and adds it to the Playlist bin, ready for
+    /// `edit.appendClip({source:{playlistIndex}})` like any other source.
+    fn generator_create_title(
+        &mut self,
+        project_id: &str,
+        params: Value,
+    ) -> BackendResult<PlaylistEntry>;
 
     /// `generator.createColor` -- constructs a plain `color:` producer
     /// (`{hexColor}`, `#AARRGGBB`) and adds it to the Playlist bin, per
@@ -526,9 +537,13 @@ pub trait Backend: Send {
     /// Commonly used with a fully-transparent `#00000000` to build a
     /// timeline spacer clip: append it, then `edit.trimClipOut` to the
     /// desired length.
-    fn generator_create_color(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
+    fn generator_create_color(
+        &mut self,
+        project_id: &str,
+        params: Value,
+    ) -> BackendResult<PlaylistEntry>;
 
-   fn subtitles_add_track(&mut self, project_id: &str) -> BackendResult<SubtitleTrackInfo>;
+    fn subtitles_add_track(&mut self, project_id: &str) -> BackendResult<SubtitleTrackInfo>;
     fn subtitles_append_item(
         &mut self,
         project_id: &str,
@@ -790,12 +805,15 @@ impl Backend for MockBackend {
 
     fn edit_add_track(&mut self, project_id: &str, kind: &str) -> BackendResult<Track> {
         if kind != "video" && kind != "audio" {
-            return Err(BackendError::InvalidParams(format!("bad track kind: {kind}")));
+            return Err(BackendError::InvalidParams(format!(
+                "bad track kind: {kind}"
+            )));
         }
         let data = self.project_mut(project_id);
         let track = Track {
             index: data.tracks.len(),
             kind: kind.to_string(),
+            name: None,
             muted: false,
             hidden: false,
             locked: false,
@@ -825,14 +843,21 @@ impl Backend for MockBackend {
         Ok(self.project_mut(project_id).tracks.clone())
     }
 
-    fn edit_reorder_track(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<Vec<Track>> {
+    fn edit_reorder_track(
+        &mut self,
+        project_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> BackendResult<Vec<Track>> {
         let data = self.project_mut(project_id);
         let len = data.tracks.len();
         if from_index >= len {
             return Err(BackendError::NotFound(format!("track {from_index}")));
         }
         if to_index >= len {
-            return Err(BackendError::InvalidParams(format!("toIndex {to_index} out of range (len {len})")));
+            return Err(BackendError::InvalidParams(format!(
+                "toIndex {to_index} out of range (len {len})"
+            )));
         }
         // Snapshot old-index -> clips before mutating `tracks`, so the
         // remap below can rebuild the HashMap keyed by each track's *new*
@@ -904,7 +929,12 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    fn edit_remove_clip(&mut self, project_id: &str, track_index: usize, clip_index: usize) -> BackendResult<()> {
+    fn edit_remove_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+    ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
         if track_index >= data.tracks.len() {
             return Err(BackendError::NotFound(format!("track {track_index}")));
@@ -914,7 +944,9 @@ impl Backend for MockBackend {
             .get_mut(&track_index)
             .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
         if clip_index >= clips.len() {
-            return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+            return Err(BackendError::NotFound(format!(
+                "clip {track_index}/{clip_index}"
+            )));
         }
         clips.remove(clip_index);
         for (i, c) in clips.iter_mut().enumerate() {
@@ -942,12 +974,13 @@ impl Backend for MockBackend {
             return Err(BackendError::NotFound(format!("track {to_track_index}")));
         }
         let mut clip = {
-            let source_clips = data
-                .clips
-                .get_mut(&from_track_index)
-                .ok_or_else(|| BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}")))?;
+            let source_clips = data.clips.get_mut(&from_track_index).ok_or_else(|| {
+                BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}"))
+            })?;
             if from_clip_index >= source_clips.len() {
-                return Err(BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}")));
+                return Err(BackendError::NotFound(format!(
+                    "clip {from_track_index}/{from_clip_index}"
+                )));
             }
             source_clips.remove(from_clip_index)
         };
@@ -994,7 +1027,13 @@ impl Backend for MockBackend {
                 clips.len()
             )));
         }
-        let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        let clip = Clip {
+            clip_id,
+            index: clip_index,
+            source,
+            in_frame: 0,
+            out_frame: 0,
+        };
         clips.insert(clip_index, clip.clone());
         for (i, c) in clips.iter_mut().enumerate() {
             c.index = i;
@@ -1025,7 +1064,13 @@ impl Backend for MockBackend {
                 clips.len()
             )));
         }
-        let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        let clip = Clip {
+            clip_id,
+            index: clip_index,
+            source,
+            in_frame: 0,
+            out_frame: 0,
+        };
         if clip_index == clips.len() {
             // No clip occupies this slot yet -- behaves like append.
             clips.push(clip.clone());
@@ -1053,7 +1098,13 @@ impl Backend for MockBackend {
         data.next_clip_id += 1;
         let clip_id = format!("clip-{}", data.next_clip_id);
         let clips = data.clips.entry(track_index).or_default();
-        let clip = Clip { clip_id, index: clips.len(), source, in_frame: 0, out_frame: 0 };
+        let clip = Clip {
+            clip_id,
+            index: clips.len(),
+            source,
+            in_frame: 0,
+            out_frame: 0,
+        };
         clips.push(clip.clone());
         data.dirty = true;
         data.undo_depth += 1;
@@ -1061,8 +1112,17 @@ impl Backend for MockBackend {
         Ok(clip)
     }
 
-    fn edit_list_clips(&mut self, project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
-        Ok(self.project_mut(project_id).clips.get(&track_index).cloned().unwrap_or_default())
+    fn edit_list_clips(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+    ) -> BackendResult<Vec<Clip>> {
+        Ok(self
+            .project_mut(project_id)
+            .clips
+            .get(&track_index)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn playback_seek(&mut self, _project_id: &str, _frame: i64) -> BackendResult<()> {
@@ -1148,14 +1208,23 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    fn playlist_move(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<()> {
+    fn playlist_move(
+        &mut self,
+        project_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
         let len = data.playlist.len();
         if from_index >= len {
-            return Err(BackendError::NotFound(format!("playlist index {from_index}")));
+            return Err(BackendError::NotFound(format!(
+                "playlist index {from_index}"
+            )));
         }
         if to_index >= len {
-            return Err(BackendError::InvalidParams(format!("toIndex {to_index} out of range (len {len})")));
+            return Err(BackendError::InvalidParams(format!(
+                "toIndex {to_index} out of range (len {len})"
+            )));
         }
         let entry = data.playlist.remove(from_index);
         data.playlist.insert(to_index, entry);
@@ -1166,7 +1235,11 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    fn playlist_get(&mut self, project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail> {
+    fn playlist_get(
+        &mut self,
+        project_id: &str,
+        index: usize,
+    ) -> BackendResult<PlaylistEntryDetail> {
         let data = self.project_mut(project_id);
         let entry = data
             .playlist
@@ -1188,43 +1261,43 @@ impl Backend for MockBackend {
         self.playlist_append(project_id, Value::from(json!({"path": path})), None)
     }
 
-   fn edit_trim_clip_in(
-       &mut self,
-       project_id: &str,
-       track_index: usize,
-       clip_index: usize,
-       new_frame: i64,
+    fn edit_trim_clip_in(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
         _ripple: bool,
-   ) -> BackendResult<()> {
-       let data = self.project_mut(project_id);
-       let clip = data
-           .clips
-           .get_mut(&track_index)
-           .and_then(|c| c.get_mut(clip_index))
-           .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
-       clip.in_frame = new_frame;
-       data.dirty = true;
-       Ok(())
-   }
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        let clip = data
+            .clips
+            .get_mut(&track_index)
+            .and_then(|c| c.get_mut(clip_index))
+            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+        clip.in_frame = new_frame;
+        data.dirty = true;
+        Ok(())
+    }
 
-   fn edit_trim_clip_out(
-       &mut self,
-       project_id: &str,
-       track_index: usize,
-       clip_index: usize,
-       new_frame: i64,
+    fn edit_trim_clip_out(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
         _ripple: bool,
-   ) -> BackendResult<()> {
-       let data = self.project_mut(project_id);
-       let clip = data
-           .clips
-           .get_mut(&track_index)
-           .and_then(|c| c.get_mut(clip_index))
-           .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
-       clip.out_frame = new_frame;
-       data.dirty = true;
-       Ok(())
-   }
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        let clip = data
+            .clips
+            .get_mut(&track_index)
+            .and_then(|c| c.get_mut(clip_index))
+            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+        clip.out_frame = new_frame;
+        data.dirty = true;
+        Ok(())
+    }
 
     fn edit_split_clip(
         &mut self,
@@ -1240,7 +1313,9 @@ impl Backend for MockBackend {
                 .get(&track_index)
                 .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
             if clip_index >= clips.len() {
-                return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+                return Err(BackendError::NotFound(format!(
+                    "clip {track_index}/{clip_index}"
+                )));
             }
             let left = &clips[clip_index];
             // Both halves must be non-empty: left [in, position-1], right [position, out].
@@ -1300,7 +1375,12 @@ impl Backend for MockBackend {
             return Err(BackendError::NotFound(format!("track {track_index}")));
         }
         data.dirty = true;
-        Ok(TransitionInfo { track_index, transition_index: 0, between_clips, duration_frames })
+        Ok(TransitionInfo {
+            track_index,
+            transition_index: 0,
+            between_clips,
+            duration_frames,
+        })
     }
 
     fn filter_add(
@@ -1332,7 +1412,10 @@ impl Backend for MockBackend {
         let filter_index = filters.len();
         filters.push(filter);
         data.dirty = true;
-        Ok(FilterInfo { filter_index, mlt_service: mlt_service.to_string() })
+        Ok(FilterInfo {
+            filter_index,
+            mlt_service: mlt_service.to_string(),
+        })
     }
 
     fn filter_set_property(
@@ -1349,7 +1432,9 @@ impl Backend for MockBackend {
             .filters
             .get_mut(clip_id)
             .and_then(|filters| filters.get_mut(filter_index))
-            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+            .ok_or_else(|| {
+                BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}"))
+            })?;
         match position {
             Some(position) => {
                 filter
@@ -1382,7 +1467,9 @@ impl Backend for MockBackend {
             .filters
             .get_mut(clip_id)
             .and_then(|filters| filters.get_mut(filter_index))
-            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+            .ok_or_else(|| {
+                BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}"))
+            })?;
         filter
             .keyframes
             .entry(property.to_string())
@@ -1406,14 +1493,23 @@ impl Backend for MockBackend {
         if !known {
             return Err(BackendError::NotFound(format!("clip {clip_id}")));
         }
-        let filters = data.filters.get(clip_id).map(|f| f.as_slice()).unwrap_or(&[]);
+        let filters = data
+            .filters
+            .get(clip_id)
+            .map(|f| f.as_slice())
+            .unwrap_or(&[]);
         Ok(filters
             .iter()
             .enumerate()
             .map(|(index, f)| FilterListEntry {
                 index,
                 mlt_service: f.mlt_service.clone(),
-                properties: Value::Object(f.properties.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                properties: Value::Object(
+                    f.properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
             })
             .collect())
     }
@@ -1425,12 +1521,13 @@ impl Backend for MockBackend {
         filter_index: usize,
     ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
-        let filters = data
-            .filters
-            .get_mut(clip_id)
-            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        let filters = data.filters.get_mut(clip_id).ok_or_else(|| {
+            BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}"))
+        })?;
         if filter_index >= filters.len() {
-            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")));
+            return Err(BackendError::NotFound(format!(
+                "filter {filter_index} on clip {clip_id}"
+            )));
         }
         filters.remove(filter_index);
         data.dirty = true;
@@ -1447,12 +1544,13 @@ impl Backend for MockBackend {
         new_index: usize,
     ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
-        let filters = data
-            .filters
-            .get_mut(clip_id)
-            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        let filters = data.filters.get_mut(clip_id).ok_or_else(|| {
+            BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}"))
+        })?;
         if filter_index >= filters.len() {
-            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")));
+            return Err(BackendError::NotFound(format!(
+                "filter {filter_index} on clip {clip_id}"
+            )));
         }
         if new_index >= filters.len() {
             return Err(BackendError::InvalidParams(format!(
@@ -1482,7 +1580,9 @@ impl Backend for MockBackend {
             .filters
             .get(clip_id)
             .and_then(|filters| filters.get(filter_index))
-            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+            .ok_or_else(|| {
+                BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}"))
+            })?;
         let mut list = filter
             .keyframes
             .get(property)
@@ -1513,7 +1613,9 @@ impl Backend for MockBackend {
             .filters
             .get_mut(clip_id)
             .and_then(|filters| filters.get_mut(filter_index))
-            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+            .ok_or_else(|| {
+                BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}"))
+            })?;
         let removed = filter
             .keyframes
             .get_mut(property)
@@ -1530,7 +1632,6 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-
     fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64> {
         let data = self.project_mut(project_id);
         for clips in data.clips.values() {
@@ -1541,20 +1642,28 @@ impl Backend for MockBackend {
         Err(BackendError::NotFound(format!("clip {clip_id}")))
     }
 
-   fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
-       let data = self.project_mut(project_id);
-       let entry = PlaylistEntry {
-           index: data.playlist.len(),
-           name: "title".to_string(),
-           source: params,
-           duration_frames: 0,
-       };
-       data.playlist.push(entry.clone());
-       data.dirty = true;
-       Ok(entry)
-   }
+    fn generator_create_title(
+        &mut self,
+        project_id: &str,
+        params: Value,
+    ) -> BackendResult<PlaylistEntry> {
+        let data = self.project_mut(project_id);
+        let entry = PlaylistEntry {
+            index: data.playlist.len(),
+            name: "title".to_string(),
+            source: params,
+            duration_frames: 0,
+        };
+        data.playlist.push(entry.clone());
+        data.dirty = true;
+        Ok(entry)
+    }
 
-    fn generator_create_color(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+    fn generator_create_color(
+        &mut self,
+        project_id: &str,
+        params: Value,
+    ) -> BackendResult<PlaylistEntry> {
         let data = self.project_mut(project_id);
         let entry = PlaylistEntry {
             index: data.playlist.len(),
@@ -1586,7 +1695,9 @@ impl Backend for MockBackend {
     ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
         if track_index >= data.subtitle_tracks {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index}"
+            )));
         }
         data.subtitle_items
             .entry(track_index)
@@ -1608,7 +1719,9 @@ impl Backend for MockBackend {
     ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
         if track_index >= data.subtitle_tracks {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index}"
+            )));
         }
         let items = data.subtitle_items.entry(track_index).or_default();
         let mut remove: Vec<usize> = item_indices.to_vec();
@@ -1634,7 +1747,9 @@ impl Backend for MockBackend {
         new_track: bool,
     ) -> BackendResult<SubtitleTrackInfo> {
         let content = std::fs::read_to_string(path).map_err(|e| {
-            BackendError::InvalidParams(format!("subtitles.importSrt path {path} is not readable: {e}"))
+            BackendError::InvalidParams(format!(
+                "subtitles.importSrt path {path} is not readable: {e}"
+            ))
         })?;
         let cues = parse_mock_srt_cues(&content);
         let track_index = if new_track || self.project_mut(project_id).subtitle_tracks == 0 {
@@ -1656,9 +1771,15 @@ impl Backend for MockBackend {
     ) -> BackendResult<String> {
         let data = self.project_mut(project_id);
         if track_index >= data.subtitle_tracks {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index}"
+            )));
         }
-        let items = data.subtitle_items.get(&track_index).cloned().unwrap_or_default();
+        let items = data
+            .subtitle_items
+            .get(&track_index)
+            .cloned()
+            .unwrap_or_default();
         let srt = format_mock_srt(&items);
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -1677,7 +1798,9 @@ impl Backend for MockBackend {
     fn subtitles_burn_in(&mut self, project_id: &str, track_index: usize) -> BackendResult<()> {
         let data = self.project_mut(project_id);
         if track_index >= data.subtitle_tracks {
-            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+            return Err(BackendError::NotFound(format!(
+                "subtitle track {track_index}"
+            )));
         }
         data.dirty = true;
         Ok(())
@@ -1707,7 +1830,9 @@ impl Backend for MockBackend {
     }
 
     fn file_probe(&mut self, _path: &str) -> BackendResult<FileProbe> {
-        Err(BackendError::Unsupported("file.probe is not available in MockBackend".into()))
+        Err(BackendError::Unsupported(
+            "file.probe is not available in MockBackend".into(),
+        ))
     }
 
     fn jobs_get(&mut self, job_id: &str) -> BackendResult<JobStatus> {
@@ -1743,7 +1868,9 @@ impl Backend for MockBackend {
         _frame: i64,
         _format: &str,
     ) -> BackendResult<String> {
-        Err(BackendError::NotFound("playback.getFrame not implemented in MockBackend".into()))
+        Err(BackendError::NotFound(
+            "playback.getFrame not implemented in MockBackend".into(),
+        ))
     }
 
     fn markers_append(
@@ -2047,13 +2174,22 @@ mod tests {
         b.edit_add_track("p", "video").unwrap();
         b.edit_add_track("p", "video").unwrap();
         b.edit_add_track("p", "video").unwrap();
-        let clip0 = b.edit_append_clip("p", 0, json!({"path": "/tmp/track0.mp4"})).unwrap();
-        let clip1 = b.edit_append_clip("p", 1, json!({"path": "/tmp/track1.mp4"})).unwrap();
-        let clip2 = b.edit_append_clip("p", 2, json!({"path": "/tmp/track2.mp4"})).unwrap();
+        let clip0 = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/track0.mp4"}))
+            .unwrap();
+        let clip1 = b
+            .edit_append_clip("p", 1, json!({"path": "/tmp/track1.mp4"}))
+            .unwrap();
+        let clip2 = b
+            .edit_append_clip("p", 2, json!({"path": "/tmp/track2.mp4"}))
+            .unwrap();
 
         // Move track 0 to index 2: new order is [track1, track2, track0].
         let tracks = b.edit_reorder_track("p", 0, 2).unwrap();
-        assert_eq!(tracks.iter().map(|t| t.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            tracks.iter().map(|t| t.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
 
         assert_eq!(b.edit_list_clips("p", 0).unwrap()[0].clip_id, clip1.clip_id);
         assert_eq!(b.edit_list_clips("p", 1).unwrap()[0].clip_id, clip2.clip_id);
@@ -2066,18 +2202,24 @@ mod tests {
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
 
-        let t = b.edit_set_track_properties("p", 0, Some(true), None, None, None).unwrap();
+        let t = b
+            .edit_set_track_properties("p", 0, Some(true), None, None, None)
+            .unwrap();
         assert!(t.muted);
         assert!(!t.hidden);
         assert!(!t.locked);
         assert_eq!(t.blend_mode, "0");
 
-        let t = b.edit_set_track_properties("p", 0, None, None, None, Some("13".into())).unwrap();
+        let t = b
+            .edit_set_track_properties("p", 0, None, None, None, Some("13".into()))
+            .unwrap();
         // muted from the previous call must survive this unrelated update.
         assert!(t.muted);
         assert_eq!(t.blend_mode, "13");
 
-        assert!(b.edit_set_track_properties("p", 5, Some(true), None, None, None).is_err());
+        assert!(b
+            .edit_set_track_properties("p", 5, Some(true), None, None, None)
+            .is_err());
     }
 
     #[test]
@@ -2093,9 +2235,13 @@ mod tests {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
-        b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
-        let keep = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
-        b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+        b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
+        let keep = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"}))
+            .unwrap();
+        b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"}))
+            .unwrap();
 
         b.edit_remove_clip("p", 0, 0).unwrap();
         let clips = b.edit_list_clips("p", 0).unwrap();
@@ -2112,8 +2258,12 @@ mod tests {
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
         b.edit_add_track("p", "video").unwrap();
-        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
-        let bee = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
+        let a = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
+        let bee = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"}))
+            .unwrap();
 
         // Same-track reorder: move clip 0 (a) to the end of track 0.
         let moved = b.edit_move_clip("p", 0, 0, 0, 1).unwrap();
@@ -2137,12 +2287,18 @@ mod tests {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
-        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
-        let c = b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+        let a = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
+        let c = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"}))
+            .unwrap();
 
         // Splice `b` between `a` and `c` in one call, distinct from
         // append+move: the caller never places `b` at the end first.
-        let inserted = b.edit_insert_clip("p", 0, 1, json!({"path": "/tmp/b.mp4"})).unwrap();
+        let inserted = b
+            .edit_insert_clip("p", 0, 1, json!({"path": "/tmp/b.mp4"}))
+            .unwrap();
         assert_eq!(inserted.index, 1);
 
         let clips = b.edit_list_clips("p", 0).unwrap();
@@ -2153,11 +2309,17 @@ mod tests {
         assert_eq!(clips[2].index, 2); // c rippled from index 1 to 2.
 
         // clipIndex == current clip count is append-equivalent.
-        let appended_via_insert = b.edit_insert_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"})).unwrap();
+        let appended_via_insert = b
+            .edit_insert_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"}))
+            .unwrap();
         assert_eq!(appended_via_insert.index, 3);
 
-        assert!(b.edit_insert_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
-        assert!(b.edit_insert_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
+        assert!(b
+            .edit_insert_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"}))
+            .is_err());
+        assert!(b
+            .edit_insert_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"}))
+            .is_err());
     }
 
     #[test]
@@ -2165,13 +2327,21 @@ mod tests {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
-        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
-        let bee = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
-        let c = b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+        let a = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
+        let bee = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"}))
+            .unwrap();
+        let c = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"}))
+            .unwrap();
 
         // Overwrite slot 1 (b) with a new clip -- unlike insertClip, this
         // must NOT shift c's index.
-        let overwritten = b.edit_overwrite_clip("p", 0, 1, json!({"path": "/tmp/x.mp4"})).unwrap();
+        let overwritten = b
+            .edit_overwrite_clip("p", 0, 1, json!({"path": "/tmp/x.mp4"}))
+            .unwrap();
         assert_eq!(overwritten.index, 1);
         assert_ne!(overwritten.clip_id, bee.clip_id);
 
@@ -2183,13 +2353,18 @@ mod tests {
         assert_eq!(clips[2].index, 2); // c did NOT ripple, unlike insertClip.
 
         // clipIndex == current clip count is append-equivalent.
-        let appended_via_overwrite =
-            b.edit_overwrite_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"})).unwrap();
+        let appended_via_overwrite = b
+            .edit_overwrite_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"}))
+            .unwrap();
         assert_eq!(appended_via_overwrite.index, 3);
         assert_eq!(b.edit_list_clips("p", 0).unwrap().len(), 4);
 
-        assert!(b.edit_overwrite_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
-        assert!(b.edit_overwrite_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
+        assert!(b
+            .edit_overwrite_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"}))
+            .is_err());
+        assert!(b
+            .edit_overwrite_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"}))
+            .is_err());
     }
 
     #[test]
@@ -2227,7 +2402,8 @@ mod tests {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
-        b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
         b.edit_trim_clip_in("p", 0, 0, 10, false).unwrap();
         b.edit_trim_clip_out("p", 0, 0, 100, false).unwrap();
         assert!(b.edit_split_clip("p", 0, 0, 10).is_err());
@@ -2271,7 +2447,9 @@ mod tests {
         b.filter_add_keyframe("p", &clip.clip_id, 0, "level", 30, json!(1.0), "discrete")
             .unwrap();
 
-        let kfs = b.filter_list_keyframes("p", &clip.clip_id, 0, "level").unwrap();
+        let kfs = b
+            .filter_list_keyframes("p", &clip.clip_id, 0, "level")
+            .unwrap();
         assert_eq!(kfs.len(), 3);
         assert_eq!(kfs[0].position, 10);
         assert_eq!(kfs[0].interpolation, "linear");
@@ -2280,8 +2458,11 @@ mod tests {
         assert_eq!(kfs[2].position, 30);
         assert_eq!(kfs[2].interpolation, "discrete");
 
-        b.filter_remove_keyframe("p", &clip.clip_id, 0, "level", 20).unwrap();
-        let kfs = b.filter_list_keyframes("p", &clip.clip_id, 0, "level").unwrap();
+        b.filter_remove_keyframe("p", &clip.clip_id, 0, "level", 20)
+            .unwrap();
+        let kfs = b
+            .filter_list_keyframes("p", &clip.clip_id, 0, "level")
+            .unwrap();
         assert_eq!(kfs.len(), 2);
         assert_eq!(kfs[0].position, 10);
         assert_eq!(kfs[1].position, 30);
@@ -2311,7 +2492,9 @@ mod tests {
         assert_eq!(m1.frame, 50);
         assert_eq!(m1.color, "#000000");
 
-        let m2 = b.markers_append("p", 200, Some("third".into()), None).unwrap();
+        let m2 = b
+            .markers_append("p", 200, Some("third".into()), None)
+            .unwrap();
         assert_eq!(m2.index, 2);
 
         let listed = b.markers_list("p").unwrap();
@@ -2400,7 +2583,10 @@ mod tests {
         b.recent_add("p", "/a.mp4").unwrap();
         b.recent_add("p", "/b.mp4").unwrap();
         b.recent_add("p", "/a.mp4").unwrap(); // move to front
-        assert_eq!(b.recent_list("p").unwrap(), vec!["/a.mp4".to_string(), "/b.mp4".to_string()]);
+        assert_eq!(
+            b.recent_list("p").unwrap(),
+            vec!["/a.mp4".to_string(), "/b.mp4".to_string()]
+        );
 
         let removed = b.recent_remove("p", "/b.mp4").unwrap();
         assert_eq!(removed, "/b.mp4");
@@ -2442,14 +2628,23 @@ mod tests {
     #[test]
     fn playlist_insert_remove_move_get_round_trip() {
         let mut b = MockBackend::new();
-        b.playlist_append("p", json!({"path": "/a.mp4"}), Some("a".into())).unwrap();
-        b.playlist_append("p", json!({"path": "/c.mp4"}), Some("c".into())).unwrap();
+        b.playlist_append("p", json!({"path": "/a.mp4"}), Some("a".into()))
+            .unwrap();
+        b.playlist_append("p", json!({"path": "/c.mp4"}), Some("c".into()))
+            .unwrap();
 
         // Insert "b" between "a" and "c".
-        let inserted = b.playlist_insert("p", 1, json!({"path": "/b.mp4"}), Some("b".into())).unwrap();
+        let inserted = b
+            .playlist_insert("p", 1, json!({"path": "/b.mp4"}), Some("b".into()))
+            .unwrap();
         assert_eq!(inserted.index, 1);
         assert_eq!(inserted.name, "b");
-        let names: Vec<String> = b.playlist_list("p").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = b
+            .playlist_list("p")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert_eq!(names, vec!["a", "b", "c"]);
 
         // playlist.get returns full entry metadata (MockBackend: probe is
@@ -2462,7 +2657,12 @@ mod tests {
 
         // Move "c" (index 2) to the front.
         b.playlist_move("p", 2, 0).unwrap();
-        let names: Vec<String> = b.playlist_list("p").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = b
+            .playlist_list("p")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert_eq!(names, vec!["c", "a", "b"]);
 
         // Remove "a" (now index 1); reindexing must be reflected.
@@ -2475,7 +2675,9 @@ mod tests {
 
         assert!(b.playlist_remove("p", 99).is_err());
         assert!(b.playlist_move("p", 0, 99).is_err());
-        assert!(b.playlist_insert("p", 99, json!({"path": "/z.mp4"}), None).is_err());
+        assert!(b
+            .playlist_insert("p", 99, json!({"path": "/z.mp4"}), None)
+            .is_err());
     }
 
     #[test]

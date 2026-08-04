@@ -56,6 +56,8 @@ pub enum ThreadMsg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComposeMsg {
+    /// Live unsent text from the retained per-thread ChatArea composer.
+    DraftChanged(String),
     SendRequested(String),
     StopRequested,
     #[allow(dead_code)]
@@ -180,9 +182,16 @@ pub enum SettingsMsg {
         agent_id: String,
     },
     DevModeToggled(bool),
+    /// Full typed create, from the settings form's transport-picker/args/
+    /// env/headers/timeout/oauth fields (`mcp_servers_view.slint`'s
+    /// `mcp-server-submit` callback with `is_edit: false`).
     McpServerCreate {
-        name: String,
-        command: String,
+        entry: crate::protocol_types::McpServerEntry,
+    },
+    /// Same form, `is_edit: true` -- updates the already-existing entry
+    /// named `entry.name` instead of creating a new one.
+    McpServerUpdate {
+        entry: crate::protocol_types::McpServerEntry,
     },
     McpServerDelete {
         name: String,
@@ -191,9 +200,14 @@ pub enum SettingsMsg {
         name: String,
         enabled: bool,
     },
-    /// OAuth / auth Connect for a remote MCP server. Persists registry-side
-    /// auth flags via `mcp_servers/update` (no separate authenticate RPC).
+    /// Begins the real MCP OAuth 2.1 flow (`mcp_servers/authenticate`)
+    /// and opens the returned authorization URL in a browser -- see
+    /// `PanelSingleton::dispatch_mcp_server_authenticate`'s doc comment.
     McpServerAuthenticate {
+        name: String,
+    },
+    /// Forgets a server's OAuth token (`mcp_servers/logout`).
+    McpServerLogout {
         name: String,
     },
     /// Per-tool enable toggle on one MCP server entry (persisted in the
@@ -202,6 +216,19 @@ pub enum SettingsMsg {
         server_name: String,
         tool_name: String,
         enabled: bool,
+    },
+    /// Per-tool deferred (lazy-load) toggle -- same persisted `tools`
+    /// JSON array as [`SettingsMsg::McpServerToolEnabledChanged`].
+    McpServerToolDeferredChanged {
+        server_name: String,
+        tool_name: String,
+        deferred: bool,
+    },
+    /// "Fetch tools" / "Refresh tools" button on one MCP server row --
+    /// kicks off a real `mcp_servers/tools_fetch` background probe (see
+    /// `acpx_core::router::Router::spawn_mcp_tools_fetch`'s doc comment).
+    McpServerToolsFetchRequested {
+        server_name: String,
     },
     ProfileCreate {
         name: String,
@@ -234,6 +261,9 @@ pub struct SettingsSaveInput {
     pub selected_thread_id: Option<String>,
     pub background_override_set: bool,
     pub background_override: bool,
+    // Genuinely dual-tier like `background_default` above -- see
+    // `settings_file::SettingsDocument::show_global_skills`'s doc comment.
+    pub show_global_skills: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,6 +307,7 @@ pub enum ChromeMsg {
         text: String,
     },
     ErrorBannerDismissed,
+    CompleteOnboarding,
 }
 
 /// Direct C++ -> Rust FFI entry points that mutate panel state and are *not*
@@ -343,6 +374,14 @@ pub struct FrameInput {
     pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
     /// Agent ids whose install/enablement RPC is still in flight.
     pub agent_operations_in_flight: Vec<String>,
+    /// MCP server actions ("<action>:<server-name>") whose RPC is still
+    /// in flight -- see `AgentBridge::mcp_operations_in_flight`'s doc
+    /// comment.
+    pub mcp_operations_in_flight: Vec<String>,
+    /// Remote session ids with a Settings > Agents "Attach" `session/
+    /// load` still in flight -- see `AgentBridge::recover_session_
+    /// operations_in_flight`'s doc comment.
+    pub recover_session_operations_in_flight: Vec<String>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
     /// PISO-8 (project-isolation-mlt-binding plan): true at most once
     /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors
@@ -389,6 +428,7 @@ pub struct SettingsGatewaySnapshot {
     pub profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub agents_fetched: bool,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
 }
@@ -404,6 +444,7 @@ pub struct SettingsPreferencesSnapshot {
     pub dev_mode: bool,
     pub background_override_set: bool,
     pub background_override: bool,
+    pub show_global_skills: bool,
 }
 
 /// Read-only bridge data collected for the currently displayed thread during

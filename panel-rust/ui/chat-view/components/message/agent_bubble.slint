@@ -4,6 +4,7 @@ import { MessageItem } from "../../../types.slint";
 import { MarkdownView } from "../../../base/markdown_view.slint";
 import { CollapseExpand } from "../../../base/collapse_expand.slint";
 import { HoverSurface } from "../../../base/hover.slint";
+import { TextPillButton } from "../../../base/text_pill_button.slint";
 
 // Agent / thinking bubble — chat-items-redesign.md #3 / #10.
 // Agent: elevated fill, no label, 3-corner radius (bottom-left cut).
@@ -19,6 +20,19 @@ export component AgentBubble inherits Rectangle {
     // thinking rows; agent rows ignore it.
     callback toggle-expanded(int);
     callback copy-message(string);
+    // Edge-triggered commands fan out to the selectable message surfaces.
+    property <int> focus-selection-command: 0;
+    property <int> select-all-command: 0;
+    // Copy/Select/Select all row is not ready for general use yet -- hidden
+    // behind the same BETA_MODE gate used elsewhere this session (see
+    // `beta_mode_enabled()` in src/lib.rs). Additive: doesn't replace the
+    // pre-existing `is-agent` condition below, just ANDs onto it.
+    in property <bool> beta-mode-enabled: false;
+
+    // Keep the rendered row discoverable in the live Slint MCP tree so
+    // thread-switch tests can distinguish A's and B's visible messages.
+    accessible-role: text;
+    accessible-label: item.text;
 
     property <bool> is-thinking: item.kind == "thinking";
     property <bool> is-agent: item.kind == "agent";
@@ -59,17 +73,13 @@ export component AgentBubble inherits Rectangle {
         padding: (is-thinking || is-pending) ? Metrics.space-2 : Metrics.space-4;
         spacing: (is-thinking || is-pending) ? Metrics.space-2 : 0px;
 
-                if is-pending : HorizontalLayout {
+                // "Agent is working..." text hidden by request -- the
+        // pending row itself (and its transparent/borderless styling
+        // above) stays, so layout/spacing during the pending state is
+        // unchanged; it now just renders no visible label.
+        if is-pending : HorizontalLayout {
             padding: Metrics.space-2;
             spacing: Metrics.space-2;
-            Text {
-                text: "Agent is working...";
-                color: Theme.text-muted;
-                font-size: 11px * Theme.font-scale;
-                font-family: Theme.font-sans;
-                font-italic: true;
-                vertical-alignment: center;
-            }
         }
 
         // Thinking header — always visible; click toggles the body.
@@ -147,8 +157,11 @@ export component AgentBubble inherits Rectangle {
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
+                blocks: item.markdown-blocks;
                 lines: item.markdown-lines;
                 fallback-text: item.text;
+                focus-selection-command: root.focus-selection-command;
+                select-all-command: root.select-all-command;
             }
         }
 
@@ -168,32 +181,37 @@ export component AgentBubble inherits Rectangle {
                     horizontal-stretch: 1;
                     preferred-width: 0px;
                     min-width: 0px;
+                    blocks: item.markdown-blocks;
                     lines: item.markdown-lines;
                     fallback-text: item.text;
+                    focus-selection-command: root.focus-selection-command;
+                    select-all-command: root.select-all-command;
                 }
             }
         }
         }
-        if is-agent : VerticalLayout {
+        if is-agent && root.beta-mode-enabled : VerticalLayout {
             padding-right: Metrics.space-3;
             alignment: end;
             padding-top: Metrics.space-2;
             vertical-stretch: 0;
-            TouchArea {
-                accessible-role: button;
-                accessible-label: "Copy message text";
-                accessible-action-default => { self.clicked(); }
-                width: 20px;
-                height: 20px;
-                mouse-cursor: pointer;
+            spacing: Metrics.space-1;
+            TextPillButton {
+                label: "Copy";
                 clicked => { root.copy-message(item.text); }
-                Text {
-                    text: "📋";
-                    font-size: 12px;
-                    width: 100%;
-                    height: 100%;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
+            }
+            TextPillButton {
+                label: "Select";
+                clicked => { root.focus-selection-command += 1; }
+            }
+            TextPillButton {
+                label: "Select all";
+                clicked => {
+                    root.select-all-command += 1;
+                    // The block StyledText path has no native selection
+                    // widget yet; copying here still makes Select all useful
+                    // for those messages while the line path highlights.
+                    root.copy-message(item.text);
                 }
             }
         }

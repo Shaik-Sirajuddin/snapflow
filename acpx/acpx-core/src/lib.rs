@@ -13,8 +13,10 @@ pub mod interaction;
 pub mod keystore;
 pub mod launch;
 pub mod lifecycle;
+pub mod mcp_client;
 pub mod mcp_servers;
 pub mod notify;
+pub mod oauth;
 pub mod persistence;
 pub mod profile;
 pub mod provider;
@@ -22,7 +24,7 @@ pub mod router;
 pub mod session_registry;
 
 pub use admin::{AdminError, AdminOps};
-pub use agent_relay::AgentRequestHub;
+pub use agent_relay::{fresh_client_id, AgentRequestHub};
 pub use agent_state::AgentEnablement;
 pub use bridge_sessions::{
     BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
@@ -35,7 +37,10 @@ pub use interaction::{
 };
 pub use lifecycle::LifecycleConfig;
 pub use notify::{NotificationHub, ResumeCursor, StreamResumeState, SubscribeError};
-pub use persistence::{PersistenceError, PersistenceStore, RecoveryStatusCounts, SessionRecord};
+pub use persistence::{
+    PersistenceError, PersistenceStore, QueueHub, QueueStore, RecoveryStatusCounts, SessionRecord,
+    TranscriptStore,
+};
 pub use router::{
     recover_open_sessions_shared, LifecycleReapReport, MethodClass, Router, StartupRecoveryPolicy,
     StartupRecoveryReport,

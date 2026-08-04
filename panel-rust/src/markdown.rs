@@ -119,6 +119,354 @@ fn parser_options() -> Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES
 }
 
+/// Architecture v2 (markdown-thread-freeze-fix phase 3, see
+/// memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+/// "Architecture v2" section): what kind of leaf a [`MarkdownBlockSpan`]
+/// is, and the data needed to render it. Unlike [`BlockAst`]/[`Block`]
+/// above (which extract styled `Run`s and get wrapped by `wrap_runs`),
+/// this carries no extracted styling at all -- `Text`'s `source_range`
+/// is handed directly to Slint's `StyledText::from_markdown`, which
+/// parses inline styling and wraps itself, so there is nothing for Rust
+/// to extract here beyond block boundaries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BlockSpanKind {
+    /// Heading/paragraph/list-item/blockquote text -- one `StyledText`.
+    Text,
+    /// One fenced/indented code block -- rendered verbatim through the
+    /// existing `TerminalLogBlock` path, never markdown-reinterpreted.
+    /// Carries the already-extracted body text (fence delimiters and
+    /// info string stripped, same `Event::Text`-only extraction
+    /// `parse_one_block`'s `Tag::CodeBlock` arm above uses) rather than
+    /// a raw byte range, since the raw range includes the fence markers
+    /// themselves (` ``` `) which are not part of the displayed code.
+    Code(String),
+    /// A table: row-major cell byte ranges plus the column count, so the
+    /// Slint side can lay out a real grid instead of today's flat
+    /// pipe-joined string.
+    Table {
+        cells: Vec<Range<usize>>,
+        col_count: usize,
+    },
+    /// Thematic break (`---`).
+    Rule,
+}
+
+/// One markdown block's structural span: which kind it is, its raw byte
+/// range in the original source (fed to `StyledText::from_markdown`
+/// as-is for `Text`/`Table` cells -- no re-serialization, since the
+/// source slice is already valid markdown for that block), its heading
+/// level if it's a heading (`StyledText.default-font-size` is set from
+/// this, not baked into any wrap math), and its container nesting depth
+/// (blockquote/list indent).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkdownBlockSpan {
+    pub kind: BlockSpanKind,
+    pub source_range: Range<usize>,
+    pub heading_level: Option<u8>,
+    pub indent: u8,
+}
+
+/// Closes unterminated `<u>`/`<font ...>` HTML tags so `StyledText::
+/// from_markdown` never fails on the actively-streaming tail block.
+/// Spike-confirmed (see the plan doc's "Spike-tested and corrected"
+/// note): CommonMark emphasis/code/link markers (`**`, `*`, `` ` ``,
+/// `[...]`) already degrade to literal text gracefully on their own when
+/// left unterminated -- only these two HTML tags hard-error
+/// (`StyledTextParseErrorKind::UnterminatedTag`), so this only needs to
+/// track those, not a general markdown-balance stack. Only ever called
+/// on the single actively-streaming tail block; every other (closed)
+/// block is already well-formed source text.
+pub fn heal_open_markers(partial: &str) -> String {
+    let mut open_tags: Vec<&'static str> = Vec::new();
+    let bytes = partial.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if partial[i..].starts_with("<u>") {
+                open_tags.push("</u>");
+                i += 3;
+                continue;
+            }
+            if partial[i..].starts_with("<font") {
+                if let Some(close) = partial[i..].find('>') {
+                    open_tags.push("</font>");
+                    i += close + 1;
+                    continue;
+                }
+                // `<font` opened but its own `>` hasn't streamed in yet --
+                // drop the dangling partial tag rather than guess at
+                // attributes; the closing `</font>` push above only
+                // fires once the opening tag itself is fully seen.
+                return format!(
+                    "{}{}",
+                    &partial[..i],
+                    open_tags.into_iter().rev().collect::<String>()
+                );
+            }
+            if partial[i..].starts_with("</u>") {
+                if open_tags.last() == Some(&"</u>") {
+                    open_tags.pop();
+                }
+                i += 4;
+                continue;
+            }
+            if partial[i..].starts_with("</font>") {
+                if open_tags.last() == Some(&"</font>") {
+                    open_tags.pop();
+                }
+                i += 7;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if open_tags.is_empty() {
+        partial.to_string()
+    } else {
+        let mut healed = String::with_capacity(partial.len() + open_tags.len() * 7);
+        healed.push_str(partial);
+        for tag in open_tags.into_iter().rev() {
+            healed.push_str(tag);
+        }
+        healed
+    }
+}
+
+/// Segments `source` into top-level block spans without extracting any
+/// inline styling -- the block-structure-only half of Architecture v2.
+/// Nested list/blockquote content is flattened to `Text` spans tagged
+/// with `indent` (matching `BlockAst`'s block-kind set) rather than kept
+/// as a recursive tree, since `StyledText` needs only a flat sequence of
+/// leaf blocks to render, not a tree.
+pub fn segment_blocks(source: &str) -> Vec<MarkdownBlockSpan> {
+    let parser = Parser::new_ext(source, parser_options());
+    let events: Vec<(Event, Range<usize>)> = parser.into_offset_iter().collect();
+    let mut spans = Vec::new();
+    segment_events(&events, 0, events.len(), 0, &mut spans);
+    spans
+}
+
+/// Walks `events[start..end]` at nesting `indent`, appending each
+/// top-level-at-this-depth block's span to `out`. Recurses one level
+/// deeper for blockquote/list contents (same depth-tracking idea as
+/// `parse_one_block`'s recursion above, but flat output instead of a
+/// tree).
+fn segment_events(
+    events: &[(Event, Range<usize>)],
+    start: usize,
+    end: usize,
+    indent: u8,
+    out: &mut Vec<MarkdownBlockSpan>,
+) {
+    let mut i = start;
+    while i < end {
+        let (event, range) = &events[i];
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let level = *level;
+                let mut j = i + 1;
+                while !matches!(&events[j].0, Event::End(TagEnd::Heading(_))) {
+                    j += 1;
+                }
+                out.push(MarkdownBlockSpan {
+                    kind: BlockSpanKind::Text,
+                    source_range: range.start..events[j].1.end,
+                    heading_level: Some(level as u8),
+                    indent,
+                });
+                i = j + 1;
+            }
+            Event::Start(Tag::Paragraph) => {
+                let mut j = i + 1;
+                while !matches!(&events[j].0, Event::End(TagEnd::Paragraph)) {
+                    j += 1;
+                }
+                out.push(MarkdownBlockSpan {
+                    kind: BlockSpanKind::Text,
+                    source_range: range.start..events[j].1.end,
+                    heading_level: None,
+                    indent,
+                });
+                i = j + 1;
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                let mut body = String::new();
+                let mut j = i + 1;
+                while !matches!(&events[j].0, Event::End(TagEnd::CodeBlock)) {
+                    if let Event::Text(t) = &events[j].0 {
+                        body.push_str(t);
+                    }
+                    j += 1;
+                }
+                // A fenced block's content always ends with a newline
+                // before the closing fence -- same trailing-newline trim
+                // `parse_one_block`'s `Tag::CodeBlock` arm above does.
+                if body.ends_with('\n') {
+                    body.pop();
+                }
+                out.push(MarkdownBlockSpan {
+                    kind: BlockSpanKind::Code(body),
+                    source_range: range.start..events[j].1.end,
+                    heading_level: None,
+                    indent,
+                });
+                i = j + 1;
+            }
+            Event::Rule => {
+                out.push(MarkdownBlockSpan {
+                    kind: BlockSpanKind::Rule,
+                    source_range: range.clone(),
+                    heading_level: None,
+                    indent,
+                });
+                i += 1;
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                let mut depth = 1;
+                let mut j = i + 1;
+                let inner_start = j;
+                while depth > 0 {
+                    match &events[j].0 {
+                        Event::Start(Tag::BlockQuote(_)) => depth += 1,
+                        Event::End(TagEnd::BlockQuote(_)) => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                segment_events(events, inner_start, j - 1, indent + 1, out);
+                i = j;
+            }
+            Event::Start(Tag::List(_)) => {
+                let mut depth = 1;
+                let mut j = i + 1;
+                let list_end;
+                while depth > 0 {
+                    match &events[j].0 {
+                        Event::Start(Tag::List(_)) => depth += 1,
+                        Event::End(TagEnd::List(_)) => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                list_end = j - 1;
+                // Each `Item` needs its own walk, not a blanket recurse
+                // over the whole list body: a *tight* list (`- one\n- two`,
+                // the common case) emits inline events (`Event::Text`,
+                // `Event::Start(Tag::Emphasis)`, ...) directly under
+                // `Item` with **no** `Tag::Paragraph` wrapper at all --
+                // pulldown-cmark only wraps item content in `Paragraph`
+                // for a *loose* list (items separated by a blank line).
+                // Recursing blindly (as this used to) meant tight-list
+                // items fell through the `_ => i += 1` catch-all doing
+                // nothing, silently dropping every tight list's content.
+                let mut k = i + 1;
+                while k < list_end {
+                    match &events[k].0 {
+                        Event::Start(Tag::Item) => {
+                            let item_start = k + 1;
+                            let mut item_depth = 1;
+                            let mut m = item_start;
+                            while item_depth > 0 {
+                                match &events[m].0 {
+                                    Event::Start(Tag::Item) => item_depth += 1,
+                                    Event::End(TagEnd::Item) => item_depth -= 1,
+                                    _ => {}
+                                }
+                                m += 1;
+                            }
+                            let item_end = m - 1;
+                            let has_block_child =
+                                events[item_start..item_end].iter().any(|(e, _)| {
+                                    matches!(
+                                        e,
+                                        Event::Start(Tag::Paragraph)
+                                            | Event::Start(Tag::List(_))
+                                            | Event::Start(Tag::CodeBlock(_))
+                                            | Event::Start(Tag::BlockQuote(_))
+                                            | Event::Start(Tag::Table(_))
+                                    )
+                                });
+                            if has_block_child {
+                                segment_events(events, item_start, item_end, indent + 1, out);
+                            } else if item_start < item_end {
+                                // Tight item: no Paragraph wrapper: the
+                                // item's own Start/End range *is* the
+                                // text span.
+                                out.push(MarkdownBlockSpan {
+                                    kind: BlockSpanKind::Text,
+                                    // `events[item_start]` (the item's
+                                    // first inline content event), not
+                                    // `events[k]` (the `Item` container
+                                    // itself, whose own range starts at
+                                    // the bullet marker `- `) -- matches
+                                    // a Paragraph-wrapped item's range,
+                                    // which likewise excludes the marker.
+                                    source_range: events[item_start].1.start
+                                        ..events[item_end].1.end,
+                                    heading_level: None,
+                                    indent: indent + 1,
+                                });
+                            }
+                            k = m;
+                        }
+                        _ => k += 1,
+                    }
+                }
+                i = j;
+            }
+            Event::Start(Tag::Table(_)) => {
+                let mut cells = Vec::new();
+                let mut col_count = 0;
+                let mut j = i + 1;
+                loop {
+                    match &events[j].0 {
+                        Event::End(TagEnd::Table) => {
+                            j += 1;
+                            break;
+                        }
+                        Event::Start(Tag::TableRow) | Event::Start(Tag::TableHead) => {
+                            let mut row_len = 0;
+                            let mut k = j + 1;
+                            loop {
+                                match &events[k].0 {
+                                    Event::End(TagEnd::TableRow)
+                                    | Event::End(TagEnd::TableHead) => {
+                                        k += 1;
+                                        break;
+                                    }
+                                    Event::Start(Tag::TableCell) => {
+                                        let cell_start = events[k].1.start;
+                                        let mut m = k + 1;
+                                        while !matches!(&events[m].0, Event::End(TagEnd::TableCell))
+                                        {
+                                            m += 1;
+                                        }
+                                        cells.push(cell_start..events[m].1.end);
+                                        row_len += 1;
+                                        k = m + 1;
+                                    }
+                                    _ => k += 1,
+                                }
+                            }
+                            col_count = col_count.max(row_len);
+                            j = k;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                out.push(MarkdownBlockSpan {
+                    kind: BlockSpanKind::Table { cells, col_count },
+                    source_range: range.start..events[j - 1].1.end,
+                    heading_level: None,
+                    indent,
+                });
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 /// Parse `source` into its top-level blocks, each tagged with the byte
 /// range it spans. Nested content (list items, blockquotes) is parsed
 /// recursively into the same [`BlockAst`] shape.
@@ -233,10 +581,44 @@ fn parse_one_block(events: &[(Event, Range<usize>)], i: usize) -> (BlockAst, usi
                                     k += 1;
                                     break;
                                 }
-                                _ => {
+                                Event::Start(Tag::Paragraph)
+                                | Event::Start(Tag::Heading { .. })
+                                | Event::Start(Tag::CodeBlock(_))
+                                | Event::Start(Tag::BlockQuote(_))
+                                | Event::Start(Tag::List(_))
+                                | Event::Start(Tag::Table(_))
+                                | Event::Rule => {
                                     let (ast, next_k, _) = parse_one_block(events, k);
                                     item_blocks.push(ast);
                                     k = next_k;
+                                }
+                                _ => {
+                                    // "Tight" list items (the common case --
+                                    // any list without a blank line between
+                                    // items) have their content emitted as
+                                    // bare inline events (Text, Code,
+                                    // Strong/Emphasis/Link start+end,
+                                    // SoftBreak, ...) with no `Tag::Paragraph`
+                                    // wrapper -- CommonMark drops the <p> for
+                                    // tight lists. Falling through to
+                                    // `parse_one_block` per individual event
+                                    // hit its generic leaf fallback, which
+                                    // treated the Link's Start/Text/End as
+                                    // three separate one-run "paragraphs":
+                                    // the Start/End produced empty-text
+                                    // lines (the "dual/triple line" bug) and
+                                    // the Text event lost `link_stack`
+                                    // context entirely (the "no href inside
+                                    // bullets" bug), since only
+                                    // `collect_inline_runs` tracks that
+                                    // stack. Collect the whole inline run as
+                                    // one paragraph instead, exactly like a
+                                    // top-level paragraph does.
+                                    let (runs, next_k, _) =
+                                        collect_inline_runs(events, k, TagEnd::Item);
+                                    item_blocks.push(BlockAst::Paragraph(runs));
+                                    k = next_k;
+                                    break;
                                 }
                             }
                         }
@@ -751,6 +1133,31 @@ mod tests {
     }
 
     #[test]
+    fn tight_list_item_with_link_stays_one_line_and_keeps_href() {
+        // Regression test: tight (no-blank-line) list items have their
+        // content emitted by pulldown-cmark as bare inline events with no
+        // `Tag::Paragraph` wrapper. Before the fix, the per-event fallback
+        // in the list-item parser split a link item into three lines
+        // (empty / text-without-link / empty) instead of one `ListItem`
+        // line carrying the href.
+        let lines = render_document("- [click me](https://example.com/x)\n", DEFAULT_WRAP_COLS);
+        assert_eq!(lines.len(), 1, "expected a single line, got {:?}", lines);
+        assert_eq!(lines[0].kind, LineKind::ListItem);
+        assert_eq!(lines[0].runs.len(), 1);
+        assert_eq!(lines[0].runs[0].text, "click me");
+        assert_eq!(lines[0].runs[0].link, "https://example.com/x");
+    }
+
+    #[test]
+    fn tight_list_item_with_bold_stays_one_line() {
+        let lines = render_document("- **bold** and plain\n", DEFAULT_WRAP_COLS);
+        assert_eq!(lines.len(), 1, "expected a single line, got {:?}", lines);
+        assert_eq!(lines[0].kind, LineKind::ListItem);
+        assert!(lines[0].runs.iter().any(|r| r.bold && r.text == "bold"));
+        assert_eq!(texts(&lines), vec!["bold and plain"]);
+    }
+
+    #[test]
     fn ordered_list_ordinals() {
         let lines = render_document("1. first\n2. second\n", DEFAULT_WRAP_COLS);
         assert_eq!(lines[0].ordinal, 1);
@@ -837,5 +1244,257 @@ mod tests {
     #[test]
     fn empty_source_renders_nothing() {
         assert!(render_document("", DEFAULT_WRAP_COLS).is_empty());
+    }
+
+    #[test]
+    fn built_by_sentence_with_inline_code_parses_as_normal_runs() {
+        // Regression test for a reported "one character per line" render
+        // bug in this exact sentence (parentheses, an inline code span,
+        // commas, a period). Root cause was NOT here: `collect_inline_runs`
+        // and `wrap_runs` already coalesce this text into a small number
+        // of normal, multi-character runs/lines -- confirmed both for a
+        // one-shot `render_document` call and for the same text streamed
+        // in one character at a time through `StreamingMarkdownRenderer`
+        // (which re-parses on every push). The actual bug was a
+        // `markdown_view.slint` layout issue (see
+        // `slint_component_e2e_test::
+        // agent_markdown_run_does_not_collapse_to_one_char_per_line`):
+        // the per-run `Text` cluster's `alignment: start` sized non-
+        // stretch children to their *minimum* width, and `wrap:
+        // word-wrap` let that minimum collapse toward a single glyph for
+        // every run once it was added, not just oversized ones. This test
+        // guards the parsing/wrapping side so a future regression here
+        // (e.g. `Event::Code` handling corrupting run-collection state)
+        // would still be caught even though it wasn't the culprit this
+        // time.
+        let text = "I'm Claude Sonnet 5 (model ID `claude-sonnet-5`), built by Anthropic, running here as your Claude Code agent.";
+
+        let lines = render_document(text, DEFAULT_WRAP_COLS);
+        assert!(
+            lines.len() <= 3,
+            "expected a small number of wrapped lines, not one-per-character: {:?}",
+            lines
+        );
+        for line in &lines {
+            assert!(
+                line.runs.len() <= 4,
+                "expected each line to hold a handful of coalesced runs, not \
+                 one-run-per-character: {:?}",
+                line
+            );
+            for run in &line.runs {
+                assert!(
+                    run.text.chars().count() > 1 || run.text.trim().is_empty(),
+                    "found a suspicious single-character run (would indicate the \
+                     parser itself split text into one-run-per-character): {:?}",
+                    run
+                );
+            }
+        }
+        // The inline code span survives as its own single coalesced run,
+        // not split into individual characters.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .any(|r| r.code && r.text.contains("claude-sonnet-5")),
+            "expected the inline code span to survive as one run: {:?}",
+            lines
+        );
+
+        // Same assertions hold when the identical text arrives streamed in
+        // one character at a time (the real agent-chat delivery path).
+        let mut renderer = StreamingMarkdownRenderer::new(DEFAULT_WRAP_COLS);
+        for ch in text.chars() {
+            renderer.push(&ch.to_string());
+            let streamed = renderer.render();
+            for line in &streamed {
+                assert!(
+                    line.runs.len() <= 4,
+                    "streaming produced a one-run-per-character line mid-stream: {:?}",
+                    line
+                );
+            }
+        }
+        let finished = renderer.finish();
+        assert_eq!(texts(&finished), texts(&lines));
+    }
+
+    // -- segment_blocks (Architecture v2 block segmentation) --
+
+    #[test]
+    fn segment_blocks_heading_and_paragraph_source_ranges_slice_back_to_the_original_text() {
+        let source = "# Title\n\nHello world.\n";
+        let spans = segment_blocks(source);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].heading_level, Some(1));
+        // pulldown-cmark's own byte range for a block includes its
+        // trailing newline -- trimmed downstream (models.rs's
+        // styled_text_for) before reaching StyledText::from_markdown,
+        // not here: segment_blocks reports the real span verbatim.
+        assert_eq!(source[spans[0].source_range.clone()].trim_end(), "# Title");
+        assert_eq!(spans[1].heading_level, None);
+        assert_eq!(
+            source[spans[1].source_range.clone()].trim_end(),
+            "Hello world."
+        );
+    }
+
+    #[test]
+    fn segment_blocks_code_block_is_tagged_code_not_text() {
+        let source = "```rust\nfn main() {}\n```\n";
+        let spans = segment_blocks(source);
+        assert_eq!(spans.len(), 1);
+        assert!(matches!(spans[0].kind, BlockSpanKind::Code(_)));
+    }
+
+    #[test]
+    fn segment_blocks_rule_is_its_own_span() {
+        let source = "above\n\n---\n\nbelow\n";
+        let spans = segment_blocks(source);
+        assert_eq!(spans.len(), 3);
+        assert!(matches!(spans[0].kind, BlockSpanKind::Text));
+        assert!(matches!(spans[1].kind, BlockSpanKind::Rule));
+        assert!(matches!(spans[2].kind, BlockSpanKind::Text));
+    }
+
+    #[test]
+    fn segment_blocks_list_items_flatten_to_indented_text_spans() {
+        let source = "- one\n- two\n";
+        let spans = segment_blocks(source);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            assert!(matches!(span.kind, BlockSpanKind::Text));
+            assert_eq!(span.indent, 1);
+        }
+        assert_eq!(source[spans[0].source_range.clone()].trim_end(), "one");
+        assert_eq!(source[spans[1].source_range.clone()].trim_end(), "two");
+    }
+
+    #[test]
+    fn segment_blocks_blockquote_increments_indent() {
+        let source = "> quoted text\n";
+        let spans = segment_blocks(source);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].indent, 1);
+        assert_eq!(
+            source[spans[0].source_range.clone()].trim_end(),
+            "quoted text"
+        );
+    }
+
+    #[test]
+    fn segment_blocks_table_captures_cell_ranges_and_col_count() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let spans = segment_blocks(source);
+        assert_eq!(spans.len(), 1);
+        match &spans[0].kind {
+            BlockSpanKind::Table { cells, col_count } => {
+                assert_eq!(*col_count, 2);
+                assert_eq!(cells.len(), 4); // header row (2) + body row (2)
+                                            // Cell ranges include the table syntax's padding
+                                            // whitespace around `|` delimiters (real pulldown-cmark
+                                            // behavior) -- trimmed downstream the same way block
+                                            // ranges' trailing newlines are.
+                let texts: Vec<&str> = cells.iter().map(|r| source[r.clone()].trim()).collect();
+                assert_eq!(texts, vec!["a", "b", "1", "2"]);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_blocks_empty_source_is_empty() {
+        assert!(segment_blocks("").is_empty());
+    }
+
+    #[test]
+    fn segment_blocks_matches_dev_fixture_checklist_shape() {
+        // Mirrors panel-rust/tests/dev_root.slint.template's "Markdown
+        // renderer checklist" agent message verbatim -- this proves the
+        // hand-authored markdown-blocks in that .slint fixture (which
+        // slint-viewer's --auto-reload can render but cannot compute,
+        // since it has no Rust behind it) actually matches what the
+        // real segment_blocks -> markdown_blocks_for pipeline produces
+        // for the same source text, not just something plausible-looking.
+        let source = "### Markdown renderer checklist\n\nBold **works**, italic *works*, and `inline code` works.\n\n1. ordered item\n2. second item\n\n| Col A | Col B |\n| --- | --- |\n| left | right |\n\nSee also [Slint docs](https://docs.slint.dev).";
+        let spans = segment_blocks(source);
+        let kinds: Vec<&str> = spans
+            .iter()
+            .map(|s| match &s.kind {
+                BlockSpanKind::Text => "text",
+                BlockSpanKind::Code(_) => "code",
+                BlockSpanKind::Table { .. } => "table",
+                BlockSpanKind::Rule => "rule",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["text", "text", "text", "text", "table", "text"],
+            "real segment_blocks output shape for the dev fixture's checklist source: {spans:?}"
+        );
+        assert_eq!(spans[0].heading_level, Some(3));
+        assert_eq!(
+            source[spans[2].source_range.clone()].trim_end(),
+            "ordered item"
+        );
+        assert_eq!(spans[2].indent, 1);
+        assert_eq!(
+            source[spans[3].source_range.clone()].trim_end(),
+            "second item"
+        );
+        assert_eq!(spans[3].indent, 1);
+        match &spans[4].kind {
+            BlockSpanKind::Table { cells, col_count } => {
+                assert_eq!(*col_count, 2);
+                let texts: Vec<&str> = cells.iter().map(|r| source[r.clone()].trim()).collect();
+                assert_eq!(texts, vec!["Col A", "Col B", "left", "right"]);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    // -- heal_open_markers --
+
+    #[test]
+    fn heal_open_markers_leaves_commonmark_emphasis_untouched() {
+        // Spike-confirmed: StyledText::from_markdown already degrades
+        // unterminated **/*/`/[...] to literal text gracefully on its
+        // own -- heal_open_markers must not touch these at all.
+        for partial in ["Hello **wor", "Hello *wor", "Hello `wor", "Hello [wor"] {
+            assert_eq!(heal_open_markers(partial), partial);
+        }
+    }
+
+    #[test]
+    fn heal_open_markers_closes_unterminated_u_tag() {
+        assert_eq!(heal_open_markers("Hello <u>world"), "Hello <u>world</u>");
+    }
+
+    #[test]
+    fn heal_open_markers_closes_unterminated_font_tag() {
+        assert_eq!(
+            heal_open_markers("Hello <font color=\"red\">world"),
+            "Hello <font color=\"red\">world</font>"
+        );
+    }
+
+    #[test]
+    fn heal_open_markers_closes_nested_tags_innermost_first() {
+        assert_eq!(
+            heal_open_markers("<u><font color=\"red\">text"),
+            "<u><font color=\"red\">text</font></u>"
+        );
+    }
+
+    #[test]
+    fn heal_open_markers_is_a_no_op_for_already_closed_tags() {
+        let closed = "Hello <u>world</u> and <font color=\"red\">red</font> text.";
+        assert_eq!(heal_open_markers(closed), closed);
+    }
+
+    #[test]
+    fn heal_open_markers_leaves_plain_text_unchanged() {
+        assert_eq!(heal_open_markers("just plain text"), "just plain text");
     }
 }

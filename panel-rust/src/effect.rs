@@ -83,6 +83,33 @@ pub enum Effect {
         thread_id: String,
         text: String,
     },
+    /// Records `text` into the thread's transcript as a real, permanent
+    /// user-role message -- `AgentBridge::push_local`'s exact effect, but
+    /// without also issuing a new `session/prompt` the way `SendPrompt`
+    /// does. Exists for a `server_queue` thread's auto-drain: ACPX's own
+    /// `spawn_queue_dispatcher` already sends the real prompt server-side
+    /// once the drained entry's queue row vanishes (see `update.rs`'s
+    /// `QueueChanged` handler), so nothing else ever performs the
+    /// immediate-send path's optimistic local transcript append for that
+    /// message -- this effect is that missing step.
+    RecordLocalMessage {
+        thread_id: String,
+        text: String,
+    },
+    /// Mutate the ACPX server-owned FIFO. The server broadcasts the
+    /// resulting authoritative queue projection back to every client.
+    MutateQueue {
+        real_index: usize,
+        params: serde_json::Value,
+    },
+    /// Probe a provider/profile selection without attaching a real chat
+    /// session. The bridge performs a pool acquire/release asynchronously
+    /// and reports the result through the normal frame event stream.
+    ProbeProvider {
+        real_index: usize,
+        provider: String,
+        profile_name: Option<String>,
+    },
     CancelGeneration {
         real_index: usize,
     },
@@ -128,8 +155,11 @@ pub enum Effect {
     },
     McpServerCreate {
         real_index: usize,
-        name: String,
-        command: String,
+        entry: crate::protocol_types::McpServerEntry,
+    },
+    McpServerUpdate {
+        real_index: usize,
+        entry: crate::protocol_types::McpServerEntry,
     },
     McpServerDelete {
         real_index: usize,
@@ -144,11 +174,33 @@ pub enum Effect {
         real_index: usize,
         name: String,
     },
+    McpServerLogout {
+        real_index: usize,
+        name: String,
+    },
     McpServerToolEnabledChanged {
         real_index: usize,
         server_name: String,
         tool_name: String,
         enabled: bool,
+    },
+    /// Per-tool deferred (lazy-load) flag -- mirrors `McpServerTool
+    /// EnabledChanged` exactly, same persisted `extra["tools"]` array,
+    /// different field.
+    McpServerToolDeferredChanged {
+        real_index: usize,
+        server_name: String,
+        tool_name: String,
+        deferred: bool,
+    },
+    /// Kicks off a real MCP `tools/list` probe (`mcp_servers/tools_
+    /// fetch`) for one server; the actual tool list comes back on a
+    /// later `mcp_servers/list` refresh, not from this effect's own
+    /// result -- see `PanelSingleton::dispatch_mcp_server_tools_fetch`'s
+    /// doc comment.
+    McpServerToolsFetchRequested {
+        real_index: usize,
+        server_name: String,
     },
     ProfileCreate {
         real_index: usize,
@@ -246,12 +298,92 @@ pub enum EffectResultMsg {
         provider: Option<String>,
         result: Result<String, EffectError>,
     },
+    /// mcp-servers-settings follow-up: dispatched synchronously from
+    /// `dispatch::dispatch_compose_send_maybe_attach`, in the same call
+    /// that kicks off `AgentBridge::attach_deferred_thread_with_config_
+    /// options` for a deferred thread's first message -- marks
+    /// `Model::first_attach_in_flight` before the background attach has
+    /// any chance to resolve, so the chat-view pulsing indicator can show
+    /// on the very next frame. Not a `Result` wrapper like the other
+    /// variants here (there is nothing to fail synchronously that isn't
+    /// already routed through `SessionAttached { result: Err(..) }`
+    /// immediately after this dispatch) -- purely a "this started" marker.
+    SessionAttachStarted {
+        thread_id: String,
+    },
+    /// stale-provider-switch-pulse fix: `AgentBridge::probe_provider_
+    /// selection` deliberately pushes NO `AgentEvent::ProviderProbe` at
+    /// all for a thread with no resolvable project directory (a normal,
+    /// fully-supported state -- see that method's own doc comment on why
+    /// treating it as a probe failure would be wrong: a spurious
+    /// "Provider unavailable" toast and a Send block for a reason that
+    /// has nothing to do with the provider). But `SettingsMsg::
+    /// ProfileSelected` already inserted `Model::provider_probes_in_flight`
+    /// before dispatching `Effect::ProbeProvider`, unconditionally --
+    /// the reducer has no visibility into bridge-side project state. With
+    /// no event ever coming for that no-op case, the marker (and the
+    /// "Switching provider..." pulse it drives) stayed stuck forever.
+    /// `effect_executor.rs`'s `Effect::ProbeProvider` arm dispatches this
+    /// the moment `probe_provider_selection` reports (via its bool return)
+    /// that it will never push a completion event, clearing just the
+    /// in-flight marker -- deliberately NOT touching `provider_errors`/
+    /// the toast path, unlike `AgentEvent::ProviderProbe`'s `Ok`/`Err`
+    /// arms, since no probe actually ran.
+    ProviderProbeSkipped {
+        real_index: usize,
+        provider: String,
+    },
+    /// mcp-servers-settings plan: unlike `SessionAttached { result: Err(..)
+    /// }` (a thread that already claimed a real `AgentBridge` slot failed
+    /// to open its ACP session -- the row stays and shows an error, see
+    /// that variant's fold), this is for the two lifecycle effects that
+    /// create the slot itself (`Effect::NewThreadDeferred`/
+    /// `Effect::RecoverSessionAttach`, both of which claim a `model.
+    /// threads` row up front but only push an `AgentBridge` slot on
+    /// success -- see `AgentBridge::add_thread_deferred`'s doc comment on
+    /// the `model.threads[i] <-> slots[i]` invariant). When the bridge
+    /// call fails, NO slot was ever pushed, so leaving the row in place
+    /// (the `SessionAttached` Err pattern) permanently shifts every later
+    /// real_index one off from its actual bridge slot -- e.g. a later
+    /// `ArchiveThread { real_index }` effect lands on a DIFFERENT
+    /// thread's slot than the one the user archived. The fold for this
+    /// variant removes the orphaned row instead, restoring alignment.
+    ThreadCreationFailed {
+        real_index: usize,
+        message: String,
+    },
     SkillWritten(Result<(), EffectError>),
     SkillCreated(Result<std::path::PathBuf, EffectError>),
     SkillPromoted(Result<(), EffectError>),
     ExternalEditorOpened(Result<(), EffectError>),
     OsDefaultOpened(Result<(), EffectError>),
     SkillEditorLoaded(Result<crate::model::SkillEditorState, EffectError>),
+    /// markdown-render-cache-layer plan Phase 2. Deliberate exception to
+    /// this enum's "one variant per `Effect` above" rule: the background
+    /// render worker (`markdown_worker.rs`) is spawned directly (its own
+    /// `spawn_background_render`/`_pooled` + `deliver`/`on_chunk`
+    /// callbacks), not via a `Vec<Effect>` `update()` returns for
+    /// `execute_effects` to run -- there is no matching `Effect::X`
+    /// variant to add above, and adding an `Effect` nothing ever
+    /// constructs would be misleading in the other direction. This is
+    /// still the right bucket semantically (an async operation's result
+    /// feeding back into the reducer), so it lives here rather than
+    /// inventing a fifth top-level `Msg` source (see `msg.rs`'s "four
+    /// sources" doc comment).
+    ///
+    /// `source_hash` must be produced by the exact same algorithm
+    /// `ThreadMessageIndex::content_hash_for` compares against
+    /// (`thread_message_index::hash_content`) -- see that function's
+    /// doc comment. `message_key` is a durable message key
+    /// (`models::transcript_row_key`'s format), resolved against the
+    /// target thread's own `ThreadMessageIndex` at apply time, never a
+    /// positional row index captured at spawn time.
+    MarkdownBlocksReady {
+        thread_id: String,
+        message_key: String,
+        source_hash: u64,
+        blocks: Vec<crate::models::MarkdownBlockData>,
+    },
     /// One of the 6 reactive-sync trigger call sites (create/promote/
     /// edit/agent-enable/agent-disable/thread-start) failed to propagate
     /// a skill to an attached agent -- see memory/acpx/gen/plans/
@@ -292,6 +424,22 @@ pub enum EffectResultMsg {
         thread_id: String,
         message: String,
     },
+    /// One MCP server settings operation (create/update/delete/enable-
+    /// toggle/authenticate/logout/tool-toggle) finished -- `Ok(message)`
+    /// is a ready-to-show success string, `Err` a ready-to-show failure
+    /// string. Reuses the same `show_toast`/`Dirty::Toast` popup
+    /// `EffectResultMsg::SettingsSaved` already shows for "Settings
+    /// saved"/"Settings save failed" -- this is the same shared, app-wide
+    /// action-feedback bar, not a new component, just not previously
+    /// reachable from this view's dispatch path (every MCP settings call
+    /// used to only `eprintln!` on failure, with nothing shown in the UI
+    /// at all).
+    McpServerOperationCompleted(Result<String, EffectError>),
+    /// Agent registry installation/enablement finished. Agent actions run
+    /// asynchronously because an `npx`/npm first-use warmup can take minutes;
+    /// completion must re-enter the reducer so the card spinner stops and a
+    /// terminal success/error message is visible to the user.
+    AgentOperationCompleted(Result<String, EffectError>),
     /// PISO-8: result of `Effect::RefreshDaemonProjectInstances`. `Err`
     /// (daemon unreachable, `snapshotd` binary missing, malformed
     /// output, ...) is a best-effort miss, not a user-facing error --

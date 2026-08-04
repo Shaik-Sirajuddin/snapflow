@@ -49,6 +49,23 @@ pub fn resolve_editor_bin(bin: &str) -> Option<PathBuf> {
 fn which_binary(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var).find_map(|dir| {
+        #[cfg(windows)]
+        {
+            // On Windows, `EDITOR_CANDIDATES`' CLI entrypoints are
+            // typically batch-script stubs, not bare PE executables --
+            // VS Code's own installer ships `code.cmd` (and `code.exe` is
+            // NOT what's on `PATH`; see the official VS Code Windows
+            // install layout: `<install>\bin\code.cmd`). A plain
+            // `dir.join(bin)` with no extension never matches that file,
+            // so probe the extensions a `.cmd`/`.bat` launcher can take,
+            // in the same order `PATHEXT` conventionally resolves them.
+            for ext in ["cmd", "bat", "exe"] {
+                let candidate = dir.join(format!("{bin}.{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
         let candidate = dir.join(bin);
         candidate.is_file().then_some(candidate)
     })
@@ -80,6 +97,47 @@ fn well_known_editor_paths(bin: &str) -> Vec<PathBuf> {
         }
         _ => {}
     }
+    // Windows install locations. VS Code's real Windows CLI entrypoint is
+    // `bin\code.cmd` under its install root (both the per-user default
+    // install under `%LOCALAPPDATA%\Programs` and an all-users install
+    // under `%ProgramFiles%` ship it that way) -- a batch-script stub, not
+    // a directly-executable `code.exe`. Sublime Text's Windows CLI helper
+    // (`subl.exe`) IS a real PE binary at its install root, so no `.cmd`
+    // handling is needed for it.
+    #[cfg(windows)]
+    {
+        match bin {
+            "code" => {
+                if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+                    paths.push(
+                        Path::new(&local_app_data)
+                            .join("Programs")
+                            .join("Microsoft VS Code")
+                            .join("bin")
+                            .join("code.cmd"),
+                    );
+                }
+                for program_files in ["ProgramFiles", "ProgramFiles(x86)"] {
+                    if let Some(dir) = std::env::var_os(program_files) {
+                        paths.push(
+                            Path::new(&dir)
+                                .join("Microsoft VS Code")
+                                .join("bin")
+                                .join("code.cmd"),
+                        );
+                    }
+                }
+            }
+            "subl" => {
+                for program_files in ["ProgramFiles", "ProgramFiles(x86)"] {
+                    if let Some(dir) = std::env::var_os(program_files) {
+                        paths.push(Path::new(&dir).join("Sublime Text").join("subl.exe"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     paths
 }
 
@@ -91,6 +149,60 @@ fn well_known_editor_paths(bin: &str) -> Vec<PathBuf> {
 /// name for `PATH`-based resolution.
 pub fn open_in_editor(bin: &str, path: &Path) -> std::io::Result<()> {
     let program = resolve_editor_bin(bin).unwrap_or_else(|| PathBuf::from(bin));
+    spawn_editor_command(&program, path)?;
+    Ok(())
+}
+
+/// Spawns `program path`, routing through `cmd /C` on Windows when
+/// `program` is (or resolves to) a `.cmd`/`.bat` launcher stub.
+///
+/// This is the actual fix for the reported "Open VSCode" `os error 193,
+/// not a valid win application" bug: on Windows, VS Code's real CLI
+/// entrypoint is `code.cmd` (a batch-script wrapper around the actual
+/// Electron binary), not a directly-executable PE file -- see the official
+/// install layout (`well_known_editor_paths`'s Windows branch above, and
+/// `%LOCALAPPDATA%\Programs\Microsoft VS Code\bin\code.cmd` in a normal
+/// per-user install). `std::process::Command::spawn` calls `CreateProcessW`
+/// directly, bypassing `cmd.exe`'s own `.cmd`/`.bat` script-launcher
+/// handling; asking it to execute a `.cmd` file as if it were a PE binary
+/// fails with `ERROR_BAD_EXE_FORMAT` (os error 193, "not a valid Win32
+/// application"). This is the same well-known Rust/Windows gotcha as
+/// spawning `npm`/`npx` bare (see rust-lang/rust#37519 and the standard
+/// `cmd /C <tool> <args>` workaround for any Node-style `.cmd`-launched
+/// CLI). Gated behind `cfg(windows)` so Unix behavior -- where `code` is a
+/// real executable or a plain shell script that direct-spawns fine -- is
+/// unchanged.
+///
+/// NOTE ON VERIFICATION: there is no Windows machine available in this
+/// environment to empirically spawn a real `code.cmd` and confirm this
+/// resolves the reported error. This fix is based on: (1) the exact
+/// Windows error code/message quoted in the bug report matching
+/// `ERROR_BAD_EXE_FORMAT` precisely, (2) VS Code's Windows CLI entrypoint
+/// being a documented, well-established `.cmd` stub (not something
+/// guessed at), and (3) `cmd /C` being the standard, widely-documented
+/// Rust workaround for this exact class of bug. It has not been run
+/// against a real Windows install.
+#[cfg(windows)]
+fn spawn_editor_command(program: &Path, path: &Path) -> std::io::Result<()> {
+    let is_script_launcher = program
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+        .unwrap_or(false);
+    if is_script_launcher {
+        Command::new("cmd")
+            .arg("/C")
+            .arg(program)
+            .arg(path)
+            .spawn()?;
+    } else {
+        Command::new(program).arg(path).spawn()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_editor_command(program: &Path, path: &Path) -> std::io::Result<()> {
     Command::new(program).arg(path).spawn()?;
     Ok(())
 }

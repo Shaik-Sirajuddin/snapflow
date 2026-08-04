@@ -2,6 +2,8 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Button } from "../../../base/button.slint";
 import { Toggle } from "../../../base/toggle.slint";
+import { SettingsSearchBar } from "../components/search_bar.slint";
+import { TextUtil } from "../../../base/text_util.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
 import { SkillOption } from "../../../types.slint";
@@ -14,13 +16,29 @@ import { SkillOption } from "../../../types.slint";
 // (`skills-management`'s "make global button", "show project_start
 // skills include global started_from").
 export component SkillsView inherits Rectangle {
+    // settings_scope_visibility_gate: "project" | "global", mirrored from
+    // SettingsPage.scope. Only `dev-mode` below is gated by it -- it's
+    // deliberately Global-tier only (see
+    // `settings_file::SettingsDocument::dev_mode`'s doc comment,
+    // bypassing the generic Project-overrides-Global merge entirely), so
+    // editing it under Project today silently wrote/read the same single
+    // global value with no project-scoped effect. The skill list itself
+    // is unrelated to this gate and stays as-is.
+    in property <string> scope: "project";
     in property <[SkillOption]> skills: [];
+    in-out property <string> page-search-query: "";
+    out property <bool> search-has-focus: skill-search-bar.input-has-focus;
     // Page-level toggle: hide the global-scope rows so a long list of
     // shared global skills doesn't drown out a project's own few local
     // ones (`skills-management`'s "a toggle to show Global Skills or
-    // not"). UI-only local state -- no round trip needed, this is a
-    // pure client-side list filter.
-    property <bool> show-global-skills: true;
+    // not"). Genuinely dual-tier (settings-scoping bug report fix): was
+    // previously component-local Slint state only -- no round trip at
+    // all, in either scope -- which is why toggling it looked identical
+    // regardless of the Project/Global scope tab. Now forwarded
+    // two-way (`<=>`) from `SettingsPage`/`app.slint` down to here, and
+    // persisted per-scope exactly like `background-default`, via
+    // `settings_file::SettingsDocument::show_global_skills`.
+    in-out property <bool> show-global-skills: true;
     callback skill-promote-to-global(string /* path */);
     // `dev-mode` task's "Dev mode option for the system" -- Global-tier
     // only (see `settings_file::SettingsDocument::dev_mode`'s doc
@@ -36,7 +54,14 @@ export component SkillsView inherits Rectangle {
     content := SettingsSection {
         width: parent.width;
 
-        SettingsSectionHeader { text: "Skills"; }
+        SettingsSectionHeader { text: "Config"; }
+
+        skill-search-bar := SettingsSearchBar {
+            width: parent.width;
+            placeholder: "Search skills...";
+            bar-accessible-label: "Search skills";
+            query <=> root.page-search-query;
+        }
 
         SettingsRow {
             label: "Show global skills";
@@ -47,7 +72,7 @@ export component SkillsView inherits Rectangle {
             }
         }
 
-        SettingsRow {
+        if root.scope == "global" : SettingsRow {
             label: "Dev mode";
             Toggle {
                 checked: root.dev-mode;
@@ -60,14 +85,27 @@ export component SkillsView inherits Rectangle {
             width: parent.width;
 
             for skill in root.skills : SettingsRow {
-                property <bool> row-visible: skill.scope != "global" || root.show-global-skills;
+                // `dev-mode` filter (dev-mode-off-resync fix): a
+                // dev-mode-only skill (the bundled placeholder
+                // `ensure_bundled_global_skill` installs) stays on disk
+                // after dev-mode is turned off, but must drop out of the
+                // visible list immediately -- this binding re-evaluates
+                // on every `root.dev-mode` change same as the existing
+                // `show-global-skills` gate below, so toggling dev-mode
+                // reactively re-filters without needing a reload.
+                property <bool> row-visible: (skill.scope != "global" || root.show-global-skills) && (!skill.is-dev-only || root.dev-mode);
+                property <bool> matches-search: TextUtil.matches-filter(
+                    skill.name + "\n" + skill.description + "\n" + skill.scope,
+                    root.page-search-query,
+                );
                 width: parent.width;
                 // No conditional-instantiation of a `for` template item in
                 // Slint (`if` can't follow `:` after a `for` binding) --
                 // collapse to zero height + invisible instead of a nested
                 // `if`, same effect as not rendering the row at all.
-                height: row-visible ? self.row-height + (self.hint == "" ? 0px : 12px) : 0px;
-                visible: row-visible;
+                height: row-visible && matches-search
+                    ? self.row-height + (self.hint == "" ? 0px : 12px) : 0px;
+                visible: row-visible && matches-search;
                 clip: true;
                 label: skill.name;
                 label-font-family: Theme.font-mono;

@@ -60,22 +60,22 @@
 use crate::conversation::ConversationState;
 use crate::gateway_actor::{
     spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_delayed_gateway_and_pool,
-    spawn_acpx_thread_with_gateway, spawn_acpx_thread_with_gateway_and_pool,
     AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
-    JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
+    JsonlStore, MessagePage, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
 };
 use crate::protocol_types::{
     AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
     TerminalCreatedEvent, TerminalOutputEvent,
 };
+use crate::state_store::PanelStateStore;
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,6 +105,10 @@ pub struct BridgeEvent {
 /// position, so restoring a subset of threads cannot silently switch agents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadSpec {
+    /// Stable PanelStateStore identity. `None` is reserved for legacy/test
+    /// constructors; production restore always supplies this so a renamed
+    /// thread cannot be split into a synthetic slug and a durable row.
+    pub thread_id: Option<String>,
     pub display_name: String,
     pub provider: String,
     pub session_id: Option<String>,
@@ -143,6 +147,7 @@ fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
     thread_names
         .iter()
         .map(|name| ThreadSpec {
+            thread_id: None,
             display_name: (*name).to_owned(),
             provider: NO_PROVIDER_REQUESTED_FALLBACK.to_owned(),
             session_id: None,
@@ -176,6 +181,11 @@ struct ThreadSlot {
     /// paging further back. Meaningless (always `0`) once
     /// `older_available` is `false`.
     oldest_loaded_index: Mutex<usize>,
+    /// Server continuation cursor for remote transcript pagination.
+    history_cursor: Mutex<Option<String>>,
+    /// Prevent repeated UI clicks from issuing concurrent pages with the
+    /// same cursor; cleared after the remote request settles or times out.
+    history_page_in_flight: AtomicBool,
     /// Live interactive requests (`session/request_permission`,
     /// `fs/read_text_file`, `fs/write_text_file`, `terminal/create`)
     /// awaiting a UI decision -- populated by
@@ -309,6 +319,185 @@ struct ThreadSlot {
     /// background session. This belongs to the owning chat, not the active
     /// project, so it is kept per slot.
     background: Mutex<bool>,
+    /// Real-user-repro regression (`queue-during-init-multi`): `send_prompt`
+    /// and `mutate_queue` are each their own independent `tokio::spawn`
+    /// task gated on `wait_for_attachment`. Once attachment completes,
+    /// there is no guarantee the FIRST turn's `send_prompt` (spawned when
+    /// the very first message was sent) actually reaches the server before
+    /// a LATER `mutate_queue` "enqueue" call (spawned when a follow-up was
+    /// typed seconds afterward) does -- if the second task's own
+    /// `wait_for_attachment` happens to resolve instantly (attachment
+    /// already complete by the time it starts) while the first task is
+    /// still finishing its own wait, the enqueue's RPC can win the race to
+    /// the transport. ACPX's own `spawn_queue_dispatcher` (`acpx-core/src/
+    /// router.rs`) checks `session_is_in_flight` before auto-draining the
+    /// queue, but that flag is only set once the router actually starts
+    /// processing the `session/prompt` request -- if the enqueue's RPC and
+    /// dispatcher run first, it reads "nothing in flight" and immediately
+    /// jumps the queue, sending the follow-up message *before* the turn it
+    /// was queued behind. The follow-up's local queued row then correctly
+    /// disappears (the server genuinely emptied its queue) -- but out of
+    /// order, which live-reproduced as "the queued message disappeared"
+    /// (`host_e2e_mcp_driver.py`'s `queue-during-init-multi`).
+    ///
+    /// Ticketed, not a plain `tokio::sync::Mutex`: a plain per-thread lock
+    /// only orders whichever task reaches `.lock().await` first, which is
+    /// exactly the same race (the later-created task can still get there
+    /// first if it skips the attachment wait). The ticket is drawn
+    /// *synchronously on the UI thread*, before either task's `tokio::
+    /// spawn`, so it captures the real order the user's actions happened
+    /// in regardless of how attachment/scheduling races afterward.
+    dispatch_order: DispatchOrder,
+}
+
+/// See [`ThreadSlot::dispatch_order`]'s doc comment for the race this
+/// exists to close. `next`/`serving` are plain, not `Mutex`-wrapped:
+/// `fetch_add`/`load`/`store` on an `AtomicU64` are already the only
+/// operations this needs and never require holding a lock across an
+/// `.await`.
+#[derive(Default)]
+struct DispatchOrder {
+    next: std::sync::atomic::AtomicU64,
+    serving: std::sync::atomic::AtomicU64,
+    turn_changed: tokio::sync::Notify,
+}
+
+impl DispatchOrder {
+    /// Draws the next ticket. Must be called synchronously (never inside
+    /// the async task itself) so its value reflects the true order
+    /// `send_prompt`/`mutate_queue` were invoked in, not whatever order
+    /// their tasks happen to reach this point later.
+    fn draw_ticket(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Blocks the caller's task until every earlier-drawn ticket for this
+    /// thread has released its own turn via [`Self::release`].
+    async fn wait_turn(&self, ticket: u64) {
+        loop {
+            if self.serving.load(std::sync::atomic::Ordering::SeqCst) >= ticket {
+                return;
+            }
+            let notified = self.turn_changed.notified();
+            // Re-check between registering the waiter and awaiting it --
+            // `serving` may have already advanced past `ticket` in the
+            // window between the loop's own load above and this
+            // subscription, which would otherwise wait for a notify that
+            // already happened.
+            if self.serving.load(std::sync::atomic::Ordering::SeqCst) >= ticket {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Advances to the next ticket and wakes every task waiting on
+    /// [`Self::wait_turn`] to re-check. Called once this ticket's own RPC
+    /// has actually been issued (dispatched to the transport), so the next
+    /// ticket-holder is only released once this one can no longer lose the
+    /// ordering race -- not merely once this one finished waiting its turn.
+    fn release(&self) {
+        self.serving
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.turn_changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod dispatch_order_tests {
+    //! Regression for a follow-up report after the "queue disappeared
+    //! during session initialization" fix first shipped: "still see
+    //! losing of user message... message going through queue path".
+    //! Live repro (`host_e2e_mcp_driver.py`'s `queue-during-init-multi`)
+    //! traced it to a second, adjacent race: `send_prompt` (the very
+    //! first message's turn) and `mutate_queue` ("enqueue" for a
+    //! follow-up typed moments later) are each their own independent task
+    //! gated on the same attachment signal, with no ordering guarantee
+    //! between them once attachment completes -- so the *later* call
+    //! could still reach ACPX's own queue dispatcher first, which jumps
+    //! the queue whenever it doesn't yet see a turn in flight. `Dispatch
+    //! Order`'s ticket, drawn synchronously before either task spawns,
+    //! is what actually closes this: these tests exercise the ticket
+    //! primitive directly (no live host, no ACP transport) since it's the
+    //! one piece of this fix that's meaningfully unit-testable in
+    //! isolation -- see `dispatch.rs`'s test module doc comment for why
+    //! the full `AgentBridge`/`ThreadSlot` machinery needs headed Slint
+    //! setup this module's tests avoid.
+    use super::DispatchOrder;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn later_drawn_ticket_always_waits_behind_an_earlier_one() {
+        let order = Arc::new(DispatchOrder::default());
+        // Draw both tickets synchronously, in the order the "user actions"
+        // happened -- exactly what `AgentBridge::send_prompt`/
+        // `mutate_queue` do on the UI thread before spawning anything.
+        let first_ticket = order.draw_ticket();
+        let second_ticket = order.draw_ticket();
+        assert!(first_ticket < second_ticket);
+
+        let observed: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Spawn the SECOND ticket's task first and let it run for a bit --
+        // this is the actual race: a later-created task's own async setup
+        // (e.g. its `wait_for_attachment` resolving instantly) can let it
+        // reach the turn-wait line before the earlier one does.
+        let order_b = order.clone();
+        let observed_b = observed.clone();
+        let second_task = tokio::spawn(async move {
+            order_b.wait_turn(second_ticket).await;
+            observed_b.lock().unwrap().push("second");
+            order_b.release();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The second task must still be blocked on its turn -- it has
+        // nothing to wait on except ticket ordering itself.
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "the later ticket ran before the earlier one released its turn"
+        );
+
+        let order_a = order.clone();
+        let observed_a = observed.clone();
+        let first_task = tokio::spawn(async move {
+            order_a.wait_turn(first_ticket).await;
+            observed_a.lock().unwrap().push("first");
+            order_a.release();
+        });
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn three_tickets_release_strictly_in_draw_order_under_concurrency() {
+        let order = Arc::new(DispatchOrder::default());
+        let tickets: Vec<u64> = (0..3).map(|_| order.draw_ticket()).collect();
+        let next_expected = Arc::new(AtomicU64::new(0));
+
+        let mut tasks = Vec::new();
+        // Spawn in REVERSE order -- the whole point is that scheduling/
+        // spawn order must not matter, only the ticket value does.
+        for &ticket in tickets.iter().rev() {
+            let order = order.clone();
+            let next_expected = next_expected.clone();
+            tasks.push(tokio::spawn(async move {
+                order.wait_turn(ticket).await;
+                let expected = next_expected.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    ticket, expected,
+                    "ticket {ticket} ran out of order (expected {expected} next)"
+                );
+                order.release();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
 }
 
 impl ThreadSlot {
@@ -381,6 +570,74 @@ struct GatewayCatalogCache {
     last_refresh: Option<std::time::Instant>,
 }
 
+/// Identity of the central MCP registry for poll-diff purposes.
+/// Ignores ephemeral `tool_catalog` (recomputed every list) so a tools
+/// fetch cannot look like a registry mutation that should evict pools.
+/// Sorted by name so list order from the gateway does not matter.
+fn mcp_registry_identity(
+    servers: &[crate::protocol_types::McpServerEntry],
+) -> Vec<(
+    String,
+    bool,
+    crate::protocol_types::McpServerConfig,
+    Option<crate::protocol_types::McpAuthStatus>,
+)> {
+    let mut rows: Vec<_> = servers
+        .iter()
+        .map(|s| (s.name.clone(), s.enabled, s.config.clone(), s.auth_status))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// Merge a fresh `mcp_servers/list` payload with the UI-side optimistic
+/// cache so concurrent list polls cannot wipe an in-flight tools_fetch
+/// spinner or enable-toggle StatusDot before the matching RPC lands.
+///
+/// Rules (per server name present on the wire):
+/// - `tools_fetch:<name>` in flight + wire `tool_catalog == None` and
+///   local was `Fetching` → keep `Fetching`
+/// - `enabled:<name>` in flight → keep local `enabled` (toggle already
+///   flipped in the UI; list may still show the pre-update value)
+/// - wire `tool_catalog == None` + local `Error` → keep the last fetch error
+///   until the next fetch explicitly replaces it with `Fetching`
+/// Wire-side Ready/Error always wins over local Fetching.
+fn merge_mcp_list_with_optimistic(
+    wire: Vec<crate::protocol_types::McpServerEntry>,
+    previous: &[crate::protocol_types::McpServerEntry],
+    ops: &HashSet<String>,
+) -> Vec<crate::protocol_types::McpServerEntry> {
+    use crate::protocol_types::McpToolCatalog;
+    wire.into_iter()
+        .map(|mut entry| {
+            let prev = previous.iter().find(|p| p.name == entry.name);
+            if ops.contains(&format!("tools_fetch:{}", entry.name))
+                && entry.tool_catalog.is_none()
+                && matches!(
+                    prev.and_then(|p| p.tool_catalog.as_ref()),
+                    Some(McpToolCatalog::Fetching)
+                )
+            {
+                entry.tool_catalog = Some(McpToolCatalog::Fetching);
+            }
+            if entry.tool_catalog.is_none()
+                && matches!(
+                    prev.and_then(|p| p.tool_catalog.as_ref()),
+                    Some(McpToolCatalog::Error { .. })
+                )
+            {
+                entry.tool_catalog = prev.and_then(|p| p.tool_catalog.clone());
+            }
+            if ops.contains(&format!("enabled:{}", entry.name)) {
+                if let Some(prev) = prev {
+                    entry.enabled = prev.enabled;
+                }
+            }
+            entry
+        })
+        .collect()
+}
+
 /// Owns the background runtime, the per-thread agent connections, the
 /// jsonl cache, and the event queue the UI thread drains via `poll`.
 pub struct AgentBridge {
@@ -417,6 +674,26 @@ pub struct AgentBridge {
     /// Agent ids with an install or enablement RPC currently in flight.
     /// Access is short-lived and read with `try_lock` from frame polling.
     agent_operations: Arc<Mutex<HashSet<String>>>,
+    /// MCP server settings actions currently in flight, keyed
+    /// `"<action>:<server-name>"` (e.g. `"create:filesystem"`,
+    /// `"authenticate:github"`) -- same shape/lifecycle as `agent_
+    /// operations` above (`begin_mcp_operation`/`mcp_operations_in_flight`
+    /// mirror `begin_agent_operation`/`agent_operations_in_flight`
+    /// exactly), kept as a separate field rather than sharing one set so
+    /// an agent id and an MCP server name can never collide on the same
+    /// key by coincidence.
+    mcp_operations: Arc<Mutex<HashSet<String>>>,
+    /// recoverable-attach-fix: remote session ids with a `recover-
+    /// session-attach` `session/load` currently in flight (Settings >
+    /// Agents "Attach" button, symptom #2 -- the row previously had no
+    /// busy-state tracking at all, unlike `agent_operations`/`mcp_
+    /// operations` above). Same shape/lifecycle: `begin_recover_session_
+    /// operation`/`recover_session_operations_in_flight` mirror `begin_
+    /// mcp_operation`/`mcp_operations_in_flight` exactly. Keyed by the
+    /// remote `acp_session_id`, not the local thread id -- a session
+    /// stays a candidate row (and therefore needs its own busy key) right
+    /// up until it disappears from `recoverable_sessions` once bound.
+    recover_session_operations: Arc<Mutex<HashSet<String>>>,
     // PROF-1: the same per-provider URL resolver the constructor used to
     // seed `gateway_urls` up front, kept around so a provider nobody
     // asked for at construction time (any real agent id, not just a
@@ -433,8 +710,15 @@ pub struct AgentBridge {
     // bridge that started with zero threads; see
     // `NO_PROVIDER_REQUESTED_FALLBACK` for that narrower case.
     default_provider: Option<String>,
+    /// Production ACPX sessions keep canonical transcript/queue state on
+    /// acpx-server. Legacy cache-backed constructors leave this false for
+    /// focused local-store tests and compatibility callers.
+    server_owned_persistence: bool,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
+    /// Mandatory production panel state store; unlike `store`, this owns
+    /// only Panel runtime/UI state and never transcript messages.
+    panel_state: Option<Arc<PanelStateStore>>,
     // Client-local PTY terminals -- v1 keeps this to at most one per
     // thread (keyed by thread `idx`), matching the settings-sheet's own
     // "one bound choice per scope" simplicity; a future increment could
@@ -712,10 +996,11 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
 /// transition because those state updates are sparse compared with message
 /// chunks and a restart must be able to reconstruct the visible cards before
 /// the gateway attachment finishes.
-fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
-    let Some(store) = store else {
-        return;
-    };
+fn persist_runtime_snapshot(
+    store: Option<&JsonlStore>,
+    panel_state: Option<&PanelStateStore>,
+    slot: &ThreadSlot,
+) {
     let terminal_order = slot
         .terminal_order
         .lock()
@@ -760,11 +1045,28 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
             .clone(),
         archived: *slot.archived.lock().unwrap_or_else(|e| e.into_inner()),
     };
-    if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
-        eprintln!(
-            "panel-rust: interaction snapshot persist failed for {}: {error}",
-            slot.thread_id
-        );
+    if let Some(panel_state) = panel_state {
+        match serde_json::to_string(&snapshot) {
+            Ok(json) => {
+                if let Err(error) = panel_state.save_runtime_snapshot(&slot.thread_id, &json) {
+                    eprintln!(
+                        "panel-rust: interaction snapshot persist failed for {}: {error}",
+                        slot.thread_id
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "panel-rust: interaction snapshot serialization failed for {}: {error}",
+                slot.thread_id
+            ),
+        }
+    } else if let Some(store) = store {
+        if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
+            eprintln!(
+                "panel-rust: interaction snapshot persist failed for {}: {error}",
+                slot.thread_id
+            );
+        }
     }
 }
 
@@ -777,7 +1079,7 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
 /// long-lived thread with thousands of cached messages (see `jsonl_
 /// store.rs`'s own 10,000-message test for the underlying primitive's
 /// own bound proof).
-const HISTORY_PAGE_SIZE: usize = 500;
+const HISTORY_PAGE_SIZE: usize = 20;
 
 /// Cold-start seeding for one thread (Phase 3 steps 1-2): loads only
 /// the newest `page_size` cached messages plus the standalone trailer
@@ -792,6 +1094,7 @@ const HISTORY_PAGE_SIZE: usize = 500;
 /// than propagating a fatal `BridgeError`.
 fn seed_thread_from_cache(
     store: Option<&JsonlStore>,
+    panel_state: Option<&PanelStateStore>,
     thread_id: &str,
     page_size: usize,
 ) -> (
@@ -801,47 +1104,109 @@ fn seed_thread_from_cache(
     usize,
     ThreadRuntimeSnapshot,
 ) {
-    let Some(store) = store else {
-        return (Vec::new(), None, false, 0, ThreadRuntimeSnapshot::default());
+    let (messages, cached_session_id, older_available, oldest_loaded_index) = if let Some(store) =
+        store
+    {
+        let page = match store.tail(thread_id, page_size) {
+            Ok(page) => page,
+            Err(e) => {
+                eprintln!("panel-rust: jsonl cache tail load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge");
+                MessagePage {
+                    messages: Vec::new(),
+                    older_available: false,
+                    oldest_loaded_index: 0,
+                }
+            }
+        };
+        let cached_session_id = match store.trailer(thread_id) {
+            Ok(trailer) => trailer
+                .as_ref()
+                .map(|t| t.acp_session_id.trim())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+            Err(e) => {
+                eprintln!("panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session");
+                None
+            }
+        };
+        (
+            page.messages,
+            cached_session_id,
+            page.older_available,
+            page.oldest_loaded_index,
+        )
+    } else {
+        (Vec::new(), None, false, 0)
     };
-    let page = match store.tail(thread_id, page_size) {
-        Ok(page) => page,
-        Err(e) => {
-            eprintln!(
-                "panel-rust: jsonl cache tail load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge"
-            );
-            return (Vec::new(), None, false, 0, ThreadRuntimeSnapshot::default());
+    let runtime_snapshot = if let Some(state) = panel_state {
+        match state.runtime_snapshot(thread_id) {
+            Ok(Some(record)) => serde_json::from_str(&record.snapshot_json).unwrap_or_else(|error| {
+                eprintln!("panel-rust: panel-state interaction snapshot decode failed for {thread_id:?} ({error}); restoring defaults");
+                ThreadRuntimeSnapshot::default()
+            }),
+            Ok(None) => ThreadRuntimeSnapshot::default(),
+            Err(error) => { eprintln!("panel-rust: panel-state interaction snapshot load failed for {thread_id:?} ({error}); restoring defaults"); ThreadRuntimeSnapshot::default() }
         }
-    };
-    let cached_session_id = match store.trailer(thread_id) {
-        Ok(trailer) => trailer
-            .as_ref()
-            .map(|t| t.acp_session_id.trim())
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned),
-        Err(e) => {
-            eprintln!(
-                "panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session"
-            );
-            None
+    } else if let Some(store) = store {
+        match store.runtime_snapshot(thread_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("panel-rust: interaction snapshot load failed for thread {thread_id:?} ({error}); restoring transcript only");
+                ThreadRuntimeSnapshot::default()
+            }
         }
-    };
-    let runtime_snapshot = match store.runtime_snapshot(thread_id) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!(
-                "panel-rust: interaction snapshot load failed for thread {thread_id:?} ({error}); restoring transcript only"
-            );
-            ThreadRuntimeSnapshot::default()
-        }
+    } else {
+        ThreadRuntimeSnapshot::default()
     };
     (
-        page.messages,
+        messages,
         cached_session_id,
-        page.older_available,
-        page.oldest_loaded_index,
+        older_available,
+        oldest_loaded_index,
         runtime_snapshot,
     )
+}
+
+/// One-time compatibility migration for Panel-owned runtime state.  Older
+/// releases stored this snapshot beside transcript JSONL; production now
+/// ignores transcript files, but importing the runtime sidecar prevents
+/// pending approvals, terminal buffers, and archive flags from disappearing
+/// on the first upgrade.  Existing SQLite rows always win.
+fn migrate_legacy_runtime_snapshots(
+    panel_state: Option<&PanelStateStore>,
+    legacy_dir: Option<&Path>,
+    thread_ids: &[String],
+) {
+    let Some(panel_state) = panel_state else {
+        return;
+    };
+    let Some(legacy_dir) = legacy_dir.filter(|path| path.is_dir()) else {
+        return;
+    };
+    let Ok(store) = JsonlStore::open(legacy_dir.to_path_buf()) else {
+        return;
+    };
+    for thread_id in thread_ids {
+        let already_present = panel_state
+            .runtime_snapshot(thread_id)
+            .ok()
+            .flatten()
+            .is_some();
+        if already_present {
+            continue;
+        }
+        let Ok(snapshot) = store.runtime_snapshot(thread_id) else {
+            continue;
+        };
+        let Ok(json) = serde_json::to_string(&snapshot) else {
+            continue;
+        };
+        if let Err(error) = panel_state.save_runtime_snapshot(thread_id, &json) {
+            eprintln!(
+                "panel-rust: legacy runtime snapshot migration failed for {thread_id}: {error}"
+            );
+        }
+    }
 }
 
 /// Compares a local cache trailer with metadata from the backend-selected
@@ -921,17 +1286,29 @@ fn resolve_acpx_server_bin_from(
     if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
         return PathBuf::from(bin);
     }
+    // A real Windows install's `acpx-server` binary is named
+    // `acpx-server.exe` -- shotcut-rebrand's CMakeLists.txt installs it
+    // via `install(PROGRAMS $<TARGET_FILE:acpx-server> ...)` with no
+    // RENAME, and CMake's `TARGET_FILE` generator expression already
+    // includes the platform executable suffix. Every candidate below
+    // previously joined a bare `"acpx-server"` with no suffix, so
+    // `candidate.is_file()` could never match the installed
+    // `acpx-server.exe` on Windows -- it always fell through to the
+    // dev-checkout fallback (which doesn't exist on a packaged install),
+    // silently leaving `gateway-ready` false forever and the sidebar's
+    // "+ New Thread" button (`sidebar.slint`'s `enabled: root.gateway-
+    // ready`) permanently, silently disabled. `EXE_SUFFIX` is `""` on
+    // Unix, so this is a no-op there.
+    let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
+    let libexec_name = format!("../libexec/acpx-server{}", std::env::consts::EXE_SUFFIX);
     if let Some(parent) = current_exe.and_then(Path::parent) {
-        for candidate in [
-            parent.join("acpx-server"),
-            parent.join("../libexec/acpx-server"),
-        ] {
+        for candidate in [parent.join(&exe_name), parent.join(&libexec_name)] {
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
-    manifest_dir.join("../acpx/target/debug/acpx-server")
+    manifest_dir.join(format!("../acpx/target/debug/{exe_name}"))
 }
 
 fn resolve_acpx_server_bin() -> PathBuf {
@@ -941,6 +1318,54 @@ fn resolve_acpx_server_bin() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
 }
+
+/// Best-effort self-heal for a real, recurring production failure: real
+/// installs (2026-08-01 `system_launch.yaml` log, "failed to spawn
+/// acpx-server for codex on port ...: Permission denied (os error 13)",
+/// twice in one session) hit `Command::spawn`'s own `EACCES` -- confirmed
+/// by tracing `spawn_gateway_process` below, where `cmd.spawn()` is the
+/// *only* syscall in this whole function whose error is wrapped into the
+/// "failed to spawn" message (the other candidate EACCES source, the
+/// per-provider stderr log `File::create` a few lines down, has its own
+/// separate error handling that falls back to `Stdio::null()` instead of
+/// failing the spawn at all -- so it can never produce this message).
+///
+/// `EACCES` from `execve` on a path that *does* resolve to a real file
+/// (as opposed to `ENOENT`, which `resolve_acpx_server_bin_from`'s own
+/// fallback chain can also produce, but that surfaces as a distinctly
+/// different os error 2) means the file exists but lacks the execute
+/// bit for this process's effective uid/gid -- exactly what a plain
+/// `cp`/archive-extract/artifact-download step that does not preserve
+/// POSIX permission bits produces (this project's own Linux packaging
+/// pipeline, `shotcut/scripts/build-snapflow.sh`'s `install_snapflow_linux`,
+/// assembles the bundle with a long sequence of manual `cp`/`install`
+/// calls rather than exclusively CMake's `install(PROGRAMS ...)`, which
+/// is the one step that would otherwise always normalize this). Rather
+/// than hard-failing the whole gateway (and every thread on this
+/// provider) over a one-bit permission defect this process is fully
+/// entitled to fix on a file it already resolved by path, attempt to add
+/// the owner/group/world execute bits before spawning. Best-effort and
+/// silent on failure (e.g. a read-only install root) -- `cmd.spawn()`'s
+/// own error still surfaces normally if this doesn't help.
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mut perms = metadata.permissions();
+    let mode = perms.mode();
+    // 0o111 = owner+group+world execute. Only touched when at least one
+    // of those bits is missing, so an already-correct file's mtime/ctime
+    // is left alone.
+    if mode & 0o111 != 0o111 {
+        perms.set_mode(mode | 0o111);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}
 
 /// Resolves the `snapflowd-mcp` binary path (`skill_injection_
 /// verification` phase): `RUI_SNAPFLOWD_MCP_BIN` env override, else a
@@ -1028,20 +1453,74 @@ pub struct DaemonProjectInstance {
 /// daemon's control socket the CLI dials, per `config.Default`'s own doc
 /// comment) flows through exactly as a test or production launch already
 /// has it set -- this function never touches `SNAPSHOTD_HOME` itself.
+const SNAPSHOTD_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn run_snapshotd_subcommand(bin: &Path, subcommand: &str) -> Result<String, String> {
-    let output = std::process::Command::new(bin)
+    // Do not use Command::output here: a wedged daemon control socket would
+    // otherwise leave the background inventory thread blocked forever. Files
+    // keep stdout/stderr drainable even if a broken daemon emits a large
+    // diagnostic before the timeout expires.
+    let unique = format!(
+        "snapflow-snapshotd-{}-{}-{}",
+        std::process::id(),
+        subcommand,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let stdout_path = std::env::temp_dir().join(format!("{unique}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("{unique}.stderr"));
+    let stdout_file = File::create(&stdout_path)
+        .map_err(|error| format!("creating snapshotd {subcommand} stdout capture: {error}"))?;
+    let stderr_file = File::create(&stderr_path)
+        .map_err(|error| format!("creating snapshotd {subcommand} stderr capture: {error}"))?;
+    let mut child = std::process::Command::new(bin)
         .arg(subcommand)
-        .output()
-        .map_err(|error| format!("spawning `snapshotd {subcommand}`: {error}"))?;
-    if !output.status.success() {
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .map_err(|error| format!("spawning snapshotd {subcommand}: {error}"))?;
+    let deadline = std::time::Instant::now() + SNAPSHOTD_CLI_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!(
+                    "snapshotd {subcommand} timed out after {}s",
+                    SNAPSHOTD_CLI_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!("waiting for snapshotd {subcommand}: {error}"));
+            }
+        }
+    };
+    let stdout = std::fs::read(&stdout_path)
+        .map_err(|error| format!("reading snapshotd {subcommand} stdout capture: {error}"))?;
+    let stderr = std::fs::read(&stderr_path)
+        .map_err(|error| format!("reading snapshotd {subcommand} stderr capture: {error}"))?;
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    if !status.success() {
         return Err(format!(
-            "`snapshotd {subcommand}` exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            "snapshotd {subcommand} exited {status}: {}",
+            String::from_utf8_lossy(&stderr)
         ));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("`snapshotd {subcommand}` produced non-UTF8 stdout: {error}"))
+    String::from_utf8(stdout)
+        .map_err(|error| format!("snapshotd {subcommand} produced non-UTF8 stdout: {error}"))
 }
 
 /// Parses `snapshotd list`'s JSONL stdout (one `registry.ProcessInstance`
@@ -1228,71 +1707,150 @@ fn snapflowd_mcp_servers_entry(
 static SNAPSHOTD_MCP_STATUS: Mutex<Option<String>> = Mutex::new(None);
 static SNAPSHOTD_WATCHER_STARTED: std::sync::Once = std::sync::Once::new();
 
-const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Last address the watcher successfully pushed into every known acpx
+/// central `McpServerStore` registry via [`sync_snapshotd_registry_if_
+/// changed`] -- separate from `SNAPSHOTD_MCP_STATUS`, which is the last
+/// *observed* address regardless of whether a registry push happened.
+/// `None` means either no push has ever succeeded, or a bridge just
+/// registered a new sync target ([`register_snapshotd_registry_sync_
+/// target`] resets this so the next tick re-syncs unconditionally, since
+/// a freshly-registered gateway has never seen a push even if the
+/// address itself hasn't changed).
+static SNAPSHOTD_MCP_SYNCED: Mutex<Option<String>> = Mutex::new(None);
+
+/// One `AgentBridge`'s worth of gateways this process's snapshotd watcher
+/// can push the synthetic `"snapflow"` registry row into, plus the tokio
+/// `Handle` to actually run that async push on (the watcher itself is a
+/// plain OS thread with no runtime of its own). `Weak` so a bridge that
+/// has since been dropped (e.g. a test's own short-lived `AgentBridge`)
+/// is silently pruned on the next tick instead of leaking.
+struct SnapshotdSyncTarget {
+    gateways: std::sync::Weak<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    runtime: tokio::runtime::Handle,
+}
+
+/// Every live `AgentBridge`'s gateway map the watcher should keep synced.
+/// Registered once per bridge construction (see [`register_snapshotd_
+/// registry_sync_target`]); almost always holds exactly one entry in
+/// production (one panel process, one `AgentBridge`), but nothing here
+/// assumes that -- each independent gateway/router process reachable from
+/// this panel needs its own registry row, since `McpServerStore` is
+/// per-router state, not shared.
+static SNAPSHOTD_SYNC_TARGETS: Mutex<Vec<SnapshotdSyncTarget>> = Mutex::new(Vec::new());
+
+/// Registers `gateways` (an `AgentBridge`'s own gateway-connection cache,
+/// keyed by base URL) as a target the background snapshotd watcher
+/// (`ensure_snapshotd_watcher_started`) should push the synthetic
+/// `"snapflow"` MCP server row into whenever the daemon's live MCP
+/// address changes. Resets [`SNAPSHOTD_MCP_SYNCED`] so the very next
+/// watcher tick pushes to this (and every other still-live) target even
+/// if the address happens to already match the last-synced value --
+/// otherwise a bridge constructed after the address stabilized would
+/// never receive an initial sync.
+fn register_snapshotd_registry_sync_target(
+    gateways: Arc<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    runtime: tokio::runtime::Handle,
+) {
+    SNAPSHOTD_SYNC_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(SnapshotdSyncTarget {
+            gateways: Arc::downgrade(&gateways),
+            runtime,
+        });
+    *SNAPSHOTD_MCP_SYNCED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Forces the process-wide watcher to revisit the current daemon address on
+/// its next tick. A bridge can gain a gateway after construction (lazy agent
+/// provisioning), and each gateway owns an independent MCP registry.
+fn invalidate_snapshotd_registry_sync() {
+    *SNAPSHOTD_MCP_SYNCED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Live gate for the built-in snapflow (snapshotd) MCP client injection.
+/// Settings UI name is `"snapflow"`; wire `mcpServers` name is
+/// `"snapshotd"`. This flag alone still governs the always-correct
+/// per-session `mcpServers` injection path (toggle must flip it and
+/// rewrite pool openers directly -- see
+/// [`AgentBridge::set_builtin_snapflow_mcp_enabled`]); it is *not*
+/// gating the central-registry sync below. As of the `mcp-servers-
+/// settings` fix, the watcher (`ensure_snapshotd_watcher_started`) also
+/// pushes a real `"snapflow"` row into every known acpx central
+/// `McpServerStore` registry (`sync_snapshotd_registry_if_changed`) via
+/// `mcp_servers/create`/`update`, so Settings' "Fetch tools" action --
+/// which calls `mcp_servers/tools_fetch` against whatever name the row
+/// displays -- has a real registry entry to query instead of failing
+/// with "no mcp server named snapflow". That registry sync is additive:
+/// the per-session client-injection mechanism below is unchanged.
+static SNAPFLOW_MCP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Serializes flag write + multi-step test assertions (and production
+/// toggle + pool rewrite) so parallel unit tests cannot race the gate.
+static SNAPFLOW_MCP_GATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Whether new/pooled sessions inject the built-in snapflow MCP.
+pub fn snapflow_mcp_enabled() -> bool {
+    SNAPFLOW_MCP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Seed or update the process-wide snapflow injection gate (e.g. from
+/// Settings on panel start). Does not touch pools — use
+/// [`AgentBridge::set_builtin_snapflow_mcp_enabled`] for a live toggle.
+pub fn set_snapflow_mcp_enabled_flag(enabled: bool) {
+    let _guard = SNAPFLOW_MCP_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    SNAPFLOW_MCP_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Settings UI / registry aliases for the built-in daemon MCP.
+pub fn is_builtin_snapflow_mcp_name(name: &str) -> bool {
+    name == "snapflow" || name == "snapshotd"
+}
 
 fn snapshotd_control_socket_path() -> PathBuf {
-    admin_token_dir().join("control.sock")
+    crate::snapshotd_client::SnapshotdControlClient::from_default_runtime()
+        .map(|client| client.socket_path().to_owned())
+        .unwrap_or_else(|| admin_token_dir().join("control.sock"))
 }
 
 /// Query the daemon's ground-truth MCP listener address over its control
 /// socket. This function is only called by the process-lifetime watcher, not
 /// from session creation or the UI thread.
-#[cfg(unix)]
 fn query_snapshotd_mcp_addr_at(path: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-
-    // UnixStream has no stable connect_timeout API. This connect runs only on
-    // the dedicated watcher thread; all subsequent socket I/O is bounded.
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream
-        .set_read_timeout(Some(SNAPSHOTD_CONTROL_TIMEOUT))
+    // std::os::unix::net::UnixStream has no connect timeout. Use a tiny
+    // current-thread runtime on the already-background watcher thread so a
+    // dead/stuck control socket cannot stop all future five-second probes.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
         .ok()?;
-    stream
-        .set_write_timeout(Some(SNAPSHOTD_CONTROL_TIMEOUT))
-        .ok()?;
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "daemon.mcpStatus",
-        "params": {}
-    });
-    let mut line = serde_json::to_vec(&request).ok()?;
-    line.push(b'\n');
-    stream.write_all(&line).ok()?;
-
-    let mut response_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response_line)
-        .ok()
-        .filter(|count| *count > 0)?;
-    let response: serde_json::Value = serde_json::from_str(&response_line).ok()?;
-    if response.get("error").is_some() {
-        return None;
-    }
-    let result = response.get("result")?;
-    if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
-        return None;
-    }
-    result
-        .get("addr")
-        .and_then(|value| value.as_str())
-        .filter(|addr| !addr.is_empty())
-        .map(str::to_owned)
+    runtime.block_on(async {
+        let client = crate::snapshotd_client::SnapshotdControlClient::new(path.to_owned());
+        let result = client
+            .call("daemon.mcpStatus", serde_json::json!({}))
+            .await
+            .ok()?;
+        if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+        result
+            .get("addr")
+            .and_then(|value| value.as_str())
+            .filter(|addr| !addr.is_empty())
+            .map(str::to_owned)
+    })
 }
 
-#[cfg(unix)]
 fn query_snapshotd_mcp_addr() -> Option<String> {
     query_snapshotd_mcp_addr_at(&snapshotd_control_socket_path())
-}
-
-#[cfg(not(unix))]
-// snapshotd currently exposes only a Unix-domain control socket on the Go
-// side. Windows therefore fails closed until the daemon and panel gain a
-// named-pipe transport; it must not silently fall back to the guessed MCP
-// TCP address.
-fn query_snapshotd_mcp_addr() -> Option<String> {
-    None
 }
 
 fn ensure_snapshotd_watcher_started() {
@@ -1301,10 +1859,161 @@ fn ensure_snapshotd_watcher_started() {
             let addr = query_snapshotd_mcp_addr();
             *SNAPSHOTD_MCP_STATUS
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addr;
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addr.clone();
+            sync_snapshotd_registry_if_changed(addr);
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
     });
+}
+
+/// Pushes the just-observed `addr` into every live [`SNAPSHOTD_SYNC_
+/// TARGETS`] registry, but only when it differs from the last address
+/// this watcher successfully synced ([`SNAPSHOTD_MCP_SYNCED`]) -- so a
+/// steady-state daemon (the overwhelmingly common case) costs one string
+/// comparison per 5s tick, not a `mcp_servers/create`/`update` round trip
+/// to every known gateway. Called from the watcher's own OS thread, which
+/// has no tokio runtime of its own; the actual async RPCs are handed off
+/// to each target's own `Handle::spawn` and this function returns without
+/// waiting for them (best-effort -- a failed push is retried whenever the
+/// address next changes, or a new target registers).
+fn sync_snapshotd_registry_if_changed(addr: Option<String>) {
+    let changed = {
+        let mut last_synced = SNAPSHOTD_MCP_SYNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_synced.as_deref() == addr.as_deref() {
+            false
+        } else {
+            *last_synced = addr.clone();
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+    // A `None` tick (daemon down / control socket unreachable) still
+    // updates `SNAPSHOTD_MCP_SYNCED` above so a later real address is
+    // recognized as a change, but there is nothing to push yet.
+    let Some(addr) = addr else {
+        return;
+    };
+    let Some(entry) = builtin_snapflow_registry_entry(&addr) else {
+        return;
+    };
+    // Prune dead (dropped-bridge) targets while collecting live ones, so
+    // this list stays bounded across e.g. many short-lived test bridges
+    // within one process.
+    let mut targets = SNAPSHOTD_SYNC_TARGETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    targets.retain(|target| target.gateways.strong_count() > 0);
+    let mut scheduled = false;
+    for target in targets.iter() {
+        let Some(gateways) = target.gateways.upgrade() else {
+            continue;
+        };
+        if gateways
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            continue;
+        }
+        scheduled = true;
+        let entry = entry.clone();
+        target.runtime.spawn(async move {
+            if !sync_snapflow_registry_entry(&gateways, &entry).await {
+                // A gateway can appear after the watcher observes the
+                // daemon address, or can temporarily reject the upsert while
+                // it is still starting. Leave the address unsynced so the
+                // next five-second watcher tick retries it.
+                *SNAPSHOTD_MCP_SYNCED
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+        });
+    }
+    if !scheduled {
+        // Do not consume the address-change edge before a gateway exists.
+        // Otherwise the first gateway created after this tick would never
+        // receive the snapflow registry row until the daemon address changed.
+        *SNAPSHOTD_MCP_SYNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Builds the central-registry `McpServerEntry` for the built-in snapflow
+/// server at `addr`, reusing [`snapshotd_mcp_server_entry_for_addr`] for
+/// the URL shape (the same `http://{addr}/mcp` this crate already injects
+/// per-session) rather than recomputing it a second way. That helper's
+/// wire shape targets ACP's own per-session `mcpServers` array (`"name":
+/// "snapshotd"`, array-of-pairs `headers`) and is also gated on the live
+/// [`snapflow_mcp_enabled`] toggle, neither of which apply to the central
+/// registry row: the Settings UI's row (and therefore what "Fetch tools"
+/// queries) is named `"snapflow"`, uses `McpServerConfig`'s object-shaped
+/// `headers`, and the registry row is what still needs to exist even
+/// while the toggle is off (else re-enabling it would race a fresh watch
+/// tick). Only the `url` field is actually reused across the two shapes.
+fn builtin_snapflow_registry_entry(addr: &str) -> Option<crate::protocol_types::McpServerEntry> {
+    let built = snapshotd_mcp_server_entry_for_addr(Some(addr));
+    let url = built.first()?.get("url")?.as_str()?.to_string();
+    Some(crate::protocol_types::McpServerEntry::new(
+        "snapflow",
+        crate::protocol_types::McpServerConfig::Http {
+            url,
+            headers: std::collections::HashMap::new(),
+            timeout: None,
+            oauth: None,
+        },
+    ))
+}
+
+/// Upserts `entry` into every gateway currently known in `gateways`
+/// (one push per distinct connected acpx-server this panel talks to --
+/// each owns an independent `McpServerStore`). Try-create-then-update-on-
+/// AlreadyExists, the same pattern `acpx-server/src/provisioning.rs`'s
+/// `apply` uses for its own declarative-reapply case, ported to the
+/// client-side `ClientError::Rpc` shape `Gateway::create_mcp_server`
+/// actually returns (the server-side `RouterError::McpServer(McpServer
+/// StoreError::AlreadyExists(_))` `apply` matches on never crosses the
+/// wire as a typed variant -- it collapses to a JSON-RPC error whose
+/// `message` is `McpServerStoreError::AlreadyExists`'s `Display` text,
+/// "mcp server store: mcp server {name} already exists", wrapped by
+/// `RouterError::McpServer`'s own `"mcp server store: {0}"` -- so this
+/// matches on that substring the same way `ClientError::is_transient`
+/// already does for its own message-sniffing cases).
+async fn sync_snapflow_registry_entry(
+    gateways: &Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>,
+    entry: &crate::protocol_types::McpServerEntry,
+) -> bool {
+    let live_gateways: Vec<Arc<acpx_client::Gateway>> = gateways
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    if live_gateways.is_empty() {
+        return false;
+    }
+    let mut all_succeeded = true;
+    for gateway in live_gateways {
+        if let Err(err) = gateway.create_mcp_server(entry).await {
+            let already_exists = matches!(
+                &err,
+                acpx_client::raw::ClientError::Rpc { message, .. }
+                    if message.to_ascii_lowercase().contains("already exists")
+            );
+            if already_exists {
+                if gateway.update_mcp_server(entry).await.is_err() {
+                    all_succeeded = false;
+                }
+            } else {
+                all_succeeded = false;
+            }
+        }
+    }
+    all_succeeded
 }
 
 /// Non-blocking read of the watcher cache. Starting the watcher is one-time
@@ -1332,6 +2041,9 @@ fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
 // token) is known; see GatewaySessionOpener's mcp_servers refresh path for
 // how project/provider-level MCP config changes now propagate instead.
 fn snapshotd_mcp_server_entry_for_addr(addr: Option<&str>) -> Vec<serde_json::Value> {
+    if !snapflow_mcp_enabled() {
+        return Vec::new();
+    }
     let Some(addr) = addr.filter(|addr| !addr.is_empty()) else {
         return Vec::new();
     };
@@ -1341,6 +2053,44 @@ fn snapshotd_mcp_server_entry_for_addr(addr: Option<&str>) -> Vec<serde_json::Va
         "url": format!("http://{addr}/mcp"),
         "headers": [],
     })]
+}
+
+/// Drop or re-add the built-in snapflow (`snapshotd`) entry on a pool's
+/// client `mcpServers` list without recomputing skills (which depend on
+/// project-dir resolution that is not stored on the pool key alone).
+///
+/// When enabling, `inject_addr` is the daemon MCP bind address to put
+/// back (live watcher value in production). Tests pass an explicit addr.
+fn apply_snapflow_to_client_mcp_list(
+    mcp_servers: &[serde_json::Value],
+    enabled: bool,
+    inject_addr: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut next: Vec<serde_json::Value> = mcp_servers
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| !is_builtin_snapflow_mcp_name(n))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    if enabled {
+        // Bypass the process-wide flag here: the caller already decided
+        // `enabled` and may still be holding the gate lock while the
+        // atomic is mid-update. Force-inject from `inject_addr` only.
+        if let Some(addr) = inject_addr.filter(|a| !a.is_empty()) {
+            next.push(serde_json::json!({
+                "type": "http",
+                "name": "snapshotd",
+                "url": format!("http://{addr}/mcp"),
+                "headers": [],
+            }));
+        }
+    }
+    next
 }
 
 // PROF-3 (`profile-only-backend-selection` plan): `resolve_backend_agent_
@@ -1404,6 +2154,114 @@ fn read_codex_api_key_from_auth_file() -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// pool-capability-fix: the other half of `read_codex_api_key_from_auth_
+/// file`'s own gap -- `codex login`'s far more common ChatGPT-plan device
+/// flow writes a `tokens.access_token` OAuth session into the same
+/// `auth.json` and leaves `OPENAI_API_KEY` null, so a real, valid,
+/// already-authenticated login of that shape was previously
+/// indistinguishable here from no login at all. Live-confirmed against
+/// this exact file shape: acpx-server's own mirrored auto-detection
+/// (`acpx-server/src/config.rs`'s `default_codex_native_auth_method`)
+/// resolved `native_auth_method_id=None` for it, and every real
+/// `session/new` failed with "backend requires authentication" until
+/// `chat-gpt` was selected explicitly -- after which a real prompt round-
+/// tripped successfully through the genuine ambient login.
+fn codex_auth_file_has_chatgpt_login() -> bool {
+    let Some(path) = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))
+    else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|token| token.as_str())
+        .is_some_and(|token| !token.is_empty())
+}
+
+/// Normalizes the free-form `auth_mode` string real `codex` CLI builds
+/// write into `auth.json` into the exact ACP `native_auth_method_id`
+/// value codex-acp expects. Case/hyphen/underscore-insensitive since
+/// only `"chatgpt"` has been directly confirmed on a live system (see
+/// `resolve_codex_native_auth_method_id`'s doc comment) -- other codex
+/// CLI versions may plausibly spell either mode differently
+/// (`"chat-gpt"`, `"ChatGPT"`, `"api-key"`, `"apiKey"`, ...), so this
+/// normalizes defensively rather than matching a single literal.
+/// Returns `None` for anything unrecognized so the caller can fall back
+/// to today's presence-based detection instead of guessing.
+fn normalize_codex_auth_mode(raw: &str) -> Option<&'static str> {
+    let normalized: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    match normalized.as_str() {
+        "chatgpt" => Some("chat-gpt"),
+        "apikey" => Some("api-key"),
+        _ => None,
+    }
+}
+
+/// Reads and normalizes `auth.json`'s own `auth_mode` field (see
+/// `codex_home_dir` for path resolution). `None` covers every "we don't
+/// have a trustworthy declared mode" case alike -- missing file,
+/// unparseable JSON, missing field, or an unrecognized value -- so
+/// callers have one signal to check before falling back.
+fn read_codex_auth_mode_from_file() -> Option<&'static str> {
+    let path = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    value
+        .get("auth_mode")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_codex_auth_mode)
+}
+
+/// Resolves the ACP `native_auth_method_id` this system's real Codex CLI
+/// login implies, mirroring acpx-server's own
+/// `default_codex_native_auth_method` (`acpx-server/src/config.rs`) --
+/// kept as a deliberately separate, hand-mirrored implementation per
+/// that function's own doc comment, not a shared crate, so keep any
+/// future change to this priority order in sync in both places.
+///
+/// **auth_mode-first, live bug this fixes.** Before this function
+/// existed, `spawn_gateway_process` inlined field-presence-only
+/// detection (API key first, then `tokens.access_token`) that completely
+/// ignored `auth.json`'s own `auth_mode` field. Live-confirmed against
+/// this exact system: its real `~/.codex/auth.json` has
+/// `"auth_mode": "chatgpt"` (a real, completed ChatGPT-plan login) *and*
+/// a stale, leftover non-empty `OPENAI_API_KEY` field left over from an
+/// earlier/different login -- so presence-only detection always picked
+/// "api-key" for it, silently contradicting what the file's own
+/// `auth_mode` field declared, and shadowing a real working login with a
+/// wrong one. This now checks `auth_mode` first via
+/// `read_codex_auth_mode_from_file`, and only falls back to the old
+/// presence-based priority (api-key field presence, then
+/// `tokens.access_token`) when `auth_mode` is missing or unrecognized,
+/// so `auth.json` shapes that predate this field (or come from a codex
+/// CLI version that doesn't set it) keep resolving exactly as before.
+fn resolve_codex_native_auth_method_id() -> Option<&'static str> {
+    if let Some(mode) = read_codex_auth_mode_from_file() {
+        return Some(mode);
+    }
+    if read_codex_api_key_from_auth_file().is_some() {
+        return Some("api-key");
+    }
+    if codex_auth_file_has_chatgpt_login() {
+        return Some("chat-gpt");
+    }
+    None
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -1795,24 +2653,70 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
     // spawn there directly (keeps the common case's URL predictable);
     // otherwise it's occupied by some unrelated service, so probe for a
     // real free ephemeral port instead of fighting over the default one.
-    let (port, lock) = if std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
-        std::time::Duration::from_millis(100),
-    )
-    .is_err()
-    {
-        match reserve_port(default_port) {
-            Ok(lock) => (default_port, lock),
-            Err(_) => reserve_ephemeral_port()
-                .ok_or_else(|| "could not reserve a loopback port".to_string())?,
-        }
-    } else {
-        reserve_ephemeral_port().ok_or_else(|| "could not reserve a loopback port".to_string())?
-    };
+    //
+    // That check only catches a port that's already *listening* --
+    // `reserve_port`'s own lock file only guards against two calls in
+    // *this* process racing each other, not an unrelated process binding
+    // the same port between this check and `spawn_gateway_process`'s own
+    // `cmd.spawn()` a moment later. When that race loses, `acpx-server`
+    // itself fails to bind and exits immediately with the real "Address
+    // already in use" -- `spawn_gateway_process` tags that specific
+    // failure with `PORT_COLLISION_ERROR_MARKER` (see its doc comment), so
+    // retry a small, bounded number of times on a fresh ephemeral port
+    // instead of surfacing a bare crash with no fallback. Any other
+    // failure shape (missing binary, bad config, permission error, ...) is
+    // returned immediately -- a retry would never fix those.
+    const MAX_PORT_COLLISION_RETRIES: u32 = 3;
+    let mut attempt = 0;
+    loop {
+        let (port, lock) = if attempt == 0 {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_err()
+            {
+                match reserve_port(default_port) {
+                    Ok(lock) => (default_port, lock),
+                    Err(_) => reserve_ephemeral_port()
+                        .ok_or_else(|| "could not reserve a loopback port".to_string())?,
+                }
+            } else {
+                reserve_ephemeral_port()
+                    .ok_or_else(|| "could not reserve a loopback port".to_string())?
+            }
+        } else {
+            reserve_ephemeral_port()
+                .ok_or_else(|| "could not reserve a loopback port".to_string())?
+        };
 
-    spawn_gateway_process(provider, port, lock, cache_dir)?;
-    Ok(format!("http://127.0.0.1:{port}"))
+        match spawn_gateway_process(provider, port, lock, cache_dir) {
+            Ok(()) => return Ok(format!("http://127.0.0.1:{port}")),
+            Err(e)
+                if e.starts_with(PORT_COLLISION_ERROR_MARKER)
+                    && attempt < MAX_PORT_COLLISION_RETRIES =>
+            {
+                attempt += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(e
+                    .strip_prefix(PORT_COLLISION_ERROR_MARKER)
+                    .unwrap_or(&e)
+                    .to_string());
+            }
+        }
+    }
 }
+
+/// Prefix `spawn_gateway_process` puts on its error string when the spawned
+/// `acpx-server` exited during startup for what its own stderr log confirms
+/// was a port collision -- lets [`provision_gateway`] distinguish "retry on
+/// a different port" from every other startup failure (missing binary, bad
+/// config, permission error, ...) that a retry would never fix. Not a real
+/// error type since every other error in this module is already a bare
+/// `String`; a marker prefix keeps this one consistent with that.
+const PORT_COLLISION_ERROR_MARKER: &str = "\u{0}PORT_COLLISION\u{0}";
 
 /// The actual `Command::spawn` -- split from [`provision_gateway`] so the
 /// port-selection policy above stays readable. See that function's doc
@@ -1876,8 +2780,26 @@ fn spawn_gateway_process(
     // for an agent that is, in fact, installed. Augmenting PATH here with a
     // real login shell's resolved PATH (once per process, cached) closes
     // that gap without needing the operator to launch from a terminal.
-    if let Some(path) = augmented_gateway_path() {
-        cmd.env("PATH", path);
+    // Match snapshotd/acpnode's global-first -> bundled fallback policy.
+    // Desktop launches often inherit a PATH with no node/npm/npx even though
+    // the official Snapflow Node bundle is installed.  Merely augmenting
+    // PATH with a login shell (the old behavior) leaves acpx-registry's
+    // `resolve_npm_bin()` and acpx-core's `which()` resolving bare commands,
+    // so a clean release reports `failed to spawn backend process` on the
+    // first agent use.  Publish the same prefix marker and PATH that the Go
+    // daemon uses when its bundled runtime wins.
+    let gateway_path = augmented_gateway_path()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    cmd.env("PATH", &gateway_path);
+    cmd.env_remove("SNAPFLOW_ACP_NODE_HOME");
+    if !system_node_toolchain_available(&gateway_path) {
+        if let Some(home) = bundled_node_home() {
+            let bundled_bin = home.join("bin");
+            let path = prepend_path_entry(&bundled_bin, &gateway_path);
+            cmd.env("SNAPFLOW_ACP_NODE_HOME", &home);
+            cmd.env("PATH", path);
+        }
     }
     // Gateway stderr goes to a per-provider log file in the cache dir,
     // NOT /dev/null: acpx-server's tracing output AND every backend
@@ -1945,10 +2867,46 @@ fn spawn_gateway_process(
         // system's already-authenticated Codex CLI login instead of
         // codex-acp's headless-incapable chat-gpt device flow (see
         // read_codex_api_key_from_auth_file's doc comment).
+        //
+        // pool-capability-fix: this used to hardcode "api-key"
+        // unconditionally whenever the env var was unset -- worse than
+        // doing nothing for a real ChatGPT-plan login (no raw API key
+        // ever stored, by design): it forced codex-acp down the
+        // api-key path with no key at all, instead of leaving
+        // auth_method_id unset so codex-acp could at least attempt its
+        // own default flow. Mirrors acpx-server's own auto-detection
+        // (`config.rs`'s `default_codex_native_auth_method`): api-key
+        // when a real key is found, else chat-gpt when a real ChatGPT
+        // OAuth login is found, else leave it unset.
+        //
+        // auth-mode-first fix: the above (field-presence-only) priority
+        // had its own live bug -- this system's real `~/.codex/auth.json`
+        // has `"auth_mode": "chatgpt"` (a real, completed ChatGPT-plan
+        // login) *and* a stale, leftover non-empty `OPENAI_API_KEY` field.
+        // Presence-only detection always resolved that combination to
+        // "api-key", silently discarding the user's actual declared
+        // login mode. `resolve_codex_native_auth_method_id` now checks
+        // the file's own `auth_mode` field first (normalized
+        // case/hyphen-insensitively) and only falls back to this
+        // presence-based priority when `auth_mode` is missing or
+        // unrecognized, so older `auth.json` shapes without the field
+        // keep behaving exactly as before.
         if std::env::var_os("ACPX_NATIVE_AUTH_METHOD_ID").is_none() {
-            cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
-        }
-        if std::env::var_os("CODEX_API_KEY").is_none() {
+            match resolve_codex_native_auth_method_id() {
+                Some("api-key") => {
+                    cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+                    if std::env::var_os("CODEX_API_KEY").is_none() {
+                        if let Some(key) = read_codex_api_key_from_auth_file() {
+                            cmd.env("CODEX_API_KEY", key);
+                        }
+                    }
+                }
+                Some("chat-gpt") => {
+                    cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "chat-gpt");
+                }
+                _ => {}
+            }
+        } else if std::env::var_os("CODEX_API_KEY").is_none() {
             if let Some(key) = read_codex_api_key_from_auth_file() {
                 cmd.env("CODEX_API_KEY", key);
             }
@@ -2032,20 +2990,67 @@ fn spawn_gateway_process(
         // TOCTOU-safe convention `reserve_ephemeral_port`'s own caller
         // (the main HTTP port, `lock` above) already uses.
     }
+    // See `ensure_executable`'s doc comment: a real, recurring production
+    // failure (`system_launch.yaml`, "Permission denied (os error 13)")
+    // traced to this exact `cmd.spawn()` call losing the resolved
+    // binary's execute bit somewhere in packaging/transfer. Self-heal
+    // before attempting the exec so a stripped permission bit does not
+    // fail every thread on this provider.
+    let acpx_server_bin = resolve_acpx_server_bin();
+    ensure_executable(&acpx_server_bin);
     let mut child = cmd.spawn().map_err(|e| {
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
-        format!("failed to spawn acpx-server for {provider} on port {port}: {e}")
+        // Distinguish "never resolved a real binary" (EACCES self-heal
+        // above cannot help, and a bare `ENOENT`/os error 2 from Command
+        // is easy to misread as a permissions problem) from "resolved a
+        // real file that still failed to exec" -- surfaces the exact
+        // path this process tried, which the bare `io::Error` alone does
+        // not include, so an operator does not have to reconstruct
+        // `resolve_acpx_server_bin_from`'s own fallback chain by hand.
+        let exists = acpx_server_bin.is_file();
+        format!(
+            "failed to spawn acpx-server for {provider} on port {port} \
+             (resolved path {acpx_server_bin:?}, exists={exists}): {e}"
+        )
     })?;
     for _ in 0..50 {
         if probe_acpx_gateway_for_agent(port, Some(provider)) {
+            // Health-visibility gap: this watcher used to silently `break`
+            // and clean up the port lock on the gateway's own unexpected
+            // exit, with no log line and nothing surfaced to the panel at
+            // all -- an already-running gateway dying (crash, OOM-kill,
+            // operator `kill`) left every thread on it stuck with no
+            // explanation anywhere on disk, the same "zero diagnostics"
+            // failure mode the stderr-log-instead-of-/dev/null fix above
+            // addresses for startup failures. Full model/UI wiring for a
+            // post-start death is a larger TEA-plumbing change (no
+            // existing global channel from this background std::thread
+            // into the reducer); this is the tractable first step so the
+            // event is at least discoverable instead of invisible.
+            let provider_owned = provider.to_string();
             std::thread::spawn(move || {
                 let mut child = child;
-                loop {
+                let exit_status = loop {
                     match child.try_wait() {
-                        Ok(Some(_)) | Err(_) => break,
+                        Ok(Some(status)) => break Some(status),
+                        Err(error) => {
+                            eprintln!(
+                                "panel-rust: lost track of acpx-server for {provider_owned} \
+                                 on port {port} (pid wait error: {error})"
+                            );
+                            break None;
+                        }
                         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
                     }
+                };
+                if let Some(status) = exit_status {
+                    eprintln!(
+                        "panel-rust: acpx-server for {provider_owned} on port {port} exited \
+                         unexpectedly ({status}); every thread still bound to this gateway \
+                         will fail its next request -- see gateway-{provider_owned}.stderr.log \
+                         for the process's own diagnostics"
+                    );
                 }
                 drop(lock);
                 let _ = std::fs::remove_file(
@@ -2061,8 +3066,30 @@ fn spawn_gateway_process(
             let _ = std::fs::remove_file(
                 std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
             );
+            // `reserve_port`/the pre-spawn `TcpStream::connect_timeout` probe
+            // in `provision_gateway` only catch a port that's already
+            // *listening*; a port bound-but-not-accepting (TIME_WAIT, or an
+            // unrelated process racing this one between the probe and this
+            // exact `cmd.spawn()`) sails through both checks and only shows
+            // up here, as `acpx-server` itself failing to bind and exiting
+            // immediately. Scan its stderr log (the only place that real
+            // "Address already in use" / EADDRINUSE text lands, see the
+            // stderr redirection above) so `provision_gateway` can tell this
+            // apart from every other startup failure and retry on a fresh
+            // port instead of surfacing a bare crash with no fallback.
+            let looks_like_port_collision = std::fs::read_to_string(&stderr_log)
+                .map(|log| {
+                    let lower = log.to_ascii_lowercase();
+                    lower.contains("address already in use") || lower.contains("eaddrinuse")
+                })
+                .unwrap_or(false);
             return Err(format!(
-                "acpx-server exited during startup for {provider} on port {port}: {status}"
+                "{}acpx-server exited during startup for {provider} on port {port}: {status}",
+                if looks_like_port_collision {
+                    PORT_COLLISION_ERROR_MARKER
+                } else {
+                    ""
+                }
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2205,6 +3232,25 @@ fn merge_path_entries(current: &str, extra: Vec<String>) -> Option<String> {
     }
 }
 
+/// Prefix one directory onto a platform-native PATH.  `merge_path_entries`
+/// deliberately emits a Unix-shaped string because it is only used by the
+/// login-shell probe above; the gateway environment is also built on Windows,
+/// where joining with a literal `:` would make the bundled npm invisible.
+fn prepend_path_entry(entry: &Path, current: &str) -> String {
+    let mut paths = vec![entry.to_path_buf()];
+    paths.extend(std::env::split_paths(current));
+    std::env::join_paths(paths)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| {
+            let separator = if cfg!(windows) { ';' } else { ':' };
+            if current.is_empty() {
+                entry.to_string_lossy().into_owned()
+            } else {
+                format!("{}{separator}{current}", entry.to_string_lossy())
+            }
+        })
+}
+
 /// Resolves PATH the same way an interactive login shell would (sourcing
 /// `.bashrc`/`.zshrc`/`.profile`/etc, where nvm/uv/etc typically export
 /// their bin dirs) rather than trusting whatever PATH this process itself
@@ -2251,6 +3297,99 @@ fn login_shell_path_entries() -> Vec<String> {
 #[cfg(not(unix))]
 fn augmented_gateway_path() -> Option<String> {
     None
+}
+
+/// Return true when one PATH resolves a complete, runnable Node toolchain.
+/// Keep this global-first check intentionally small and synchronous: it runs
+/// once per gateway launch and mirrors `acpnode.systemOK`'s node/npm/npx
+/// requirement without importing the Go daemon's resolver into panel-rust.
+fn system_node_toolchain_available(path: &str) -> bool {
+    let find = |name: &str| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| executable_file(candidate))
+    };
+    let Some(node) = find("node") else {
+        return false;
+    };
+    let Some(npm) = find("npm") else {
+        return false;
+    };
+    let Some(npx) = find("npx") else {
+        return false;
+    };
+    std::process::Command::new(node)
+        .arg("--version")
+        .env("PATH", path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+        && std::process::Command::new(npm)
+            .arg("--version")
+            .env("PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        && executable_file(&npx)
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn executable_prefix(home: &Path) -> bool {
+    ["node", "npm", "npx"]
+        .iter()
+        .all(|name| executable_file(&home.join("bin").join(name)))
+}
+
+/// Resolve the official bundled Node layout used by `snapshotd/internal/
+/// acpnode`: an explicit `SNAPFLOW_ACP_NODE_HOME` wins, otherwise the
+/// installed product root (`SNAPFLOW_INSTALL_DIR` or
+/// `$HOME/.local/share/snapflow`) contributes `runtime/node`.
+fn bundled_node_home() -> Option<PathBuf> {
+    let home = bundled_node_home_from(
+        nonempty_env_path("SNAPFLOW_ACP_NODE_HOME"),
+        nonempty_env_path("SNAPFLOW_INSTALL_DIR"),
+        nonempty_env_path("HOME").or_else(|| nonempty_env_path("USERPROFILE")),
+    )?;
+    executable_prefix(&home).then_some(home)
+}
+
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn bundled_node_home_from(
+    override_home: Option<PathBuf>,
+    install_dir: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    override_home.or_else(|| {
+        install_dir
+            .or_else(|| user_home.map(|home| home.join(".local/share/snapflow")))
+            .map(|dir| dir.join("runtime/node"))
+    })
 }
 
 fn self_spawned_admin_creds() -> &'static Mutex<HashMap<String, (String, String)>> {
@@ -2426,32 +3565,230 @@ fn complete_attachment(slot: &ThreadSlot, error: Option<String>) {
     slot.attachment_ready.notify_waiters();
 }
 
+/// Append a transcript message without performing filesystem I/O on the
+/// ACP runtime worker.  The caller awaits this future, so a single event
+/// forwarder still preserves append order, while Tokio can continue polling
+/// other connections while the disk write is in progress.
+async fn append_jsonl_offloaded(
+    store: &JsonlStore,
+    thread_id: &str,
+    message: &ChatMessage,
+) -> Result<(), String> {
+    let store = store.clone();
+    let thread_id = thread_id.to_owned();
+    let message = message.clone();
+    tokio::task::spawn_blocking(move || store.append(&thread_id, &message))
+        .await
+        .map_err(|error| format!("jsonl append worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod jsonl_append_offload_tests {
+    use super::append_jsonl_offloaded;
+    use crate::jsonl_store::JsonlStore;
+    use crate::protocol_types::{ChatMessage, MessageKind};
+
+    #[test]
+    fn offloaded_append_preserves_serial_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JsonlStore::open(dir.path()).expect("open store");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for text in ["first", "second", "third"] {
+                let message = ChatMessage {
+                    kind: MessageKind::Agent,
+                    text: text.to_owned(),
+                    status: None,
+                    id: None,
+                    raw_input: None,
+                    raw_output: None,
+                };
+                append_jsonl_offloaded(&store, "thread", &message)
+                    .await
+                    .expect("append");
+            }
+        });
+        let cached = store.load("thread").expect("load");
+        let texts: Vec<_> = cached.messages.iter().map(|message| message.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+    }
+}
+
 fn spawn_event_forwarder(
     runtime: &tokio::runtime::Handle,
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     events_out: Arc<Mutex<VecDeque<BridgeEvent>>>,
     store_for_task: Option<JsonlStore>,
+    panel_state_for_task: Option<Arc<PanelStateStore>>,
     slot_for_task: Arc<ThreadSlot>,
     idx: usize,
 ) {
+    // Server-owned mode (no local cache configured, see `store_for_task`'s
+    // own doc comment and `AgentBridge::load_older_page`'s identical
+    // `self.store.is_none()` check) used to window `history` down to a
+    // fixed cap here, evicting already-rendered live messages so that a
+    // very-long-running session could keep re-deriving "there are now more
+    // messages than fit in one page" the same way a cold-start/resume
+    // attach does. That actively truncated the live, currently-rendered
+    // transcript -- reported as "messages truncated to the last few" --
+    // which is strictly worse than the speculative problem it was trying
+    // to solve: no plan doc in this worktree
+    // (`memory/acpx/gen/plans/thread-stream-persistence/*.md`) requires a
+    // live, still-streaming session to expose an older-messages affordance
+    // without a reload, and the real, concrete case -- a thread that *was*
+    // cold-started/resumed with only the first page loaded -- is already
+    // handled correctly and independently by the real `paginate_history`
+    // round trip in `spawn_background_attachment` (see its
+    // `is_fresh_session`/`AgentEvent::HistoryPage` handling below), which
+    // sets `older_available`/`history_cursor` from the server's own real
+    // `next_cursor`, no local simulation needed. So: `history` here just
+    // keeps accumulating every message it receives, exactly as it did
+    // before that windowing was introduced.
     runtime.spawn(async move {
+        // ACP message events are ordered, but a fast stream can deliver many
+        // adjacent snapshots before the UI gets a useful chance to paint.
+        // Keep every message in history/persistence while coalescing only the
+        // visual refresh to bounded bursts. Any semantic event flushes the
+        // pending visual state before it is handled.
+        let mut pending_visual_messages = 0usize;
         while let Some(ev) = events_rx.recv().await {
+            if !matches!(ev, AgentEvent::Message(_)) && pending_visual_messages > 0 {
+                refresh_transcript(&slot_for_task);
+                pending_visual_messages = 0;
+            }
             match &ev {
-                AgentEvent::Message(msg) => {
-                    slot_for_task
-                        .history
+                AgentEvent::ConnectionRestored => {
+                    if slot_for_task
+                        .history_page_in_flight
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        continue;
+                    }
+                    let handle = slot_for_task.handle.clone();
+                    let events_out = events_out.clone();
+                    let thread_index = idx;
+                    let slot = slot_for_task.clone();
+                    let panel_state = panel_state_for_task.clone();
+                    let store = store_for_task.clone();
+                    let terminal_ids = slot
+                        .terminal_order
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push(msg.clone());
-                    refresh_transcript(&slot_for_task);
+                        .clone();
+                    tokio::spawn(async move {
+                        let page_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.paginate_history(None),
+                        )
+                        .await;
+                        if let Err(error) = match page_result {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => Err("timed out".to_owned()),
+                        } {
+                            events_out
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(BridgeEvent {
+                                    thread_index,
+                                    event: AgentEvent::Error(format!(
+                                        "history refresh after reconnect failed: {error}"
+                                    )),
+                                });
+                        }
+                        slot.history_page_in_flight
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        for terminal_id in terminal_ids {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                handle.refresh_terminal_output(terminal_id.clone()),
+                            )
+                            .await;
+                            if let Ok(Ok(output)) = result {
+                                store_terminal_output(&slot, &output);
+                                persist_runtime_snapshot(
+                                    store.as_ref(),
+                                    panel_state.as_deref(),
+                                    &slot,
+                                );
+                                events_out
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push_back(BridgeEvent {
+                                        thread_index,
+                                        event: AgentEvent::TerminalOutput(output),
+                                    });
+                            }
+                        }
+                    });
+                }
+                AgentEvent::Message(msg) => {
+                    {
+                        let mut history = slot_for_task
+                            .history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        history.push(msg.clone());
+                    }
+                    pending_visual_messages = pending_visual_messages.saturating_add(1);
+                    if pending_visual_messages >= 4 {
+                        refresh_transcript(&slot_for_task);
+                        pending_visual_messages = 0;
+                    }
                     if let Some(store) = &store_for_task {
-                        if let Err(e) = store.append(&slot_for_task.thread_id, msg) {
+                        if let Err(e) = append_jsonl_offloaded(
+                            store,
+                            &slot_for_task.thread_id,
+                            msg,
+                        )
+                        .await
+                        {
                             eprintln!(
                                 "panel-rust: jsonl append failed for {}: {e}",
                                 slot_for_task.thread_id
                             );
                         }
                     }
+                }
+                AgentEvent::HistoryPage {
+                    messages,
+                    next_cursor,
+                } => {
+                    {
+                        let mut history = slot_for_task
+                            .history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let mut prepended = messages.clone();
+                        prepended.extend(history.drain(..));
+                        *history = prepended;
+                        // Guard must be dropped (end of this inner block)
+                        // before `refresh_transcript` below re-locks
+                        // `slot_for_task.history` itself -- `std::sync::
+                        // Mutex` is not reentrant, and Rust only drops an
+                        // owned binding like this `MutexGuard` at the end
+                        // of its *lexical* scope, not eagerly after its
+                        // last use (NLL affects borrow-checking only, not
+                        // `Drop` timing) -- so without this explicit inner
+                        // scope, the guard stayed alive across the
+                        // `refresh_transcript` call below and self-
+                        // deadlocked this exact thread on every real
+                        // `AgentEvent::HistoryPage` delivery (confirmed
+                        // live: both this event-forwarder task and the
+                        // Slint UI thread parked forever in `FUTEX_WAIT`
+                        // on the same lock word once a real pagination
+                        // page arrived).
+                    }
+                    *slot_for_task
+                        .history_cursor
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = next_cursor.clone();
+                    *slot_for_task
+                        .older_available
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = next_cursor.is_some();
+                    refresh_transcript(&slot_for_task);
                 }
                 AgentEvent::TurnEnded(_) => {
                     persist_thread_snapshot(store_for_task.as_ref(), &slot_for_task, now_token());
@@ -2465,22 +3802,50 @@ fn spawn_event_forwarder(
                     *slot_for_task.usage.lock().expect("usage mutex poisoned") = (*used, *size);
                 }
                 AgentEvent::Error(_) => {}
+                AgentEvent::ProviderProbe { .. } => {}
                 AgentEvent::PermissionRequest(req) => {
                     slot_for_task
                         .pending_requests
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(req.clone());
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
+                }
+                AgentEvent::AgentResolution(resolution) => {
+                    if !resolution.selected {
+                        slot_for_task
+                            .pending_requests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(|request| request.relay_id != resolution.relay_id);
+                        persist_runtime_snapshot(
+                            store_for_task.as_ref(),
+                            panel_state_for_task.as_deref(),
+                            &slot_for_task,
+                        );
+                    }
                 }
                 AgentEvent::TerminalOutput(term_ev) => {
                     store_terminal_output(&slot_for_task, term_ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
                 AgentEvent::TerminalCreated(created_ev) => {
                     store_terminal_created(&slot_for_task, created_ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
+                AgentEvent::QueueChanged { .. } | AgentEvent::SessionSteer(_) => {}
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_)
@@ -2488,7 +3853,11 @@ fn spawn_event_forwarder(
                 | AgentEvent::PlanUpdate(_)
                 | AgentEvent::SessionInfoUpdate { .. } => {
                     store_capability_event(&slot_for_task, &ev);
-                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                    persist_runtime_snapshot(
+                        store_for_task.as_ref(),
+                        panel_state_for_task.as_deref(),
+                        &slot_for_task,
+                    );
                 }
             }
             events_out
@@ -2498,6 +3867,11 @@ fn spawn_event_forwarder(
                     thread_index: idx,
                     event: ev,
                 });
+        }
+        // If the stream closes after a partial burst, publish the remaining
+        // messages so the final transcript is not left stale.
+        if pending_visual_messages > 0 {
+            refresh_transcript(&slot_for_task);
         }
     });
 }
@@ -2551,6 +3925,7 @@ fn spawn_background_attachment(
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     events_out: Arc<Mutex<VecDeque<BridgeEvent>>>,
     store: Option<JsonlStore>,
+    panel_state: Option<Arc<PanelStateStore>>,
     idx: usize,
     requested_session_id: Option<String>,
     has_cached_transcript: bool,
@@ -2558,6 +3933,7 @@ fn spawn_background_attachment(
     desired_config_options: Vec<(String, serde_json::Value)>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
+    server_owned_persistence: bool,
     // acpx-client-session-lease-pool: whether `handle` was constructed
     // with a pool (`build_slot`'s `pool_for` returned `Some` at spawn
     // time) -- `false` for every call site not yet cut over (currently
@@ -2658,6 +4034,15 @@ fn spawn_background_attachment(
         // "on reconnect, resume the leased/idle session but do not replay
         // session/load history" rule -- a pool-attached thread relies on
         // its own jsonl cache for history, never a live server replay.
+        // Set below, in whichever arm actually performs `session/new` (or a
+        // pool lease the pool itself just created rather than resumed) --
+        // used after a successful attach to tell a genuinely brand-new
+        // session (server-side transcript is provably still empty) from a
+        // resumed/reattached one (may have real prior history), so the
+        // `server_owned_persistence` branch further down can skip the
+        // otherwise-unconditional `paginate_history(None)` network round
+        // trip for the new-thread case, where its answer is already known.
+        let mut is_fresh_session = false;
         let result = if uses_pool {
             let key = acpx_client::pool::PoolKey::new(
                 cwd.to_string_lossy().into_owned(),
@@ -2674,7 +4059,15 @@ fn spawn_background_attachment(
                 )
                 .await
             {
-                Ok(attached) => Ok(attached.session_id),
+                // `attached.resumed_from_saved` was previously unread here
+                // (see `AttachedSession`'s own doc comment on why no
+                // capability-event decision needs it) -- it is now also
+                // consumed for `is_fresh_session`, the pagination-skip
+                // signal above.
+                Ok(attached) => {
+                    is_fresh_session = !attached.resumed_from_saved;
+                    Ok(attached.session_id)
+                }
                 Err(error) => Err(error),
             }
         } else if let Some(session_id) = requested_session_id.clone() {
@@ -2688,8 +4081,15 @@ fn spawn_background_attachment(
                 &session_id,
                 remote_sessions.as_deref(),
             );
-            let resume_result = if has_cached_transcript && !cache_is_stale {
-                match handle.reattach_session(session_id.clone(), cwd.clone()).await {
+            let resume_result = if server_owned_persistence {
+                handle
+                    .reattach_session(session_id.clone(), cwd.clone(), mcp_servers.clone())
+                    .await
+            } else if has_cached_transcript && !cache_is_stale {
+                match handle
+                    .reattach_session(session_id.clone(), cwd.clone(), mcp_servers.clone())
+                    .await
+                {
                     Ok(()) => Ok(()),
                     Err(reattach_error) => {
                         eprintln!(
@@ -2712,6 +4112,7 @@ fn spawn_background_attachment(
                             "panel-rust: cached acpx session resume failed for thread {:?} ({resume_error}); opening a fresh session",
                             slot.thread_id
                         );
+                        is_fresh_session = true;
                         open_session_maybe_profiled(
                             &handle,
                             cwd,
@@ -2723,6 +4124,7 @@ fn spawn_background_attachment(
                 }
             }
         } else {
+            is_fresh_session = true;
             open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
         };
 
@@ -2751,17 +4153,30 @@ fn spawn_background_attachment(
                     .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
                 persist_thread_snapshot(store.as_ref(), &slot, now_token());
 
-                if requested_session_id.is_some() {
+                if requested_session_id.is_some() && !server_owned_persistence {
                     let mut cached_index = 0usize;
                     let mut replayed_any = false;
                     while let Ok(ev) = events_rx.try_recv() {
                         if let AgentEvent::Message(message) = &ev {
-                            let mut history = slot.history.lock().unwrap_or_else(|e| e.into_inner());
-                            if !replay_matches_cached_position(&history, &mut cached_index, message) {
-                                history.push(message.clone());
+                            let replayed = {
+                                let mut history = slot.history.lock().unwrap_or_else(|e| e.into_inner());
+                                if !replay_matches_cached_position(&history, &mut cached_index, message) {
+                                    history.push(message.clone());
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if replayed {
                                 replayed_any = true;
                                 if let Some(store) = &store {
-                                    if let Err(error) = store.append(&slot.thread_id, message) {
+                                    if let Err(error) = append_jsonl_offloaded(
+                                        store,
+                                        &slot.thread_id,
+                                        message,
+                                    )
+                                    .await
+                                    {
                                         eprintln!(
                                             "panel-rust: jsonl append failed for {}: {error}",
                                             slot.thread_id
@@ -2776,6 +4191,59 @@ fn spawn_background_attachment(
                     }
                 }
                 complete_attachment(&slot, None);
+                if server_owned_persistence {
+                    if is_fresh_session {
+                        // This attach went through `session/new` (or a pool
+                        // lease the pool itself just created, see
+                        // `is_fresh_session` above), never `session/resume`
+                        // or `session/load` -- no prior history could
+                        // possibly exist yet, so `paginate_history(None)`'s
+                        // answer is already known and the round trip is
+                        // pure waste (and, under host/gateway load, a real
+                        // source of spurious "initial remote history page
+                        // failed ... timed out" errors for a thread that
+                        // was never actually missing anything). Set exactly
+                        // what a real empty-page `AgentEvent::HistoryPage`
+                        // response would have set -- see
+                        // `spawn_event_forwarder`'s `HistoryPage` arm: no
+                        // next cursor, no older page available.
+                        *slot
+                            .history_cursor
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = None;
+                        *slot
+                            .older_available
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = false;
+                    } else {
+                        // Attachment readiness must not be held hostage by
+                        // an optional history refresh. Senders can proceed
+                        // as soon as the session is bound; the refresh
+                        // result is still surfaced as an agent error and
+                        // can be retried by the normal pagination path.
+                        let pagination_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.paginate_history(None),
+                        )
+                        .await;
+                        if let Err(error) = match pagination_result {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => Err("timed out".to_owned()),
+                        } {
+                            events_out
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(BridgeEvent {
+                                    thread_index: idx,
+                                    event: AgentEvent::Error(format!(
+                                        "initial remote history page failed for {:?}: {error}",
+                                        slot.thread_id
+                                    )),
+                                });
+                        }
+                    }
+                }
             }
             Err(error) => {
                 let message = format!("open_session failed: {error}");
@@ -2797,6 +4265,7 @@ fn spawn_background_attachment(
             events_rx,
             events_out,
             store,
+            panel_state,
             slot,
             idx,
         );
@@ -2817,7 +4286,7 @@ impl AgentBridge {
                 provision_gateway(provider, Some(&cache_dir_for_resolver))
                     .map_err(BridgeError::Gateway)
             },
-            Some(cache_dir),
+            None,
         )
     }
 
@@ -2844,7 +4313,8 @@ impl AgentBridge {
 
     /// Production constructor for durable panel thread records. The caller
     /// provides each thread's persisted provider/session/profile binding;
-    /// cached transcript paging still comes from the local JSONL store.
+    /// transcript paging is server-owned; the local-store constructor remains
+    /// available for tests and explicit compatibility callers.
     pub fn new_with_thread_specs(thread_specs: &[ThreadSpec]) -> Result<Self, BridgeError> {
         Self::new_with_thread_specs_and_initial_cwd(thread_specs, None)
     }
@@ -2873,17 +4343,46 @@ impl AgentBridge {
         // host supplies `initial_cwd` as the already-derived project store;
         // prefer it here so recreating the panel for Project B cannot restore
         // Project A's JSONL/session binding from one global cache directory.
-        let cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
-        let cache_dir_for_resolver = cache_dir.clone();
+        // Production persistence belongs to acpx-server. Keep the panel's
+        // project store as the ACP cwd, but do not create a second local
+        // transcript owner in the real host constructor. The explicit
+        // `..._and_cache_dir` constructors below remain available to unit
+        // tests and legacy callers that intentionally exercise local JSONL.
+        let gateway_cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
+        let cache_dir_for_resolver = gateway_cache_dir.clone();
         Self::new_with_thread_specs_and_gateway_resolver_and_cache_dir_and_initial_cwd(
             thread_specs,
             move |provider| {
                 provision_gateway(provider, Some(&cache_dir_for_resolver))
                     .map_err(BridgeError::Gateway)
             },
-            Some(cache_dir),
+            None,
             initial_cwd,
             initial_project_path,
+            None,
+        )
+    }
+
+    /// Production constructor with the mandatory PanelStateStore. ACPX owns
+    /// transcript/history; this store owns only Panel runtime/UI state.
+    pub fn new_with_thread_specs_and_initial_identity_and_panel_state(
+        thread_specs: &[ThreadSpec],
+        initial_cwd: Option<PathBuf>,
+        initial_project_path: Option<PathBuf>,
+        panel_state: Arc<PanelStateStore>,
+    ) -> Result<Self, BridgeError> {
+        let gateway_cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
+        let cache_dir_for_resolver = gateway_cache_dir.clone();
+        Self::new_with_thread_specs_and_gateway_resolver_and_cache_dir_and_initial_cwd(
+            thread_specs,
+            move |provider| {
+                provision_gateway(provider, Some(&cache_dir_for_resolver))
+                    .map_err(BridgeError::Gateway)
+            },
+            None,
+            initial_cwd,
+            initial_project_path,
+            Some(panel_state),
         )
     }
 
@@ -2921,6 +4420,7 @@ impl AgentBridge {
             cache_dir,
             None,
             None,
+            None,
         )
     }
 
@@ -2930,6 +4430,7 @@ impl AgentBridge {
         cache_dir: Option<PathBuf>,
         initial_cwd: Option<PathBuf>,
         initial_project_path: Option<PathBuf>,
+        panel_state: Option<Arc<PanelStateStore>>,
     ) -> Result<Self, BridgeError> {
         // Boxed immediately so the same resolver this constructor uses to
         // seed `gateway_urls` up front can also be kept on the struct for
@@ -3008,7 +4509,8 @@ impl AgentBridge {
             gateway_setters.entry(url.clone()).or_default();
         }
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
-        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial_cwd));
+        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> =
+            Arc::new(Mutex::new(initial_cwd.clone()));
         let session_project_path_override = Arc::new(Mutex::new(initial_project_path));
 
         // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
@@ -3017,8 +4519,27 @@ impl AgentBridge {
         // it schedules then run on the runtime's own worker threads for the
         // rest of the process's life, well past this guard's drop.
         let _guard = runtime.enter();
+        let server_owned_persistence = cache_dir.is_none();
+        let legacy_thread_ids: Vec<String> = thread_specs
+            .iter()
+            .map(|spec| slug(&spec.display_name))
+            .collect();
+        // Project-scoped panels read the legacy sidecar from that project's
+        // cache.  Projectless panels historically used the global cache
+        // fallback, so keep that upgrade path instead of silently skipping
+        // their runtime snapshots.
+        let legacy_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
+        migrate_legacy_runtime_snapshots(
+            panel_state.as_deref(),
+            Some(legacy_dir.as_path()),
+            &legacy_thread_ids,
+        );
         for (idx, spec) in thread_specs.iter().enumerate() {
-            let thread_id = slug(&spec.display_name);
+            let thread_id = spec
+                .thread_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| slug(&spec.display_name));
 
             // Cold-start seed: read whatever this thread's jsonl file
             // already holds -- of any prior shape/length -- *before*
@@ -3037,7 +4558,12 @@ impl AgentBridge {
             // empty scrollback for *that thread only*, same as any other
             // cache miss.
             let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-                seed_thread_from_cache(store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
+                seed_thread_from_cache(
+                    store.as_ref(),
+                    panel_state.as_deref(),
+                    &thread_id,
+                    HISTORY_PAGE_SIZE,
+                );
             let has_cached_transcript = !seeded.is_empty();
 
             let provider = spec.provider.as_str();
@@ -3067,6 +4593,8 @@ impl AgentBridge {
                 acp_session_id: Mutex::new(None),
                 older_available: Mutex::new(older_available),
                 oldest_loaded_index: Mutex::new(oldest_loaded_index),
+                history_cursor: Mutex::new(None),
+                history_page_in_flight: AtomicBool::new(false),
                 pending_requests: Mutex::new(runtime_snapshot.pending_requests),
                 usage: Mutex::new((0, 0)),
                 terminal_buffers: Mutex::new(
@@ -3119,6 +4647,7 @@ impl AgentBridge {
                 project_path: Mutex::new(spec.project_path.as_deref().map(PathBuf::from)),
                 deferred: false,
                 background: Mutex::new(false),
+                dispatch_order: DispatchOrder::default(),
             });
             slots.push(slot.clone());
 
@@ -3129,6 +4658,7 @@ impl AgentBridge {
                 events_rx,
                 events.clone(),
                 store.clone(),
+                panel_state.clone(),
                 idx,
                 spec.session_id.clone().or(cached_session_id),
                 has_cached_transcript,
@@ -3136,6 +4666,7 @@ impl AgentBridge {
                 Vec::new(),
                 attachment_gate,
                 session_cwd_override.clone(),
+                server_owned_persistence,
                 // acpx-client-session-lease-pool: bulk cold-start restore
                 // is not yet cut over to the pool (SQL binding hydration
                 // isn't built yet either -- see meta.json) -- unchanged
@@ -3157,6 +4688,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway.clone());
+                invalidate_snapshotd_registry_sync();
                 for setter in setters {
                     setter.set_gateway(gateway.clone());
                 }
@@ -3171,12 +4703,23 @@ impl AgentBridge {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(url, gateway.clone());
+                    invalidate_snapshotd_registry_sync();
                     for setter in setters {
                         setter.set_gateway(gateway.clone());
                     }
                 });
             }
         }
+
+        // mcp-servers-settings: this bridge's gateway map is a target the
+        // process-wide snapshotd watcher should keep the central-registry
+        // "snapflow" row synced into (see `register_snapshotd_registry_
+        // sync_target`'s doc comment). Registered here, once per bridge,
+        // rather than only from `snapshotd_mcp_addr()`'s first caller --
+        // that call site has no `Arc<Mutex<HashMap<..., Arc<Gateway>>>>` or
+        // runtime handle to offer, and may run long before any bridge
+        // (and its gateways) exist at all.
+        register_snapshotd_registry_sync_target(gateways.clone(), runtime.handle().clone());
 
         Ok(AgentBridge {
             runtime,
@@ -3188,9 +4731,13 @@ impl AgentBridge {
             gateway_catalog: Arc::new(Mutex::new(GatewayCatalogCache::default())),
             gateway_catalog_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
+            mcp_operations: Arc::new(Mutex::new(HashSet::new())),
+            recover_session_operations: Arc::new(Mutex::new(HashSet::new())),
             resolve_gateway,
             default_provider,
+            server_owned_persistence: cache_dir.is_none(),
             store,
+            panel_state,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_cwd_override,
             session_project_path_override,
@@ -3238,6 +4785,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway);
+                invalidate_snapshotd_registry_sync();
                 return Ok(());
             }
             let _guard = self.runtime.enter();
@@ -3251,6 +4799,7 @@ impl AgentBridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway);
+                invalidate_snapshotd_registry_sync();
             });
         }
         Ok(())
@@ -3287,6 +4836,111 @@ impl AgentBridge {
         )
     }
 
+    /// Returns whether a `ProviderProbe` `BridgeEvent` will eventually be
+    /// pushed for this call (synchronously, on an immediate precondition
+    /// failure below, or asynchronously once the spawned acquire+release
+    /// round-trip finishes) -- `false` only for the deliberate silent
+    /// no-op case (see the "no resolvable project directory" comment
+    /// below). `SettingsMsg::ProfileSelected` inserts `Model::
+    /// provider_probes_in_flight` unconditionally before dispatching
+    /// `Effect::ProbeProvider` (the reducer has no visibility into the
+    /// bridge-side project/gateway/pool state this method resolves), so
+    /// the caller (`effect_executor.rs`'s `Effect::ProbeProvider` arm)
+    /// uses this return value to clear that marker itself when it knows
+    /// no event is ever coming -- otherwise the "Switching provider..."
+    /// pulse stayed stuck forever for exactly the thread state this
+    /// no-op case exists to support (a thread with no project bound and
+    /// no session cwd override).
+    pub fn probe_provider_selection(
+        &self,
+        idx: usize,
+        provider: String,
+        profile_name: Option<String>,
+    ) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        // A thread with no resolvable project directory (no project bound
+        // and no session cwd override) is a normal, fully-supported state
+        // -- not a provider problem. `PoolKey`/session acquisition require a
+        // real project dir structurally, so the probe mechanism itself
+        // cannot run here; that's a precondition failure of the probe, not
+        // evidence this provider's auth is broken. Skip silently: no
+        // `provider_errors` entry, no toast, Send stays unaffected by
+        // provider state. Push nothing at all (not even an `Ok`) so a
+        // stale error from a previous project stays until a probe that can
+        // actually run replaces it.
+        let Some(project_dir) = thread_project_dir(
+            slot.project_path_snapshot().as_deref(),
+            &self.session_cwd_override,
+        ) else {
+            return false;
+        };
+        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ProviderProbe {
+                        provider: provider.clone(),
+                        result: Err(format!("no gateway is configured for {provider}")),
+                    },
+                });
+            return true;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ProviderProbe {
+                        provider: provider.clone(),
+                        result: Err(format!(
+                            "could not initialize the gateway pool for {provider}"
+                        )),
+                    },
+                });
+            return true;
+        };
+        let events = self.events.clone();
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            provider.clone(),
+            crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
+        );
+        let preview_thread_id = format!("provider-probe:{idx}:{provider}");
+        self.runtime.spawn(async move {
+            let result = match pool
+                .acquire(
+                    key,
+                    preview_thread_id,
+                    acpx_client::pool::OpenSpec {
+                        saved_session_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(lease) => pool
+                    .release(&lease)
+                    .await
+                    .map_err(|error| format!("provider probe cleanup failed: {error}")),
+                Err(error) => Err(error.to_string()),
+            };
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ProviderProbe { provider, result },
+                });
+        });
+        true
+    }
+
     /// Notify every pool for the settings gateway that its admin-plane MCP
     /// configuration changed. The pool generation refresh evicts idle
     /// sessions immediately; a currently leased session is left alive and is
@@ -3302,6 +4956,117 @@ impl AgentBridge {
                 .collect::<Vec<_>>()
         };
         for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Retires every pool owned by a project whose identity changed. Idle
+    /// sessions are removed immediately; active leases become stale and are
+    /// removed by their owner after the current turn finishes.
+    fn refresh_pools_for_project_dir(&self, project_dir: &Path) {
+        let prefix = format!("{}|", project_dir.to_string_lossy());
+        let pools = {
+            let pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            self.runtime.spawn(async move {
+                pool.refresh_all().await;
+            });
+        }
+    }
+
+    /// Starts bounded warmup for the resolved default agent when its gateway
+    /// is already available. It activates the pool without taking a thread
+    /// lease and never waits for `session/new` on the caller thread.
+    pub fn prewarm_default_agent(&self, agent_id: &str, profile_name: Option<&str>) {
+        let Some(project_dir) = self
+            .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let Some(base_url) = self.gateway_urls.get(agent_id).cloned() else {
+            return;
+        };
+        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), agent_id);
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            return;
+        };
+        let key = acpx_client::pool::PoolKey::new(
+            project_dir.to_string_lossy().into_owned(),
+            agent_id,
+            crate::gateway_actor::provider_profile_key(profile_name),
+        );
+        self.runtime.spawn(async move {
+            pool.prewarm(key).await;
+        });
+    }
+
+    /// Async counterpart to [`Self::refresh_pools_for_gateway`] for use
+    /// inside already-spawned MCP-settings futures that only hold a
+    /// pre-captured `project_pools` Arc (no `&self`).
+    async fn refresh_captured_pools(
+        project_pools: &Mutex<
+            std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>,
+        >,
+        base_url: Option<&str>,
+    ) {
+        let Some(url) = base_url else {
+            return;
+        };
+        let pools = {
+            let pools = project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .iter()
+                .filter(|(key, _)| key.rsplit_once('|').is_some_and(|(_, u)| u == url))
+                .map(|(_, (pool, _))| pool.clone())
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            pool.refresh_all().await;
+        }
+    }
+
+    /// Toggle the built-in snapflow (snapshotd) MCP for **live** pool
+    /// openers and future `session/new` client `mcpServers`.
+    ///
+    /// Unlike registry enable (`mcp_servers/update`), this is not a
+    /// central-store row — Settings shows it as a non-removable "snapflow"
+    /// row while injection uses wire name `"snapshotd"`. Flipping the
+    /// gate alone would leave already-pooled sessions with the old list
+    /// forever; this rewrites every pool's opener mcp list and
+    /// `refresh_all` so idle leases drop and the next acquire omits (or
+    /// re-adds) snapflow. Currently-leased sessions stay until release
+    /// (same generation semantics as registry refresh).
+    pub fn set_builtin_snapflow_mcp_enabled(&self, enabled: bool) {
+        set_snapflow_mcp_enabled_flag(enabled);
+        let inject_addr = if enabled { snapshotd_mcp_addr() } else { None };
+        let pools_to_refresh = {
+            let mut pools = self.project_pools.lock().unwrap_or_else(|e| e.into_inner());
+            let mut to_refresh = Vec::new();
+            for (_key, (pool, last_mcp)) in pools.iter_mut() {
+                let next =
+                    apply_snapflow_to_client_mcp_list(last_mcp, enabled, inject_addr.as_deref());
+                if next.as_slice() != last_mcp.as_slice() {
+                    pool.opener()
+                        .set_mcp_servers(serde_json::Value::Array(next.clone()));
+                    *last_mcp = next;
+                    to_refresh.push(pool.clone());
+                }
+            }
+            to_refresh
+        };
+        for pool in pools_to_refresh {
             self.runtime.spawn(async move {
                 pool.refresh_all().await;
             });
@@ -3342,12 +5107,116 @@ impl AgentBridge {
         self.set_active_project_identity(&identity);
     }
 
+    /// project-close-session-teardown: soft-releases every open thread's
+    /// live session that is still bound to the CURRENTLY active project
+    /// (i.e. the one about to stop being active), scoped by each
+    /// [`ThreadSlot`]'s own recorded `project_path` (the same value
+    /// `thread_project_path`/`retain_items_for_project` use to scope the
+    /// sidebar). Must be called BEFORE [`Self::set_active_project_
+    /// identity`] overwrites `session_project_path_override`, since that
+    /// is exactly the "currently active project" this method reads.
+    ///
+    /// Unscoped threads (`project_path: None`) are ALSO released here, on
+    /// every switch, regardless of what (if anything) was previously
+    /// active. Unlike scoped threads, an unscoped thread's `project_path`
+    /// is never bound to whatever project happens to be active -- it stays
+    /// `None` for the thread's whole life (barring an explicit rebind, see
+    /// `rebind_unscoped_project_path`) -- so there is no "switching away
+    /// from it" moment to key off of the way there is for a scoped thread.
+    /// Without this, an unscoped thread's live session/pool lease would
+    /// never be released by ANY project switch, accumulating indefinitely
+    /// no matter how many times the user changes projects. This does not
+    /// affect sidebar visibility: `retain_items_for_project` unconditionally
+    /// keeps unscoped threads listed (they were never tied to a project),
+    /// and releasing here never sets the permanent `closed` flag, so a
+    /// released unscoped thread reappears exactly like a released
+    /// scoped-foreign-project thread does today -- listed, session-less,
+    /// reopenable on next send.
+    ///
+    /// Root cause this closes: before this method existed, a project
+    /// switch or close only ever updated `session_cwd_override`/
+    /// `session_project_path_override` (so *future* `session/new` calls
+    /// picked up the new project) and, via `refresh_pools_for_project_dir`,
+    /// bumped the previous project's pool generation -- which only evicts
+    /// currently-IDLE pool entries and marks a currently-LEASED one stale
+    /// for later. A thread's [`gateway_actor::thread_actor`] actor holds
+    /// its lease for the thread's entire life (see that module's
+    /// `current_lease`), released only on an explicit close/delete or the
+    /// next `SendPrompt` -- neither of which a thread belonging to a
+    /// project the user just switched away from (or closed) will ever see
+    /// again while that project stays inactive. The live ACPX session and
+    /// its pooled connection therefore stayed open/leased indefinitely,
+    /// exactly the "threads keep running in the background instead of
+    /// being torn down" bug this fixes.
+    ///
+    /// Uses `close_session(true)` (background=true) rather than a hard
+    /// close/delete: per `Command::CloseSession`'s `background` branch in
+    /// `gateway_actor/thread_actor.rs`, a background close still releases
+    /// this panel's client-side pool lease back to Idle -- freeing the
+    /// pooled connection slot, this bug's actual complaint -- while asking
+    /// acpx-core for a resumable soft close on the backend side, so
+    /// switching back to this project later resumes the conversation
+    /// instead of losing it. Deliberately does NOT set `slot.closed` --
+    /// that flag is the user-facing, permanent "Close" button state
+    /// ([`Self::close_thread`]); this is an automatic lifecycle teardown,
+    /// not an explicit user action, and must not make an untouched thread
+    /// look explicitly closed in the sidebar.
+    ///
+    /// Errors are logged and otherwise ignored, same posture as this
+    /// file's other best-effort teardown paths (e.g. `Drop for
+    /// AgentBridge`) -- a failed release here should not block the
+    /// project switch itself.
+    pub fn release_sessions_for_current_project(&self) {
+        let leaving_project_path = self
+            .session_project_path_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for slot in &self.slots {
+            let slot_project_path = slot.project_path_snapshot();
+            // Unscoped threads (`project_path: None`) are never tied to any
+            // one project, so they never match `leaving_project_path` by
+            // equality -- release them on EVERY switch, regardless of what
+            // (if anything) was previously active, otherwise their live
+            // session accumulates forever across arbitrarily many project
+            // switches. Scoped threads keep the original behavior: release
+            // only when they match the project actually being left.
+            let should_release = match (&slot_project_path, &leaving_project_path) {
+                (None, _) => true,
+                (Some(slot_path), Some(leaving_path)) => slot_path == leaving_path,
+                (Some(_), None) => false,
+            };
+            if !should_release {
+                continue;
+            }
+            let handle = slot.handle.clone();
+            let thread_id = slot.thread_id.clone();
+            self.runtime.spawn(async move {
+                if let Err(error) = handle.close_session(true).await {
+                    eprintln!(
+                        "panel-rust: release_sessions_for_current_project close_session failed for thread {thread_id} (async): {error}"
+                    );
+                }
+            });
+        }
+    }
+
     /// Apply the complete lifecycle identity, including an untitled UUID.
     /// An untitled project has no raw MLT path to publish to snapshotd, but it
     /// still owns a staging store and therefore must provide a real ACP cwd.
     pub fn set_active_project_identity(&self, identity: &crate::model::ProjectIdentity) {
+        let previous_store_path = self
+            .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let store_path = crate::project_store::project_store_dir(identity, &resolve_cache_dir());
         let raw_path = identity.saved_path().map(PathBuf::from);
+        if previous_store_path != store_path {
+            if let Some(previous_store_path) = previous_store_path {
+                self.refresh_pools_for_project_dir(&previous_store_path);
+            }
+        }
         *self
             .session_cwd_override
             .lock()
@@ -3475,7 +5344,12 @@ impl AgentBridge {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
         let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-            seed_thread_from_cache(self.store.as_ref(), thread_id, HISTORY_PAGE_SIZE);
+            seed_thread_from_cache(
+                self.store.as_ref(),
+                self.panel_state.as_deref(),
+                thread_id,
+                HISTORY_PAGE_SIZE,
+            );
         let has_cached_transcript = !seeded.is_empty();
 
         let project_path_for_slot = self
@@ -3556,6 +5430,8 @@ impl AgentBridge {
             acp_session_id: Mutex::new(None),
             older_available: Mutex::new(older_available),
             oldest_loaded_index: Mutex::new(oldest_loaded_index),
+            history_cursor: Mutex::new(None),
+            history_page_in_flight: AtomicBool::new(false),
             pending_requests: Mutex::new(runtime_snapshot.pending_requests),
             usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(
@@ -3597,6 +5473,7 @@ impl AgentBridge {
             project_path: Mutex::new(project_path_for_slot),
             deferred,
             background: Mutex::new(false),
+            dispatch_order: DispatchOrder::default(),
         });
         Ok((
             slot,
@@ -3653,11 +5530,26 @@ impl AgentBridge {
         name: &str,
         preferred_provider: Option<&str>,
     ) -> Result<usize, BridgeError> {
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        self.add_thread_deferred_with_id(&thread_id, name, preferred_provider)
+    }
+
+    /// Create a deferred slot using the caller's durable identity so model,
+    /// bridge, transcript, and archive state remain aligned.
+    pub fn add_thread_deferred_with_id(
+        &mut self,
+        thread_id: &str,
+        name: &str,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(BridgeError::Gateway("thread name cannot be empty".into()));
         }
-        let thread_id = slug(name);
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(BridgeError::Gateway("thread id cannot be empty".into()));
+        }
         if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
             return Err(BridgeError::Gateway(format!(
                 "thread already exists: {name}"
@@ -3720,6 +5612,7 @@ impl AgentBridge {
             events_rx,
             self.events.clone(),
             self.store.clone(),
+            self.panel_state.clone(),
             idx,
             cached_session_id,
             has_cached_transcript,
@@ -3727,6 +5620,7 @@ impl AgentBridge {
             desired_config_options,
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
+            self.server_owned_persistence,
             uses_pool,
         );
         Ok(())
@@ -3770,6 +5664,7 @@ impl AgentBridge {
             events_rx,
             self.events.clone(),
             self.store.clone(),
+            self.panel_state.clone(),
             idx,
             cached_session_id,
             has_cached_transcript,
@@ -3777,6 +5672,7 @@ impl AgentBridge {
             Vec::new(),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
+            self.server_owned_persistence,
             uses_pool,
         );
 
@@ -3842,6 +5738,38 @@ impl AgentBridge {
     /// [`Self::add_thread_with_profile`]'s own cached-session-resume
     /// branch already establishes for a different trigger (local jsonl
     /// cache instead of a picked remote session).
+    ///
+    /// recoverable-attach-fix: this used to resolve the gateway and run
+    /// `session/load` via two `self.runtime.block_on(..)` calls right
+    /// here, on whatever thread called this method -- the Slint "Attach"
+    /// button's click handler, i.e. the UI thread. That froze the whole
+    /// app for the full round trip (and up to a 10s gateway-wait on top).
+    /// Every other attach path in this file (`add_thread_deferred`'s
+    /// eventual `attach_deferred_thread`, `add_thread_with_profile_and_
+    /// provider`) claims its slot's index synchronously (cheap: name
+    /// dedup + a `HashMap` lookup) and then does the real network work on
+    /// `self.runtime` via `spawn_background_attachment`, in the
+    /// background. This method now follows the identical shape, using
+    /// the same delayed-gateway handle (`spawn_acpx_thread_with_delayed_
+    /// gateway`) `build_slot` uses for its own non-pool branch, so the
+    /// slot is pushed -- and this call returns -- before any RPC ever
+    /// starts. The slot starts with `AttachmentState::default()`
+    /// (`complete: false`), exactly like every other in-flight attach;
+    /// `external_snapshot.rs`'s existing "no binding yet, not deferred"
+    /// check already renders such a slot as a loading/"Starting new
+    /// thread..." row with zero additional wiring (see its own "eager/
+    /// recovered" comment, which already anticipated this path), and
+    /// `wait_for_attachment` already makes a `send_prompt` issued before
+    /// attachment completes wait for it in the background rather than
+    /// erroring or blocking the caller.
+    ///
+    /// Deliberately does NOT reuse `spawn_background_attachment` itself:
+    /// that function's `requested_session_id` branch falls back to a
+    /// brand-new `session/new` if `session/load` fails for a non-auth
+    /// reason, which would silently violate this method's own contract
+    /// ("never `session/new`") the moment a picked-from-`session/list`
+    /// session id turned out to be stale/gone -- exactly the case a
+    /// recovery flow most needs to fail loudly on, not paper over.
     pub fn add_thread_recovering_session(
         &mut self,
         name: &str,
@@ -3860,40 +5788,67 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let base_url =
-            self.gateway_urls.get(provider).cloned().ok_or_else(|| {
-                BridgeError::Gateway(format!("gateway URL missing for {provider}"))
-            })?;
-        let gateways = self.gateways.clone();
-        let gateway = self.runtime.block_on(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if let Some(gateway) = gateways
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&base_url)
-                    .cloned()
-                {
-                    return Ok(gateway);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(BridgeError::Gateway(format!(
-                        "gateway connection missing for {base_url}"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let base_url = match self.gateway_urls.get(provider).cloned() {
+            Some(base_url) => base_url,
+            None => {
+                return Err(BridgeError::Gateway(format!(
+                    "gateway URL missing for {provider}"
+                )))
             }
-        })?;
+        };
+        // Marked busy from this point on (a real attach is about to
+        // start) through the background task's completion below --
+        // covers both the success and error exits, symmetric with `end_
+        // recover_session_operation` at the bottom of the spawned task.
+        self.begin_recover_session_operation(session_id);
 
         // Deliberately does not consult the local jsonl cache for
         // `thread_id` -- this is a *new* local thread identity being
         // bound to a pre-existing *remote* session, not a reopen of a
         // thread this panel already knew about (that path is `add_
         // thread_with_profile`'s own `cached_session_id` branch).
-        let mut handle = {
+        //
+        // Same delayed-gateway construction `build_slot`'s non-pool
+        // branch uses: the handle is usable immediately (queues its
+        // first command until a gateway is set), so nothing here needs
+        // to wait -- synchronously if already connected, or via a
+        // background poll loop (identical to `build_slot`'s own) if the
+        // gateway's `Gateway::connect` task from the constructor hasn't
+        // resolved yet.
+        let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread_with_gateway(gateway)
+            spawn_acpx_thread_with_delayed_gateway()
         };
+        match self
+            .gateways
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&base_url)
+            .cloned()
+        {
+            Some(gateway) => gateway_setter.set_gateway(gateway),
+            None => {
+                let gateways = self.gateways.clone();
+                self.runtime.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Some(gateway) = gateways
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&base_url)
+                            .cloned()
+                        {
+                            gateway_setter.set_gateway(gateway);
+                            return;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+            }
+        }
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
         let project_path_for_slot = self
@@ -3913,6 +5868,8 @@ impl AgentBridge {
             acp_session_id: Mutex::new(None),
             older_available: Mutex::new(false),
             oldest_loaded_index: Mutex::new(0),
+            history_cursor: Mutex::new(None),
+            history_page_in_flight: AtomicBool::new(false),
             pending_requests: Mutex::new(Vec::new()),
             usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(HashMap::new()),
@@ -3923,73 +5880,147 @@ impl AgentBridge {
             available_commands: Mutex::new(Vec::new()),
             plan: Mutex::new(Vec::new()),
             session_title: Mutex::new(None),
-            attachment: Mutex::new(AttachmentState {
-                complete: true,
-                error: None,
-            }),
+            // Not yet attached: `session/load` hasn't even been sent
+            // yet, let alone completed. `wait_for_attachment` (used by
+            // `send_prompt`/`cancel_prompt`) blocks on this in the
+            // background until the task below calls `complete_
+            // attachment`, and `external_snapshot.rs`'s thread-list
+            // hydration already renders a slot in this state as a
+            // loading row.
+            attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(false),
             project_path: Mutex::new(project_path_for_slot),
             deferred: false,
             background: Mutex::new(false),
+            dispatch_order: DispatchOrder::default(),
         });
+        self.slots.push(slot.clone());
 
-        // `slot.project_path` (not `self.session_cwd_override` directly) so
-        // this cwd -- and the MCP `--project-dir` below -- can never
-        // disagree with what was just recorded on the slot a few lines
-        // above (PISO-4): both trace back to the same `project_path_for_
-        // slot` snapshot taken before construction, not an independent
-        // re-read of the global that could have moved since.
-        let slot_project_path = slot.project_path_snapshot();
-        let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
-        let project_dir =
-            thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), provider);
-        self.runtime
-            .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
-            .map_err(|error| BridgeError::Gateway(error.to_string()))?;
-        *slot
-            .acp_session_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
-        persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
+        let session_id = session_id.to_string();
+        let store = self.store.clone();
+        let panel_state = self.panel_state.clone();
+        let session_cwd_override = self.session_cwd_override.clone();
+        let events_out = self.events.clone();
+        let recover_session_operations = self.recover_session_operations.clone();
+        self.runtime.spawn(async move {
+            // `slot.project_path` (not `session_cwd_override` directly) so
+            // this cwd -- and the MCP `--project-dir` below -- can never
+            // disagree with what was just recorded on the slot above
+            // (PISO-4): both trace back to the same snapshot, not an
+            // independent re-read of the global that could have moved
+            // since.
+            let slot_project_path = slot.project_path_snapshot();
+            let cwd = cwd_for_session(slot_project_path.as_deref(), &session_cwd_override);
+            let project_dir =
+                thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
+            let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), &slot.provider);
+            match handle
+                .resume_session(session_id.clone(), cwd, mcp_servers)
+                .await
+            {
+                Ok(()) => {
+                    *slot
+                        .acp_session_id
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
+                    persist_thread_snapshot(store.as_ref(), &slot, now_token());
 
-        // `resume_session`'s own replayed `session/update` history has
-        // already fully arrived on `events_rx` by the time the call
-        // above returns (it drains to a real ACP response before
-        // `AcpxThreadHandle::resume_session` resolves -- see that
-        // method's own actor-loop implementation) -- drain it now into
-        // this brand-new slot's `history`, same `try_recv` sweep
-        // `add_thread_with_profile`'s own cached-resume branch uses,
-        // before handing the receiver off to the continuous forwarder
-        // for anything that arrives afterward.
-        let mut replayed_any = false;
-        while let Ok(event) = events_rx.try_recv() {
-            if let AgentEvent::Message(message) = event {
-                slot.history
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(message.clone());
-                replayed_any = true;
-                if let Some(store) = &self.store {
-                    let _ = store.append(&slot.thread_id, &message);
+                    // `resume_session`'s own replayed `session/update`
+                    // history -- AND the capability events (`session/
+                    // load`'s own `configOptions`/`modes`, emitted via
+                    // `emit_capability_events` before the RPC resolves --
+                    // see `Command::ResumeSession`'s handler) -- have
+                    // already fully arrived on `events_rx` by the time
+                    // the call above returns. Drain both into this
+                    // brand-new slot's state now, before handing the
+                    // receiver off to the continuous forwarder for
+                    // anything that arrives afterward. Previously this
+                    // drain only matched `AgentEvent::Message`, silently
+                    // dropping every `ConfigOptions`/`SessionModes`/etc.
+                    // event already queued here -- the recovered
+                    // thread's compose bar never got a provider/model
+                    // dropdown because the one and only capability event
+                    // `session/load` ever emits for it was thrown away
+                    // right here, before the forwarder task (which DOES
+                    // handle those variants via `store_capability_event`)
+                    // ever got a chance to see it.
+                    let mut replayed_any = false;
+                    while let Ok(event) = events_rx.try_recv() {
+                        match &event {
+                            AgentEvent::Message(message) => {
+                                {
+                                    slot.history
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(message.clone());
+                                }
+                                replayed_any = true;
+                                if let Some(store) = &store {
+                                    if let Err(error) = append_jsonl_offloaded(
+                                        store,
+                                        &slot.thread_id,
+                                        message,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "panel-rust: jsonl append failed for {}: {error}",
+                                            slot.thread_id
+                                        );
+                                    }
+                                }
+                            }
+                            AgentEvent::SessionModes(_)
+                            | AgentEvent::CurrentModeChanged(_)
+                            | AgentEvent::ConfigOptions(_)
+                            | AgentEvent::AvailableCommands(_)
+                            | AgentEvent::PlanUpdate(_)
+                            | AgentEvent::SessionInfoUpdate { .. } => {
+                                store_capability_event(&slot, &event);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if replayed_any {
+                        refresh_transcript(&slot);
+                    }
+                    complete_attachment(&slot, None);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "session/load failed for recovered session {session_id:?}: {error}"
+                    );
+                    complete_attachment(&slot, Some(message.clone()));
+                    events_out
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(message),
+                        });
                 }
             }
-        }
-        if replayed_any {
-            refresh_transcript(&slot);
-        }
-
-        spawn_event_forwarder(
-            &self.runtime.handle().clone(),
-            events_rx,
-            self.events.clone(),
-            self.store.clone(),
-            slot.clone(),
-            idx,
-        );
-        self.slots.push(slot);
+            // Symmetric with `begin_recover_session_operation` above --
+            // covers both the `Ok` and `Err` arms, so the Settings >
+            // Agents row's spinner (`RemoteSessionOption.busy`, sourced
+            // from `recover_session_operations_in_flight`) clears the
+            // instant this attach settles, success or failure alike.
+            recover_session_operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&session_id);
+            spawn_event_forwarder(
+                &tokio::runtime::Handle::current(),
+                events_rx,
+                events_out,
+                store,
+                panel_state,
+                slot,
+                idx,
+            );
+        });
         Ok(idx)
     }
 
@@ -4046,6 +6077,23 @@ impl AgentBridge {
             .get(idx)
             .map(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .unwrap_or_default()
+    }
+
+    /// Just the last message of a thread's scrollback, if any -- O(1)
+    /// relative to that thread's history length, unlike `history()` which
+    /// clones the entire `Vec<ChatMessage>`. Used by per-frame snapshot
+    /// paths (e.g. the sidebar's one-line description) that only ever
+    /// look at the final message and must not scale with a thread's total
+    /// message count, since those paths run on every poll tick for every
+    /// thread regardless of which thread (if any) is actively sending.
+    pub fn last_message(&self, idx: usize) -> Option<ChatMessage> {
+        self.slots.get(idx).and_then(|s| {
+            s.history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
+        })
     }
 
     /// The durable identity of an already-open thread, used by the panel's
@@ -4185,6 +6233,47 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
+    /// Gateway-native permission profile catalog for a thread's provider.
+    pub fn list_permission_profiles(
+        &self,
+        idx: usize,
+    ) -> Vec<acpx_proto::gateway::PermissionProfile> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        self.runtime
+            .block_on(slot.handle.clone().list_permission_profiles())
+            .unwrap_or_default()
+    }
+
+    /// Read the effective permission profile attached to a gateway session.
+    pub fn get_permission_profile(
+        &self,
+        idx: usize,
+        session_id: impl Into<String>,
+    ) -> Option<acpx_proto::gateway::SessionPermissionProfileResult> {
+        let Some(slot) = self.slots.get(idx) else {
+            return None;
+        };
+        self.runtime
+            .block_on(slot.handle.clone().get_permission_profile(session_id))
+            .ok()
+    }
+
+    /// Attach/update a gateway-native permission profile for a session.
+    pub fn set_permission_profile(
+        &self,
+        idx: usize,
+        params: acpx_proto::gateway::SessionPermissionProfileParams,
+    ) -> Option<acpx_proto::gateway::SessionPermissionProfileResult> {
+        let Some(slot) = self.slots.get(idx) else {
+            return None;
+        };
+        self.runtime
+            .block_on(slot.handle.clone().set_permission_profile(params))
+            .ok()
+    }
+
     /// `profiles/create` against thread `idx`'s bound gateway. Returns
     /// `true` on success -- the caller (`lib.rs`'s settings-sheet
     /// profile-management form) is expected to re-call [`Self::
@@ -4217,6 +6306,66 @@ impl AgentBridge {
         self.runtime
             .block_on(handle.delete_profile(name.to_string()))
             .is_ok()
+    }
+
+    /// Non-blocking profile create for Settings. The synchronous wrapper is
+    /// retained for compatibility tests, but UI effects must use this
+    /// runtime-owned path so a slow gateway cannot stall Slint.
+    pub fn create_profile_async(
+        &self,
+        idx: usize,
+        entry: serde_json::Value,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let handle = slot.handle.clone();
+        let cache = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .create_profile(entry)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                if let Ok(mut cache) = cache.try_lock() {
+                    cache.last_refresh = None;
+                }
+            }
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking profile delete for Settings; see
+    /// [`Self::create_profile_async`] for the threading contract.
+    pub fn delete_profile_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let handle = slot.handle.clone();
+        let cache = self.gateway_catalog.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_profile(name)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                if let Ok(mut cache) = cache.try_lock() {
+                    cache.last_refresh = None;
+                }
+            }
+            on_complete(result);
+        });
     }
 
     /// Explicit, opt-in-only `session/close` on thread `idx` -- see
@@ -4301,7 +6450,7 @@ impl AgentBridge {
             return false;
         };
         *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = archived;
-        persist_runtime_snapshot(self.store.as_ref(), slot);
+        persist_runtime_snapshot(self.store.as_ref(), self.panel_state.as_deref(), slot);
         true
     }
 
@@ -4312,6 +6461,22 @@ impl AgentBridge {
         self.slots
             .get(idx)
             .map(|slot| *slot.archived.lock().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or(false)
+    }
+
+    pub fn set_thread_archived_by_id(&self, thread_id: &str, archived: bool) -> bool {
+        self.slots
+            .iter()
+            .position(|slot| slot.thread_id == thread_id)
+            .map(|idx| self.set_thread_archived(idx, archived))
+            .unwrap_or(false)
+    }
+
+    pub fn thread_archived_by_id(&self, thread_id: &str) -> bool {
+        self.slots
+            .iter()
+            .position(|slot| slot.thread_id == thread_id)
+            .map(|idx| self.thread_archived(idx))
             .unwrap_or(false)
     }
 
@@ -4329,57 +6494,616 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
-    /// `mcp_servers/create`. Returns `true` on success -- the caller
-    /// (`lib.rs`'s settings-sheet save handler) is expected to re-call
-    /// [`Self::list_mcp_servers`] afterward to refresh the UI list from
-    /// the gateway's own state, same "don't optimistically mutate
-    /// client-side state" posture the mode/config selector uses.
-    pub fn create_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+    /// `mcp_servers/create`. Returns the real gateway/transport error
+    /// text on failure (e.g. a duplicate-name rejection from
+    /// `acpx_core::mcp_servers::McpServerStore::create`, surfaced through
+    /// `AcpxThreadError`'s `Display`) instead of collapsing it to a bare
+    /// `bool` -- `lib.rs`'s settings dispatch methods show this verbatim
+    /// in the action-feedback toast, so a generic "failed" message no
+    /// longer hides *why*. On success, the caller (`lib.rs`'s settings
+    /// dispatch methods) is expected to re-call [`Self::
+    /// list_mcp_servers`] afterward to refresh the UI list from the
+    /// gateway's own state, same "don't optimistically mutate client-side
+    /// state" posture the mode/config selector uses.
+    pub fn create_mcp_server(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        let success = self
+        let result = self
             .runtime
             .block_on(handle.create_mcp_server(entry))
-            .is_ok();
-        if success {
+            .map_err(|err| err.to_string());
+        // Main's live-pool refresh: registry mutations must bump pool
+        // generations so already-open sessions pick up the change on next
+        // reacquire (see notify_mcp_settings_changed).
+        if result.is_ok() {
             self.notify_mcp_settings_changed(idx);
         }
-        success
+        result
     }
 
-    /// `mcp_servers/update` -- same payload shape as [`Self::
-    /// create_mcp_server`].
-    pub fn update_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+    /// `mcp_servers/update` -- same payload shape and error-surfacing
+    /// contract as [`Self::create_mcp_server`].
+    pub fn update_mcp_server(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+    ) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        let success = self
+        let result = self
             .runtime
             .block_on(handle.update_mcp_server(entry))
-            .is_ok();
-        if success {
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
             self.notify_mcp_settings_changed(idx);
         }
-        success
+        result
     }
 
     /// `mcp_servers/delete`.
-    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> bool {
+    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> Result<(), String> {
         let Some(slot) = self.slots.get(idx) else {
-            return false;
+            return Err("no active thread for this settings gateway".to_string());
         };
         let handle = slot.handle.clone();
-        let success = self
+        let result = self
             .runtime
             .block_on(handle.delete_mcp_server(name.to_string()))
-            .is_ok();
-        if success {
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
             self.notify_mcp_settings_changed(idx);
         }
-        success
+        result
+    }
+
+    /// `mcp_servers/authenticate`. Returns the authorization URL to open
+    /// in a browser on success, the real error text on failure (server
+    /// not found, stdio transport, discovery failure, etc.) instead of
+    /// collapsing it to `None`.
+    pub fn authenticate_mcp_server(&self, idx: usize, name: &str) -> Result<String, String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.authenticate_mcp_server(name.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// `mcp_servers/logout`.
+    pub fn logout_mcp_server(&self, idx: usize, name: &str) -> Result<(), String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.logout_mcp_server(name.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// `mcp_servers/tools_fetch` -- fire-and-forget kickoff of a real MCP
+    /// `tools/list` probe. See `AcpxThreadHandle::fetch_mcp_server_tools`'s
+    /// doc comment: the real tool list arrives on a later
+    /// [`Self::list_mcp_servers`] call, not this one.
+    pub fn fetch_mcp_server_tools(&self, idx: usize, name: &str) -> Result<(), String> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Err("no active thread for this settings gateway".to_string());
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.fetch_mcp_server_tools(name.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// Non-blocking counterparts to the six `*_mcp_server` methods above --
+    /// same rationale as `install_agent_async`/`set_agent_enabled_async`
+    /// (PUI-013): every one of those synchronous methods does `self.
+    /// runtime.block_on(...)` directly on the calling thread, which for
+    /// every MCP settings action is the Slint UI callback thread, freezing
+    /// the whole panel for the RPC's full duration (the reported "jittery
+    /// lag while toggling the switch" -- a real block, not just visual
+    /// jank). These run the same RPC on `self.runtime` via `spawn` instead,
+    /// deduped through `mcp_operations` exactly like `agent_operations`
+    /// dedupes agent installs, and hand the real `Result` to `on_complete`
+    /// -- invoked on the runtime thread, never the UI thread, so callers
+    /// (`lib.rs`'s `dispatch_mcp_server_*_async` methods) must re-enter the
+    /// event loop themselves (`slint::invoke_from_event_loop`) before
+    /// touching any Slint/`PanelSingleton` state, same as every other
+    /// background-thread completion in this codebase (`effect_executor.rs`'s
+    /// skill-effect handlers, `report_mcp_server_result`).
+    ///
+    /// On successful create/update/delete/enabled, also fires
+    /// [`Self::notify_mcp_settings_changed`] so pooled sessions refresh
+    /// (same contract as the synchronous methods above -- critical because
+    /// the Settings UI exclusively uses these async paths).
+    pub fn create_mcp_server_async(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("create:{}", entry.name);
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        // Cannot call &self methods from the spawn future; capture base_url
+        // + project_pools the same way notify_mcp_settings_changed resolves
+        // them so a successful mutation still refreshes pools off the UI
+        // thread (Settings uses only these async paths).
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .create_mcp_server(entry)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn update_mcp_server_async(
+        &self,
+        idx: usize,
+        entry: crate::protocol_types::McpServerEntry,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("update:{}", entry.name);
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .update_mcp_server(entry)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn delete_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("delete:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking enabled-toggle. Mirrors `lib.rs`'s synchronous
+    /// `dispatch_mcp_server_enabled_changed` (fetch the current entry,
+    /// flip `enabled`, `mcp_servers/update` it back) but runs the whole
+    /// fetch-mutate-update sequence on `self.runtime` instead of blocking
+    /// the caller -- there is no dedicated `mcp_servers/set_enabled` RPC,
+    /// so this composes the same two real calls [`Self::list_mcp_servers`]/
+    /// [`Self::update_mcp_server`] use, just via their `handle.*.await`
+    /// counterparts instead of `self.runtime.block_on`.
+    pub fn set_mcp_server_enabled_async(
+        &self,
+        idx: usize,
+        name: &str,
+        enabled: bool,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        // Built-in snapflow is client-injected, not a central registry
+        // entry — route off the registry update path entirely.
+        if is_builtin_snapflow_mcp_name(name) {
+            self.set_builtin_snapflow_mcp_enabled(enabled);
+            on_complete(Ok(()));
+            return;
+        }
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("enabled:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let project_pools = self.project_pools.clone();
+        // Optimistic local flip so StatusDot / status-line re-derive from
+        // the new enabled state this frame (list poll will confirm).
+        if let Ok(mut cache) = self.gateway_catalog.try_lock() {
+            if let Some(entry) = cache
+                .mcp_servers
+                .iter_mut()
+                .find(|entry| entry.name == name)
+            {
+                entry.enabled = enabled;
+            }
+            cache.last_refresh = None;
+        }
+        let catalog = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut entry = handle
+                    .list_mcp_servers()
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| {
+                        format!("MCP server \"{name}\" disappeared before its enabled state could update")
+                    })?;
+                entry.enabled = enabled;
+                handle
+                    .update_mcp_server(entry)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            .await;
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            // Confirm StatusDot from wire without waiting out the 2s debounce.
+            if let Ok(mut cache) = catalog.try_lock() {
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`]. Returns the authorization URL
+    /// on success, same contract as the synchronous [`Self::
+    /// authenticate_mcp_server`].
+    pub fn authenticate_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<String, String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("authenticate:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .authenticate_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`].
+    pub fn logout_mcp_server_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("logout:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        self.runtime.spawn(async move {
+            let result = handle
+                .logout_mcp_server(name)
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            on_complete(result);
+        });
+    }
+
+    /// See [`Self::create_mcp_server_async`]. Kicks off the same real
+    /// `mcp_servers/tools_fetch` probe as the synchronous [`Self::
+    /// fetch_mcp_server_tools`], just off the calling thread -- the
+    /// fetched catalog itself still only ever arrives via a later
+    /// [`Self::list_mcp_servers`] poll, so this has no new "busy" UI of
+    /// its own to drive: the existing `tool_fetch_status == "fetching"`
+    /// state (already polled from that same catalog) is what the Fetch/
+    /// Refresh button's spinner is sourced from, not `mcp_operations_in_
+    /// flight` -- the kickoff round-trip this dedupes is typically much
+    /// shorter than the probe itself.
+    pub fn fetch_mcp_server_tools_async(
+        &self,
+        idx: usize,
+        name: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("tools_fetch:{name}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let name = name.to_string();
+        // Optimistic Fetching: the kickoff RPC is short, the real probe
+        // is not -- stamp the local catalog cache immediately so the
+        // Fetch button spinner and "fetching" status show this frame,
+        // not only after the next mcp_servers/list round-trip.
+        if let Ok(mut cache) = self.gateway_catalog.try_lock() {
+            if let Some(entry) = cache
+                .mcp_servers
+                .iter_mut()
+                .find(|entry| entry.name == name)
+            {
+                entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Fetching);
+            }
+            cache.last_refresh = None;
+        }
+        let catalog = self.gateway_catalog.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .fetch_mcp_server_tools(name.clone())
+                .await
+                .map_err(|err| err.to_string());
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            // Kickoff returned: server has stamped Fetching (or failed).
+            // Drop debounce so the next frame's list poll can pick up
+            // Fetching → Ready without waiting the default 2s.
+            if let Err(error) = &result {
+                // Keep the real RPC failure visible on the row after the
+                // short-lived toast disappears. This is also emitted by
+                // the panel process so async errors can be correlated
+                // with acpx/daemon logs.
+                eprintln!("panel-rust: mcp_servers/tools_fetch failed for {name}: {error}");
+            }
+            if let Ok(mut cache) = catalog.try_lock() {
+                if let Err(error) = &result {
+                    if let Some(entry) = cache
+                        .mcp_servers
+                        .iter_mut()
+                        .find(|entry| entry.name == name)
+                    {
+                        entry.tool_catalog = Some(crate::protocol_types::McpToolCatalog::Error {
+                            message: error.clone(),
+                        });
+                    }
+                }
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    /// Non-blocking update of one discovered MCP tool preference. The
+    /// read/modify/write sequence stays together on the bridge runtime so a
+    /// UI effect never performs either registry RPC synchronously.
+    pub fn update_mcp_tool_preference_async(
+        &self,
+        idx: usize,
+        server_name: &str,
+        tool_name: &str,
+        field: &str,
+        value: bool,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active thread for this settings gateway".to_string()));
+            return;
+        };
+        let key = format!("tool:{server_name}:{tool_name}:{field}");
+        if !self.begin_mcp_operation(&key) {
+            return;
+        }
+        let handle = slot.handle.clone();
+        let operations = self.mcp_operations.clone();
+        let catalog = self.gateway_catalog.clone();
+        let project_pools = self.project_pools.clone();
+        let base_url = self
+            .slots
+            .get(idx)
+            .and_then(|s| self.gateway_urls.get(&s.provider).cloned());
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let field = field.to_string();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut entry = handle
+                    .list_mcp_servers()
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.name == server_name)
+                    .ok_or_else(|| {
+                        format!(
+                            "MCP server \"{server_name}\" disappeared before tool preference update"
+                        )
+                    })?;
+                let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
+                if let Some(tools) = tools {
+                    if let Some(tool) = tools.iter_mut().find(|tool| {
+                        tool.get("name").and_then(|name| name.as_str()) == Some(tool_name.as_str())
+                    }) {
+                        if let Some(object) = tool.as_object_mut() {
+                            object.insert(field.clone(), serde_json::Value::Bool(value));
+                        }
+                    } else {
+                        let mut object = serde_json::Map::new();
+                        object.insert(
+                            "name".to_string(),
+                            serde_json::Value::String(tool_name.clone()),
+                        );
+                        object.insert(field.clone(), serde_json::Value::Bool(value));
+                        tools.push(serde_json::Value::Object(object));
+                    }
+                } else {
+                    let mut object = serde_json::Map::new();
+                    object.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(tool_name.clone()),
+                    );
+                    object.insert(field.clone(), serde_json::Value::Bool(value));
+                    entry.extra.insert(
+                        "tools".to_string(),
+                        serde_json::Value::Array(vec![serde_json::Value::Object(object)]),
+                    );
+                }
+                handle
+                    .update_mcp_server(entry)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            .await;
+            if result.is_ok() {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            if let Ok(mut cache) = catalog.try_lock() {
+                cache.last_refresh = None;
+            }
+            on_complete(result);
+        });
+    }
+
+    fn begin_mcp_operation(&self, key: &str) -> bool {
+        self.mcp_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned())
+    }
+
+    /// Non-blocking read, safe to call every frame poll -- same contract
+    /// as [`Self::agent_operations_in_flight`]. Keys are `"<action>:
+    /// <server-name>"` (see `mcp_operations`'s own doc comment); callers
+    /// that only need "is *this* server busy at all" should check for any
+    /// key ending in `:<name>`.
+    pub fn mcp_operations_in_flight(&self) -> Vec<String> {
+        self.mcp_operations
+            .try_lock()
+            .map(|operations| operations.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// recoverable-attach-fix: marks `session_id` busy for the duration
+    /// of its `recover-session-attach` `session/load`. Mirrors `begin_
+    /// mcp_operation`'s own contract; the key is removed again once the
+    /// background attach task completes (success or error) -- inlined
+    /// there directly (via a cloned `Arc`) rather than through a `&self`
+    /// method, since that task runs detached from any `AgentBridge`
+    /// borrow.
+    fn begin_recover_session_operation(&self, session_id: &str) {
+        self.recover_session_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_owned());
+    }
+
+    /// Non-blocking read, safe to call every frame poll -- same contract
+    /// as [`Self::mcp_operations_in_flight`]. Keys are bare remote
+    /// `acp_session_id`s (never composite like the MCP/agent sets above,
+    /// since a session id alone is already unique).
+    pub fn recover_session_operations_in_flight(&self) -> Vec<String> {
+        self.recover_session_operations
+            .try_lock()
+            .map(|operations| operations.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// `agents/list` against thread `idx`'s bound gateway -- the
@@ -4482,8 +7206,14 @@ impl AgentBridge {
     /// the installed status still refreshes on its own. Kept separate from
     /// `install_agent` so the synchronous, bool-returning method still
     /// backs the unit tests.
-    pub fn install_agent_async(&self, idx: usize, agent_id: &str) {
+    pub fn install_agent_async(
+        &self,
+        idx: usize,
+        agent_id: &str,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
         let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err("no active gateway for agent installation".to_owned()));
             return;
         };
         let handle = slot.handle.clone();
@@ -4498,8 +7228,13 @@ impl AgentBridge {
         // We can't call methods on self from the spawned task after move;
         // invalidate last_refresh so the next UI request_gateway_catalog_refresh runs.
         self.runtime.spawn(async move {
-            if handle.install_agent(agent_id.clone()).await.is_err() {
-                eprintln!("panel-rust: install_agent({agent_id}) failed (async)");
+            let result = handle
+                .install_agent(agent_id.clone())
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                eprintln!("panel-rust: install_agent({agent_id}) failed (async): {error}");
             }
             if let Ok(mut c) = cache.try_lock() {
                 c.last_refresh = None;
@@ -4509,6 +7244,7 @@ impl AgentBridge {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&agent_id);
             let _ = refresh_idx; // catalog refresh is UI-driven next frame
+            on_complete(result);
         });
     }
 
@@ -4541,6 +7277,7 @@ impl AgentBridge {
                 profiles: cache.profiles.clone(),
                 mcp_servers: cache.mcp_servers.clone(),
                 agents: cache.agents.clone(),
+                agents_fetched: cache.gen > 0,
                 recoverable_sessions: cache.recoverable_sessions.clone(),
                 recovery_provider: cache.recovery_provider.clone(),
             })
@@ -4555,22 +7292,56 @@ impl AgentBridge {
             .is_none_or(|cache| cache.gen == 0)
     }
 
+    /// Drop the catalog's last-refresh stamp so the next
+    /// [`Self::request_gateway_catalog_refresh`] actually hits the gateway
+    /// instead of being absorbed by the 2s debounce. Used after MCP
+    /// mutations (tools_fetch kickoff, enable toggle, create/update/
+    /// delete) so Settings sees Fetching/Ready and enabled state live.
+    pub fn invalidate_gateway_catalog(&self) {
+        if let Ok(mut cache) = self.gateway_catalog.try_lock() {
+            cache.last_refresh = None;
+        }
+    }
+
     /// Fire-and-forget background refresh of profiles / MCP / agents /
     /// recoverable sessions. Safe to call every frame: single-flight via
     /// `gateway_catalog_refreshing`, and skips if a fresh fill landed within
     /// `min_interval`. Installation does not need a special case because the
     /// frame path never waits for these RPCs.
     ///
+    /// While any MCP server's `toolCatalog` is `Fetching` (or a
+    /// `tools_fetch:<name>` op is still in flight), the debounce shrinks
+    /// to 200ms so the Fetch-tools spinner and expanded tool list update
+    /// as soon as the background probe finishes (the 2s default otherwise
+    /// made "Fetch tools" look dead).
+    ///
     /// **Must not** be awaited on the UI thread — all RPC work runs on the
     /// bridge tokio runtime (canonical push pattern; same as `poll` drain).
     pub fn request_gateway_catalog_refresh(&self, idx: usize) {
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const FETCHING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
         {
             let Ok(cache) = self.gateway_catalog.try_lock() else {
                 return;
             };
+            let ops = self.mcp_operations.try_lock().ok();
+            let any_tools_fetch_op = ops
+                .as_ref()
+                .is_some_and(|set| set.iter().any(|k| k.starts_with("tools_fetch:")));
+            let any_tools_fetching = any_tools_fetch_op
+                || cache.mcp_servers.iter().any(|entry| {
+                    matches!(
+                        entry.tool_catalog,
+                        Some(crate::protocol_types::McpToolCatalog::Fetching)
+                    )
+                });
+            let min_interval = if any_tools_fetching {
+                FETCHING_INTERVAL
+            } else {
+                MIN_INTERVAL
+            };
             if let Some(at) = cache.last_refresh {
-                if cache.gen > 0 && at.elapsed() < MIN_INTERVAL {
+                if cache.gen > 0 && at.elapsed() < min_interval {
                     return;
                 }
             }
@@ -4596,12 +7367,27 @@ impl AgentBridge {
             })
             .collect();
         let cache = self.gateway_catalog.clone();
+        let operations = self.mcp_operations.clone();
         let refreshing = self.gateway_catalog_refreshing.clone();
         let admin_creds = resolve_admin_creds();
+        // mcp-registry-live-propagation: on a real central-registry diff
+        // (not the cold first fill), refresh every project pool bound to
+        // this gateway so idle sessions drop and leased ones stamp stale.
+        let base_url = self.gateway_urls.get(&provider).cloned();
+        let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
-            let profiles = handle.list_profiles().await.unwrap_or_default();
-            let mcp_servers = handle.list_mcp_servers().await.unwrap_or_default();
-            let mut agents = handle.list_agents().await.unwrap_or_default();
+            // These four RPCs are independent of each other (only the admin-enablement
+            // merge below depends on `agents` having resolved), so run them concurrently
+            // via `tokio::join!` instead of paying for N sequential round-trips.
+            let (profiles, mcp_servers, agents_result, sessions_result) = tokio::join!(
+                handle.list_profiles(),
+                handle.list_mcp_servers(),
+                handle.list_agents(),
+                handle.list_sessions_for_agent(provider.clone())
+            );
+            let profiles = profiles.unwrap_or_default();
+            let mcp_servers = mcp_servers.unwrap_or_default();
+            let mut agents = agents_result.unwrap_or_default();
             if let Some((admin_url, admin_token)) = admin_creds {
                 let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
                 if let Ok(entries) = client.list_agents().await {
@@ -4616,23 +7402,32 @@ impl AgentBridge {
                     }
                 }
             }
-            let recoverable_sessions = handle
-                .list_sessions_for_agent(provider.clone())
-                .await
+            let recoverable_sessions = sessions_result
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|session| !bound.contains(&session.acp_session_id))
                 .collect();
-            {
+            let registry_changed = {
                 if let Ok(mut c) = cache.try_lock() {
+                    let had_prior_fill = c.gen > 0;
+                    let ops = operations.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let merged = merge_mcp_list_with_optimistic(mcp_servers, &c.mcp_servers, &ops);
+                    let changed = had_prior_fill
+                        && mcp_registry_identity(&c.mcp_servers) != mcp_registry_identity(&merged);
                     c.profiles = profiles;
-                    c.mcp_servers = mcp_servers;
+                    c.mcp_servers = merged;
                     c.agents = agents;
                     c.recoverable_sessions = recoverable_sessions;
                     c.recovery_provider = provider;
                     c.gen = c.gen.saturating_add(1).max(1);
                     c.last_refresh = Some(std::time::Instant::now());
+                    changed
+                } else {
+                    false
                 }
+            };
+            if registry_changed {
+                Self::refresh_captured_pools(&project_pools, base_url.as_deref()).await;
             }
             refreshing.store(false, Ordering::SeqCst);
         });
@@ -4758,41 +7553,45 @@ impl AgentBridge {
     }
 
     /// Answers a pending interactive request (identified by `relay_id`)
-    /// with `response` and removes it from the thread's pending queue --
-    /// called from the Slint approve/reject button callbacks via
-    /// `lib.rs`. Fire-and-forget on the background runtime, same as
-    /// [`Self::send_prompt`]: the caller is the synchronous UI thread,
-    /// and any failure (gateway gone, relay already timed out) surfaces
-    /// as a queued `AgentEvent::Error` rather than a return value this
-    /// call site couldn't usefully act on. Removing the entry from
-    /// `pending_requests` happens synchronously, before the async
-    /// response is even sent -- the UI should stop showing this
-    /// request's card immediately on click, regardless of whether the
-    /// gateway round trip that follows succeeds.
+    /// with `response`, called from the Slint approve/reject button callbacks
+    /// via `lib.rs`. This is fire-and-forget on the background runtime, same
+    /// as [`Self::send_prompt`]. The card remains pending until ACPX accepts
+    /// the response (`Ok(true)`), so a transient gateway failure can be
+    /// replayed after reconnect. A stale/expired relay (`Ok(false)`) is
+    /// terminal and dismisses the card; transport errors retain it.
     pub fn respond_to_request(&self, idx: usize, relay_id: &str, response: serde_json::Value) {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
-        {
-            let mut pending = slot
-                .pending_requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.retain(|req| req.relay_id != relay_id);
-        }
-        persist_runtime_snapshot(self.store.as_ref(), slot);
+        let slot = slot.clone();
+        let panel_state = self.panel_state.clone();
+        let store = self.store.clone();
         let handle = slot.handle.clone();
         let events_out = self.events.clone();
         let relay_id = relay_id.to_string();
         self.runtime.spawn(async move {
-            if let Err(e) = handle.respond_agent_request(relay_id, response).await {
-                events_out
+            match handle.respond_agent_request(relay_id.clone(), response).await {
+                Ok(true) => {
+                    slot.pending_requests.lock().unwrap_or_else(|e| e.into_inner()).retain(|req| req.relay_id != relay_id);
+                    persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
+                }
+                Ok(false) => {
+                    slot.pending_requests.lock().unwrap_or_else(|e| e.into_inner()).retain(|req| req.relay_id != relay_id);
+                    persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
+                    events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error("agent request expired or was already handled; dismissing the approval card".to_owned()),
+                    });
+                }
+                Err(e) => {
+                    events_out
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("respond_agent_request failed: {e}")),
                     });
+                }
             }
         });
     }
@@ -4868,6 +7667,52 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
+        if self.store.is_none()
+            && slot
+                .acp_session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
+            let before = slot
+                .history_cursor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if !*slot
+                .older_available
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+            {
+                return false;
+            }
+            if slot
+                .history_page_in_flight
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return false;
+            }
+            let handle = Arc::clone(&slot.handle);
+            let slot_for_task = Arc::clone(slot);
+            self.runtime.handle().spawn(async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    handle.paginate_history(before),
+                )
+                .await;
+                if let Err(error) = match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => Err("timed out".to_owned()),
+                } {
+                    eprintln!("panel-rust: remote history pagination failed: {error}");
+                }
+                slot_for_task
+                    .history_page_in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+            return true;
+        }
         let Some(store) = &self.store else {
             return false;
         };
@@ -4930,11 +7775,20 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
+        // See `ThreadSlot::dispatch_order`'s doc comment: drawn
+        // synchronously, here on the UI thread, so this ticket reflects
+        // the true order this call happened in relative to any other
+        // `send_prompt`/`mutate_queue` call for the same thread -- not
+        // whatever order the two independently-spawned tasks below
+        // happen to reach the transport in.
+        let ticket = slot.dispatch_order.draw_ticket();
         let slot = slot.clone();
         let handle = slot.handle.clone();
         let events = self.events.clone();
+        let runtime = self.runtime.handle().clone();
         self.runtime.spawn(async move {
             if let Err(error) = wait_for_attachment(&slot).await {
+                slot.dispatch_order.release();
                 events
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -4944,15 +7798,120 @@ impl AgentBridge {
                     });
                 return;
             }
-            if let Err(e) = handle.send_prompt(text).await {
+            slot.dispatch_order.wait_turn(ticket).await;
+            // Release as soon as this call has actually joined the actor's
+            // own `cmd_rx` FIFO (`call_signaling_dispatch`'s doc comment),
+            // not after `send_prompt` itself returns -- which for a real
+            // turn only resolves once the *whole turn* ends. Releasing
+            // that late would serialize every subsequent queue mutation
+            // (including "Send now"'s own cancel-and-steer `QueueMutation`)
+            // behind an entire in-flight turn instead of just behind this
+            // one RPC's own dispatch, silently breaking steering. The
+            // actual call runs in its own task so this one can release the
+            // instant it's dispatched without waiting for the turn itself.
+            let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+            let call_events = events.clone();
+            runtime.spawn(async move {
+                let result = handle
+                    .send_prompt_signaling_dispatch(text, dispatched_tx)
+                    .await;
+                if let Err(e) = result {
+                    call_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(format!("send_prompt failed: {e}")),
+                        });
+                }
+            });
+            // If the call task is dropped before sending (actor gone), the
+            // channel closes and this resolves as `Err` -- still correct
+            // to release: a gone actor can never win or lose the ordering
+            // race for real.
+            let _ = dispatched_rx.await;
+            slot.dispatch_order.release();
+        });
+    }
+
+    /// Fire-and-forget mutation of the ACPX server-owned per-session queue.
+    /// The server returns the authoritative projection through the queue
+    /// callback stream; this method intentionally does not mutate the local
+    /// queue a second time.
+    pub fn mutate_queue(&self, idx: usize, mut params: serde_json::Value) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        // See `ThreadSlot::dispatch_order`'s doc comment and `send_prompt`'s
+        // identical ticket draw -- every `send_prompt`/`mutate_queue` call
+        // for one thread shares this same ticket sequence, so a queue
+        // mutation (an "enqueue" jumping the FIFO ahead of the turn it was
+        // queued behind was the live-reproduced bug) can never reach the
+        // actor's `cmd_rx` out of the order the UI issued these calls in.
+        let ticket = slot.dispatch_order.draw_ticket();
+        let slot = slot.clone();
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        let runtime = self.runtime.handle().clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = wait_for_attachment(&slot).await {
+                slot.dispatch_order.release();
                 events
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
-                        event: AgentEvent::Error(format!("send_prompt failed: {e}")),
+                        event: AgentEvent::Error(format!("session attachment failed: {error}")),
                     });
+                return;
             }
+            let Some(session_id) = slot
+                .acp_session_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            else {
+                slot.dispatch_order.release();
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::Error(
+                        "queue mutation skipped: session attachment completed without a session id"
+                            .to_owned(),
+                    ),
+                });
+                return;
+            };
+            // The reducer may have emitted this effect while a deferred
+            // thread was still unbound. Resolve the authoritative remote id
+            // only after the attachment gate opens; the local thread slug is
+            // never sent as an ACPX queue key.
+            params["sessionId"] = serde_json::Value::String(session_id);
+            slot.dispatch_order.wait_turn(ticket).await;
+            // Same split as `send_prompt`: release the instant this joins
+            // the actor's queue, not once the mutation's own response
+            // arrives, so a later-ticketed caller is never stuck behind
+            // this one's full round trip.
+            let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+            let call_events = events.clone();
+            runtime.spawn(async move {
+                if let Err(error) = handle
+                    .mutate_queue_signaling_dispatch(params, dispatched_tx)
+                    .await
+                {
+                    call_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(format!("queue mutation failed: {error}")),
+                        });
+                }
+            });
+            let _ = dispatched_rx.await;
+            slot.dispatch_order.release();
         });
     }
 
@@ -5079,6 +8038,26 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
+    /// pre-send-config-options-visibility, Finding C: `NO_PROVIDER_
+    /// REQUESTED_FALLBACK` ("codex") is a valid `session/new`/pool
+    /// provider sentinel -- omitting an explicit profile/agent selector
+    /// there lets acpx-server fall back to its own `ACPX_DEFAULT_AGENT_ID`
+    /// -- but `models/list`'s `agentId` param requires a real, resolvable
+    /// registry id and rejects the bare sentinel outright. Confirmed live
+    /// via a direct RPC: `agentId=codex` -> real error "unknown agent id
+    /// codex"; `agentId=codex-acp` -> a real, correct model catalog. Only
+    /// `list_models` calls need this resolved; every other call site in
+    /// this file that already works with the bare sentinel (session/new,
+    /// the pool preview path, snapflowd_mcp_servers_entry's own dual-form
+    /// handling) is untouched.
+    fn resolve_registry_agent_id_for_capability_probe(provider: &str) -> String {
+        if provider == NO_PROVIDER_REQUESTED_FALLBACK {
+            "codex-acp".to_owned()
+        } else {
+            provider.to_owned()
+        }
+    }
+
     /// Start one background `models/list` probe for the provider currently
     /// selected in the compose bar. This is intentionally not limited to
     /// deferred threads: changing provider on any session-less thread must
@@ -5131,10 +8110,27 @@ impl AgentBridge {
             &self.session_cwd_override,
         );
         let Some(project_dir) = project_dir else {
-            let agent_id = provider.clone();
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
             let events = events.clone();
+            // pre-send-config-options-visibility: `cwd` here was `None`
+            // (real project dir unknown before any project is opened/
+            // saved) on the theory that "there's nothing absolute to
+            // send" -- wrong, and live-confirmed a real bug: a `None`
+            // cwd omits the field entirely, `probe_adapter_capabilities`
+            // then rejects the server's own `"."` default outright
+            // (same "must be an absolute path" error Finding A already
+            // fixed for the other two branches). It only ever appeared
+            // to work for whichever provider happened to already have
+            // server-side cached capabilities (this gateway's own
+            // default agent, warmed some other way) -- confirmed live:
+            // an identical never-yet-probed second provider on the same
+            // cwd-less branch failed immediately. `probe_adapter_
+            // capabilities` doesn't need a *meaningful* cwd, just a
+            // valid absolute one for a generic capability probe, so the
+            // process's own cwd is a perfectly good fallback here.
+            let cwd = std::env::current_dir().ok();
             self.runtime.spawn(async move {
-                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
                 target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5150,10 +8146,16 @@ impl AgentBridge {
             return;
         };
         let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
-            let agent_id = provider.clone();
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
             let events = events.clone();
+            let cwd = Some(project_dir.clone());
             self.runtime.spawn(async move {
-                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                // pre-send-config-options-visibility: this branch has a
+                // real project_dir even though gateway_urls missed --
+                // sending it (absolute, per thread_project_dir) is what
+                // makes probe_adapter_capabilities accept the call
+                // instead of rejecting the "." it defaults to otherwise.
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
                 target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5171,10 +8173,12 @@ impl AgentBridge {
         let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
         let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
         else {
-            let agent_id = provider.clone();
+            let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
             let events = events.clone();
+            let cwd = Some(project_dir.clone());
             self.runtime.spawn(async move {
-                let options = handle.list_models(agent_id).await.unwrap_or_default();
+                // Same reasoning as the gateway_urls-miss branch above.
+                let options = handle.list_models(agent_id, cwd).await.unwrap_or_default();
                 target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5195,6 +8199,8 @@ impl AgentBridge {
             crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
         );
         let preview_thread_id = format!("preview:{idx}:{provider}");
+        let cwd = Some(project_dir.clone());
+        let agent_id = Self::resolve_registry_agent_id_for_capability_probe(&provider);
         self.runtime.spawn(async move {
             let options = match pool
                 .acquire(
@@ -5218,7 +8224,7 @@ impl AgentBridge {
                     }
                     if options.is_empty() {
                         handle
-                            .list_models(provider.clone())
+                            .list_models(agent_id.clone(), cwd.clone())
                             .await
                             .unwrap_or_default()
                     } else {
@@ -5228,7 +8234,7 @@ impl AgentBridge {
                 Err(error) => {
                     eprintln!("panel-rust: capability preview pool acquire failed: {error}");
                     handle
-                        .list_models(provider.clone())
+                        .list_models(agent_id.clone(), cwd.clone())
                         .await
                         .unwrap_or_default()
                 }
@@ -5583,6 +8589,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepend_path_entry_uses_native_path_list_separator() {
+        let current =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).expect("native PATH");
+        let prefixed =
+            prepend_path_entry(Path::new("/bundle/node/bin"), &current.to_string_lossy());
+        let entries: Vec<_> = std::env::split_paths(&prefixed).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/bundle/node/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn bundled_node_home_prefers_explicit_override() {
+        let resolved = bundled_node_home_from(
+            Some(PathBuf::from("/opt/snapflow/runtime/node")),
+            Some(PathBuf::from("/opt/other")),
+            Some(PathBuf::from("/home/tester")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/opt/snapflow/runtime/node")));
+    }
+
+    #[test]
+    fn bundled_node_home_defaults_to_install_dir_runtime_node() {
+        let resolved = bundled_node_home_from(
+            None,
+            Some(PathBuf::from("/opt/snapflow")),
+            Some(PathBuf::from("/home/tester")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/opt/snapflow/runtime/node")));
+    }
+
+    #[test]
+    fn bundled_node_prefix_requires_node_npm_and_npx() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        for name in ["node", "npm", "npx"] {
+            let path = bin.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("executable");
+            }
+        }
+        assert!(executable_prefix(temp.path()));
+        std::fs::remove_file(bin.join("npx")).expect("remove npx");
+        assert!(!executable_prefix(temp.path()));
+    }
+
     fn exited_buffer() -> TerminalBuffer {
         TerminalBuffer {
             output: "done".to_owned(),
@@ -5715,6 +8778,7 @@ mod tests {
     fn rebind_project_path_moves_only_the_renamed_projects_threads() {
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-a".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -5722,6 +8786,7 @@ mod tests {
                 project_path: Some("/projects/a/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-b".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -5729,6 +8794,7 @@ mod tests {
                 project_path: Some("/projects/b/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "unscoped".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -5784,6 +8850,7 @@ mod tests {
     #[test]
     fn rebind_project_path_with_an_empty_old_path_touches_no_thread() {
         let specs = vec![ThreadSpec {
+            thread_id: None,
             display_name: "unscoped".to_owned(),
             provider: "codex".to_owned(),
             session_id: None,
@@ -5804,6 +8871,139 @@ mod tests {
             None,
             "an unscoped thread must never be retro-bound via an empty `old`"
         );
+    }
+
+    /// project-close-session-teardown: releasing sessions for the
+    /// currently active project must not touch threads recorded against a
+    /// DIFFERENT project -- mirrors `rebind_project_path_moves_only_the_
+    /// renamed_projects_threads`'s "only the matching project's threads
+    /// move" shape, but for teardown instead of rename. Unscoped threads
+    /// are deliberately NOT exempt here (see the sibling test below for
+    /// that behavior) -- this test only pins down the scoped-vs-scoped
+    /// isolation. None of these threads ever opened a real session (an
+    /// unreachable gateway URL, same as every other bridge-construction
+    /// test in this module), so `close_session` resolves to an immediate
+    /// no-op success on each -- this test's real assertion is that the
+    /// call is safe (no panic) for every slot regardless of project, and
+    /// that it never sets the permanent user-facing `closed` state, which
+    /// only the explicit close/delete UI actions may do.
+    #[test]
+    fn release_sessions_for_current_project_never_marks_threads_permanently_closed() {
+        let specs = vec![
+            ThreadSpec {
+                thread_id: None,
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                thread_id: None,
+                display_name: "on-b".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/b/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                thread_id: None,
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        // No active project recorded yet -- releasing is still safe (and,
+        // per the new unscoped behavior, actively releases the unscoped
+        // thread's session) but must never touch the permanent `closed`
+        // flag on any thread.
+        bridge.release_sessions_for_current_project();
+        for idx in 0..3 {
+            assert!(!bridge.thread_closed(idx));
+        }
+
+        // Now project A becomes active; releasing must leave every thread
+        // (A's own, B's, and the unscoped one) not permanently closed.
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/a/timeline.mlt".to_owned(),
+        ));
+        bridge.release_sessions_for_current_project();
+        for idx in 0..3 {
+            assert!(
+                !bridge.thread_closed(idx),
+                "release must never flip the permanent closed flag"
+            );
+        }
+    }
+
+    /// New behavior: unscoped threads' live sessions must be released on
+    /// EVERY project switch, not just when a scoped thread's own project is
+    /// being left -- otherwise an unscoped thread's session/pool lease
+    /// would never be released by any switch and accumulate indefinitely.
+    /// Verifies this holds both for a "no-project -> project A" switch and
+    /// a "project A -> project B" switch, and that the unscoped thread
+    /// stays visible/reopenable (never permanently `closed`) afterward,
+    /// matching how a released scoped-foreign-project thread already
+    /// behaves.
+    #[test]
+    fn release_sessions_for_current_project_releases_unscoped_threads_on_every_switch() {
+        let specs = vec![
+            ThreadSpec {
+                thread_id: None,
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                thread_id: None,
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        // "no project -> project A": previously no project was active at
+        // all, yet the unscoped thread's session must still be released.
+        bridge.release_sessions_for_current_project();
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/a/timeline.mlt".to_owned(),
+        ));
+
+        // "project A -> project B": the unscoped thread is released again,
+        // same as A's own thread is released for leaving A.
+        bridge.release_sessions_for_current_project();
+        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
+            "/projects/b/timeline.mlt".to_owned(),
+        ));
+
+        // Neither release call may ever flip the permanent `closed` flag --
+        // both threads must remain visible/reopenable, just session-less.
+        for idx in 0..2 {
+            assert!(
+                !bridge.thread_closed(idx),
+                "releasing a session must never permanently close the thread \
+                 (slot {idx} must remain visible and reopenable)"
+            );
+        }
     }
 
     #[test]
@@ -5969,6 +9169,102 @@ mod tests {
 
         assert_eq!(missing_file_result, None);
         assert_eq!(empty_key_result, None);
+    }
+
+    /// Writes `contents` to a disposable temp `auth.json`, points
+    /// `ACPX_CODEX_AUTH_FILE` at it, and returns a guard whose drop
+    /// restores the prior env var and removes the temp dir -- shared
+    /// setup for `resolve_codex_native_auth_method_id`'s regression
+    /// tests below, which each need a fresh file of a specific shape.
+    struct TempCodexAuthFile {
+        dir: PathBuf,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl TempCodexAuthFile {
+        fn write(contents: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rui-codex-auth-mode-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let auth_file = dir.join("auth.json");
+            std::fs::write(&auth_file, contents).expect("write temp auth file");
+            let prior = std::env::var_os("ACPX_CODEX_AUTH_FILE");
+            unsafe {
+                std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+            }
+            Self { dir, prior }
+        }
+    }
+
+    impl Drop for TempCodexAuthFile {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => unsafe { std::env::set_var("ACPX_CODEX_AUTH_FILE", value) },
+                None => unsafe { std::env::remove_var("ACPX_CODEX_AUTH_FILE") },
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Regression test for the actual live bug this plan fixes: this
+    /// developer's real `~/.codex/auth.json` had `"auth_mode": "chatgpt"`
+    /// (a real, completed ChatGPT-plan login) *and* a stale, leftover
+    /// non-empty `OPENAI_API_KEY` field, and the old field-presence-only
+    /// detection always picked "api-key" for that combination, silently
+    /// contradicting the file's own declared mode. `auth_mode` must now
+    /// win regardless of the leftover key's presence.
+    #[test]
+    fn resolve_codex_native_auth_method_id_prefers_declared_chatgpt_over_leftover_api_key() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(
+            r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": "sk-stale-leftover-key", "tokens": {"access_token": "at-real-login"}}"#,
+        );
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
+    }
+
+    /// `auth_mode` absent entirely (an `auth.json` shape from before this
+    /// field existed) must still fall back to the old presence-based
+    /// priority: a real `OPENAI_API_KEY` resolves to "api-key".
+    #[test]
+    fn resolve_codex_native_auth_method_id_falls_back_to_api_key_presence_without_auth_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(r#"{"OPENAI_API_KEY": "sk-test-key"}"#);
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("api-key"));
+    }
+
+    /// `auth_mode: "chatgpt"` must be trusted on its own -- with
+    /// `OPENAI_API_KEY` explicitly `null` and no `tokens` object at all
+    /// (no recognized token evidence whatsoever) -- since acpx's
+    /// `authenticate` call only ever sends `{"methodId": "chat-gpt"}`
+    /// with no credential payload; codex-acp itself re-reads the same
+    /// auth.json natively to actually consume the login.
+    #[test]
+    fn resolve_codex_native_auth_method_id_trusts_declared_chatgpt_with_no_token_evidence() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(r#"{"auth_mode": "chatgpt", "OPENAI_API_KEY": null}"#);
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("chat-gpt"));
+    }
+
+    /// An unrecognized `auth_mode` value must be ignored (not trusted as
+    /// either mode) and fall back to presence-based detection, same as a
+    /// missing field.
+    #[test]
+    fn resolve_codex_native_auth_method_id_falls_back_on_unrecognized_auth_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _auth = TempCodexAuthFile::write(
+            r#"{"auth_mode": "some-future-mode", "OPENAI_API_KEY": "sk-test-key"}"#,
+        );
+
+        assert_eq!(resolve_codex_native_auth_method_id(), Some("api-key"));
     }
 
     /// read_codex_model_provider_from_config derives the .codex directory
@@ -6214,15 +9510,37 @@ mod tests {
             persona: &str,
             db_path: Option<&std::path::Path>,
         ) -> Self {
+            // `acpx-server` now defaults `ACPX_DB_PATH` to a fixed
+            // `~/.acpx/acpx.db` when unset (durable-persistence-by-
+            // default, see `main.rs::default_db_path`'s doc comment) --
+            // every test spawn that used to rely on "no ACPX_DB_PATH ==
+            // no persistence, fully isolated in-memory state" would
+            // otherwise silently share and lock-contend on that one real
+            // file across every parallel test process. When the caller
+            // doesn't ask for a specific `db_path`, mint a fresh one-off
+            // sqlite file per spawn instead (leaked via `into_path`, not
+            // cleaned up -- same tradeoff any throwaway test tempfile
+            // makes; a locked/shared default file across dozens of
+            // concurrent `cargo test` processes is the far worse
+            // failure mode this avoids).
+            let owned_db_path;
+            let db_path = match db_path {
+                Some(path) => path,
+                None => {
+                    owned_db_path = tempfile::tempdir()
+                        .expect("tempdir for isolated test ACPX_DB_PATH")
+                        .into_path()
+                        .join("acpx-test.db");
+                    owned_db_path.as_path()
+                }
+            };
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
                 test_only_set_backend_cmd_env(command, backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
-                    .env("RUST_LOG", "error");
-                if let Some(db_path) = db_path {
-                    command.env("ACPX_DB_PATH", db_path);
-                }
+                    .env("RUST_LOG", "error")
+                    .env("ACPX_DB_PATH", db_path);
             });
             TestGateway { child, base_url }
         }
@@ -6391,6 +9709,109 @@ mod tests {
             .iter()
             .any(|message| { message.text.contains("HELLO FROM A NEW THREAD") }));
         assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
+    }
+
+    /// paginate-history-skip-for-new-thread: a brand-new, never-resumed
+    /// server-owned thread (`open_session_maybe_profiled`'s `else` arm in
+    /// `spawn_background_attachment`, i.e. `requested_session_id` is
+    /// `None`) sets `is_fresh_session`, so its attach must settle straight
+    /// into "no older messages" (the same state a real empty-page
+    /// `AgentEvent::HistoryPage` response would have produced, see
+    /// `spawn_event_forwarder`'s `HistoryPage` arm) without ever waiting on
+    /// -- or erroring out of -- the `paginate_history(None)` round trip.
+    /// This is a state/outcome check, not a wire-level assertion that the
+    /// RPC was never sent: this module has no seam to intercept
+    /// `acpx/sessions/paginate` client-side without pulling in materially
+    /// more harness weight than this narrow fix warrants.
+    #[test]
+    fn new_thread_attach_settles_no_older_messages_without_a_pagination_wait() {
+        let gateway = TestGateway::spawn();
+        let names = ["Brand New Thread"];
+        // No cache_dir -> `server_owned_persistence` is true, the exact
+        // branch this fix touches.
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+        wait_for_thread_ready(&bridge, 0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !bridge.has_older_page(0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a brand-new thread never settled into has_older_page() == false"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let errors: Vec<_> = bridge
+            .poll()
+            .into_iter()
+            .filter(|event| matches!(&event.event, AgentEvent::Error(_)))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a brand-new thread's attach must not surface any pagination error, got: {errors:?}"
+        );
+    }
+
+    /// Regression test for the "messages truncated to the last few" live
+    /// bug: a now-removed `LIVE_HISTORY_WINDOW` cap in
+    /// `spawn_event_forwarder` used to `history.drain(..)` a server-owned
+    /// thread's live-forwarded messages down to 50 once a session had been
+    /// live long enough, actively evicting already-rendered transcript
+    /// content rather than just capping a disk/server pagination page.
+    /// Drives 20 real `send_prompt`/`TurnEnded` round trips against
+    /// `rui-mock-agent` (3 `ChatMessage`s per turn, see this file's
+    /// `probe_messages_per_turn`-shaped measurement) against a
+    /// `server_owned_persistence` thread (no `cache_dir`, the exact branch
+    /// the removed eviction only ever ran under) -- comfortably past the
+    /// old 50-message window -- and asserts every message is still
+    /// present, in order, starting from the very first turn's own reply.
+    #[test]
+    fn live_session_never_evicts_already_received_messages_from_history() {
+        let gateway = TestGateway::spawn();
+        let names = ["Long Live Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+        wait_for_thread_ready(&bridge, 0);
+
+        const TURNS: usize = 20;
+        for turn in 0..TURNS {
+            bridge.send_prompt(0, format!("live turn {turn}"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut ended = false;
+            while std::time::Instant::now() < deadline && !ended {
+                ended = bridge
+                    .poll()
+                    .into_iter()
+                    .any(|e| matches!(e.event, AgentEvent::TurnEnded(_)));
+                if !ended {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            assert!(ended, "turn {turn} did not finish");
+        }
+
+        let history = bridge.history(0);
+        assert!(
+            history.len() > 50,
+            "test setup must exceed the old 50-message window, got {} messages",
+            history.len()
+        );
+        assert!(
+            history.iter().any(|m| m.text.contains("LIVE TURN 0")),
+            "the very first turn's reply must still be present in a live session's history, \
+             not evicted once later turns pushed the count past the old window: {history:?}"
+        );
+        // The old eviction path also flipped `older_available`/set a
+        // synthetic `history_cursor` purely from local live growth -- a
+        // still-live, never-resumed-from-a-real-page session must not
+        // fabricate a "Load older messages" affordance either.
+        assert!(
+            !bridge.has_older_page(0),
+            "a live session that was never cold-started/resumed from a real paginated page \
+             must not claim older messages are available"
+        );
     }
 
     /// Real, live, billed "click + -> a real reply, rendered" chain,
@@ -6586,17 +10007,26 @@ mod tests {
                 )
             });
 
-        crate::sync::apply_message_ops(&model, &thread_id, &ops);
+        crate::sync::apply_thread_message_ops(&model, &thread_id, &ops);
 
         assert!(
-            model.messages_model.row_count() > 0,
-            "the real {provider} reply must render into the shared messages_model, not just \
+            model
+                .thread_view_models
+                .get(&thread_id)
+                .unwrap()
+                .row_count()
+                > 0,
+            "the real {provider} reply must render into its retained thread model, not just \
              AgentBridge::history()"
         );
         assert_eq!(
-            model.messages_model.row_count(),
-            model.message_model_keys.borrow().len(),
-            "messages_model and its key cache must stay aligned after a real reply renders \
+            model
+                .thread_view_models
+                .get(&thread_id)
+                .unwrap()
+                .row_count(),
+            model.thread_view_models.keys(&thread_id).unwrap().len(),
+            "retained thread model and its key cache must stay aligned after a real reply renders \
              (this exact desync used to abort the whole process)"
         );
         let rendered_text: String = (0..model.messages_model.row_count())
@@ -6980,8 +10410,20 @@ mod tests {
         let recovered_idx = bridge
             .add_thread_recovering_session("Recovered Thread", "codex", &orphan_session_id)
             .expect("add_thread_recovering_session");
+        // recoverable-attach-fix: the attach itself (gateway resolution +
+        // `session/load`) now runs on the background runtime instead of
+        // blocking this call, so the binding is not necessarily present
+        // the instant `add_thread_recovering_session` returns -- poll for
+        // it with a deadline, same convention every other event-driven
+        // assertion in this module already follows.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut binding = bridge.thread_binding(recovered_idx);
+        while std::time::Instant::now() < deadline && binding.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            binding = bridge.thread_binding(recovered_idx);
+        }
         assert_eq!(
-            bridge.thread_binding(recovered_idx).map(|b| b.session_id),
+            binding.map(|b| b.session_id),
             Some(orphan_session_id.clone()),
             "the recovered thread must bind to the orphan's own session id, not a new one"
         );
@@ -7813,6 +11255,45 @@ done
         );
     }
 
+    /// A thread with no project bound and no session cwd override is a
+    /// normal, fully-supported state (default cold-start thread, unscoped
+    /// thread kept open across a project switch -- see
+    /// `retain_items_for_project` and the `2e20021c`/`a8058a45` seeded
+    /// default thread). `probe_provider_selection` must not treat "no
+    /// project" as a provider auth failure: no `ProviderProbe` event at all
+    /// should be emitted, since a stored `Err` here becomes a
+    /// "Provider unavailable" toast and disables Send
+    /// (`selected-provider-unavailable`) for a reason that has nothing to
+    /// do with the provider itself.
+    #[test]
+    fn probe_provider_selection_is_a_silent_noop_when_thread_has_no_project() {
+        let mut bridge =
+            AgentBridge::new_with_gateway_url(&["Untitled"], "http://127.0.0.1:1".to_owned())
+                .expect("bridge");
+
+        // stale-provider-switch-pulse fix: the `bool` return is exactly
+        // what `effect_executor.rs`'s `Effect::ProbeProvider` arm uses to
+        // know no completion event is ever coming, so it can clear
+        // `Model::provider_probes_in_flight` itself instead of leaving the
+        // "Switching provider..." pulse stuck forever. Must be `false`
+        // here -- see this test's own doc comment above for why no event
+        // is pushed for this precondition.
+        let will_complete = bridge.probe_provider_selection(0, "codex".to_owned(), None);
+        assert!(
+            !will_complete,
+            "a no-project probe must report that no completion event is coming"
+        );
+
+        // Give any (unexpected) spawned task a chance to land before
+        // asserting the queue is empty.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let events = bridge.poll();
+        assert!(
+            events.is_empty(),
+            "no-project probe must not emit any ProviderProbe event, got: {events:?}"
+        );
+    }
+
     /// Supersedes the old `normalize_provider_maps_registry_ids_onto_
     /// gateway_keys` test now that `normalize_provider` is gone entirely
     /// (see `resolve_provider_for`'s doc comment): every distinct
@@ -7855,7 +11336,10 @@ done
             Some("codex-acp"),
             "provider is recorded as the raw requested registry id, not normalized"
         );
-        assert_eq!(bridge.thread_provider(claude_idx).as_deref(), Some("claude-acp"));
+        assert_eq!(
+            bridge.thread_provider(claude_idx).as_deref(),
+            Some("claude-acp")
+        );
         assert_eq!(
             bridge.thread_provider(grok_idx).as_deref(),
             Some("grok-build"),
@@ -7872,10 +11356,16 @@ done
 
     #[test]
     fn packaged_gateway_binary_resolution_prefers_override_then_relative_install() {
+        // Windows installs the real binary as `acpx-server.exe`
+        // (`EXE_SUFFIX`) -- exercise the exact platform-appropriate name
+        // so this test still proves the resolver finds a real packaged
+        // install on every CI OS (build-windows.yml runs `cargo test
+        // --release` on windows-latest too), not just Unix's bare name.
+        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        let packaged = bin_dir.join("acpx-server");
+        let packaged = bin_dir.join(&exe_name);
         std::fs::write(&packaged, b"binary").expect("packaged binary");
         let exe = bin_dir.join("panel");
 
@@ -7894,20 +11384,21 @@ done
 
         let libexec_dir = temp.path().join("libexec");
         std::fs::create_dir_all(&libexec_dir).expect("libexec dir");
-        let libexec_bin = libexec_dir.join("acpx-server");
+        let libexec_bin = libexec_dir.join(&exe_name);
         std::fs::write(&libexec_bin, b"binary").expect("libexec binary");
         std::fs::remove_file(&packaged).expect("remove sibling binary");
         assert_eq!(
             resolve_acpx_server_bin_from(None, Some(&exe), Path::new("/manifest")),
-            bin_dir.join("../libexec/acpx-server")
+            bin_dir.join(format!("../libexec/{exe_name}"))
         );
     }
 
     #[test]
     fn packaged_gateway_binary_resolution_falls_back_to_dev_checkout() {
+        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         assert_eq!(
             resolve_acpx_server_bin_from(None, None, Path::new("/manifest")),
-            PathBuf::from("/manifest/../acpx/target/debug/acpx-server")
+            PathBuf::from(format!("/manifest/../acpx/target/debug/{exe_name}"))
         );
     }
 
@@ -8217,6 +11708,7 @@ done
         let claude_url = claude_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Thread".to_owned(),
                 provider: "codex-acp".to_owned(),
                 session_id: None,
@@ -8224,6 +11716,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Thread".to_owned(),
                 provider: "claude-acp".to_owned(),
                 session_id: None,
@@ -8312,6 +11805,7 @@ done
         let claude_url = claude_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Thread".to_owned(),
                 provider: "codex-acp".to_owned(),
                 session_id: None,
@@ -8319,6 +11813,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Thread".to_owned(),
                 provider: "claude-acp".to_owned(),
                 session_id: None,
@@ -8404,6 +11899,7 @@ done
         let gemini_url = gemini_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Thread".to_owned(),
                 provider: "codex-acp".to_owned(),
                 session_id: None,
@@ -8411,6 +11907,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Thread".to_owned(),
                 provider: "claude-acp".to_owned(),
                 session_id: None,
@@ -8418,6 +11915,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Gemini Thread".to_owned(),
                 provider: "gemini-acp".to_owned(),
                 session_id: None,
@@ -8508,6 +12006,7 @@ done
         let claude_url = claude_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Seed".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8515,6 +12014,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Seed".to_owned(),
                 provider: "claude".to_owned(),
                 session_id: None,
@@ -8737,9 +12237,13 @@ done
             }
         }
         assert!(answered, "permission request never surfaced on the bridge");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !bridge.pending_requests(0).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             bridge.pending_requests(0).is_empty(),
-            "pending_requests should be cleared synchronously by respond_to_request"
+            "pending_requests should clear after ACPX accepts respond_to_request"
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -8976,6 +12480,7 @@ done
         // rather than picking one over the other.
         let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
             command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+            command.env("ACPX_DB_PATH", script_dir.path().join("gateway.sqlite3"));
             test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                 .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
                 .env("RUST_LOG", "error");
@@ -9107,6 +12612,7 @@ done
         let mut command = std::process::Command::new(acpx_server_bin());
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env("ACPX_DB_PATH", script_dir.path().join("gateway.sqlite3"))
             .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
             .env("ACPX_DEFAULT_AGENT_ID", "terminal-cap-agent")
             .env("RUST_LOG", "error")
@@ -9395,23 +12901,48 @@ done
             bridge.list_mcp_servers(0).is_empty(),
             "expected no MCP servers on a fresh gateway"
         );
-        assert!(bridge.create_mcp_server(
-            0,
-            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs" })
-        ));
+        let stdio_entry = |command: &str| {
+            crate::protocol_types::McpServerEntry::new(
+                "bridge-fs",
+                crate::protocol_types::McpServerConfig::Stdio {
+                    command: command.to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    timeout: None,
+                },
+            )
+        };
+        assert!(bridge
+            .create_mcp_server(0, stdio_entry("mcp-bridge-fs"))
+            .is_ok());
         let after_create = bridge.list_mcp_servers(0);
         assert_eq!(after_create.len(), 1);
         assert_eq!(after_create[0].name, "bridge-fs");
 
-        assert!(bridge.update_mcp_server(
-            0,
-            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs-v2" })
-        ));
+        // The real failure-text contract this test exists to prove:
+        // create_mcp_server/etc. used to collapse every failure into a
+        // bare `bool`/`Option`, discarding the actual reason. A duplicate
+        // create against the real gateway is rejected server-side
+        // (`acpx_core::mcp_servers::McpServerStore::create`'s
+        // `AlreadyExists` error) -- confirm that real message reaches the
+        // caller, not a generic "failed" string with no context.
+        let duplicate_create_err = bridge
+            .create_mcp_server(0, stdio_entry("mcp-bridge-fs"))
+            .expect_err("creating the same name twice must fail");
+        assert!(
+            duplicate_create_err.contains("bridge-fs") || duplicate_create_err.contains("already"),
+            "expected the real gateway rejection reason (naming the duplicate server or \
+             \"already exists\"), got: {duplicate_create_err:?}"
+        );
+
+        assert!(bridge
+            .update_mcp_server(0, stdio_entry("mcp-bridge-fs-v2"))
+            .is_ok());
         let after_update = bridge.list_mcp_servers(0);
         assert_eq!(after_update.len(), 1);
-        assert_eq!(after_update[0].command.as_deref(), Some("mcp-bridge-fs-v2"));
+        assert_eq!(after_update[0].command(), Some("mcp-bridge-fs-v2"));
 
-        assert!(bridge.delete_mcp_server(0, "bridge-fs"));
+        assert!(bridge.delete_mcp_server(0, "bridge-fs").is_ok());
         assert!(
             bridge.list_mcp_servers(0).is_empty(),
             "expected the server to be gone after delete"
@@ -9427,6 +12958,86 @@ done
         assert!(
             !bridge.install_agent(0, "definitely-not-a-real-agent-id"),
             "install_agent against an unknown id should fail against the real registry, not succeed"
+        );
+    }
+
+    /// Real end-to-end proof of `AgentBridge::fetch_mcp_server_tools` --
+    /// proven at the layer `lib.rs` actually calls from Slint (the
+    /// sibling `gateway_actor_mcp_agents_e2e_test.rs` tests only prove
+    /// this one level lower, through `AcpxThreadHandle` directly).
+    /// Real `snapflowd-mcp` subprocess, real `mcp_servers/tools_fetch`
+    /// RPC, real background probe, polled through the real gateway.
+    #[test]
+    fn fetch_mcp_server_tools_reaches_a_real_backend_through_the_bridge() {
+        let gateway = TestGateway::spawn();
+        let names = ["Tools Fetch Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        let global_dir = tempfile::tempdir().expect("global dir tempdir");
+        std::fs::create_dir_all(global_dir.path().join("release")).expect("skill dir");
+        std::fs::write(
+            global_dir.path().join("release").join("SKILL.md"),
+            "---\nname: release\ndescription: release process\n---\n",
+        )
+        .expect("write SKILL.md");
+
+        let entry = crate::protocol_types::McpServerEntry::new(
+            "bridge-tools-preview",
+            crate::protocol_types::McpServerConfig::Stdio {
+                command: resolve_snapflowd_mcp_bin().to_string_lossy().into_owned(),
+                args: vec![
+                    "--global-dir".to_string(),
+                    global_dir.path().to_string_lossy().into_owned(),
+                ],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        assert!(bridge.create_mcp_server(0, entry).is_ok());
+
+        let before_fetch = bridge
+            .list_mcp_servers(0)
+            .into_iter()
+            .find(|e| e.name == "bridge-tools-preview")
+            .expect("just-created entry should be listed");
+        assert_eq!(before_fetch.tool_catalog, None);
+
+        assert!(
+            bridge
+                .fetch_mcp_server_tools(0, "bridge-tools-preview")
+                .is_ok(),
+            "fetch_mcp_server_tools kickoff should reach the real gateway"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ready_tools = None;
+        while std::time::Instant::now() < deadline {
+            let entry = bridge
+                .list_mcp_servers(0)
+                .into_iter()
+                .find(|e| e.name == "bridge-tools-preview")
+                .expect("entry should still be listed while polling");
+            match entry.tool_catalog {
+                Some(crate::protocol_types::McpToolCatalog::Ready { tools }) => {
+                    ready_tools = Some(tools);
+                    break;
+                }
+                Some(crate::protocol_types::McpToolCatalog::Error { message }) => {
+                    panic!("real tools/list probe through the bridge failed: {message}");
+                }
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let tool_names: Vec<String> = ready_tools
+            .expect("expected a ready real tool catalog within the timeout")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            tool_names.contains(&"list_skills".to_string()),
+            "expected the real snapflowd-mcp tool catalog to include list_skills, got {tool_names:?}"
         );
     }
 
@@ -9601,7 +13212,16 @@ done
         // Seed a real cache file with more than one page's worth of
         // messages, independent of this bridge (mirrors a prior run's
         // accumulated scrollback).
-        let total_messages = HISTORY_PAGE_SIZE * 2 + 37;
+        // Remainder must stay smaller than HISTORY_PAGE_SIZE so the third
+        // page (the "real start") is reached in exactly one more
+        // `load_older_page` call after the first two full pages -- this
+        // constant shrank from 500 to 20 (see
+        // memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+        // "Cross-check: message loading is already paginated" section);
+        // the original `+ 37` relied on `37 < 500` and silently broke this
+        // test's "two total load_older_page calls reach the start"
+        // assumption once the page size shrank below it.
+        let total_messages = HISTORY_PAGE_SIZE * 2 + 7;
         let seeded_messages: Vec<ChatMessage> = (0..total_messages)
             .map(|i| ChatMessage {
                 // Alternating User/Agent -- a realistic shape (unlike an
@@ -9670,7 +13290,7 @@ done
         );
         assert!(bridge.has_older_page(0));
 
-        // Second call reaches the real start (37 remaining messages).
+        // Second call reaches the real start (7 remaining messages).
         assert!(bridge.load_older_page(0));
         let after_two = bridge.history(0);
         assert_eq!(after_two.len(), total_messages);
@@ -9685,6 +13305,135 @@ done
         // `load_older_page` actually refreshed `transcript`, not just
         // `history`.
         assert_eq!(bridge.transcript(0).len(), total_messages);
+    }
+
+    /// Server-owned persistence integration: a resumed ACPX session starts
+    /// with the gateway's newest page, then `load_older_page` must dispatch
+    /// the returned continuation cursor and prepend the older page through
+    /// the normal event-forwarder path. This deliberately constructs the
+    /// second bridge without a local cache so the test cannot accidentally
+    /// pass through `JsonlStore::predecessor_page`.
+    #[test]
+    fn server_owned_load_older_page_prepends_remote_history_page() {
+        if !mock_agent_bin().exists() {
+            eprintln!(
+                "skipping: real rui-mock-agent binary is not built at {}",
+                mock_agent_bin().display()
+            );
+            return;
+        }
+        let gateway = TestGateway::spawn();
+        let thread_id = "remote-page-thread".to_owned();
+        let first_specs = [ThreadSpec {
+            thread_id: Some(thread_id.clone()),
+            display_name: "Remote page thread".to_owned(),
+            provider: "test".to_owned(),
+            session_id: None,
+            profile_name: None,
+            project_path: None,
+        }];
+        let base_url = gateway.base_url.clone();
+        let first = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &first_specs,
+            move |_provider| Ok(base_url.clone()),
+            None,
+        )
+        .expect("initial server-owned bridge");
+        wait_for_thread_ready(&first, 0);
+
+        // The mock backend contributes multiple transcript updates per turn;
+        // enough turns ensure the server's first page (50 updates) has an
+        // older continuation page to return.
+        for turn in 0..30 {
+            first.send_prompt(0, format!("remote page turn {turn}"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut ended = false;
+            while std::time::Instant::now() < deadline && !ended {
+                ended = first
+                    .poll()
+                    .into_iter()
+                    .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+                if !ended {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            assert!(ended, "remote seed turn {turn} did not complete");
+        }
+        let session_id = first
+            .thread_binding(0)
+            .expect("seed session binding")
+            .session_id;
+        // Keep the first bridge alive while the resumed bridge is created:
+        // dropping an AgentBridge tears down its Tokio runtime, which would
+        // invalidate the shared Gateway handle before the second bridge can
+        // complete its session/resume handshake. The two bridges represent
+        // a reconnecting panel and are intentionally independent here.
+
+        let second_specs = [ThreadSpec {
+            thread_id: Some(thread_id),
+            display_name: "Remote page thread".to_owned(),
+            provider: "test".to_owned(),
+            session_id: Some(session_id),
+            profile_name: None,
+            project_path: None,
+        }];
+        let base_url = gateway.base_url.clone();
+        let second = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &second_specs,
+            move |_provider| Ok(base_url.clone()),
+            None,
+        )
+        .expect("resumed server-owned bridge");
+        wait_for_thread_ready(&second, 0);
+
+        let initial_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < initial_deadline
+            && (!second.has_older_page(0) || second.history(0).is_empty())
+        {
+            let _ = second.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(second.has_older_page(0), "initial remote page had no continuation");
+        let newest_page = second.history(0);
+        assert!(!newest_page.is_empty(), "initial remote page was empty");
+        let newest_first = newest_page[0].text.clone();
+        let newest_len = newest_page.len();
+
+        assert!(second.load_older_page(0), "remote pagination dispatch was rejected");
+        let older_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < older_deadline
+            && second.has_older_page(0)
+            && second.history(0).len() == newest_len
+        {
+            let _ = second.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let full_history = second.history(0);
+        assert!(
+            full_history.len() > newest_len,
+            "remote older page did not prepend history (initial={newest_len}, final={})",
+            full_history.len()
+        );
+        assert_ne!(full_history[0].text, newest_first);
+        // Continue walking until ACPX returns `nextCursor = null`; the mock
+        // backend may produce more than one older page depending on how many
+        // updates each turn emitted.
+        let mut pages = 1usize;
+        while second.has_older_page(0) && pages < 8 {
+            assert!(second.load_older_page(0), "remote continuation dispatch was rejected");
+            let before_len = second.history(0).len();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline
+                && second.history(0).len() == before_len
+                && second.has_older_page(0)
+            {
+                let _ = second.poll();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(second.history(0).len() > before_len, "remote page was empty");
+            pages += 1;
+        }
+        assert!(!second.has_older_page(0), "remote continuation cursor was not exhausted");
     }
 
     /// `skill_injection_verification` phase: `snapflowd_mcp_servers_entry`'s
@@ -9724,6 +13473,45 @@ done
             !args.contains(&serde_json::Value::String("--project-dir".to_string())),
             "no project open -- args must not claim a --project-dir"
         );
+    }
+
+    #[test]
+    fn snapshotd_mcp_entry_omitted_when_snapflow_disabled() {
+        let _gate = SNAPFLOW_MCP_GATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = SNAPFLOW_MCP_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        SNAPFLOW_MCP_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let without = snapshotd_mcp_server_entry_for_addr(Some("127.0.0.1:9"));
+        assert!(
+            without.is_empty(),
+            "disabled snapflow must not inject snapshotd into mcpServers"
+        );
+        SNAPFLOW_MCP_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let with = snapshotd_mcp_server_entry_for_addr(Some("127.0.0.1:9"));
+        assert_eq!(with.len(), 1);
+        assert_eq!(with[0]["name"], "snapshotd");
+        SNAPFLOW_MCP_ENABLED.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn apply_snapflow_to_client_mcp_list_removes_and_restores() {
+        let base = vec![
+            serde_json::json!({"name": "skills", "command": "x", "env": []}),
+            serde_json::json!({"type": "http", "name": "snapshotd", "url": "http://1/mcp", "headers": []}),
+        ];
+        let off = apply_snapflow_to_client_mcp_list(&base, false, None);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0]["name"], "skills");
+        let on = apply_snapflow_to_client_mcp_list(&off, true, Some("127.0.0.1:9"));
+        assert!(
+            on.iter()
+                .any(|e| e.get("name").and_then(|n| n.as_str()) == Some("snapshotd")),
+            "re-enable with an inject addr must put snapshotd back"
+        );
+        assert!(on
+            .iter()
+            .any(|e| e.get("name").and_then(|n| n.as_str()) == Some("skills")));
     }
 
     /// **Regression test for the real, live-found silent-drop bug**
@@ -9919,6 +13707,125 @@ done
         );
     }
 
+    /// Broad coverage for registry poll-diff identity: name/enabled/config
+    /// changes count; tool_catalog (ephemeral fetch state) does not; order
+    /// is irrelevant.
+    #[test]
+    fn mcp_registry_identity_ignores_tool_catalog_and_detects_real_diffs() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog};
+
+        let a = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-filesystem".into(),
+                ],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let mut a_with_tools = a.clone();
+        a_with_tools.tool_catalog = Some(McpToolCatalog::Fetching);
+        assert_eq!(
+            mcp_registry_identity(std::slice::from_ref(&a)),
+            mcp_registry_identity(std::slice::from_ref(&a_with_tools)),
+            "tool catalog must not look like a registry mutation"
+        );
+
+        let mut disabled = a.clone();
+        disabled.enabled = false;
+        assert_ne!(
+            mcp_registry_identity(std::slice::from_ref(&a)),
+            mcp_registry_identity(std::slice::from_ref(&disabled)),
+            "enabled flip is a real registry change"
+        );
+
+        let b = McpServerEntry::new(
+            "git",
+            McpServerConfig::Stdio {
+                command: "mcp-git".into(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        let ordered = mcp_registry_identity(&[b.clone(), a.clone()]);
+        let reversed = mcp_registry_identity(&[a, b]);
+        assert_eq!(ordered, reversed, "list order must not matter");
+    }
+
+    #[test]
+    fn merge_mcp_list_keeps_fetching_and_enabled_while_ops_in_flight() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog};
+        use std::collections::HashSet;
+
+        let mut local = McpServerEntry::new(
+            "fs",
+            McpServerConfig::Stdio {
+                command: "npx".into(),
+                args: vec![],
+                env: Default::default(),
+                timeout: None,
+            },
+        );
+        local.enabled = false;
+        local.tool_catalog = Some(McpToolCatalog::Fetching);
+
+        // Wire still shows pre-toggle enabled=true and no catalog yet.
+        let mut wire = local.clone();
+        wire.enabled = true;
+        wire.tool_catalog = None;
+
+        let mut ops = HashSet::new();
+        ops.insert("tools_fetch:fs".to_owned());
+        ops.insert("enabled:fs".to_owned());
+
+        let merged = merge_mcp_list_with_optimistic(vec![wire], std::slice::from_ref(&local), &ops);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            !merged[0].enabled,
+            "in-flight enable toggle must keep optimistic enabled"
+        );
+        assert_eq!(
+            merged[0].tool_catalog,
+            Some(McpToolCatalog::Fetching),
+            "in-flight tools_fetch must keep optimistic Fetching over empty list"
+        );
+
+        // Wire Ready wins even while tools_fetch key is still present.
+        let mut ready = local.clone();
+        ready.tool_catalog = Some(McpToolCatalog::Ready { tools: vec![] });
+        let merged_ready =
+            merge_mcp_list_with_optimistic(vec![ready], std::slice::from_ref(&local), &ops);
+        assert!(matches!(
+            merged_ready[0].tool_catalog,
+            Some(McpToolCatalog::Ready { .. })
+        ));
+
+        // An immediate RPC failure must survive the next empty list poll so
+        // the row remains useful after the shared toast expires.
+        let error_message = "300002: no mcp server named snapflow".to_owned();
+        let mut failed = local.clone();
+        failed.tool_catalog = Some(McpToolCatalog::Error {
+            message: error_message.clone(),
+        });
+        let mut empty_catalog = failed.clone();
+        empty_catalog.tool_catalog = None;
+        let merged_error = merge_mcp_list_with_optimistic(
+            vec![empty_catalog],
+            std::slice::from_ref(&failed),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            merged_error[0].tool_catalog,
+            Some(McpToolCatalog::Error {
+                message: error_message,
+            })
+        );
+    }
+
     /// lock_audit Layer 1 (F-01/F-02): frame-poll catalog path must never
     /// `block_on` — empty bridge returns an empty cache immediately, and
     /// a refresh with no slots is a no-op (does not hang the caller).
@@ -9934,6 +13841,7 @@ done
             profiles: Vec::new(),
             mcp_servers: Vec::new(),
             agents: Vec::new(),
+            agents_fetched: false,
             recoverable_sessions: Vec::new(),
             recovery_provider: String::new(),
         };

@@ -11,11 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"snapshotd/internal/transport"
 )
 
 // freePort asks the OS for an unused TCP port on 127.0.0.1, then releases
@@ -56,7 +57,7 @@ func TestCLI_MCPStatusRestartAuthInstallConfig(t *testing.T) {
 		_ = serveCmd.Wait()
 	})
 
-	controlSock := filepath.Join(homeDir, "control.sock")
+	controlSock := transport.DefaultControlEndpoint(homeDir)
 	waitForSocket(t, controlSock, 5*time.Second, &serveOut)
 
 	// status on a fresh daemon: listening, auth disabled.

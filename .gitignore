@@ -11,6 +11,17 @@
 /.DS_Store
 /.idea/
 /.vscode/
+
+# shotcut-rebrand is checked out separately per this worktree's own VNC/CI
+# workflow (fresh from Shaik-Sirajuddin/shotcut, not this repo's history) --
+# never track it here.
+/shotcut-rebrand/
+/snapshotd/.snapshotd.build.lock
+
+# live_oauth_browser_e2e.sh's Playwright dependency -- installed on
+# demand by that script, not vendored (package.json/package-lock.json
+# are committed, node_modules itself is not).
+/panel-rust/tests/node_modules/
 acpx/target/
 /snapshotd/snapshotd
 

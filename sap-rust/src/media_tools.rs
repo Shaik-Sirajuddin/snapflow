@@ -35,8 +35,9 @@ pub(crate) const DEFAULT_FPS: i64 = 30;
 /// direct `ffprobe` on both a freshly generated PNG and the pre-existing
 /// `overlay.png` fixture -- neither ever reports a duration field), so no
 /// still image could ever be used as a producer through this codepath.
-pub(crate) const STILL_IMAGE_CODECS: &[&str] =
-    &["png", "mjpeg", "bmp", "gif", "tiff", "webp", "targa", "ppm", "pgm", "pbm", "sgi"];
+pub(crate) const STILL_IMAGE_CODECS: &[&str] = &[
+    "png", "mjpeg", "bmp", "gif", "tiff", "webp", "targa", "ppm", "pgm", "pbm", "sgi",
+];
 
 /// Default duration applied to a still image when ffprobe reports none,
 /// matching real Shotcut's default still-image duration preference (4s)
@@ -77,9 +78,9 @@ pub(crate) fn normalize_vcodec(codec: &str) -> String {
 /// this module doesn't already know how to normalize. Returns the offending
 /// line if found.
 pub(crate) fn detect_unrecognised_codec(stderr: &str) -> Option<&str> {
-    stderr
-        .lines()
-        .find(|line| line.contains("unrecognised - ignoring") || line.contains("unrecognized - ignoring"))
+    stderr.lines().find(|line| {
+        line.contains("unrecognised - ignoring") || line.contains("unrecognized - ignoring")
+    })
 }
 
 /// Evicts terminal (non-`"running"`) jobs from `jobs` until its size is
@@ -143,7 +144,9 @@ pub(crate) fn probe_media(path: &str) -> BackendResult<FileProbe> {
             path,
         ])
         .output()
-        .map_err(|e| BackendError::InvalidParams(format!("failed to run ffprobe on {path}: {e}")))?;
+        .map_err(|e| {
+            BackendError::InvalidParams(format!("failed to run ffprobe on {path}: {e}"))
+        })?;
     if !output.status.success() {
         return Err(BackendError::InvalidParams(format!(
             "ffprobe failed on {path}: {}",
@@ -155,27 +158,42 @@ pub(crate) fn probe_media(path: &str) -> BackendResult<FileProbe> {
     let streams = json
         .get("streams")
         .and_then(Value::as_array)
-        .ok_or_else(|| BackendError::InvalidParams(format!("ffprobe returned no streams for {path}")))?;
+        .ok_or_else(|| {
+            BackendError::InvalidParams(format!("ffprobe returned no streams for {path}"))
+        })?;
     let stream = streams
         .iter()
         .find(|s| s.get("codec_type").and_then(Value::as_str) == Some("video"))
         .or_else(|| streams.first())
-        .ok_or_else(|| BackendError::InvalidParams(format!("ffprobe returned no streams for {path}")))?;
+        .ok_or_else(|| {
+            BackendError::InvalidParams(format!("ffprobe returned no streams for {path}"))
+        })?;
     let codec = stream
         .get("codec_name")
         .and_then(Value::as_str)
-        .ok_or_else(|| BackendError::InvalidParams(format!("ffprobe returned no codec for {path}")))?;
+        .ok_or_else(|| {
+            BackendError::InvalidParams(format!("ffprobe returned no codec for {path}"))
+        })?;
     let is_still_image = STILL_IMAGE_CODECS.contains(&codec);
     let probed_duration_seconds = json
         .get("format")
         .and_then(|f| f.get("duration"))
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| stream.get("duration").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()));
+        .or_else(|| {
+            stream
+                .get("duration")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<f64>().ok())
+        });
     let duration_seconds = match probed_duration_seconds {
         Some(d) => d,
         None if is_still_image => DEFAULT_IMAGE_DURATION_FRAMES as f64 / DEFAULT_FPS as f64,
-        None => return Err(BackendError::InvalidParams(format!("ffprobe returned no duration for {path}"))),
+        None => {
+            return Err(BackendError::InvalidParams(format!(
+                "ffprobe returned no duration for {path}"
+            )))
+        }
     };
     let duration_frames = stream
         .get("nb_frames")
@@ -190,7 +208,9 @@ pub(crate) fn probe_media(path: &str) -> BackendResult<FileProbe> {
             }
         });
     if duration_frames <= 0 || !duration_seconds.is_finite() || duration_seconds < 0.0 {
-        return Err(BackendError::InvalidParams(format!("ffprobe returned an invalid duration for {path}")));
+        return Err(BackendError::InvalidParams(format!(
+            "ffprobe returned an invalid duration for {path}"
+        )));
     }
     Ok(FileProbe {
         path: path.to_string(),
@@ -285,8 +305,12 @@ mod tests {
 
     #[test]
     fn detect_unrecognised_codec_finds_the_offending_line() {
-        let stderr = "some noise\n[libx264 @ 0x1] frobnicate\nfoo unrecognised - ignoring\nmore noise";
-        assert_eq!(detect_unrecognised_codec(stderr), Some("foo unrecognised - ignoring"));
+        let stderr =
+            "some noise\n[libx264 @ 0x1] frobnicate\nfoo unrecognised - ignoring\nmore noise";
+        assert_eq!(
+            detect_unrecognised_codec(stderr),
+            Some("foo unrecognised - ignoring")
+        );
         assert_eq!(detect_unrecognised_codec("all clean"), None);
     }
 }

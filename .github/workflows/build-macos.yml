@@ -45,7 +45,24 @@ jobs:
       - name: Build acpx-server (test dependency)
         working-directory: acpx
         run: cargo build -p acpx-server
+      # See build-linux.yml's identical step: panel-rust/Cargo.toml's
+      # package.version is a dev placeholder, stamped here from the
+      # release tag so the version shown in Settings
+      # (env!("CARGO_PKG_VERSION"), lib.rs) never goes stale.
+      - name: Stamp Cargo.toml version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i '' "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
       - run: cargo build --release
+      - name: Verify native daemon transport and SAP protocol tests
+        run: |
+          cargo test --lib snapshotd_client --no-default-features
+          cargo test --manifest-path ../sap-rust/Cargo.toml --quiet
+      - name: Build SAP macOS static library (compile-time transport variant)
+        run: cargo build --manifest-path ../sap-rust/Cargo.toml --release
       # See build-linux.yml's identical step: RUST_TEST_THREADS=4 didn't
       # reliably fix agent_bridge's flakiness on a real GitHub runner
       # despite being verified locally -- back to advisory.
@@ -58,6 +75,10 @@ jobs:
         with:
           name: panel-rust-staticlib-macos
           path: panel-rust/target/release/libpanel_rust.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap-rust-staticlib-macos
+          path: sap-rust/target/release/libsap_rust.a
 
   snapshotd:
     runs-on: macos-latest
@@ -74,6 +95,8 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd ./cmd/snapshotd
+      - name: Verify native AF_UNIX transport and endpoint consumers
+        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       # macOS's default TMPDIR (/var/folders/<xx>/<hash>/T/) is long enough
       # that once the tests' own random subdirectories are appended, real
       # AF_UNIX sockets bound under a temp RunDir (daemon/procmgr/sapproxy
@@ -108,13 +131,13 @@ jobs:
 
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry --
       # it started life as a local-only git worktree on the dev machine, now
-      # pushed to Shaik-Sirajuddin/shotcut.git's rebrand/snapflow branch), so
+      # pushed to Shaik-Sirajuddin/shotcut.git's master branch), so
       # check it out separately rather than expecting it in this repo's own
       # checkout.
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: rebrand/snapflow
+          ref: master
           path: shotcut-rebrand
 
       - name: Place sap-rust as a sibling of shotcut-rebrand

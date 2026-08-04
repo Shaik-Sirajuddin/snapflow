@@ -123,6 +123,20 @@ pub struct SessionEntry {
     /// it, whereas `pinned` exempts a session from idle reaping
     /// entirely regardless of any TTL.
     pub custom_idle_ttl: Option<std::time::Duration>,
+    /// Whether this session currently occupies a slot in the gateway's
+    /// live-session admission counters (`AdmissionState` in `router.rs`).
+    ///
+    /// **Capacity semantics (live fix):** admission exists to bound *live*
+    /// work (a real `session/new`, recovery of a real gateway session, or
+    /// the first in-flight turn against a session), **not** passive
+    /// catalog imports. `session/list` bulk-registration of backend
+    /// history sets this to `false` so an empty discovery burst cannot
+    /// saturate `max_sessions_per_tenant` before the user opens a single
+    /// new thread. The first real turn (`set_in_flight` 0→N / proxied
+    /// prompt path) promotes the session and flips this to `true`.
+    /// Default `true` preserves pre-existing behavior for every path that
+    /// already called `admit_session` before registering.
+    pub capacity_counted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -133,11 +147,45 @@ pub struct SessionRegistry {
     /// tenants can never see or overwrite each other's entries even if
     /// (hypothetically) they shared an inner id string.
     sessions: HashMap<TenantId, HashMap<String, SessionEntry>>,
+    /// Gateway-owned permission profile attachment, kept separate from the
+    /// agent-bound `SessionEntry` fields for backwards-compatible recovery.
+    permission_profiles: HashMap<TenantId, HashMap<String, crate::profile::PermissionProfile>>,
 }
 
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_permission_profile(
+        &mut self,
+        tenant_id: &TenantId,
+        session_id: impl Into<String>,
+        profile: crate::profile::PermissionProfile,
+    ) {
+        self.permission_profiles
+            .entry(tenant_id.clone())
+            .or_default()
+            .insert(session_id.into(), profile);
+    }
+
+    pub fn permission_profile(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &str,
+    ) -> Option<&crate::profile::PermissionProfile> {
+        self.permission_profiles
+            .get(tenant_id)
+            .and_then(|profiles| profiles.get(session_id))
+    }
+
+    pub fn clear_permission_profile(&mut self, tenant_id: &TenantId, session_id: &str) {
+        if let Some(profiles) = self.permission_profiles.get_mut(tenant_id) {
+            profiles.remove(session_id);
+            if profiles.is_empty() {
+                self.permission_profiles.remove(tenant_id);
+            }
+        }
     }
 
     /// Register a newly-created session, minting a fresh gateway session id.
@@ -190,9 +238,23 @@ impl SessionRegistry {
                 in_flight_since: None,
                 pinned: false,
                 custom_idle_ttl: None,
+                // Callers that register without a prior admit_session
+                // (session/list discovery) must flip this to false
+                // explicitly -- see `capacity_counted`'s doc comment.
+                capacity_counted: true,
             },
         );
         gateway_id
+    }
+
+    /// Mutable resolve -- used when promoting a discovery-only session to
+    /// capacity-counted on first real turn.
+    pub fn resolve_mut(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_id: &GatewaySessionId,
+    ) -> Option<&mut SessionEntry> {
+        self.sessions.get_mut(tenant_id)?.get_mut(&gateway_id.0)
     }
 
     pub fn resolve(
@@ -836,5 +898,37 @@ mod tests {
         assert!(reg
             .stuck_in_flight_candidates(Instant::now() + deadline * 10, &lifecycle)
             .is_empty());
+    }
+
+    #[test]
+    fn permission_profile_attachment_is_tenant_scoped_and_replaceable() {
+        let mut reg = SessionRegistry::new();
+        let tenant_a = TenantId::from("a");
+        let tenant_b = TenantId::from("b");
+        reg.set_permission_profile(
+            &tenant_a,
+            "s1",
+            crate::profile::PermissionProfile::readonly(),
+        );
+        assert_eq!(
+            reg.permission_profile(&tenant_a, "s1")
+                .unwrap()
+                .profile_type,
+            crate::profile::PermissionProfileType::Readonly
+        );
+        assert!(reg.permission_profile(&tenant_b, "s1").is_none());
+        reg.set_permission_profile(
+            &tenant_a,
+            "s1",
+            crate::profile::PermissionProfile::not_allowed(),
+        );
+        assert_eq!(
+            reg.permission_profile(&tenant_a, "s1")
+                .unwrap()
+                .profile_type,
+            crate::profile::PermissionProfileType::NotAllowed
+        );
+        reg.clear_permission_profile(&tenant_a, "s1");
+        assert!(reg.permission_profile(&tenant_a, "s1").is_none());
     }
 }

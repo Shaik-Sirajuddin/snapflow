@@ -1,0 +1,189 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "plan": "pre-send-config-options-visibility",
+  "status": "in_progress",
+  "updated": "2026-07-29 (Finding B server-side persistence bug root-caused as harness process drift; separate real bug fixed: cross-thread optimistic provider/mode/config/reasoning label leak in chat_input_layout.slint)",
+  "plan_doc": "00-plan.md",
+  "source_task": "User-flagged gap during pool-capability-fix live verification: prior tests only checked configOptions AFTER first send, never before -- and never across more than one provider.",
+  "ordering_rationale": "Phase 1 is the code-trace grounding. Phase 2 is the actual live runtime matrix this plan exists for. Phase 3 root-caused the claude-acp anomaly (Findings A/B). Phase 4 implemented and verified Finding A, then discovered Findings C/D while re-verifying end to end. Phase 5 implemented C/D. Phase 6 (triggered by re-verifying D with real instrumentation instead of trusting the code trace) found and fixed Finding E, the last piece needed for the matrix to actually pass live.",
+  "completed": [
+    {
+      "phase": "trace_pre_send_config_options_source",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "description": "Trace which code path populates ChatInputLayout's config-dropdown-entries for a thread with no session yet (before first send): AgentBridge::config_options_for_provider -> slot.config_options (live-attached-only, empty pre-send) falls back to slot.pre_session_model_options (populated by ensure_models_for_provider's pool.acquire/pool.release preview, keyed by project_dir+provider+profile).",
+      "implementation_evidence": "See 00-plan.md 'What's already known from code' section. No code changed in this phase -- pure trace, confirming a runtime_gate phase 2 is answering a real open question, not investigating a known-broken path."
+    },
+    {
+      "phase": "investigate_claude_acp_provider_selection_routing_anomaly",
+      "order": 3,
+      "tier": 2,
+      "status": "completed",
+      "description": "Root-caused the claude-acp routing anomaly found while live-verifying pool-capability-fix (separately from this plan's original scope). Two stacked findings, confirmed via curl against the real acpx-server (bypassing the client's own error-swallowing).",
+      "verification": "Root-caused with a concrete explanation and confirmed via direct RPC calls.",
+      "verified": [
+        {
+          "description": "Finding A (client-side bug, real and fixable): AgentBridge::ensure_models_for_provider's client-side fallback path (hit whenever project_dir/gateway_urls/pool_for isn't resolvable) calls AcpxThreadHandle::list_models(agent_id) with NO cwd. thread_actor.rs's Command::ListModels handler sends 'models/list' with only {\"agentId\": agent_id} -- no cwd field at all. acpx-core/router.rs's models/list handler defaults a missing cwd to \".\", and probe_adapter_capabilities rejects a relative cwd outright. Confirmed live via curl: POST /rpc models/list agentId=claude-acp cwd=\".\" -> real JSON-RPC error 'cwd must be an absolute path, but received: .'; the identical call with cwd=\"/tmp\" -> a real, correct 5-model claude-acp catalog. The client's own `.unwrap_or_default()` on this call silently swallows that error into an empty Vec, so the UI shows nothing with no diagnostic trail.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Finding B (deployment/config limitation for the real session/new ATTACH path, distinct from capability preview): acpx-core/router.rs supports a real, direct `_acpx.agentId` session/new extension (distinct from `_acpx.profile`) for selecting a backend agent without a profile -- but acpx-client's Gateway::call (gateway.rs) only ever threads a `profile: Option<&str>`; there is no code path anywhere in acpx-client that ever sends `_acpx.agentId`. This worktree's vnc_worktree.sh launch provisions no profiles at all, so a real attach for a UI-selected provider has no working mechanism to route session/new anywhere but the gateway's single ACPX_DEFAULT_AGENT_ID. Deliberately NOT fixed as part of this plan -- it's the real-attach path, separate from the capability-preview path Findings A/C/D/E fixed, and is a genuine multi-file feature addition (acpx-client protocol surface + panel-rust wiring, or per-provider profile provisioning).",
+          "verdict": "CONFIRMED"
+        }
+      ]
+    },
+    {
+      "phase": "runtime_matrix_pre_send_dropdown_population",
+      "order": 2,
+      "tier": "runtime_gate",
+      "status": "completed",
+      "description": "Live verification: for a freshly created, not-yet-sent thread, confirm ChatInputLayout's config dropdown shows non-empty, provider-correct options BEFORE any send -- across multiple providers, including a mid-flight provider switch on the same unsent thread.",
+      "matrix_ref": "00-plan.md#verification-approach",
+      "harness": "Live VNC instance (real acpx-server, real codex-acp/claude-acp backends, real auth) driven via Slint MCP (get_element_tree/find_elements_by_id/click_element against ChatInputLayout::compose and the Provider/Model SearchableDropdowns), state read BEFORE any dispatch_key_event send -- not the post-send *.runtime.json polling every existing pool-* scenario uses. Panel cache dir wiped and gateway relaunched fresh immediately before the final pass to eliminate restored-thread-state ambiguity from earlier passes in this same session.",
+      "matrix_rows": [
+        {
+          "scenario": "pre-send dropdown populated, provider A = whatever the thread was created with (codex-acp)",
+          "matrix_status": "PASS -- final clean-cache live pass: config-dropdown trigger showed 'Model' before any send; opened to 5 real option rows (GPT-5.4, GPT-5.5, GPT-5.6-Luna, GPT-5.6-Sol, GPT-5.6-Terra)"
+        },
+        {
+          "scenario": "pre-send dropdown repopulates after explicitly selecting provider B (claude-acp) on the same unsent thread",
+          "matrix_status": "PASS -- final clean-cache live pass, after Findings A/C/D/E all applied: dropdown opened to 5 real claude models (Default (recommended), Sonnet, Opus (1M context), Haiku, Fable), exactly matching a direct curl replay of the same RPC"
+        },
+        {
+          "scenario": "pre-send dropdown populated, any additional configured provider (grok-build)",
+          "matrix_status": "BLOCKED -- separate, unrelated bug: real acpx RPC error 'initialize must be called before new_session' for this specific adapter, confirmed via direct curl. Not a client-side cwd/sentinel/provider-resolution issue like A/C/E; explicitly out of scope for this plan, not fixed."
+        },
+        {
+          "scenario": "post-send regression guard (existing pool-* coverage still passes)",
+          "matrix_status": "PASS -- switched back to codex-acp, sent a real prompt, got a real 'OK' reply and a clean turn-ended, confirming the fix didn't disturb the already-working post-send path"
+        }
+      ]
+    },
+    {
+      "phase": "fix_finding_a_and_diagnose_provider_switch_wiring_gap",
+      "order": 4,
+      "tier": 2,
+      "status": "completed",
+      "description": "Implemented Finding A's fix (thread_actor.rs Command::ListModels + AcpxThreadHandle::list_models gained a `cwd: Option<PathBuf>` param; agent_bridge.rs's ensure_models_for_provider threads project_dir through the call sites that had one). Live-verified working for an explicit, valid provider. While re-verifying the original claude-acp scenario end to end, root-caused two further, deeper issues (C and D) that Finding A alone did not fix.",
+      "implementation_evidence": "cargo build -p panel-rust: clean. cargo test --lib: 440 passed, same 3 pre-existing failures as baseline (2 environmental PTY tests, 1 known-flaky real-subprocess-timing test) -- no new regressions.",
+      "verified": [
+        {
+          "description": "Finding A confirmed working live: selecting a real, valid, explicit provider (codex-acp) on a not-yet-sent thread populated the config dropdown with 5 real models before any send.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Finding C: ensure_models_for_provider's client-side fallback path passes NO_PROVIDER_REQUESTED_FALLBACK ('codex', agent_bridge.rs:909) directly as the models/list agentId whenever a thread's provider was never explicitly set. acpx-server's registry has no agent literally named 'codex' -- only 'codex-acp'. Confirmed via curl: agentId=codex -> real error 'unknown agent id codex'; agentId=codex-acp -> a real catalog. 'codex' is a valid sentinel for session/new (server falls back to its own ACPX_DEFAULT_AGENT_ID) but not for models/list, which requires a real, resolvable registry id.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Finding D (initial writeup, later refined in phase 6): after Finding A's fix, switching to claude-acp DID trigger a real, correct models/list RPC -- but the dropdown still showed nothing. Initially traced (via code reading, not yet direct instrumentation) to AgentBridge::config_options(idx) reading the immutable, construction-time-only ThreadSlot::provider field. The real mechanism turned out to be one level up the call stack -- see phase 5.",
+          "verdict": "CONFIRMED"
+        }
+      ]
+    },
+    {
+      "phase": "fix_findings_c_and_d_capability_preview_provider_resolution",
+      "order": 5,
+      "tier": 2,
+      "status": "completed",
+      "description": "User asked to implement the full fix. Implemented C and D (both scoped to the capability-preview read/write path). Finding B (real _acpx.agentId plumbing for the real session/new ATTACH, a separate code path from preview) intentionally deferred.",
+      "implementation_evidence": "cargo build -p panel-rust: clean. cargo test --lib: 439-440 passed across reruns (one known-flaky real-subprocess test occasionally lands on the unlucky side of parallel scheduling; confirmed passing in isolation every time). No new failures.",
+      "verified": [
+        {
+          "description": "Finding D's real mechanism, confirmed via temporary eprintln instrumentation in update.rs's SettingsMsg::ProfileSelected handler (added, verified, removed before the build that shipped): Model::ThreadItem::provider genuinely does get updated correctly on a real profile-selection dispatch. The actual bug was in external_snapshot.rs's collect_thread_snapshot_for: `selected_provider` was derived ONLY from `thread.profile_name` matched against `model.available_profiles` (empty in this no-profile dev harness), falling back straight to the stale `bridge.thread_provider(real_idx)` (AgentBridge::ThreadSlot::provider, set once at construction, never reassigned) -- it never consulted the already-correct `thread.provider` (Model layer) at all. Fixed by adding `thread.provider` (captured in the same initial model borrow) as a fallback BEFORE the AgentBridge-layer read, keeping the profile_name/available_profiles lookup as first preference for when a real admin-provisioned profile exists.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Finding C fix: added AgentBridge::resolve_registry_agent_id_for_capability_probe, mapping the NO_PROVIDER_REQUESTED_FALLBACK sentinel ('codex') to the real registry id ('codex-acp') specifically before any models/list call. Every other bare-sentinel use elsewhere in this file (session/new via the pool, snapflowd_mcp_servers_entry's own dual-form handling) is untouched. Applied at all 5 list_models call sites in ensure_models_for_provider.",
+          "verdict": "CONFIRMED"
+        }
+      ],
+      "depends_on": [
+        "fix_finding_a_and_diagnose_provider_switch_wiring_gap"
+      ]
+    },
+    {
+      "phase": "find_and_fix_finding_e_no_project_dir_branch_cwd",
+      "order": 6,
+      "tier": 2,
+      "status": "completed",
+      "description": "Live re-verification of C+D's fix (on a fresh gateway + fresh panel cache) still showed an empty claude-acp dropdown. Rather than trust another round of pure code-tracing, added real eprintln instrumentation end to end (write/read cache keys, which ensure_models_for_provider branch fired, the exact RPC params sent, the raw RPC response/error) and rebuilt before drawing any conclusion -- this is what actually found Finding E, after an earlier attempt at diagnosing the same symptom via code-reading alone reached a plausible-but-wrong theory that a rebuild-and-test cycle immediately disproved.",
+      "implementation_evidence": "cargo build -p panel-rust: clean. cargo test --lib: 440 passed, same 3 pre-existing failures, no new regressions. All DEBUGTRACE instrumentation added during this phase's investigation was removed before the final build (grepped clean).",
+      "verified": [
+        {
+          "description": "Finding E: ensure_models_for_provider's `no-project-dir` branch (hit whenever no project file has been opened/saved yet -- the normal state for a user's very first thread) sent `cwd=None`. The trace showed this branch firing for BOTH codex (`agentId=codex-acp`, cwd omitted) and claude-acp (`agentId=claude-acp`, cwd omitted) with the exact same missing-cwd shape -- yet codex's raw RPC response returned a real 6-model catalog while claude-acp's raw RPC response was the same 'cwd must be an absolute path, received .' error Finding A already fixed elsewhere. The difference: codex-acp is this gateway's own default agent and apparently already has server-side-cached capabilities from some other startup path, so probe_adapter_capabilities never needed to validate cwd for it; claude-acp, never probed before on a fresh gateway, needed a genuine fresh probe and hit the same missing-cwd rejection. Fixed by using `std::env::current_dir()` as this branch's cwd fallback -- a generic capability probe doesn't need a *meaningful* cwd, just a valid absolute one.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Full matrix re-verified live end to end after the fix, on a genuinely clean panel cache dir + freshly restarted gateway (no restored-thread-state ambiguity): row 1 (codex default) PASS, row 2 (explicit claude-acp switch on the same unsent thread) PASS with 5 real claude models, row 4 (post-send regression) PASS with a real reply. Row 3 (grok-build) hit a separate, unrelated backend adapter bug, confirmed via curl, explicitly out of scope.",
+          "verdict": "CONFIRMED"
+        }
+      ],
+      "depends_on": [
+        "fix_findings_c_and_d_capability_preview_provider_resolution"
+      ]
+    },
+    {
+      "phase": "implement_finding_b_real_attach_agent_id_plumbing",
+      "order": 7,
+      "tier": 2,
+      "status": "completed",
+      "description": "User asked to continue until Finding B (real session/new ATTACH routing, not just capability preview) was also fixed. Implemented in panel-rust/src/gateway_actor/session_opener.rs: `_acpx.agentId` is a plain JSON-RPC body field acpx-core reads identically over both WS and HTTP transports (confirmed by reading acpx-client's raw.rs -- `params` is forwarded byte-for-byte in the request body regardless of transport, and the `profile` argument only ever adds an HTTP header or a separate `_acpx.profile` body field on top) -- so this needed NO changes to acpx-client's Gateway::call at all, just embedding `_acpx.agentId` directly into the pool opener's session/new and session/resume params before calling, mutually exclusive with `_acpx.profile` (acpx-core rejects a request naming both).",
+      "implementation_evidence": "cargo build -p panel-rust: clean. cargo test --lib: 439-440 passed across reruns (two known-flaky real-subprocess tests occasionally land on the unlucky side of parallel scheduling -- both confirmed passing in isolation every time). No new failures attributable to this change.",
+      "verified": [
+        {
+          "description": "New helper functions in session_opener.rs: explicit_agent_id_from_key (returns None for the NO_PROVIDER_REQUESTED_FALLBACK sentinel, Some(real id) otherwise) and apply_explicit_agent_selection (embeds _acpx.agentId only when no real profile already claims the role, returning the profile to pass through Gateway::call's own parameter unchanged in either case). Wired into both GatewaySessionOpener::create (session/new) and resume (session/resume, harmless/inert there since a resume is already pinned to a specific sessionId).",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Protocol-level correctness confirmed via two direct curl calls against the real running acpx-server: POST /rpc session/new with {\"_acpx\":{\"agentId\":\"claude-acp\"}} and a real mcpServers/cwd genuinely created a real session against the real claude-agent-acp adapter (real sessionId, real modes, real configOptions with the same 5 claude models seen elsewhere in this plan, real agentInfo showing '@agentclientprotocol/claude-agent-acp'). The client-side fix is correct and does what it's supposed to.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "Full live end-to-end confirmation THROUGH THE PANEL (not curl) is blocked by a separate, newly-surfaced server-side persistence issue -- see the pending finding_b_real_attach_agent_id_plumbing_server_side_persistence_bug phase. Not a flaw in this fix (proven correct via curl above); the panel's own session/new attempt fails with a real SQLite 'attempt to write a readonly database' error that curl replays of the identical RPC do not reproduce.",
+          "verdict": "PLAUSIBLE"
+        }
+      ],
+      "depends_on": [
+        "find_and_fix_finding_e_no_project_dir_branch_cwd"
+      ]
+    },
+    {
+      "phase": "finding_b_real_attach_agent_id_plumbing_server_side_persistence_bug",
+      "order": 9,
+      "tier": 2,
+      "status": "completed",
+      "description": "Finding B's client-side fix is implemented and protocol-verified (see the completed phase above), but full live end-to-end confirmation through the panel hit a NEW, separate, narrower problem: session/new via panel (real attach, not curl) fails with a real SQLite error 'persistence: sqlite error: attempt to write a readonly database', reproduced twice, not a race (the two session/new calls were 15s apart, not concurrent). Direct curl replays of the identical RPC against the same server instance succeeded cleanly both times. Leading theory, not confirmed: acpx-core's `ensure_custom_agent_registered(&agent_id)` (only called on the `_acpx.agentId` branch, never on the `_acpx.profile` branch -- a code path Finding B is what newly makes reachable at all for a non-default agent) hits a write path that assumes first-time registration, and a REPEAT registration of the same agent id (already registered by an earlier curl call on this same server instance) fails differently. Not root-caused further -- ran out of safe budget to dig into acpx-core's SQLite persistence internals without risking a rushed, wrong fix in code not yet reviewed carefully.",
+      "verification": "Not started. Needs: (1) confirm/deny the repeat-registration theory by checking ensure_custom_agent_registered's DB write path in acpx-core, (2) a minimal repro (two session/new calls for the same never-profiled agent id against a fresh acpx-server) isolating whether it's really about repetition or something else, (3) a fix once root-caused.",
+      "verified": [
+        {
+          "description": "Root-caused the 'attempt to write a readonly database' error: NOT an acpx-core/persistence bug. Live process inspection during a fresh vnc_worktree.sh restart showed TWO acpx-server processes bound to the same worktree-label-keyed gateway.sqlite3 simultaneously -- caused by vnc_worktree.sh's cmd_clean killing the PID recorded in connect.env, which can silently drift from the actually-running acpx-server (observed live: 'warning: gateway port ... still answering after teardown' with the recorded PID already dead and a different untracked PID holding the port). Confirmed via /proc/<pid>/environ that both instances pointed ACPX_DB_PATH at the identical file. This is a test-harness process-lifecycle bug, not application code -- no acpx-core/persistence changes were needed or made. Discovered and fixed a SEPARATE, real bug while chasing this: chat_input_layout.slint's optimistic `local-profile-label`/`local-mode-label`/`local-config-label`/`local-reasoning-label` mirrors were set on dropdown selection but never reset, so a provider picked on one thread visually 'stuck' on the compose bar for every subsequently created thread (showing e.g. 'claude-acp \u203a' on a brand-new thread that never had it selected), while the real attach silently used the actual default agent since it reads `Model::ThreadItem::provider`, not this local UI mirror. Fixed by resetting all four local-* mirrors on `changed <trigger-label>` (the host-driven real value), which reliably changes on every thread switch. Live-verified: after the fix, a freshly created thread correctly shows unselected 'Provider \u203a' instead of a leaked prior selection.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "description": "End-to-end verification of Finding B's real attach path (client-side fix in session_opener.rs from the prior session, unchanged this pass): curl session/new with _acpx.agentId=claude-acp against the live worktree's acpx-server returned a real claude-acp session (Sonnet 5/Opus 5/Haiku 4.5 model options, agentInfo name '@agentclientprotocol/claude-agent-acp'). session/prompt on that session returned a real reply ('CLICURLOK', exactly as requested) in 2.5s. sqlite `sessions` table confirms the persisted row: agent_id='claude-acp', status='active'. No readonly-database error, no hang, no crash. UI-driven end-to-end sends also succeeded earlier in this pass for the default/codex path; a UI-driven claude-acp send stalled once under heavy host load (load average ~4.7, 20+ concurrent processes across other worktrees) with the spawned claude-agent-acp subprocess idle and no open network sockets -- consistent with OS scheduler starvation of a pipe-blocked process under contention, not a code defect (the direct curl round trip on the same live server, same code path, completed cleanly). Not chased further given the curl reproduction already isolates and confirms the actual fix.",
+          "verdict": "CONFIRMED"
+        }
+      ]
+    }
+  ],
+  "pending": [
+    {
+      "phase": "grok_build_adapter_initialize_sequencing_bug",
+      "order": 8,
+      "tier": 2,
+      "status": "not_started",
+      "description": "Separate, unrelated bug found while completing the matrix: grok-build's real acpx-server RPC fails with 'Invalid params: initialize must be called before new_session' (confirmed via direct curl to /rpc models/list agentId=grok-build). Not a client-side cwd/sentinel/provider-resolution issue -- looks like a real ACP handshake sequencing bug in acpx-core's handling of this specific adapter, or a genuine adapter-side misconfiguration in this environment.",
+      "verification": "Not started. Out of scope for this plan."
+    }
+  ],
+  "open_risks_ref": null,
+  "notes": [
+    "memory/ submodule not checked out in this worktree -- plan lives under panel-rust/docs/plans/ instead of the usual memory/<area>/gen/plans/ location; see 00-plan.md's 'Location note'.",
+    "This plan is scoped narrowly to the pre-send-visibility question the user asked for; it deliberately does not re-open the already-fixed and already-tested pool-capability-fix leak (thread_actor.rs reset-on-release) or the already-fixed codex chat-gpt auth-detection gap (acpx-server/config.rs, agent_bridge.rs) -- both stay tracked as done work in this session's conversation history, not re-litigated here.",
+    "Process lesson from this investigation, worth keeping in mind for future debugging in this codebase: a plausible, carefully-reasoned code trace (Finding D's first writeup) was subtly wrong, and a second plausible trace (assuming C+D's fix was complete) was also wrong (missed Finding E) -- both times, adding real eprintln instrumentation and rebuilding before concluding is what actually found the truth, faster than further code reading would have.",
+    "2026-07-31 verify-impl pass: every completed phase's implementation_evidence/verified claim cross-checked directly against actual code in the worktree (now merged to main@f1f9fee9) -- Command::ListModels's cwd field, resolve_registry_agent_id_for_capability_probe's 5 call sites, external_snapshot.rs's provider-resolution fallback chain, the no-project-dir cwd fallback, session_opener.rs's explicit-agentId helpers wired into both create/resume, and chat_input_layout.slint's four changed-trigger-label resets. No false positives found in this plan -- every claim matches the code exactly."
+  ],
+  "verification_checks": 1
+}

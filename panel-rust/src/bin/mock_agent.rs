@@ -11,6 +11,10 @@
 //!   then one `agent_message_chunk` echoing the prompt text back
 //!   uppercased (so tests can assert on a known transformation instead of
 //!   just "some string arrived"), then responds `StopReason::EndTurn`.
+//!   A `"stream "`-prefixed prompt instead sends its body as several
+//!   partial `agent_message_chunk`s (fixed-size, mid-token splits
+//!   included) with a real delay between each -- see the prompt handler's
+//!   `"stream "` marker branch.
 //! - `session/list`: returns every session created so far, with a
 //!   `title`/`updated_at` that changes each time a prompt completes on it
 //!   (so cache-staleness tests have something real to diff against).
@@ -19,16 +23,18 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, DeleteSessionRequest,
-    DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionConfigSelectOption,
-    SessionId, SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, CreateTerminalRequest,
+    DeleteSessionRequest, DeleteSessionResponse, InitializeResponse, ListSessionsResponse,
+    LoadSessionResponse, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption,
+    SessionConfigSelectOption, SessionId, SessionInfo, SessionInfoUpdate, SessionNotification,
+    SessionUpdate, StopReason, TerminalOutputRequest, TextContent, ToolCall, ToolCallId,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Handled, Result, Stdio};
 use std::collections::HashMap;
+use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,6 +118,7 @@ fn record_gateway_event(method: &str, session_id: Option<&str>, detail: &str) {
     let _ = writeln!(file, "{record}");
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SessionState {
     title: String,
     updated_at: String,
@@ -126,7 +133,7 @@ struct SessionState {
     model: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ReplayTurn {
     prompt_text: String,
 }
@@ -137,6 +144,45 @@ fn with_sessions<T>(f: impl FnOnce(&mut HashMap<String, SessionState>) -> T) -> 
     let mut guard = SESSIONS.lock().expect("mock-agent session map poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
+}
+
+/// Optional durable state for the real-server restart matrix. Normal mock
+/// agent runs stay process-local; setting this path makes session/list,
+/// session/load, and session/resume survive a fresh mock-agent process while
+/// keeping the fixture deterministic and isolated per test.
+fn state_file() -> Option<std::path::PathBuf> {
+    std::env::var_os("RUI_MOCK_AGENT_STATE_FILE").map(std::path::PathBuf::from)
+}
+
+fn load_persisted_sessions() {
+    let Some(path) = state_file() else {
+        return;
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(sessions) = serde_json::from_slice::<HashMap<String, SessionState>>(&bytes) else {
+        return;
+    };
+    let mut guard = SESSIONS.lock().expect("mock-agent session map poisoned");
+    *guard = Some(sessions);
+}
+
+fn persist_sessions() {
+    let Some(path) = state_file() else {
+        return;
+    };
+    let sessions = {
+        let guard = SESSIONS.lock().expect("mock-agent session map poisoned");
+        guard.clone().unwrap_or_default()
+    };
+    let Ok(bytes) = serde_json::to_vec(&sessions) else {
+        return;
+    };
+    let temp = path.with_extension("json.tmp");
+    if fs::write(&temp, bytes).is_ok() {
+        let _ = fs::rename(temp, path);
+    }
 }
 
 /// Coverage-matrix `session/cancel` host-scenario support: a prompt whose
@@ -196,6 +242,7 @@ async fn send_replay(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_persisted_sessions();
     Agent
         .builder()
         .name("rui-mock-agent")
@@ -227,6 +274,7 @@ async fn main() -> Result<()> {
                         },
                     );
                 });
+                persist_sessions();
                 // PISO-6: the live isolation matrix needs to assert each
                 // thread's `session/new` actually carried its OWN project's
                 // cwd (not the global override) -- `request.cwd` is the one
@@ -381,6 +429,52 @@ async fn main() -> Result<()> {
                     });
                     return Ok(());
                 }
+                // markdown-render-cache-layer MCP-04 coverage: a
+                // `"stream "`-prefixed prompt sends its markdown body as
+                // several partial `agent_message_chunk`s (mid-token splits
+                // included) with a real delay between each, instead of the
+                // usual single complete chunk `send_replay` sends below --
+                // the only way a live e2e test can observe a genuinely
+                // unterminated trailing block (e.g. `"**bol"` before
+                // `"d**"` arrives) and confirm `heal_open_markers` +
+                // `markdown_worker`'s epoch/dedupe machinery behave the
+                // same live as they do against the synthetic partial
+                // strings the unit tests use. Chunk boundaries are fixed
+                // (every 6 bytes) rather than word-aligned so runs land
+                // mid-marker often, not just between words.
+                if let Some(marker_text) = text.strip_prefix("stream ") {
+                    let body = format!("{}{}", persona_prefix(), marker_text);
+                    let connection_for_stream = connection.clone();
+                    let session_id_for_stream = session_id.clone();
+                    tokio::spawn(async move {
+                        let bytes = body.as_bytes();
+                        const CHUNK_LEN: usize = 6;
+                        let mut sent = 0usize;
+                        while sent < bytes.len() {
+                            let end = (sent + CHUNK_LEN).min(bytes.len());
+                            // `body` is UTF-8; fall back to the next char
+                            // boundary if a fixed byte cut lands mid-codepoint.
+                            let mut end = end;
+                            while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                                end += 1;
+                            }
+                            let piece = String::from_utf8_lossy(&bytes[sent..end]).into_owned();
+                            let _ =
+                                connection_for_stream.send_notification(SessionNotification::new(
+                                    session_id_for_stream.clone(),
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(piece)),
+                                    )),
+                                ));
+                            sent = end;
+                            if sent < bytes.len() {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                        }
+                        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    });
+                    return Ok(());
+                }
                 if let Some(marker_text) = text.strip_prefix("permission ") {
                     // Coverage-matrix `session/request_permission` host
                     // scenario: sends a real ACP `session/request_
@@ -457,6 +551,94 @@ async fn main() -> Result<()> {
                     });
                     return Ok(());
                 }
+                // Real terminal relay coverage: ask the ACP client to create
+                // and read a terminal, then include its output in the live
+                // assistant update. This is opt-in via the `terminal ` prompt
+                // marker so existing deterministic mock-agent scenarios keep
+                // their stable three-update transcript.
+                if let Some(marker_text) = text.strip_prefix("terminal ") {
+                    let marker_text = marker_text.to_string();
+                    let connection_for_terminal = connection.clone();
+                    let session_id_for_terminal = session_id.clone();
+                    tokio::spawn(async move {
+                        // Invoke `echo` directly and pass the complete marker
+                        // as one ACP argument, preserving both the terminal
+                        // and assistant assertions even when the marker has
+                        // spaces.
+                        let command =
+                            CreateTerminalRequest::new(session_id_for_terminal.clone(), "echo")
+                                .args(vec![marker_text.clone()]);
+                        let created = connection_for_terminal
+                            .send_request(command)
+                            .block_task()
+                            .await;
+                        let output = match created {
+                            Ok(created) => {
+                                let terminal_id = created.terminal_id.clone();
+                                let mut output = String::new();
+                                let mut last_error = None;
+                                for _ in 0..40 {
+                                    match connection_for_terminal
+                                        .send_request(TerminalOutputRequest::new(
+                                            session_id_for_terminal.clone(),
+                                            terminal_id.clone(),
+                                        ))
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            output = result.output;
+                                            if !output.is_empty() || result.exit_status.is_some() {
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            last_error = Some(format!("{error:?}"));
+                                            break;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                                if let Some(error) = last_error {
+                                    record_gateway_event(
+                                        "terminal/output_error",
+                                        Some(session_id_for_terminal.0.as_ref()),
+                                        &error,
+                                    );
+                                    "terminal-output-error".to_string()
+                                } else {
+                                    output
+                                }
+                            }
+                            Err(error) => {
+                                record_gateway_event(
+                                    "terminal/create_error",
+                                    Some(session_id_for_terminal.0.as_ref()),
+                                    &format!("{error:?}"),
+                                );
+                                "terminal-create-error".to_string()
+                            }
+                        };
+                        record_gateway_event(
+                            "terminal/output",
+                            Some(session_id_for_terminal.0.as_ref()),
+                            &output,
+                        );
+                        let _ =
+                            connection_for_terminal.send_notification(SessionNotification::new(
+                                session_id_for_terminal,
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!(
+                                        "{}{}",
+                                        persona_prefix(),
+                                        output
+                                    ))),
+                                )),
+                            ));
+                        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    });
+                    return Ok(());
+                }
                 with_sessions(|sessions| {
                     if let Some(s) = sessions.get_mut(session_id.0.as_ref()) {
                         s.turn_count += 1;
@@ -467,6 +649,7 @@ async fn main() -> Result<()> {
                         });
                     }
                 });
+                persist_sessions();
                 let turn = ReplayTurn { prompt_text: text };
                 send_replay(&connection, &session_id, &turn).await?;
                 responder.respond(PromptResponse::new(StopReason::EndTurn))
@@ -552,6 +735,7 @@ async fn main() -> Result<()> {
                 with_sessions(|sessions| {
                     sessions.remove(request.session_id.0.as_ref());
                 });
+                persist_sessions();
                 responder.respond(DeleteSessionResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
@@ -657,10 +841,25 @@ async fn main() -> Result<()> {
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
+                // Responses belong to the SDK's pending-request router.  A
+                // catch-all dispatch handler must pass them through; claiming
+                // one here turns every typed agent->client response (for
+                // example terminal/create) into an internal "unhandled
+                // message" error before the waiting send_request task sees
+                // it.  Requests/notifications are the only messages this
+                // fallback is meant to reject.
+                if let Dispatch::Response(_, _) = &message {
+                    return Ok(Handled::No {
+                        message,
+                        retry: false,
+                    });
+                }
+                record_gateway_event("unhandled", None, message.method());
                 message.respond_with_error(
                     agent_client_protocol::util::internal_error("unhandled message"),
                     cx,
-                )
+                )?;
+                Ok(Handled::Yes)
             },
             agent_client_protocol::on_receive_dispatch!(),
         )

@@ -59,6 +59,17 @@ pub struct SkillEntry {
     pub path: PathBuf,
     pub scope: SkillScope,
     pub started_from: Option<String>,
+    // Dev-mode-only bug fix: `scan_skills_dir` reflects every SKILL.md on
+    // disk regardless of `dev_mode`, including the bundled placeholder
+    // `ensure_bundled_global_skill` installs. Without this flag the
+    // Skills settings view had no `dev_mode` signal to filter by at all
+    // -- disabling dev mode left the bundled skill visible forever since
+    // it's a real on-disk directory scan_skills_dir has no reason to
+    // skip. True when this entry's name matches `BUNDLED_SKILL_NAME`;
+    // `skills_view.slint` hides such rows while dev-mode is off (the
+    // file itself is left untouched, same "don't clobber user edits"
+    // philosophy as `ensure_bundled_global_skill`).
+    pub is_dev_only: bool,
 }
 
 /// Extracts `name`/`description`/`started_from` from a `SKILL.md`'s YAML
@@ -143,12 +154,14 @@ pub fn scan_skills_dir(dir: &Path, scope: SkillScope) -> Vec<SkillEntry> {
             } else {
                 front_matter_name
             };
+            let is_dev_only = name == BUNDLED_SKILL_NAME;
             Some(SkillEntry {
                 name,
                 description,
                 path: entry.path(),
                 scope,
                 started_from,
+                is_dev_only,
             })
         })
         .collect();

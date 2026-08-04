@@ -37,6 +37,7 @@ import (
 
 	"snapshotd/internal/health"
 	"snapshotd/internal/registry"
+	"snapshotd/internal/transport"
 )
 
 // liveInstanceHealthTimeout bounds the socket-health probe Launch performs
@@ -101,7 +102,10 @@ type Manager struct {
 	// "<instanceID>.log" per launched child), config.Config.LogDir. Empty
 	// means "discard" (kept for callers/tests that don't care about logs),
 	// matching the old nil-Stdout/Stderr behavior.
-	LogDir string
+	// HomeDir is the daemon's resolved runtime home. It is propagated to
+	// managed GUI children because their HOME is intentionally sandboxed.
+	LogDir  string
+	HomeDir string
 
 	// ConnectTimeout bounds the poll-connect health check performed right
 	// after spawning (the v1 simplification described in the package doc).
@@ -304,9 +308,11 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// using all 16 hex characters can exceed the conservative AF_UNIX limit
 	// before the child has even started.
 	socketID := shortID[:12]
-	sockPath := filepath.Join(m.RunDir, socketID+".sock")
+	sockPath := transport.DefaultSAPEndpoint(m.RunDir, socketID)
 	const maxSockPathLen = 100 // conservative margin under the ~108-byte sun_path limit
-	if len(sockPath) > maxSockPathLen {
+	// Named pipes are not subject to Unix sun_path limits; their endpoint
+	// names are validated by the Windows transport implementation instead.
+	if !strings.HasPrefix(sockPath, `\\.\pipe\`) && len(sockPath) > maxSockPathLen {
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
 	}
 
@@ -357,8 +363,15 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// appending our own: glibc's getenv returns the *first* match in
 	// envp, so simply appending a second "HOME=..." after os.Environ()'s
 	// original one would silently lose to it.
-	cmd.Env = append(filterEnvKeys(os.Environ(), "HOME"),
+	cmd.Env = append(filterEnvKeys(os.Environ(),
+		"HOME",
+		"SNAPSHOT_SAP_ENDPOINT",
+		"SNAPSHOT_SAP_SOCKET",
+		"SNAPSHOT_SAP_TOKEN",
+		"SNAPSHOTD_MANAGED",
+	),
 		"HOME="+qtHomeDir,
+		"SNAPSHOT_SAP_ENDPOINT="+sockPath,
 		"SNAPSHOT_SAP_SOCKET="+sockPath,
 		"SNAPSHOT_SAP_TOKEN="+token,
 		"SNAPSHOTD_MANAGED=1",
@@ -369,6 +382,12 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_PROJECT_PREOPENED="+strconv.FormatBool(preopened),
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
+	if m.HomeDir != "" {
+		cmd.Env = append(cmd.Env,
+			"SNAPSHOTD_HOME="+m.HomeDir,
+			"SNAPSHOTD_CONTROL_SOCKET="+filepath.Join(m.HomeDir, "control.sock"),
+		)
+	}
 	// The child's own embedded chat panel (panel-rust's agent_bridge.rs)
 	// spawns its own per-provider acpx-server gateways and, for the
 	// "codex" provider, tries to read $HOME/.codex/auth.json for

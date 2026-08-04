@@ -42,7 +42,19 @@ pub struct PersistenceStore {
 impl PersistenceStore {
     /// Open (creating if absent) a sqlite database file at `path` and
     /// ensure the schema exists.
+    ///
+    /// Ensures `path`'s parent directory exists and is actually writable
+    /// before handing off to sqlite: a fresh isolated `ACPX_DB_PATH` (e.g.
+    /// an e2e test harness's own per-run temp dir, or `acpxmgr`'s
+    /// `os.MkdirAll` on the Go side) is routinely created by a caller whose
+    /// process umask strips the owner-write bit, which produces a
+    /// directory that genuinely exists but that sqlite cannot create its
+    /// rollback journal in -- reported as "attempt to write a readonly
+    /// database", not a clearer missing-directory/permission error. This
+    /// store owns its storage directory outright (nothing else is meant to
+    /// live there), so forcing the owner write/exec bits here is safe.
     pub fn open(path: &Path) -> Result<Self, PersistenceError> {
+        ensure_writable_parent_dir(path)?;
         let conn = Connection::open(path)?;
         Self::from_connection(conn)
     }
@@ -815,6 +827,98 @@ impl PersistenceStore {
         .await
     }
 
+    /// MCP OAuth 2.1 token storage (`crate::oauth`) -- same encrypted-row
+    /// shape as `record_secret`/`load_all_secrets`/`delete_secret` above,
+    /// just keyed by `server_name` instead of an opaque `KeyRef` (one MCP
+    /// server has at most one live OAuth token set, so the server name
+    /// itself is a stable, meaningful primary key).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_oauth_tokens(
+        &self,
+        server_name: impl Into<String>,
+        ciphertext: Vec<u8>,
+        nonce: Vec<u8>,
+        key_version: u32,
+        created_at: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let server_name = server_name.into();
+        let created_at = created_at.into();
+        let updated_at = updated_at.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO oauth_tokens \
+                 (server_name, ciphertext, nonce, key_version, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(server_name) DO UPDATE SET \
+                     ciphertext = excluded.ciphertext, \
+                     nonce = excluded.nonce, \
+                     key_version = excluded.key_version, \
+                     updated_at = excluded.updated_at",
+                params![
+                    server_name,
+                    ciphertext,
+                    nonce,
+                    key_version,
+                    created_at,
+                    updated_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every persisted OAuth token row, for startup reload -- mirrors
+    /// `load_all_secrets`'s shape (`(server_name, ciphertext, nonce,
+    /// key_version)`) so `Router::enable_durable_config` can decrypt each
+    /// one the same way it already decrypts secrets.
+    pub async fn load_all_oauth_tokens(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>, Vec<u8>, u32)>, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement = conn.prepare(
+                "SELECT server_name, ciphertext, nonce, key_version \
+                 FROM oauth_tokens ORDER BY server_name ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    let key_version: i64 = row.get(3)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        key_version as u32,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PersistenceError::from)?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn delete_oauth_tokens(
+        &self,
+        server_name: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let server_name = server_name.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "DELETE FROM oauth_tokens WHERE server_name = ?1",
+                params![server_name],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Best-effort mirror of `Router::register_provider`'s in-memory
     /// create-or-update -- see that method's doc comment for why this is
     /// fire-and-forget from the caller's perspective (no JSON-RPC
@@ -1015,6 +1119,35 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
     })
 }
 
+/// Creates `path`'s parent directory if absent, and makes sure it carries
+/// the owner read/write/execute bits sqlite needs to create its rollback
+/// journal, regardless of the calling process's umask. See
+/// [`PersistenceStore::open`]'s doc comment for why this exists.
+#[cfg(unix)]
+fn ensure_writable_parent_dir(path: &Path) -> Result<(), PersistenceError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir)?;
+    let mut perms = std::fs::metadata(dir)?.permissions();
+    let writable_mode = perms.mode() | 0o700;
+    if writable_mode != perms.mode() {
+        perms.set_mode(writable_mode);
+        std::fs::set_permissions(dir, perms)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_writable_parent_dir(path: &Path) -> Result<(), PersistenceError> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
+}
+
 /// Idempotently add columns introduced after the first `sessions` schema.
 ///
 /// `CREATE TABLE IF NOT EXISTS` never changes an existing table, and SQLite
@@ -1096,6 +1229,147 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PersistenceStore::open` must work from a clean slate: a fresh
+    /// isolated `ACPX_STORAGE_DIR`/`ACPX_DB_PATH` (the e2e-harness/`acpxmgr`
+    /// shape) whose containing directories do not exist yet at all.
+    #[tokio::test]
+    async fn open_creates_missing_nested_parent_directories() {
+        let dir = std::env::temp_dir().join(format!(
+            "acpx-persistence-fresh-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let db_path = dir.join("nested/gateway.sqlite3");
+        assert!(!dir.exists());
+
+        let store = PersistenceStore::open(&db_path).expect("open on a clean slate");
+        store
+            .record_session(
+                "session-1",
+                "agent-1",
+                "backend-1",
+                None,
+                "2026-07-16T00:00:00Z",
+                "default",
+            )
+            .await
+            .expect("write to the freshly created database");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A directory that already exists but lost its owner-write bit (a
+    /// restrictive process umask stripping it from a caller's own
+    /// `create_dir_all`, or a stale copy) must not surface as sqlite's
+    /// opaque "attempt to write a readonly database" -- `open` restores the
+    /// bit itself, since it owns this directory outright.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_repairs_a_readonly_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "acpx-persistence-readonly-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("strip owner-write bit");
+
+        let db_path = dir.join("gateway.sqlite3");
+        let store =
+            PersistenceStore::open(&db_path).expect("open repairs the readonly parent directory");
+        store
+            .record_session(
+                "session-1",
+                "agent-1",
+                "backend-1",
+                None,
+                "2026-07-16T00:00:00Z",
+                "default",
+            )
+            .await
+            .expect("write to the repaired database");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore write bit for cleanup");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn oauth_tokens_round_trip_upsert_load_and_delete() {
+        let store = PersistenceStore::open_in_memory().expect("in-memory store");
+        assert!(store
+            .load_all_oauth_tokens()
+            .await
+            .expect("empty load")
+            .is_empty());
+
+        store
+            .upsert_oauth_tokens(
+                "remote-mcp",
+                b"ciphertext-v1".to_vec(),
+                b"nonce-v1".to_vec(),
+                1,
+                "2026-07-16T00:00:00Z",
+                "2026-07-16T00:00:00Z",
+            )
+            .await
+            .expect("insert");
+        let rows = store
+            .load_all_oauth_tokens()
+            .await
+            .expect("load after insert");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "remote-mcp");
+        assert_eq!(rows[0].1, b"ciphertext-v1");
+        assert_eq!(rows[0].2, b"nonce-v1");
+        assert_eq!(rows[0].3, 1);
+
+        // Upsert on an existing server_name replaces, not duplicates --
+        // the same "re-authenticate refreshes the same row" contract
+        // `mcp_server_configs`'s `upsert_mcp_server` already has.
+        store
+            .upsert_oauth_tokens(
+                "remote-mcp",
+                b"ciphertext-v2".to_vec(),
+                b"nonce-v2".to_vec(),
+                2,
+                "2026-07-16T00:00:00Z",
+                "2026-07-16T01:00:00Z",
+            )
+            .await
+            .expect("update");
+        let rows = store
+            .load_all_oauth_tokens()
+            .await
+            .expect("load after update");
+        assert_eq!(
+            rows.len(),
+            1,
+            "update must replace, not append, a second row"
+        );
+        assert_eq!(rows[0].1, b"ciphertext-v2");
+        assert_eq!(rows[0].3, 2);
+
+        store
+            .delete_oauth_tokens("remote-mcp")
+            .await
+            .expect("delete");
+        assert!(store
+            .load_all_oauth_tokens()
+            .await
+            .expect("load after delete")
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn state_revision_detects_an_out_of_band_database_write() {

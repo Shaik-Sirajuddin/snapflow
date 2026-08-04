@@ -73,6 +73,7 @@ fn model_gateway_catalog_snapshot(model: &crate::model::Model) -> msg::SettingsG
         profiles: model.available_profiles.clone(),
         mcp_servers: model.available_mcp_servers.clone(),
         agents: model.agent_catalog.clone(),
+        agents_fetched: model.agent_catalog_fetched,
         recoverable_sessions: model.recoverable_sessions.clone(),
         recovery_provider: model.recovery_provider.clone(),
     }
@@ -100,6 +101,111 @@ fn daemon_projects_refresh_due() -> bool {
     })
 }
 
+/// Copy completed ACP bindings into the TEA model before routing the events
+/// drained in this frame. Two identities matter here, and they resolve at
+/// different times:
+///
+/// - `AgentBridge::thread_binding` (full session binding: durable id +
+///   remote session id) only becomes `Some` once `session/new`/`session/
+///   load` has actually succeeded.
+/// - `AgentBridge::thread_id` (the slot's durable pre-session identity, see
+///   its own doc comment) is set the moment the slot is built -- before any
+///   ACP request goes out -- specifically so a bridge event can be routed
+///   by thread index before a session exists yet
+///   (`collect_frame_input`'s `bridge_event_thread_ids` falls back to it
+///   for exactly this).
+///
+/// A brand-new thread's model row is seeded with a synthetic
+/// `"thread:{index}"` placeholder (`update.rs`'s `ThreadMsg::New`,
+/// `visible_thread_row`'s doc comment: "fall back to synthetic so keys
+/// always match ... when bridge binding was not yet known"). Previously
+/// only a *successful* `thread_binding` ever replaced that placeholder
+/// with the real durable id. A thread whose attach fails before ever
+/// acquiring a session (e.g. autohand's "backend requires authentication
+/// before session/new") never gets a `thread_binding` at all -- so the
+/// model row's `thread_id` stayed `"thread:{index}"` forever, permanently
+/// mismatched against the slug-based durable id the pre-session error's
+/// `BridgeEvent` is routed under. `update_frame` then can't resolve
+/// `model.thread_index_for_id(durable_id)`, silently drops the error
+/// event as "stale or mid-attach" (its own comment: "the next frame will
+/// retry once binding hydration makes the identity available" -- except
+/// for a pre-session failure, hydration never ran, so no retry ever
+/// surfaces it), and the thread is stuck in `Loading` with no way out.
+///
+/// Hydrating the durable pre-session id unconditionally (not just on
+/// binding success) closes that gap: it collapses to the same value
+/// `thread_binding` would have set anyway once a session exists (both
+/// trace back to the same `ThreadSlot::thread_id`), so this changes
+/// nothing for the already-working attach-succeeds path -- it only makes
+/// the id available immediately instead of waiting on a session that, for
+/// a pre-session failure, is never coming.
+///
+/// Split out of `ExternalSnapshotSource::hydrate_model_thread_bindings` as
+/// a free function so this exact routing-identity invariant is
+/// unit-testable against a real `AgentBridge` without needing a live
+/// `PanelSingleton`/Slint platform (see `dispatch.rs`'s test module doc
+/// comment for why that constructor requires headed Slint setup).
+/// Returns whether anything changed, so the caller knows whether
+/// `Model::rebuild_thread_indices` is needed.
+pub(crate) fn hydrate_thread_ids_from_bridge(
+    model: &mut crate::model::Model,
+    bridge: &AgentBridge,
+) -> bool {
+    let mut changed = false;
+    for index in 0..bridge.thread_count() {
+        let Some(durable_id) = bridge.thread_id(index) else {
+            continue;
+        };
+        let session_id = bridge
+            .thread_binding(index)
+            .map(|binding| binding.session_id);
+        let Some(thread) = model.threads.get_mut(index) else {
+            continue;
+        };
+        if thread.thread_id != durable_id {
+            thread.thread_id = durable_id;
+            changed = true;
+        }
+        if let Some(session_id) = session_id {
+            if thread.session_id.as_deref() != Some(session_id.as_str()) {
+                thread.session_id = Some(session_id);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// PUI-014: a DEFERRED slot (created but intentionally not yet attached --
+/// provider still editable, no message sent) is idle and ready for input,
+/// NOT an attach-in-flight, so it never gets the "Starting new thread..."
+/// loading affordance. A slot whose attach has actually begun (eager or
+/// recovered) but has no binding yet *does* get it -- with one exception:
+/// gateway-fail-state fix, `2026-08-01`. A binding never arrives after a
+/// failed attach (gateway provisioning error, e.g. the real "Permission
+/// denied (os error 13)" `spawn_gateway_process` failure -- see
+/// `agent_bridge.rs`'s `ensure_executable`), so without the `status`
+/// check this used to re-force "loading" on that exact row every single
+/// frame forever, silently overwriting the correct "error" status
+/// `models::build_thread_items` already computed from `ThreadState::Error`
+/// (set by `update.rs`'s `AgentEvent::Error`/`SessionAttached{Err}`
+/// handling, which both the async attach-failure path
+/// (`spawn_background_attachment`) and the synchronous gateway-
+/// provisioning-failure path (`dispatch_compose_send_maybe_attach`)
+/// already route through) -- the thread looked permanently stuck loading
+/// instead of showing its real failure. Once a frame has landed the row
+/// on "error", this leaves it there; only a fresh attach attempt (which
+/// re-derives `status` from `ThreadState` again, not this function) can
+/// clear it.
+fn shows_starting_thread_loading(
+    closed: bool,
+    status: &str,
+    has_binding: bool,
+    is_deferred: bool,
+) -> bool {
+    !closed && status != "error" && !has_binding && !is_deferred
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -109,42 +215,15 @@ impl<'a> ExternalSnapshotSource<'a> {
         Self { panel }
     }
 
-    /// Copy completed ACP bindings into the TEA model before routing the
-    /// events drained in this frame. This closes the attach window where
-    /// `session/new`/`session/load` had completed in `AgentBridge`, but the
-    /// model still had no remote session identity for map-based routing.
+    /// See [`hydrate_thread_ids_from_bridge`]'s doc comment for the full
+    /// rationale; this method just supplies the live `PanelSingleton`'s
+    /// bridge/model.
     fn hydrate_model_thread_bindings(&self) {
-        let bindings = self
-            .panel
-            .bridge
-            .as_ref()
-            .map(|bridge| {
-                (0..bridge.thread_count())
-                    .filter_map(|index| {
-                        bridge.thread_binding(index).map(|binding| (index, binding))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if bindings.is_empty() {
+        let Some(bridge) = self.panel.bridge.as_ref() else {
             return;
-        }
+        };
         let mut model = self.panel.model.borrow_mut();
-        let mut changed = false;
-        for (index, binding) in bindings {
-            let Some(thread) = model.threads.get_mut(index) else {
-                continue;
-            };
-            if thread.thread_id != binding.thread_id {
-                thread.thread_id = binding.thread_id;
-                changed = true;
-            }
-            if thread.session_id.as_deref() != Some(binding.session_id.as_str()) {
-                thread.session_id = Some(binding.session_id);
-                changed = true;
-            }
-        }
-        if changed {
+        if hydrate_thread_ids_from_bridge(&mut model, bridge) {
             model.rebuild_thread_indices();
         }
     }
@@ -240,6 +319,18 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .as_ref()
                 .map(AgentBridge::agent_operations_in_flight)
                 .unwrap_or_default(),
+            mcp_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::mcp_operations_in_flight)
+                .unwrap_or_default(),
+            recover_session_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::recover_session_operations_in_flight)
+                .unwrap_or_default(),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold
             // the result, so the live skills view tracks filesystem/state
@@ -274,6 +365,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                 profiles: Vec::new(),
                 mcp_servers: Vec::new(),
                 agents: Vec::new(),
+                agents_fetched: false,
                 recoverable_sessions: Vec::new(),
                 recovery_provider: String::new(),
             })
@@ -323,16 +415,23 @@ impl<'a> ExternalSnapshotSource<'a> {
             selected_thread_id.clone(),
             &mut discarded_warnings,
         );
-        let (defaults, default_agent_id) = prefs
-            .map(|prefs| (prefs.defaults, prefs.default_agent_id))
+        let (defaults, default_agent_id, show_global_skills) = prefs
+            .map(|prefs| {
+                (
+                    prefs.defaults,
+                    prefs.default_agent_id,
+                    prefs.show_global_skills,
+                )
+            })
             .unwrap_or_else(|| {
                 let defaults =
                     crate::load_panel_prefs(selected_thread_id.clone(), &mut discarded_warnings);
-                let default_agent_id = crate::settings_file::SettingsPaths::from_env()
+                let resolved = crate::settings_file::SettingsPaths::from_env()
                     .load_resolved()
-                    .ok()
-                    .and_then(|resolved| resolved.default_agent_id);
-                (defaults, default_agent_id)
+                    .ok();
+                let default_agent_id = resolved.as_ref().and_then(|r| r.default_agent_id.clone());
+                let show_global_skills = resolved.map(|r| r.show_global_skills).unwrap_or(true);
+                (defaults, default_agent_id, show_global_skills)
             });
         let (background_override_set, background_override) = selected_thread_id
             .as_deref()
@@ -354,6 +453,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             dev_mode: crate::settings_file::SettingsPaths::from_env().dev_mode(),
             background_override_set,
             background_override,
+            show_global_skills,
         };
         store_prefs_snapshot(snap.clone());
         snap
@@ -396,6 +496,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .map(|thread| thread.error.clone().unwrap_or_default())
             .collect();
+        // thread-unread-state: unlike archived/closed this lives on the TEA
+        // ThreadModel, not on an AgentBridge slot -- it is in-memory only
+        // (see ThreadModel::unread) and is folded by `update_frame`, so the
+        // model is its single source of truth.
+        let unread: Vec<bool> = model.threads.iter().map(|thread| thread.unread).collect();
         drop(model);
 
         let descriptions: Vec<String> = names
@@ -409,8 +514,8 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .bridge
                     .as_ref()
                     .map(|bridge| {
-                        models::describe_thread(
-                            &bridge.history(idx),
+                        models::describe_thread_from_last(
+                            bridge.last_message(idx).as_ref(),
                             crate::THREAD_DESCRIPTION_MAX_CHARS,
                         )
                     })
@@ -457,11 +562,17 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .enumerate()
             .map(|(idx, _)| {
-                self.panel
-                    .bridge
-                    .as_ref()
-                    .map(|bridge| bridge.thread_archived(idx))
-                    .unwrap_or(false)
+                let thread_id = self
+                    .panel
+                    .model
+                    .borrow()
+                    .threads
+                    .get(idx)
+                    .map(|thread| thread.thread_id.clone())
+                    .unwrap_or_default();
+                self.panel.bridge.as_ref().map(|bridge| {
+                    bridge.thread_archived_by_id(&thread_id)
+                }).unwrap_or(false)
             })
             .collect();
         let providers: Vec<String> = names
@@ -504,6 +615,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             &background_sessions,
             &closed,
             &archived,
+            &unread,
             &query,
         );
         // Plan phase 26: the chat view binds to the selected project --
@@ -576,17 +688,21 @@ impl<'a> ExternalSnapshotSource<'a> {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
                     row.has_session = thread.session_id.is_some();
                 }
-                // PUI-014: a DEFERRED slot (created but intentionally not yet
-                // attached -- provider still editable, no message sent) is idle
-                // and ready for input, NOT an attach-in-flight. Only show the
-                // "Starting new thread..." loading state for a slot whose attach
-                // has actually begun (eager/recovered) but not yet bound.
-                if !row.closed
-                    && self.panel.bridge.as_ref().is_some_and(|bridge| {
-                        bridge.thread_binding(item.real_index).is_none()
-                            && !bridge.is_deferred(item.real_index)
-                    })
-                {
+                // See `shows_starting_thread_loading`'s doc comment for the
+                // full PUI-014 / gateway-fail-state contract this predicate
+                // implements.
+                if shows_starting_thread_loading(
+                    row.closed,
+                    row.status.as_str(),
+                    self.panel
+                        .bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.thread_binding(item.real_index).is_some()),
+                    self.panel
+                        .bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.is_deferred(item.real_index)),
+                ) {
                     row.status = "loading".into();
                     row.busy = true;
                     // Plan phase 30: immediate feedback while the
@@ -687,13 +803,35 @@ impl<'a> ExternalSnapshotSource<'a> {
         real_idx: usize,
     ) -> Option<msg::ThreadFrameSnapshot> {
         let bridge = self.panel.bridge.as_ref()?;
-        let selected_profile = self
-            .panel
-            .model
-            .borrow()
-            .threads
-            .get(real_idx)
-            .and_then(|thread| thread.profile_name.clone());
+        let (selected_profile, model_thread_provider) = {
+            let model = self.panel.model.borrow();
+            let thread = model.threads.get(real_idx);
+            (
+                thread.and_then(|thread| thread.profile_name.clone()),
+                thread
+                    .map(|thread| thread.provider.clone())
+                    .filter(|provider| !provider.is_empty()),
+            )
+        };
+        // pre-send-config-options-visibility: `thread.provider` (the Model/
+        // TEA layer) is what `SettingsMsg::ProfileSelected` actually keeps
+        // current the instant the compose bar's Provider picker changes
+        // (see update.rs's own "Critical: deferred attach uses thread.
+        // provider... Leaving provider at create-time default made the
+        // Provider picker a pure cosmetic change" comment) -- `AgentBridge::
+        // thread_provider` (the fallback this used to end on) reads
+        // `ThreadSlot::provider`, a plain field set once at thread
+        // construction and never reassigned anywhere afterward. Live-
+        // confirmed real bug this fixes: switching providers on a not-yet-
+        // sent thread fetched the new provider's own capabilities
+        // correctly (a real, successful models/list round trip) but the
+        // dropdown stayed empty, because this resolution kept resolving
+        // back to the thread's original (construction-time) provider via
+        // the AgentBridge fallback -- so the fetch and the read population
+        // it just also feeds were silently keyed on different providers.
+        // The profile_name -> available_profiles lookup stays first: a
+        // real, admin-provisioned profile is a more specific selection
+        // than the plain provider id and should still win when present.
         let selected_provider = selected_profile
             .as_deref()
             .and_then(|profile_name| {
@@ -705,6 +843,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .find(|profile| profile.name == profile_name)
                     .map(|profile| profile.agent_id.clone())
             })
+            .or(model_thread_provider)
             .or_else(|| bridge.thread_provider(real_idx))
             .unwrap_or_default();
         bridge.ensure_models_for_provider(
@@ -808,6 +947,18 @@ impl<'a> ExternalSnapshotSource<'a> {
         selected.and_then(|real_idx| self.collect_thread_snapshot_for(real_idx))
     }
 
+    /// One `ThreadRecord` per bound thread that `update()`'s frame fold
+    /// hasn't already persisted (`model.traced_attachment_threads`, checked
+    /// via `HashSet::insert` in `update.rs`'s `for record in frame.
+    /// thread_record_snapshots` loop -- every already-traced thread's
+    /// record is built here just to be thrown away there). Filtering by the
+    /// same set here, rather than after collection, means a poll tick
+    /// (60-90fps) with N already-persisted open threads skips N thread_
+    /// binding/thread_provider bridge lookups and ~7 `String` clones per
+    /// thread (`display_name`, `profile_name`, `permission_profile`,
+    /// `thread_id`, `session_id`, `project_path`, ...) that would otherwise
+    /// be built and discarded on every single tick regardless of whether
+    /// any new thread ever attaches.
     pub(crate) fn collect_thread_record_snapshots(&self) -> Vec<crate::state_store::ThreadRecord> {
         let Some(bridge) = self.panel.bridge.as_ref() else {
             return Vec::new();
@@ -819,6 +970,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             .enumerate()
             .filter_map(|(idx, thread)| {
                 let binding = bridge.thread_binding(idx)?;
+                if model.traced_attachment_threads.contains(&binding.thread_id) {
+                    return None;
+                }
                 let provider = bridge.thread_provider(idx)?;
                 Some(crate::state_store::ThreadRecord {
                     thread_id: binding.thread_id,
@@ -857,5 +1011,360 @@ impl<'a> ExternalSnapshotSource<'a> {
             background_session: None,
             project_path: bridge.thread_project_path(real_idx),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `autohand-pre-session-error-hang` root-cause + fix coverage.
+    //!
+    //! The bug: a thread whose ACP session attach fails *before* a
+    //! session ever forms (e.g. autohand's real, adapter-reported
+    //! "backend requires authentication before session/new", triggered by
+    //! the AutoHand CLI binary being uninstalled -- see
+    //! `acpx/scripts/verify_autohand_acp.sh`) sat stuck in `Loading`
+    //! forever: `AgentBridge` genuinely pushes a real
+    //! `BridgeEvent::Error` (`agent_bridge.rs`'s `open_session`'s `Err`
+    //! branch), but `update_frame` could never route it, because the
+    //! model thread row's `thread_id` was still the synthetic
+    //! `"thread:{index}"` placeholder `ThreadMsg::New` seeds every new
+    //! thread with (`update.rs`) -- only a *successful*
+    //! `AgentBridge::thread_binding` ever replaced it with the real
+    //! durable id, and a pre-session failure never produces one.
+    //!
+    //! This drives the real, installed AutoHand ACP adapter through a
+    //! real `acpx-server` (same mechanism `verify_autohand_acp.sh` uses)
+    //! and exercises the exact production hydrate-then-route sequence
+    //! `collect_frame_input`/`update_frame` run every frame, using real
+    //! `AgentBridge`/`Model` methods -- just without a live
+    //! `PanelSingleton`, which needs headed Slint setup this module's
+    //! tests avoid (see `dispatch.rs`'s test module doc comment).
+    use super::*;
+    use crate::agent_bridge::{reserve_ephemeral_port, test_only_set_backend_cmd_env};
+    use crate::model::{Model, ThreadModel};
+    use crate::protocol_types::AgentEvent;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// gateway-fail-state (2026-08-01): pins the exact regression this fix
+    /// closes -- a thread whose attach already failed (no binding, not a
+    /// deliberately-unattached deferred slot -- indistinguishable from
+    /// "attach still in flight" by binding/deferred state alone) must NOT
+    /// have its already-correct "error" status forced back to "loading"
+    /// on the next frame. Pure-function coverage (no `PanelSingleton`/
+    /// `AgentBridge` needed) for the predicate `collect_thread_list_
+    /// snapshot`'s per-row loop calls; see that call site's real
+    /// production trigger (`spawn_gateway_process`'s "Permission denied
+    /// (os error 13)" failure, `system_launch.yaml`) in this function's
+    /// own doc comment.
+    #[test]
+    fn shows_starting_thread_loading_does_not_override_an_already_failed_attach() {
+        // The exact state a thread lands in after `spawn_background_
+        // attachment`'s error branch (or the synchronous gateway-
+        // provisioning-failure path in `dispatch_compose_send_maybe_
+        // attach`) has folded through to `ThreadState::Error` and
+        // `models::build_thread_items` has already produced "error":
+        // never bound, not deferred, not closed.
+        assert!(
+            !shows_starting_thread_loading(false, "error", false, false),
+            "an already-failed attach's row must stay on its real \"error\" \
+             status, not be forced back to \"loading\" forever"
+        );
+    }
+
+    #[test]
+    fn shows_starting_thread_loading_still_covers_the_real_in_flight_case() {
+        // The case this predicate exists FOR: a genuinely in-flight eager/
+        // recovered attach (status not yet "error" -- e.g. still "idle"
+        // from the row's initial seed) with no binding yet and not
+        // deferred. PUI-014's "Starting new thread..." affordance must
+        // still show here; this fix must not have regressed it.
+        assert!(shows_starting_thread_loading(false, "idle", false, false));
+    }
+
+    #[test]
+    fn shows_starting_thread_loading_leaves_deferred_and_closed_rows_alone() {
+        // PUI-014: a deferred (intentionally unattached) slot is idle and
+        // ready for input, never shown as loading.
+        assert!(!shows_starting_thread_loading(false, "idle", false, true));
+        // A closed thread never gets the loading affordance either,
+        // regardless of binding/status.
+        assert!(!shows_starting_thread_loading(true, "idle", false, false));
+        // A thread that already has a binding is attached; no loading
+        // affordance needed even if some other status value slipped
+        // through.
+        assert!(!shows_starting_thread_loading(false, "idle", true, false));
+    }
+
+    fn autohand_adapter_entry() -> std::path::PathBuf {
+        std::path::Path::new(&std::env::var("HOME").expect("HOME set"))
+            .join(".acpx/adapters/autohand/node_modules/@autohandai/autohand-acp/dist/index.js")
+    }
+
+    fn acpx_server_bin() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+    }
+
+    struct RealAutohandGateway {
+        child: Child,
+        base_url: String,
+    }
+
+    impl Drop for RealAutohandGateway {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl RealAutohandGateway {
+        /// Real `acpx-server`, configured exactly like
+        /// `verify_autohand_acp.sh`: `ACPX_DEFAULT_AGENT_ID=autohand` +
+        /// the real installed adapter as the native default backend
+        /// command (`ACPX_BACKEND_CMD` is `ACPX_DEFAULT_ACP_COMMAND`'s
+        /// legacy-but-still-live alias, see `config.rs::from_env`'s doc
+        /// comment) -- no mock anywhere in this path.
+        fn spawn(adapter_entry: &std::path::Path) -> Self {
+            let db_dir = std::env::temp_dir().join(format!(
+                "panel-autohand-hang-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&db_dir).expect("create temp db dir");
+            for attempt in 0..5 {
+                let Some((port, lock)) = reserve_ephemeral_port() else {
+                    std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+                    continue;
+                };
+                let mut command = Command::new(acpx_server_bin());
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_DB_PATH", db_dir.join("acpx-test.db"))
+                    .env("ACPX_DEFAULT_AGENT_ID", "autohand")
+                    .env("RUST_LOG", "error")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                test_only_set_backend_cmd_env(
+                    &mut command,
+                    format!("node {}", adapter_entry.display()),
+                );
+                let child = command.spawn().expect("spawn real acpx-server binary");
+                drop(lock);
+                let base_url = format!("http://127.0.0.1:{port}");
+                let gateway = RealAutohandGateway { child, base_url };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                        return gateway;
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if attempt < 4 {
+                    continue;
+                }
+                return gateway;
+            }
+            panic!("real acpx-server for autohand never became reachable");
+        }
+    }
+
+    /// The exact routing logic `update_frame` (`update.rs`, ~line 2377)
+    /// runs to resolve a `BridgeEvent`'s target thread: look up the
+    /// event's durable/session identity in `model`'s thread-id index.
+    /// Pulled out here (rather than depending on `update_frame` itself,
+    /// which is private to `update.rs` and folds far more than routing)
+    /// so this test proves precisely the invariant that broke: whether
+    /// the model can resolve the identity `collect_frame_input` attaches
+    /// to a given bridge event.
+    fn resolve_target_index(model: &Model, durable_thread_id: &str) -> Option<usize> {
+        model.thread_index_for_id(durable_thread_id)
+    }
+
+    /// Reproduces the pre-fix `hydrate_model_thread_bindings`: only ever
+    /// syncs the model's `thread_id` from a *successful*
+    /// `AgentBridge::thread_binding` (requires a live ACP session), never
+    /// from the slot's durable pre-session `AgentBridge::thread_id`. Kept
+    /// here, deliberately, as a literal stand-in for the code this test
+    /// file's fix replaced, so the test can assert the *shipped* fix
+    /// (`hydrate_thread_ids_from_bridge`, used above) actually resolves
+    /// what this old logic could not -- not just that some behavior
+    /// changed.
+    fn hydrate_thread_ids_from_bridge_pre_fix(model: &mut Model, bridge: &AgentBridge) -> bool {
+        let mut changed = false;
+        for index in 0..bridge.thread_count() {
+            let Some(binding) = bridge.thread_binding(index) else {
+                continue;
+            };
+            let Some(thread) = model.threads.get_mut(index) else {
+                continue;
+            };
+            if thread.thread_id != binding.thread_id {
+                thread.thread_id = binding.thread_id;
+                changed = true;
+            }
+            if thread.session_id.as_deref() != Some(binding.session_id.as_str()) {
+                thread.session_id = Some(binding.session_id);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    #[test]
+    fn autohand_pre_session_failure_is_never_routed_by_the_pre_fix_hydration_but_is_by_the_real_fix(
+    ) {
+        let adapter_entry = autohand_adapter_entry();
+        if !adapter_entry.exists() {
+            eprintln!(
+                "skipping: real AutoHand ACP adapter not installed at {} \
+                 (see acpx/scripts/verify_autohand_acp.sh)",
+                adapter_entry.display()
+            );
+            return;
+        }
+        if !acpx_server_bin().exists() {
+            eprintln!(
+                "skipping: acpx-server not built at {}, run \
+                 `cargo build --manifest-path acpx/Cargo.toml -p acpx-server` first",
+                acpx_server_bin().display()
+            );
+            return;
+        }
+
+        let gateway = RealAutohandGateway::spawn(&adapter_entry);
+        let base_url = gateway.base_url.clone();
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[],
+            move |_provider| Ok(base_url.clone()),
+            None,
+        )
+        .expect("bridge against the real autohand-backed acpx-server");
+
+        // Mirrors `ThreadMsg::New` (`update.rs`) exactly: a brand-new
+        // thread's model row is seeded with the synthetic
+        // `"thread:{index}"` placeholder, *not* the bridge's own
+        // slug-based durable id -- that mismatch is the root cause this
+        // test exists to pin down.
+        let real_index = 0usize;
+        let mut model = Model {
+            threads: vec![ThreadModel {
+                thread_id: format!("thread:{real_index}"),
+                display_name: "New thread 1".to_owned(),
+                provider: "autohand".to_owned(),
+                ..ThreadModel::default()
+            }],
+            ..Model::default()
+        };
+        model.rebuild_thread_indices();
+
+        // PUI-014 deferred-create + first-send attach, the same shape
+        // every real new thread goes through
+        // (`dispatch_compose_send_maybe_attach`).
+        let idx = bridge
+            .add_thread_deferred("New thread 1", Some("autohand"))
+            .expect("add_thread_deferred");
+        assert_eq!(idx, real_index);
+        bridge
+            .attach_deferred_thread(idx, Some("autohand"), None)
+            .expect("attach_deferred_thread");
+
+        // Wait for the real adapter's real auth failure to actually
+        // arrive as a `BridgeEvent::Error` -- proves `open_session`'s
+        // `Err` branch really is hit for autohand, independent of any
+        // routing question.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut error_event = None;
+        while Instant::now() < deadline && error_event.is_none() {
+            for event in bridge.poll() {
+                if event.thread_index == idx {
+                    if let AgentEvent::Error(message) = &event.event {
+                        error_event = Some(message.clone());
+                    }
+                }
+            }
+            if error_event.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let error_message = error_event.expect(
+            "expected AgentBridge to push a real BridgeEvent::Error for autohand's pre-session \
+             authentication failure within 20s",
+        );
+        assert!(
+            error_message.to_lowercase().contains("authentic"),
+            "expected the real autohand adapter's own authentication-required error, got: \
+             {error_message:?}"
+        );
+
+        // The durable pre-session identity `collect_frame_input` routes
+        // this event's thread_index through (`bridge_event_thread_ids`'s
+        // `.or_else(bridge.thread_id(...))` fallback).
+        let durable_thread_id = bridge
+            .thread_id(idx)
+            .expect("slot must have a durable thread_id once built");
+        assert_ne!(
+            durable_thread_id,
+            format!("thread:{real_index}"),
+            "the durable id must be the real slug, distinct from the synthetic placeholder \
+             the model row starts with -- otherwise this test isn't exercising the mismatch"
+        );
+
+        // There was never a successful session, so there is no full
+        // binding to hydrate from -- exactly the state that starved the
+        // pre-fix hydration path.
+        assert!(
+            bridge.thread_binding(idx).is_none(),
+            "autohand's pre-session failure must never produce a full session binding \
+             (session/new never succeeded) -- if it did, this test would no longer be \
+             covering the pre-session-failure gap"
+        );
+
+        // THE BUG, reproduced directly: the pre-fix hydration logic never
+        // touches `model.threads[idx].thread_id` here (no binding to sync
+        // from), so the model can never resolve the event's durable id --
+        // `update_frame` would drop the error event as "stale or
+        // mid-attach" forever, and the thread stays stuck in Loading.
+        let mut pre_fix_model = model.clone();
+        hydrate_thread_ids_from_bridge_pre_fix(&mut pre_fix_model, &bridge);
+        assert_eq!(
+            pre_fix_model.threads[idx].thread_id,
+            format!("thread:{real_index}"),
+            "pre-fix hydration must leave the synthetic placeholder in place -- this is the \
+             exact stuck-in-Loading bug"
+        );
+        assert_eq!(
+            resolve_target_index(&pre_fix_model, &durable_thread_id),
+            None,
+            "pre-fix hydration must be UNABLE to route the pre-session error event -- \
+             reproduces the silent drop in update_frame that left autohand threads hanging"
+        );
+
+        // THE FIX: the real, shipped `hydrate_thread_ids_from_bridge`
+        // syncs the durable pre-session id unconditionally, so the event
+        // resolves.
+        let changed = hydrate_thread_ids_from_bridge(&mut model, &bridge);
+        assert!(
+            changed,
+            "the real fix must report a change once a durable id is available"
+        );
+        assert_eq!(
+            model.threads[idx].thread_id, durable_thread_id,
+            "the real fix must replace the synthetic placeholder with the bridge's durable id"
+        );
+        model.rebuild_thread_indices();
+        assert_eq!(
+            resolve_target_index(&model, &durable_thread_id),
+            Some(idx),
+            "after the real fix, the pre-session error event's durable id must resolve to the \
+             thread that actually failed -- this is what lets update_frame surface the real \
+             error instead of dropping it and leaving the thread stuck in Loading"
+        );
     }
 }

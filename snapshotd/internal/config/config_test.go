@@ -34,6 +34,22 @@ func TestDefaultReadsPersistedRuntimeConfigWithEnvPrecedence(t *testing.T) {
 	}
 }
 
+func TestDiscoverShotcutBinPathFindsInstalledProductionBundle(t *testing.T) {
+	root := t.TempDir()
+	app := filepath.Join(root, "Snapflow.app")
+	if err := os.MkdirAll(app, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(app, "snapflow")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := discoverShotcutBinPath([]string{root})
+	if got != wrapper {
+		t.Fatalf("installed production wrapper = %q, want %q", got, wrapper)
+	}
+}
+
 func setOrUnset(key, value string) {
 	if value == "" {
 		_ = os.Unsetenv(key)

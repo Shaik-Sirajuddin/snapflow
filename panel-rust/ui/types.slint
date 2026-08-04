@@ -28,6 +28,13 @@ export struct ThreadItem {
     // flag -- archiving does not send any ACP request, it just hides the
     // Archive control and swaps the row's status label to "archived".
     archived: bool,
+    // thread-unread-state: true when visible agent output has arrived for
+    // this thread while it was NOT the displayed thread, and the user has
+    // not opened it since. Deliberately NOT durable (unlike `archived`):
+    // nothing can arrive while the panel process is down, so every restart
+    // legitimately starts with nothing unread -- see ThreadModel::unread.
+    // Only recolors the plain status dot; it never changes `status`.
+    unread: bool,
     // layout-redesign.md Phase 8: the thread's real provider (persisted
     // `AgentBridge::thread_provider`) and active model (the `"model"`
     // config option's current value, the same `configOptions[]` feed the
@@ -73,7 +80,6 @@ export struct ThreadItem {
     has-session: bool,
 }
 
-
 // Streaming markdown (from streaming-markdown-slint): visual lines/runs.
 export struct MarkdownRun {
     text: string,
@@ -99,6 +105,21 @@ export struct MarkdownLine {
     plain-text: string,
 }
 
+// Architecture v2 (markdown-thread-freeze-fix phase 3): one native
+// StyledText per markdown block instead of Rust-computed wrap. See
+// memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+// "Architecture v2" section. `kind` selects which of `text`/`table-cells`/
+// `code-text` is populated; the others stay at their default (empty).
+export struct MarkdownBlock {
+    kind: string, // "text" | "table" | "code" | "rule"
+    text: styled-text, // used when kind == "text" -- headings/paragraphs/quotes/list items
+    default-font-size: length, // set per heading level; 0px = inherit MarkdownView's default
+    indent: int,
+    table-cells: [styled-text], // used when kind == "table", row-major flat list
+    table-col-count: int,
+    code-text: string, // used when kind == "code" -- verbatim, routed through TerminalLogBlock
+}
+
 export struct MessageItem {
     // chat-items-redesign.md #5/#11: "tool-call" is being retired in
     // favor of the finer taxonomy `models::classify_tool_call_kind`
@@ -111,6 +132,12 @@ export struct MessageItem {
     // Default agent bodies: pre-parsed streaming markdown visual lines.
     // Empty => MarkdownView falls back to plain `text`.
     markdown-lines: [MarkdownLine],
+    // Architecture v2 (markdown-thread-freeze-fix phase 3): when
+    // non-empty, MarkdownView should prefer this over `markdown-lines`
+    // -- one native StyledText per block, no Rust-computed wrap. Both
+    // fields coexist during the migration so existing call sites/tests
+    // depending on `markdown-lines` are undisturbed.
+    markdown-blocks: [MarkdownBlock],
     // Phase 3: tool-call execution status, already-uppercased display
     // text (e.g. "COMPLETED") or "" for non-tool-call kinds / messages
     // cached before this field existed -- monochrome text badge only,
@@ -167,6 +194,28 @@ export struct MessageItem {
     // ladder of `if`s. 0 for every other row, including non-start members
     // of the same run.
     tool-group-len: int,
+}
+
+export struct ToolGroupItem {
+    label: string,
+    item-count: int,
+    messages: [MessageItem],
+}
+
+// One durable thread identity plus its stable observable message model.
+// The model is supplied by Rust and is never replaced during a thread
+// switch; only the selected view/model reference changes.
+export struct ThreadViewItem {
+    thread-id: string,
+    messages: [MessageItem],
+    // One slot per message index. Tool-group starts contain a compact
+    // group-local model; non-start slots are empty placeholders so a
+    // message row resolves its group without scanning groups.
+    tool-groups: [ToolGroupItem],
+    // Unsaved composer text belongs to the retained thread view, not to a
+    // shared ChatViewStack buffer. Rust mirrors this value in
+    // ThreadModel.compose_draft for persistence across selection changes.
+    compose-text: string,
 }
 
 // One choice in a pending approval — ACP `PermissionOption` shape
@@ -308,19 +357,35 @@ export struct ConfigOptionRow {
 // on the Rust side (`acpx-core::McpServerStore` never interprets more
 // than `"name"`), this struct only surfaces what the list view needs.
 //
-// One tool advertised by an MCP server (`tools/list`), individually
-// toggleable. Mirrors opencode's per-tool control (its global `tools`
-// glob config, e.g. `"my-mcp*": false`) plus its experimental
-// `mcp_lazy`/`mcp_search` deferred loading and Claude Code's ToolSearch
-// deferred-tool pattern. **UI-only** -- no `tools/list` round trip or
-// per-tool persistence exists yet.
+// One tool advertised by an MCP server, individually toggleable. Mirrors
+// opencode's per-tool control (its global `tools` glob config, e.g.
+// `"my-mcp*": false`) plus its experimental `mcp_lazy`/`mcp_search`
+// deferred loading and Claude Code's ToolSearch deferred-tool pattern.
+// Backed by a real `tools/list` round trip (`mcp_servers/tools_fetch`,
+// `acpx_core::mcp_client`) reconciled with persisted per-tool
+// `enabled`/`deferred` preferences -- see `McpServerOption.tools`'s doc
+// comment.
 export struct McpToolOption {
     name: string,
-    // Whether this tool is exposed to the model (opencode `tools` glob).
+    // Real description from the tool's `tools/list` advertisement, when
+    // the server provided one -- "" otherwise. View-only.
+    description: string,
+    // `enabled`/`deferred` are carried through from the persisted
+    // per-tool preference (`extra["tools"]`) but **deliberately not
+    // rendered as interactive controls** in `mcp_servers_view.slint`:
+    // checked against the real ACP schema (`agent-client-protocol-
+    // schema` 1.4.0, both v1 and v2 -- `McpServerStdio`/`McpServerHttp`/
+    // `McpServerSse` have no field for this) and the real MCP spec
+    // (tool `annotations` describe *behavior* hints, not an enable/
+    // disable switch, and no client-side filtering convention exists
+    // either), neither protocol gives acpx a way to actually make a
+    // "disabled" tool disappear from what a session's backend agent
+    // sees -- toggling this would silently do nothing. Kept as plain
+    // data (not removed) so the persisted-preference read/write
+    // plumbing survives if this is revisited with a real enforcement
+    // mechanism (e.g. acpx becoming a live MCP-traffic intermediary),
+    // rather than being ripped out and rebuilt from scratch.
     enabled: bool,
-    // Lazy-loaded: its schema is not injected up front but discovered
-    // on demand (opencode `mcp_lazy` / Claude Code ToolSearch). Shown as
-    // a monochrome "deferred" tag, never a colored marker.
     deferred: bool,
     // Approximate token cost of this tool's schema being included in the
     // model's context (0 when unknown/not yet measured). UI-only estimate
@@ -330,22 +395,24 @@ export struct McpToolOption {
     token-usage: int,
 }
 
-// `transport`/`url`/`enabled`/`status`/`needs-auth`/`auth-status`/`tools`
-// are **UI-only for now** (settings-pane-redesign "shell phase, UI ahead
-// of backend" posture -- same convention `harness_view.slint` documents
-// for its own toggles). The real backend (`src/agent_bridge.rs`
-// `mcp_servers/*`) only supports create/delete by name+command today:
-// `models::to_mcp_server_options` default-fills these fields (`""`,
-// `false`, empty tool list) via `..Default::default()`. They mirror the
-// *set of real per-server config options* established coding agents
-// expose -- benchmarked here against opencode's `mcp` config schema
-// (https://opencode.ai/docs/mcp-servers): a `type` of `"local"`
-// (command child process) vs `"remote"` (a `url`, optional `oauth`), an
-// `enabled` flag, and -- via opencode's global `tools` glob config plus
-// its experimental `mcp_lazy`/`mcp_search` deferred-loading -- per-tool
-// enable/disable and lazy ("deferred") tool loading. Wiring these to a
-// real `mcp_servers/update` RPC, a live status feed, and a `tools/list`
-// round trip is a later phase.
+// Full round-trip data model as of the MCP-server-settings data/
+// persistence/OAuth rebuild -- `transport`/`url`/`enabled`/`needs-auth`/
+// `auth-status`/`args`/`env`/`headers`/`timeout`/`oauth-client-id` are all
+// backed by real typed fields on `acpx_client::mcp::McpServerEntry`
+// (`panel-rust::models::to_mcp_server_option_rows` populates them from
+// there, not by guessing at an opaque JSON blob's inconsistently-named
+// keys the way this struct's fields used to be filled). `status`/`tools`
+// remain best-effort passthrough from the entry's opaque `extra` map --
+// acpx has no live per-connection health probe or `tools/list` round trip
+// yet, so those two are still commonly empty. `env`/`headers` are
+// rendered/edited as `KEY=VALUE`/`Header: value` newline-separated text
+// rather than a dynamic add/remove row list: this Slint version has no
+// array push/slice/concat available in `.slint` code (confirmed
+// elsewhere, see `chat_area.slint`'s `full-view` doc comment), so a real
+// per-row editor would need new Rust-side `VecModel` plumbing for what is
+// otherwise small, rarely-edited transient form state -- the multi-line
+// text convention (the same one many `.env`-style editors use) covers the
+// same need without it.
 export struct McpServerOption {
     name: string,
     command: string,
@@ -383,11 +450,26 @@ export struct McpServerOption {
     // (which only gates whether "Connect" shows): this reports the actual
     // authenticated-vs-not state, never as a colored badge.
     auth-status: string,
-    // Tools this server advertises via MCP `tools/list`, each individually
-    // enable/disable-able and markable "deferred" (lazy-loaded). Empty
-    // list renders no tool section (backend not yet supplying a tool
-    // catalog -- always empty today).
+    // Tools this server advertises, reconciled from a real MCP `tools/
+    // list` fetch (once one has run -- see `tool-fetch-status`) with any
+    // already-persisted per-tool enable/deferred preference. Empty list
+    // renders no tool section (never fetched yet, and no preference was
+    // ever recorded for any tool on this server).
     tools: [McpToolOption],
+    // Status of the real background `tools/list` probe kicked off by the
+    // "Fetch tools"/"Refresh tools" button (`mcp_servers/tools_fetch`,
+    // see `panel-rust::models::to_mcp_server_option_rows`'s doc comment):
+    // "" (never fetched), "fetching", "ready", or "error". Drives that
+    // button's label/enabled state.
+    tool-fetch-status: string,
+    // Real error text from a failed fetch (empty unless `tool-fetch-
+    // status == "error"`).
+    tool-fetch-error: string,
+    // Pre-joined `name`/`description` of every tool in `tools`
+    // (newline-separated, Rust-computed) -- lets the page-level search
+    // bar match a server by one of its real discovered tool names
+    // without Slint needing an array-reduce it doesn't have.
+    tools-search-blob: string,
     // False for built-in, session-injected servers the user cannot delete
     // (PUI-015: the `snapshotd` daemon MCP, always injected into every
     // session while the daemon is reachable -- it is not a user registry
@@ -395,6 +477,74 @@ export struct McpServerOption {
     // default for every acpx-registry row) means the user added it and may
     // remove it.
     removable: bool,
+    // Per-action "RPC currently in flight for this row" flags, sourced
+    // from `AgentBridge::mcp_operations_in_flight` (see `panel-rust::
+    // models::to_mcp_server_option_rows`'s doc comment) -- each drives
+    // its own button showing a `Spinner` in place of its label instead
+    // of a global busy indicator. Deliberately excludes tools-fetch: the
+    // Fetch/Refresh button already has its own, longer-lived busy signal
+    // (`tool-fetch-status == "fetching"`), and excludes Add/Save (that
+    // one busy flag lives on `McpServersView` itself, not per-row, since
+    // only one add/edit form can be open at a time).
+    remove-busy: bool,
+    enabled-busy: bool,
+    authenticate-busy: bool,
+    logout-busy: bool,
+    // Stdio-transport fields, "" / empty for an http server.
+    args: string,
+    env: string,
+    // Http-transport fields, "" / empty for a stdio server.
+    headers: string,
+    // Shared: "" means unset for either transport.
+    timeout: string,
+    // Set only for an http server with `oauth.client_id` configured --
+    // gates whether the OAuth "Connect"/"Logout" actions in
+    // `mcp_servers_view.slint` are even reachable, independent of
+    // `needs-auth` (which additionally requires not-yet-authenticated).
+    oauth-client-id: string,
+}
+
+// One `KEY=VALUE`/`Header: value` line, parsed/formatted entirely on the
+// Rust side (`models.rs`'s `format_env_lines`/`parse_env_lines` and their
+// header equivalents) -- kept as a struct here only so a future real
+// per-row editor (if this Slint version ever gains array mutation
+// support) has a ready-made element type; today's
+// `KeyValueListEditor` renders/edits the newline-joined `string` form
+// directly, no `[KeyValueEntry]` model involved yet.
+export struct KeyValueEntry {
+    key: string,
+    value: string,
+}
+
+// Add/edit-server form submission (`mcp_servers_view.slint`'s single
+// combined callback, `mcp-server-submit`) -- carries every field either
+// transport needs so `PanelSingleton::dispatch_mcp_server_submit` (Rust)
+// can build a full typed `McpServerEntry` and call `mcp_servers/create`
+// or `mcp_servers/update` in one shot, instead of the old two-string
+// `mcp-server-create(name, command)` shortcut that silently dropped
+// everything else.
+export struct McpServerFormData {
+    name: string,
+    // "stdio" | "http".
+    transport: string,
+    command: string,
+    // Whitespace-separated (parsed with Rust's `str::split_whitespace`,
+    // so quoting/escaping is not supported -- matches the level of a
+    // single plain-text field, not a real shell parser).
+    args: string,
+    // `KEY=VALUE` per line.
+    env: string,
+    url: string,
+    // `Header-Name: value` per line.
+    headers: string,
+    // Decimal seconds; "" means unset.
+    timeout: string,
+    oauth-client-id: string,
+    // True when this submission should `mcp_servers/update` the
+    // already-existing entry named `name` instead of `mcp_servers/create`
+    // a new one -- set by `mcp_servers_view.slint` when the form was
+    // opened via a row's "Edit" action.
+    is-edit: bool,
 }
 
 // Skill-manager sidebar/settings row -- `skill_discovery_backend` phase of
@@ -416,6 +566,12 @@ export struct SkillOption {
     // from scratch) -- `skills-management`'s "show project_start skills
     // include global `started_from`".
     started-from: string,
+    // True for the bundled placeholder skill dev-mode installs
+    // (`ensure_bundled_global_skill`) -- `skills_view.slint` hides such
+    // rows while dev-mode is off, so disabling dev-mode re-filters the
+    // list instead of leaving it visible forever just because the file
+    // still exists on disk.
+    is-dev-only: bool,
 }
 
 // Recovery/import sheet addition (Coverage Matrix `session/list` row):
@@ -428,6 +584,12 @@ export struct RemoteSessionOption {
     provider: string,
     title: string,
     updated_at: string,
+    // recoverable-attach-fix: true while this session's `session/load`
+    // attach is in flight (Settings > Agents "Attach" click), sourced
+    // from `AgentBridge::recover_session_operations_in_flight`. Drives
+    // the Attach Button's own `busy` spinner -- this row previously had
+    // no busy-state tracking at all.
+    busy: bool,
 }
 
 // Settings-sheet addition: one agent-catalog entry, as returned by
@@ -442,6 +604,14 @@ export struct AgentCatalogEntry {
     id: string,
     name: string,
     version: string,
+    website: string,
+    // Display-ready host portion of `website` (e.g. "openai.com" for
+    // "https://openai.com/codex"), computed Rust-side in
+    // `models::website_domain` -- Slint has no string-split primitive,
+    // so this rides alongside the raw `website` field (still used
+    // verbatim for the actual click-to-open URL) rather than being
+    // sliced in `agent_card.slint`.
+    website-domain: string,
     status: string,
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: current admin-plane enablement, merged in client-side (see

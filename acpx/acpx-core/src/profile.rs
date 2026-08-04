@@ -152,6 +152,63 @@ pub enum PermissionPolicy {
     AutoReject,
 }
 
+/// Gateway-owned safety profile which can be attached to any ACP session,
+/// independently of the selected backend agent. Built-ins are intentionally
+/// closed so clients can render a stable cross-agent selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProfileType {
+    #[default]
+    AgentFullAccess,
+    Readonly,
+    NotAllowed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PermissionProfile {
+    pub profile_type: PermissionProfileType,
+    pub allow_fs_access: bool,
+    pub allow_terminal_access: bool,
+    pub permission_policy: PermissionPolicy,
+}
+
+impl PermissionProfile {
+    pub const fn agent_full_access() -> Self {
+        Self {
+            profile_type: PermissionProfileType::AgentFullAccess,
+            allow_fs_access: true,
+            allow_terminal_access: true,
+            permission_policy: PermissionPolicy::AutoAllow,
+        }
+    }
+
+    pub const fn readonly() -> Self {
+        Self {
+            profile_type: PermissionProfileType::Readonly,
+            allow_fs_access: true,
+            allow_terminal_access: false,
+            permission_policy: PermissionPolicy::AutoReject,
+        }
+    }
+
+    pub const fn not_allowed() -> Self {
+        Self {
+            profile_type: PermissionProfileType::NotAllowed,
+            allow_fs_access: false,
+            allow_terminal_access: false,
+            permission_policy: PermissionPolicy::AutoReject,
+        }
+    }
+
+    pub fn builtins() -> [Self; 3] {
+        [
+            Self::agent_full_access(),
+            Self::readonly(),
+            Self::not_allowed(),
+        ]
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProfileStoreError {
     #[error("profile {0} already exists")]

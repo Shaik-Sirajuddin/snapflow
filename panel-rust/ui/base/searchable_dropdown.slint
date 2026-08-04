@@ -5,6 +5,7 @@ import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
+import { ThinScrollbar } from "thin_scrollbar.slint";
 
 // Layer 3 (base) -- trigger + upward popup list of `DropdownEntry` rows.
 // Search UX mirrors the compose `/` skills popup:
@@ -233,7 +234,15 @@ export component SearchableDropdown inherits Rectangle {
         filter = "";
         open = true;
         root.opened();
-        reselect-closest();
+        // No keyboard pre-highlight on open. `reselect-closest()` used to
+        // run here, which parks `kb-sel` on row 0 and paints it with the
+        // same strong treatment the genuinely-selected row needs -- so
+        // e.g. picking `claude-acp` and reopening showed row 0
+        // (`codex-acp`) as the chosen one. `kb-move()` already treats
+        // kb-sel < 0 as "start at the first visible row", so Up/Down is
+        // unaffected. `changed filter` still pre-highlights the first
+        // match, which is what Enter-to-accept-a-search needs.
+        kb-sel = -1;
     }
 
     function toggle-popup() {
@@ -284,14 +293,58 @@ export component SearchableDropdown inherits Rectangle {
         spacing: Metrics.space-2;
         alignment: stretch;
         cross-axis-alignment: center;
-        Text {
-            text: root.trigger-label;
-            color: Theme.text-primary;
-            font-family: Theme.font-mono;
-            font-size: 10px * Theme.font-scale;
-            vertical-alignment: center;
+        // Own-bounds horizontal scroll for the trigger label -- when the
+        // assigned trigger width (e.g. a narrow docked panel, or several
+        // triggers competing for space in chat_input_layout.slint's
+        // row2-strip) is too small for the full label, text must stay
+        // containable within the trigger rather than spilling past its
+        // border (root's `clip` defaults to false). Mirrors row2-host's
+        // own pattern one level up: a TouchArea handling only
+        // `scroll-event` (wheel/trackpad) so plain clicks still fall
+        // through undisturbed to `trigger-touch` below (declared before
+        // this HorizontalLayout, so it only sees events this layout's
+        // children don't consume), plus a ThinScrollbar overlay for a
+        // visible affordance. `active` mirrors row2-strip's ThinScrollbar
+        // (pressed, not has-hover) -- see chat_input_layout.slint.
+        label-scroll-host := Rectangle {
             horizontal-stretch: 1;
-            overflow: elide;
+            min-width: 0px;
+            height: parent.height;
+            clip: true;
+            property <length> pan: 0px;
+            property <length> overflow: max(0px, label-text.preferred-width - self.width);
+            label-scroll := TouchArea {
+                width: 100%;
+                height: 100%;
+                scroll-event(e) => {
+                    if (label-scroll-host.overflow > 0px) {
+                        label-scroll-host.pan = max(-label-scroll-host.overflow,
+                            min(0px, label-scroll-host.pan + e.delta-x + e.delta-y));
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            label-text := Text {
+                x: label-scroll-host.overflow > 0px ? label-scroll-host.pan : 0px;
+                height: parent.height;
+                text: root.trigger-label;
+                color: Theme.text-primary;
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: clip;
+            }
+            ThinScrollbar {
+                horizontal: true;
+                x: 0px;
+                y: parent.height - self.thumb-width;
+                visible-width: label-scroll-host.width;
+                viewport-width: label-scroll-host.width + label-scroll-host.overflow;
+                viewport-x <=> label-scroll-host.pan;
+                thumb-width: 2px;
+                active: label-scroll.pressed;
+            }
         }
         Text {
             text: "\u{25BE}";
@@ -325,13 +378,14 @@ export component SearchableDropdown inherits Rectangle {
 
         // Was `init =>` when this Rectangle only existed while `open` --
         // that only ever fires once now that it's permanently mounted, so
-        // this needs to re-run reselect-closest() on every open instead.
-        // `changed` only accepts a local property name (not a qualified
-        // `root.open` path), hence this reactive local mirror.
+        // this needs to re-run on every open instead. `changed` only
+        // accepts a local property name (not a qualified `root.open`
+        // path), hence this reactive local mirror. Clears the keyboard
+        // highlight for the same reason `open-popup()` does.
         property <bool> local-open: root.open;
         changed local-open => {
             if (root.open) {
-                root.reselect-closest();
+                root.kb-sel = -1;
             }
         }
 
@@ -362,9 +416,18 @@ export component SearchableDropdown inherits Rectangle {
                     self.focus-input();
                 }
             }
-            Flickable {
+            // Wrapper Rectangle so `options-scrollbar` below can overlay
+            // the Flickable as a free-floating sibling positioned against
+            // a fixed-size parent -- same pattern used for the compose
+            // bar's row2-host horizontal scrollbar and the Settings page's
+            // vertical one, both added earlier this session.
+            options-scroll-host := Rectangle {
                 vertical-stretch: 1;
-                viewport-height: options-col.preferred-height;
+                clip: true;
+                options-flickable := Flickable {
+                    width: parent.width;
+                    height: parent.height;
+                    viewport-height: options-col.preferred-height;
                 options-col := VerticalLayout {
                     alignment: start;
                     for entry[i] in root.options : Rectangle {
@@ -373,9 +436,12 @@ export component SearchableDropdown inherits Rectangle {
                         property <bool> hi: !hidden && i == root.kb-sel;
                         height: hidden ? 0px : root.row-h;
                         clip: true;
+                        // The selected row must not share a token with the
+                        // plain hover state -- it did (bg-primary-container
+                        // both), leaving the only cue a 600-vs-400 font
+                        // weight, which read as "my pick didn't register".
                         background: entry.is-header ? transparent
-                            : hi ? Theme.bg-primary
-                            : current ? Theme.bg-primary-container
+                            : (hi || current) ? Theme.bg-primary
                             : row-touch.has-hover ? Theme.bg-primary-container
                             : transparent;
                         animate background { duration: 100ms; }
@@ -405,7 +471,7 @@ export component SearchableDropdown inherits Rectangle {
                             Text {
                                 text: entry.is-header ? entry.label + ":" : entry.label;
                                 color: entry.is-header ? Theme.text-secondary
-                                    : (hi || current) ? (hi ? Theme.text-on-primary : Theme.text-primary)
+                                    : (hi || current) ? Theme.text-on-primary
                                     : Theme.text-primary;
                                 font-family: Theme.font-mono;
                                 font-size: (entry.is-header ? 9px : 10px) * Theme.font-scale;
@@ -415,6 +481,15 @@ export component SearchableDropdown inherits Rectangle {
                             }
                         }
                     }
+                }
+                }
+                ThinScrollbar {
+                    x: parent.width - self.width - 2px;
+                    y: 2px;
+                    visible-height: options-flickable.height - 4px;
+                    viewport-height: options-col.preferred-height;
+                    viewport-y <=> options-flickable.viewport-y;
+                    thumb-width: 4px;
                 }
             }
         }

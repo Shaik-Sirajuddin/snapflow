@@ -55,7 +55,29 @@ jobs:
       - name: Build acpx-server (test dependency)
         working-directory: acpx
         run: cargo build -p acpx-server
+      # See build-linux.yml's identical step: panel-rust/Cargo.toml's
+      # package.version is a dev placeholder, stamped here from the
+      # release tag so the version shown in Settings
+      # (env!("CARGO_PKG_VERSION"), lib.rs) never goes stale. Uses bash
+      # (git-for-windows, already relied on elsewhere in this workflow --
+      # see the shotcut-rebrand job's "Place sap-rust..." step) rather
+      # than the runner's default pwsh, so the same sed invocation works
+      # unmodified on every platform.
+      - name: Stamp Cargo.toml version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
       - run: cargo build --release
+      - name: Verify native daemon transport and SAP protocol tests
+        run: |
+          cargo test --lib snapshotd_client --no-default-features
+          cargo test --manifest-path ../sap-rust/Cargo.toml --quiet
+      - name: Build SAP Windows static library (compile-time transport variant)
+        run: cargo build --manifest-path ../sap-rust/Cargo.toml --release
       # See build-linux.yml's identical step: RUST_TEST_THREADS=4 didn't
       # reliably fix agent_bridge's flakiness on a real GitHub runner
       # despite being verified locally -- back to advisory.
@@ -68,6 +90,10 @@ jobs:
         with:
           name: panel-rust-staticlib-windows
           path: panel-rust/target/release/panel_rust.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap-rust-staticlib-windows
+          path: sap-rust/target/release/sap_rust.lib
 
   snapshotd:
     runs-on: windows-latest
@@ -84,6 +110,12 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd.exe ./cmd/snapshotd
+      - name: Verify native named-pipe transport and endpoint consumers
+        # sdp/sapproxy/discovery integration tests create Unix-domain sockets;
+        # Windows cannot bind those paths (even though the production
+        # transport uses named pipes). Keep the Windows gate focused on the
+        # transport/config packages; the Unix socket suites run on Linux.
+        run: go test ./internal/transport ./internal/health ./internal/config
       # Windows AF_UNIX has a much shorter max socket path than Linux; the
       # default runner %TEMP% path is too long once the tests' own random
       # subdirectories are appended (snapshotd's daemon/procmgr/sapproxy
@@ -119,13 +151,27 @@ jobs:
         with:
           path: multi-media-main
 
+      # See the panel-rust job's identical step above -- this is the
+      # checkout that actually ships (copied in as a sibling of
+      # shotcut-rebrand and compiled via Corrosion below), so it needs the
+      # same tag-derived version stamp for Settings' displayed version to
+      # be correct in the real, released app.
+      - name: Stamp panel-rust/Cargo.toml version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" multi-media-main/panel-rust/Cargo.toml
+          grep -m1 '^version = ' multi-media-main/panel-rust/Cargo.toml
+
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry
       # -- pushed separately to Shaik-Sirajuddin/shotcut.git's
-      # rebrand/snapflow branch), so check it out on its own.
+      # master branch), so check it out on its own.
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: rebrand/snapflow
+          ref: master
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
@@ -355,6 +401,14 @@ jobs:
           cp dist/snapflowd-windows/snapflowd.exe "$OUT/bin/snapflowd.exe"
           cp dist/panel-rust-staticlib-windows/panel_rust.lib "$OUT/bin/panel_rust.lib"
           unzip -q dist/shotcut-rebrand-windows/snapflow-win64-*.zip -d "$OUT"
+          # snapshotd launch --gui must have the real production
+          # FfiBackend-linked child in the shipped bundle. The Windows
+          # installer persists this executable as SNAPSHOT_BIN_PATH.
+          test -f "$OUT/Snapflow/snapflow.exe" || {
+            echo "production snapshot child missing from Snapflow bundle" >&2
+            find "$OUT" -maxdepth 4 -type f -iname 'snapflow*.exe' -print >&2 || true
+            exit 1
+          }
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null
           sha256sum "$OUT.zip" > "$OUT.zip.sha256"
 

@@ -4,13 +4,14 @@
 use acpx_conductor::SpawnSpec;
 use acpx_core::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
-    PersistenceStore,
+    PersistenceStore, QueueStore,
 };
 use acpx_core::{
     recover_open_sessions_shared,
     router::{Router, StartupRecoveryPolicy},
     LifecycleConfig,
 };
+use acpx_proto::session_stream::{QueueMutationParams, QueueOperation};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -411,6 +412,72 @@ async fn shared_recovery_scheduler_recovers_distinct_connectors_concurrently() {
         started.elapsed() < Duration::from_millis(1800),
         "two different connector processes should recover concurrently"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_recovery_releases_crashed_queue_claim_and_resumes_dispatch() {
+    let store = PersistenceStore::open_in_memory().expect("open persistence store");
+    seed_load_candidate(&store, "queued-recovery", "queue-agent").await;
+    let queue_dir = tempfile::tempdir().expect("queue directory");
+    let queue = QueueStore::new(queue_dir.path());
+    queue
+        .mutate(
+            "queued-recovery",
+            QueueMutationParams {
+                session_id: "queued-recovery".into(),
+                idempotency_key: "queued-a".into(),
+                operation: QueueOperation::Enqueue,
+                queue_entry_id: None,
+                text: Some("resume this queued prompt".into()),
+            },
+        )
+        .await
+        .expect("enqueue durable prompt");
+    let _claimed = queue
+        .take_next("queued-recovery")
+        .await
+        .expect("claim prompt")
+        .expect("queued prompt exists");
+
+    let log_path =
+        std::env::temp_dir().join(format!("acpx-queue-recovery-{}.log", uuid::Uuid::new_v4()));
+    let mut router = Router::new("queue-agent")
+        .with_persistence(store.clone())
+        .with_queue_store(queue.clone());
+    router.register_agent("queue-agent", recording_backend_spec(&log_path));
+    let router = Arc::new(Mutex::new(router));
+
+    let report = recover_open_sessions_shared(
+        &router,
+        StartupRecoveryPolicy {
+            timeout: Duration::from_secs(3),
+            concurrency: 1,
+            fail_fast: false,
+        },
+    )
+    .await
+    .expect("startup recovery");
+    assert_eq!(report.restored, 1);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(&log_path).await {
+                if contents.contains("session/prompt") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered queue prompt dispatched");
+    assert!(queue
+        .snapshot("queued-recovery")
+        .await
+        .unwrap()
+        .queue
+        .is_empty());
+    let _ = tokio::fs::remove_file(log_path).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

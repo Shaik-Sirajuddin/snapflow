@@ -69,22 +69,150 @@ pub struct ChatMessage {
     pub raw_output: Option<serde_json::Value>,
 }
 
+/// Server-owned queue snapshot delivered on the separate ACPX queue stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItemInfo {
+    pub queue_entry_id: String,
+    pub idempotency_key: String,
+    pub text: String,
+    pub state: String,
+    pub position: u32,
+}
+
+/// Outcome of a relayed agent request. `selected=false` tells a connected
+/// panel that another client won the approval race and its card is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentResolutionEvent {
+    pub relay_id: String,
+    pub selected: bool,
+    pub late: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSteerEvent {
+    pub session_id: String,
+    pub state: String,
+    pub queue_entry_id: Option<String>,
+}
+
+/// Longest single JSON string leaf kept inside a tool call's
+/// `rawInput`/`rawOutput` payload.
+///
+/// A tool that returns an image (an image-generation skill, an MCP tool
+/// answering with an `{"type":"image","data":"<base64>"}` content block)
+/// puts megabytes of base64 into exactly one string leaf. That string is
+/// re-serialized into the transcript on every ingested chunk
+/// (`conversation::rebuild_from_chat_messages`), deep-cloned out of the
+/// bridge on every 60-90fps poll tick
+/// (`external_snapshot::collect_thread_snapshot_for`), and finally handed
+/// to Slint as the `raw-output` of a wrapping, uncapped, read-only
+/// `TextInput` (`ui/base/terminal_log_block.slint`) whose height *is* its
+/// own `preferred-height`. The software renderer's physical coordinate
+/// space is `i16` (`i-slint-renderer-software`'s `PhysicalRect =
+/// euclid::Rect<i16, PhysicalPx>`), and euclid's `cast()` is
+/// `try_cast().unwrap()` -- so once that text wraps past 32767 physical
+/// pixels of height, rendering it panics, and this crate builds with
+/// `panic = "abort"`.
+pub const MAX_RAW_PAYLOAD_STRING_BYTES: usize = 4 * 1024;
+
+/// Cap on the whole serialized payload, applied after
+/// [`elide_large_payload_strings`] so a payload that is large by breadth
+/// (thousands of small fields) is bounded too.
+pub const MAX_RAW_PAYLOAD_TOTAL_BYTES: usize = 32 * 1024;
+
+/// Truncates `s` to at most `max` bytes on a char boundary, appending a
+/// marker naming how much was dropped. No-op when already within `max`.
+fn truncate_with_marker(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let dropped = s.len() - max;
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str(&format!("\u{2026} <{dropped} more bytes elided>"));
+}
+
+/// Replaces every oversized string leaf in `value` with a truncated
+/// preview, in place, leaving the JSON *structure* (and therefore every
+/// small field, e.g. the `skill` key `models::classify_tool_call_kind`
+/// probes for) intact. See [`MAX_RAW_PAYLOAD_STRING_BYTES`].
+pub fn elide_large_payload_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => truncate_with_marker(s, MAX_RAW_PAYLOAD_STRING_BYTES),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(elide_large_payload_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(elide_large_payload_strings),
+        _ => {}
+    }
+}
+
+/// The display string for a tool payload: `value` serialized, bounded by
+/// both caps above. Every path that turns a stored `raw_input`/
+/// `raw_output` `Value` into the `SharedString` Slint renders goes
+/// through here, so a payload cached to jsonl before the ingestion-side
+/// bound existed is bounded on the way out too.
+pub fn bounded_payload_display_string(value: &serde_json::Value) -> String {
+    // Scan before cloning: on the live path the payload was already
+    // bounded at ingestion, and this runs once per stored tool row on
+    // every transcript rebuild (i.e. once per streamed chunk).
+    let mut out = if has_oversized_string(value) {
+        let mut owned = value.clone();
+        elide_large_payload_strings(&mut owned);
+        owned.to_string()
+    } else {
+        value.to_string()
+    };
+    truncate_with_marker(&mut out, MAX_RAW_PAYLOAD_TOTAL_BYTES);
+    out
+}
+
+fn has_oversized_string(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.len() > MAX_RAW_PAYLOAD_STRING_BYTES,
+        serde_json::Value::Array(items) => items.iter().any(has_oversized_string),
+        serde_json::Value::Object(map) => map.values().any(has_oversized_string),
+        _ => false,
+    }
+}
+
 /// Events flowing out of a bound thread's gateway actor, consumed from
 /// `AcpxThreadHandle::take_events`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    /// The gateway re-established this session after a transport reconnect.
+    /// Panel-Rust uses this edge to request a fresh first history page from
+    /// ACPX before accepting further UI interactions.
+    ConnectionRestored,
     Message(ChatMessage),
+    HistoryPage {
+        messages: Vec<ChatMessage>,
+        next_cursor: Option<String>,
+    },
+    QueueChanged {
+        items: Vec<QueueItemInfo>,
+        paused: bool,
+    },
     /// A prompt turn finished; carries the ACP stop reason as a
     /// human-readable tag (`"end_turn"`, `"cancelled"`, etc.) rather
     /// than re-exporting the wire enum.
     TurnEnded(String),
     Error(String),
+    /// Result of a provider-picker pool acquire probe, separate from a
+    /// thread's error because selection does not attach a real session.
+    ProviderProbe {
+        provider: String,
+        result: Result<(), String>,
+    },
     /// A live agent-initiated request needing an interactive client
     /// decision -- `session/request_permission`, `fs/read_text_file`,
     /// `fs/write_text_file`, or `terminal/create`, relayed live over the
     /// acpx gateway's WS transport (see `acpx_core::agent_relay`'s
     /// module doc comment).
     PermissionRequest(AgentRequestEvent),
+    AgentResolution(AgentResolutionEvent),
+    SessionSteer(SessionSteerEvent),
     /// A live output-buffer push from a `terminal/create`d command, via
     /// the gateway's `acpx/terminal_output` notification (see
     /// `acpx_core::router::spawn_terminal_output_stream`'s doc comment
@@ -287,42 +415,16 @@ pub struct AgentRequestEvent {
 }
 
 /// One centrally-registered MCP server, as returned by `mcp_servers/
-/// list` -- typed narrowly to the two fields a settings-gear list view
-/// actually renders (`McpServerOption` in `panel-rust::models`), per
-/// Phase 2 step 3's "no Slint-adjacent code sees raw JSON" goal.
-/// `extra` retains the full original entry (env/args/url/whatever else
-/// a real MCP server entry carries) as an opaque JSON object for a
-/// future settings-sheet edit dialog that needs the complete payload --
-/// `acpx-core::McpServerStore` itself never interprets more than
-/// `"name"`, so this crate has no more reason to hand-type every field
-/// than the server does.
-#[derive(Debug, Clone, PartialEq)]
-pub struct McpServerEntry {
-    pub name: String,
-    pub command: Option<String>,
-    pub extra: serde_json::Value,
-}
-
-impl McpServerEntry {
-    /// Parses one `mcp_servers/list` array entry. `None` only for an
-    /// entry missing the required `"name"` field -- `acpx-core::
-    /// McpServerStore::create`/`update` both reject such an entry
-    /// server-side, so a well-behaved gateway never actually returns
-    /// one, but this stays tolerant (skip, don't panic) rather than
-    /// assuming that invariant holds forever.
-    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
-        let name = value.get("name")?.as_str()?.to_string();
-        let command = value
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(str::to_string);
-        Some(Self {
-            name,
-            command,
-            extra: value.clone(),
-        })
-    }
-}
+/// list`. Re-exported directly from `acpx-client` (not re-typed here)
+/// since `panel-rust` already depends on that crate for every other
+/// gateway call -- see `acpx_client::mcp`'s own module doc comment for
+/// why the full `command`/`args`/`env`/`url`/`headers`/`timeout`/`oauth`
+/// shape lives there rather than being narrowed down to the two fields a
+/// settings-gear list view happens to render today, which is what this
+/// type used to do (and is exactly the "incomplete data" this replaced).
+pub use acpx_client::mcp::{
+    McpAuthStatus, McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo, OAuthClientConfig,
+};
 
 /// Registry-reported install/detection status for one agent catalog
 /// entry (`agents/list`/`agents/status`) -- mirrors `acpx_proto::
@@ -372,12 +474,14 @@ impl AgentStatus {
 
 /// One agent-registry catalogue entry, as returned by `agents/list`
 /// (each entry) or `agents/status` (one entry, keyed by the requested
-/// id).
+/// id). `website` is the registry's official public landing page, if one
+/// is supplied; it is kept separate from any ACPX gateway URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCatalogEntry {
     pub id: String,
     pub name: String,
     pub version: String,
+    pub website: String,
     pub status: AgentStatus,
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: `agents/list` itself carries no enablement info (that's an
@@ -407,6 +511,12 @@ impl AgentCatalogEntry {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let website = value
+            .get("website")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let status = value
             .get("status")
             .and_then(|v| v.as_str())
@@ -416,9 +526,83 @@ impl AgentCatalogEntry {
             id,
             name,
             version,
+            website,
             status,
             enabled: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod raw_payload_bound_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Stand-in for a real image-generation tool result: one ~4 MB
+    /// base64 string leaf inside an otherwise ordinary content block.
+    fn image_tool_output() -> serde_json::Value {
+        json!({
+            "content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "A".repeat(4 * 1024 * 1024),
+            }],
+            "isError": false,
+        })
+    }
+
+    #[test]
+    fn oversized_string_leaf_is_elided_in_place() {
+        let mut value = image_tool_output();
+        elide_large_payload_strings(&mut value);
+        let data = value["content"][0]["data"].as_str().expect("data string");
+        assert!(
+            data.len() < MAX_RAW_PAYLOAD_STRING_BYTES + 64,
+            "elided leaf still {} bytes",
+            data.len()
+        );
+        assert!(data.contains("more bytes elided"));
+        // Structure and small sibling fields survive.
+        assert_eq!(value["content"][0]["mimeType"], "image/png");
+        assert_eq!(value["isError"], false);
+    }
+
+    #[test]
+    fn display_string_of_an_image_payload_stays_under_the_total_cap() {
+        let rendered = bounded_payload_display_string(&image_tool_output());
+        assert!(
+            rendered.len() <= MAX_RAW_PAYLOAD_TOTAL_BYTES + 64,
+            "rendered payload is {} bytes",
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn breadth_heavy_payload_is_capped_even_without_a_long_leaf() {
+        let map: serde_json::Map<String, serde_json::Value> = (0..20_000)
+            .map(|i| (format!("k{i}"), json!("short")))
+            .collect();
+        let rendered = bounded_payload_display_string(&serde_json::Value::Object(map));
+        assert!(rendered.len() <= MAX_RAW_PAYLOAD_TOTAL_BYTES + 64);
+        assert!(rendered.ends_with("more bytes elided>"));
+    }
+
+    #[test]
+    fn small_payload_is_passed_through_unchanged() {
+        let value = json!({"skill": "trailer-writer", "ok": true});
+        assert_eq!(bounded_payload_display_string(&value), value.to_string());
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multi_byte_char() {
+        let mut value = serde_json::Value::String("\u{1f600}".repeat(MAX_RAW_PAYLOAD_STRING_BYTES));
+        elide_large_payload_strings(&mut value);
+        // Round-tripping proves the truncated string is still valid UTF-8
+        // (a `String` that split a char boundary could not exist).
+        assert!(value
+            .as_str()
+            .expect("string")
+            .contains("more bytes elided"));
     }
 }
 
@@ -429,22 +613,24 @@ mod parsing_tests {
 
     #[test]
     fn mcp_server_entry_parses_name_and_command() {
-        let value = json!({"name": "central-fs", "command": "mcp-central-fs"});
-        let entry = McpServerEntry::from_json(&value).expect("entry");
+        let value = json!({"name": "central-fs", "type": "stdio", "command": "mcp-central-fs"});
+        let entry: McpServerEntry = serde_json::from_value(value).expect("entry");
         assert_eq!(entry.name, "central-fs");
-        assert_eq!(entry.command.as_deref(), Some("mcp-central-fs"));
+        assert_eq!(entry.command(), Some("mcp-central-fs"));
     }
 
     #[test]
-    fn mcp_server_entry_none_without_command_is_still_valid() {
-        let value = json!({"name": "url-only"});
-        let entry = McpServerEntry::from_json(&value).expect("entry");
-        assert_eq!(entry.command, None);
+    fn mcp_server_entry_parses_url_only_http_entry() {
+        let value = json!({"name": "url-only", "type": "http", "url": "https://example.com/mcp"});
+        let entry: McpServerEntry = serde_json::from_value(value).expect("entry");
+        assert_eq!(entry.command(), None);
+        assert_eq!(entry.url(), Some("https://example.com/mcp"));
     }
 
     #[test]
-    fn mcp_server_entry_is_none_without_a_name() {
-        assert!(McpServerEntry::from_json(&json!({"command": "x"})).is_none());
+    fn mcp_server_entry_is_err_without_a_name() {
+        let value = json!({"type": "stdio", "command": "x"});
+        assert!(serde_json::from_value::<McpServerEntry>(value).is_err());
     }
 
     #[test]
@@ -472,12 +658,14 @@ mod parsing_tests {
             "id": "codex-acp",
             "name": "Codex Agent",
             "version": "1.0.0",
+            "website": "https://example.com/codex",
             "status": "installed"
         });
         let entry = AgentCatalogEntry::from_json(&value).expect("entry");
         assert_eq!(entry.id, "codex-acp");
         assert_eq!(entry.name, "Codex Agent");
         assert_eq!(entry.version, "1.0.0");
+        assert_eq!(entry.website, "https://example.com/codex");
         assert_eq!(entry.status, AgentStatus::Installed);
     }
 

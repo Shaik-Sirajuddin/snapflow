@@ -40,18 +40,6 @@ impl ProjectIdentity {
     }
 }
 
-/// Leave/return snapshot for one thread's chat list presentation.
-/// Rows include `MessageItem.expanded` so expand state survives A→B→A.
-/// Not a Slint tree cache — host-owned values installed into the shared
-/// `messages_model` on switch (see chat_view_audit_report §5).
-#[derive(Debug, Clone, Default)]
-pub struct ThreadListUiCache {
-    pub keys: Vec<String>,
-    pub rows: Vec<crate::MessageItem>,
-    #[allow(dead_code)]
-    pub gen: u64,
-}
-
 /// Result of `Effect::LoadInitialState` -- the same data
 /// `panel_rust_create` reads from `PanelStateStore` today (thread
 /// records, or the default thread set when the store is empty/missing),
@@ -79,6 +67,11 @@ pub struct InitialState {
     /// the same as `threads`/`thread_ids`; a missing/short entry falls
     /// back to an empty in-memory-only queue.
     pub send_queues: Vec<crate::send_queue::SendQueue>,
+    /// ACPX owns queue persistence and dispatch for production sessions.
+    /// Kept explicit so pure reducer tests can continue to exercise the
+    /// legacy local queue contract.
+    pub server_queue: bool,
+    pub onboarding_completed: bool,
 }
 
 /// One thread's `Model`-side state -- the former parallel-array fields in
@@ -90,6 +83,16 @@ pub struct ThreadModel {
     /// may be absent while a new thread is attaching.
     pub thread_id: String,
     pub display_name: String,
+    /// mcp-servers-settings, agent-proposed-session-title: true once the
+    /// user has explicitly renamed this thread via `ThreadMsg::
+    /// RenameRequested` (set alongside `display_name` there). While
+    /// `false`, an agent-pushed `session_info_update` title (see
+    /// `session_title` below) is allowed to auto-rename `display_name`;
+    /// once `true`, a live title must never overwrite what the user
+    /// typed -- see `update.rs`'s `selected_thread_snapshot` fold (the
+    /// site that applies an agent title to `display_name`) for the
+    /// actual gate.
+    pub name_user_set: bool,
     pub provider: String,
     pub profile_name: Option<String>,
     pub permission_profile: Option<String>,
@@ -120,6 +123,7 @@ pub struct ThreadModel {
     /// showed nothing at all, indistinguishable from a hang.
     pub agent_content_this_turn: bool,
     pub send_queue: SendQueue,
+    pub server_queue: bool,
     /// Per-thread compose draft (leak_audit_report §2.5 / §4.2). The
     /// global `Model::compose_text` is only the *active* buffer for the
     /// displayed thread; switching saves/restores via this field.
@@ -129,13 +133,82 @@ pub struct ThreadModel {
     // presentation flag (see AgentBridge::archive_thread's doc comment) --
     // never sends an ACP request, unlike `closed`.
     pub archived: bool,
+    /// thread-unread-state: visible agent output arrived for this thread
+    /// while some OTHER thread was displayed, and the user has not opened
+    /// it since. Set in `update_frame`'s `AgentEvent::Message` arm (gated
+    /// on `model.displayed_thread != Some(this thread)`, so a thread
+    /// streaming its own reply in front of the user never flips), cleared
+    /// in `apply_thread_selection_switch`.
+    ///
+    /// Deliberately in-memory only, unlike `archived`: bridge events exist
+    /// only while this process runs the ACPX actor, so no content can be
+    /// delivered to a thread while the panel is closed. A restart therefore
+    /// has nothing the user could have missed, and hydrating every thread
+    /// as read is the correct -- not merely the cheap -- behaviour. That is
+    /// why this gets no `ThreadRuntimeSnapshot`/sqlite column.
+    pub unread: bool,
     /// Stable message identities currently known to the TEA model. Streaming
     /// effect results must resolve against this list, never a cached row
     /// index, before producing a `Dirty::MessageStreamingDelta`.
     pub message_ids: Vec<String>,
     pub transcript: Vec<TranscriptItem>,
     pub transcript_keys: Vec<String>,
+    /// `(send_queue, generation_in_flight)` captured the last time this
+    /// thread's message rows were actually rebuilt from `transcript` in
+    /// `update.rs`'s frame-poll fold. `None` until the first rebuild.
+    ///
+    /// The frame poll runs at 60-90fps and re-collects `snapshot.transcript`
+    /// every tick regardless of whether it changed (`ExternalSnapshotSource::
+    /// collect_thread_snapshot_for`'s doc comment). Before this field
+    /// existed, the fold unconditionally re-ran `message_rows_for_thread_
+    /// with_state` on every tick too -- re-cloning the whole transcript and
+    /// re-parsing every tool row's `raw_input` JSON (`to_message_rows_from_
+    /// transcript`'s `serde_json::from_str` call), even on an idle thread
+    /// whose transcript was byte-identical to the previous tick. Comparing
+    /// against this field (alongside `thread.transcript == snapshot.
+    /// transcript`) lets that tick instead reuse the already-installed rows
+    /// from `Model::thread_view_models` (cheap `Rc`-backed clones, no
+    /// re-parse) -- see the frame-poll fold in `update.rs` for the actual
+    /// gate. `send_queue`/`in_flight` are tracked too because either can
+    /// change the row projection (queued rows, the "sending" flag) even
+    /// while `transcript` itself stays the same.
+    pub rows_synced_with: Option<(SendQueue, bool)>,
+    #[cfg(test)]
+    /// Legacy projection fixture retained only by unit tests that exercise
+    /// the pre-migration shared-list reducer. Production rows live in the
+    /// durable-ID keyed `ThreadViewModels` registry.
     pub message_rows: Vec<crate::MessageItem>,
+    /// markdown-render-cache-layer plan, Phase 1/3: this thread's own
+    /// message-key -> {row_index, content_hash, rendered markdown} cache
+    /// (`panel-rust/src/thread_message_index.rs`), replacing the old
+    /// global, text-keyed `MARKDOWN_CACHE`/`MARKDOWN_BLOCK_CACHE`
+    /// thread_locals in `models.rs`. Per-thread (not global) so a
+    /// worker-delivered background render has somewhere durable and
+    /// correctly-scoped to land regardless of which thread is currently
+    /// displayed -- see that plan's "Chosen state shape".
+    /// `RefCell`-wrapped (not a plain field): main's retained per-thread
+    /// ChatView architecture rebuilds rows via `sync.rs`'s
+    /// `projected_thread_rows`, which only ever holds `&Model`/
+    /// `&ThreadModel` (rows now live in the Slint-side `thread_view_models`
+    /// registry, not a mutable Rust row cache) -- so this cache needs
+    /// interior mutability to stay writable from that shared-reference
+    /// context, the same shape `thread_view_models`'s own Slint models
+    /// already use for the identical reason.
+    pub markdown_render_index: RefCell<crate::thread_message_index::ThreadMessageIndex>,
+    /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: this
+    /// thread's own render generation counter. Deliberately per-thread,
+    /// not one shared global counter -- bumping it invalidates any
+    /// in-flight background render for THIS thread only (e.g. because
+    /// its transcript changed again before the previous render
+    /// finished), without touching unrelated background pre-renders for
+    /// other threads. See `markdown_worker::EpochCounter`'s own doc
+    /// comment for why a shared/global counter caused real cross-test
+    /// interference in this exact module.
+    pub markdown_epoch: crate::markdown_worker::EpochCounter,
+    /// Companion to `markdown_epoch`: de-dupes a redundant background
+    /// render spawn for the exact same `(thread_id, epoch)` this thread
+    /// already has in flight.
+    pub markdown_in_flight: crate::markdown_worker::InFlightRegistry,
     pub has_older_messages: bool,
     pub pending_request: crate::PendingRequestItem,
     pub terminals: Vec<crate::TerminalItem>,
@@ -152,6 +225,9 @@ pub struct ThreadModel {
     pub config_options: Vec<ConfigOptionInfo>,
     /// PUI-003: the agent's built-in slash commands for the `/` menu.
     pub available_commands: Vec<AvailableCommandInfo>,
+    /// Per-thread slash-command filter. The source catalog remains
+    /// immutable; the Slint command model is a derived visible copy.
+    pub command_filter: String,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
     /// PROF-11: the agent's most recently pushed execution plan/todo
@@ -199,18 +275,14 @@ pub struct Model {
     pub search_query: String,
     pub visible_indices: Vec<usize>,
     /// Index-parallel expand flags for the *currently displayed* list only.
-    /// Durable expand lives on each `MessageItem.expanded` and in
-    /// `list_ui_cache` / `ThreadModel.message_rows` across switches.
+    /// Durable expand lives on each retained thread's `MessageItem` rows.
     pub expanded: Vec<bool>,
     pub displayed_thread: Option<usize>,
     /// Who currently owns `messages_model` (durable thread id). Must match
     /// the displayed thread after every install; used to refuse cross-thread
     /// writes and detect owner mismatch after selection.
+    #[cfg(test)]
     pub list_owner_thread_id: Option<String>,
-    /// Bumps on every full list install (switch / cold hydrate).
-    pub list_gen: u64,
-    /// Per-thread list presentation cache for leave/return (content + expand).
-    pub list_ui_cache: HashMap<String, ThreadListUiCache>,
     pub expanded_terminal_id: Option<String>,
     /// Terminal-tabs phase: every terminal id currently pinned open as a
     /// full-view tab, in the order tabs were first opened (not
@@ -274,12 +346,49 @@ pub struct Model {
     pub background_default: bool,
     pub default_agent_id: String,
     pub dev_mode: bool,
+    pub onboarding_completed: bool,
+    /// Feature-flag gate (env-var driven, see `PANEL_PROFILE_WIRING_ENABLED`
+    /// in lib.rs) for the "default profile"/"permission profile" settings
+    /// controls in `agents_view.slint`. Both are genuinely dual-tier
+    /// (visible/working under Project and Global scope alike, unlike the
+    /// six categories gated Global-only in 6745aa0e) but are hidden
+    /// entirely, in both scopes, until this flag is turned on. Computed
+    /// once at startup from the environment and never mutated afterward.
+    pub profile_wiring_enabled: bool,
+    /// Feature-flag gate (env-var driven, see `beta_mode_enabled()` in
+    /// lib.rs, `BETA_MODE`) for in-development UI surfaces: the Chat
+    /// Defaults "Profile" field (`agents_view.slint`, additive on top of
+    /// `profile_wiring_enabled` above) and the whole Harness settings tab
+    /// (`left_tabs.slint` / `settings_page.slint`). Computed once at
+    /// startup from the environment and never mutated afterward.
+    pub beta_mode_enabled: bool,
     pub background_override_set: bool,
     pub background_override: bool,
+    /// Skills settings view's "Show global skills" row
+    /// (`skills_view.slint`). Genuinely dual-tier, same
+    /// Project-overrides-Global mechanism as `background_default` --
+    /// see `settings_file::SettingsDocument::show_global_skills`'s doc
+    /// comment.
+    pub show_global_skills: bool,
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub agent_catalog_fetched: bool,
     pub agent_operations_in_flight: Vec<String>,
+    /// Same shape/lifecycle as `agent_operations_in_flight` above, sourced
+    /// from `AgentBridge::mcp_operations_in_flight` -- keys are `"<action>:
+    /// <server-name>"` (see that method's own doc comment). Folded into
+    /// `McpServerOption`'s per-row busy booleans by `to_mcp_server_option_
+    /// rows`, driving the Spinner shown on whichever button's action is
+    /// actually in flight.
+    pub mcp_operations_in_flight: Vec<String>,
+    /// Same shape/lifecycle as `mcp_operations_in_flight` above, sourced
+    /// from `AgentBridge::recover_session_operations_in_flight`. Folded
+    /// into `RemoteSessionOption.busy` by `to_remote_session_option_
+    /// rows`, driving the Attach button's Spinner while a recoverable
+    /// session's `session/load` is in flight (symptom #2: this row
+    /// previously had no busy-state tracking at all).
+    pub recover_session_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot
@@ -295,6 +404,34 @@ pub struct Model {
     pub toast_message: String,
     pub toast_kind: String,
     pub toast_seq: i32,
+    pub provider_errors: HashMap<String, String>,
+    /// mcp-servers-settings follow-up (chat-view provider-switch loading
+    /// indicator): providers with a `probe_provider_selection` acquire+
+    /// release round-trip currently in flight (see `SettingsMsg::
+    /// ProfileSelected`'s `Effect::ProbeProvider` dispatch for the insert
+    /// and `AgentEvent::ProviderProbe`'s handling in `update_frame` for the
+    /// removal on completion). Keyed by provider like `provider_errors`
+    /// above, not by thread -- the probe itself has no other per-thread
+    /// state worth tracking and this mirrors `provider_errors`'s own
+    /// "keyed off the selected thread's *provider*" contract exactly (see
+    /// `sync::selected_provider_unavailable`'s doc comment).
+    pub provider_probes_in_flight: HashSet<String>,
+    /// mcp-servers-settings follow-up (chat-view first-attach loading
+    /// indicator): thread ids whose FIRST real ACP session attach --
+    /// deferred to first send, see `dispatch::dispatch_compose_send_
+    /// maybe_attach`'s doc comment -- is currently in flight. Inserted
+    /// right there, in the same synchronous call that kicks off
+    /// `AgentBridge::attach_deferred_thread_with_config_options`
+    /// (`EffectResultMsg::SessionAttachStarted`); removed either on
+    /// success -- `update_frame`'s `frame.thread_list_snapshot` fold,
+    /// the real place a background attach's `session_id` transitions
+    /// `None` -> `Some` today (`SessionAttached`'s `Ok` arm is dead for
+    /// this path, see its own doc comment) -- or on failure, via the
+    /// existing `SessionAttached` `Err` arm (synchronous provisioning
+    /// failure) and `AgentEvent::Error` (async attach failure). Keyed by
+    /// thread_id like `provider_probes_in_flight` is keyed by provider --
+    /// this is inherently a per-thread transition, not a per-provider one.
+    pub first_attach_in_flight: HashSet<String>,
     pub active_skill_name: String,
     pub active_skill_path: String,
     /// PUI-010: the actual SKILL.md file path (active_skill_path is the
@@ -312,8 +449,19 @@ pub struct Model {
     /// delegates retain identity across unrelated inserts/removals.
     pub thread_model: Rc<VecModel<crate::ThreadItem>>,
     pub thread_model_keys: RefCell<Vec<String>>,
+    /// Stable Slint records that expose one thread-owned message model per
+    /// durable thread to the UI.
+    pub thread_views_model: Rc<VecModel<crate::ThreadViewItem>>,
+    pub thread_views_model_keys: RefCell<Vec<String>>,
+    /// Test-only fixtures for the retired shared-message implementation.
+    /// Production ownership is exclusively in `thread_view_models`.
+    #[cfg(test)]
     pub messages_model: Rc<VecModel<crate::MessageItem>>,
+    #[cfg(test)]
     pub message_model_keys: RefCell<Vec<String>>,
+    /// Stable per-thread Slint-facing message models. This is the sole
+    /// production ownership foundation for retained ChatView instances.
+    pub thread_view_models: crate::thread_view::ThreadViewModels,
     pub skills_model: Rc<VecModel<crate::SkillOption>>,
     /// PUI-003: the displayed thread's ACP available_commands, projected as
     /// SkillOption rows (name+description) for the compose `/` menu. Reuses
@@ -349,8 +497,13 @@ pub struct Model {
 pub(crate) struct PersistentModels {
     pub(crate) thread_model: Rc<VecModel<crate::ThreadItem>>,
     pub(crate) thread_model_keys: Vec<String>,
+    pub(crate) thread_views_model: Rc<VecModel<crate::ThreadViewItem>>,
+    pub(crate) thread_views_model_keys: Vec<String>,
+    #[cfg(test)]
     pub(crate) messages_model: Rc<VecModel<crate::MessageItem>>,
+    #[cfg(test)]
     pub(crate) message_model_keys: Vec<String>,
+    pub(crate) thread_view_models: crate::thread_view::ThreadViewModels,
     pub(crate) skills_model: Rc<VecModel<crate::SkillOption>>,
     pub(crate) skill_model_keys: Vec<std::path::PathBuf>,
     pub(crate) commands_model: Rc<VecModel<crate::SkillOption>>,
@@ -373,8 +526,13 @@ impl Model {
         PersistentModels {
             thread_model: self.thread_model.clone(),
             thread_model_keys: self.thread_model_keys.borrow().clone(),
+            thread_views_model: self.thread_views_model.clone(),
+            thread_views_model_keys: self.thread_views_model_keys.borrow().clone(),
+            #[cfg(test)]
             messages_model: self.messages_model.clone(),
+            #[cfg(test)]
             message_model_keys: self.message_model_keys.borrow().clone(),
+            thread_view_models: self.thread_view_models.clone(),
             skills_model: self.skills_model.clone(),
             skill_model_keys: self.skill_model_keys.borrow().clone(),
             commands_model: self.commands_model.clone(),
@@ -396,8 +554,14 @@ impl Model {
     pub(crate) fn restore_persistent_models(&mut self, persistent: PersistentModels) {
         self.thread_model = persistent.thread_model;
         *self.thread_model_keys.borrow_mut() = persistent.thread_model_keys;
-        self.messages_model = persistent.messages_model;
-        *self.message_model_keys.borrow_mut() = persistent.message_model_keys;
+        self.thread_views_model = persistent.thread_views_model;
+        *self.thread_views_model_keys.borrow_mut() = persistent.thread_views_model_keys;
+        #[cfg(test)]
+        {
+            self.messages_model = persistent.messages_model;
+            *self.message_model_keys.borrow_mut() = persistent.message_model_keys;
+        }
+        self.thread_view_models = persistent.thread_view_models;
         self.skills_model = persistent.skills_model;
         *self.skill_model_keys.borrow_mut() = persistent.skill_model_keys;
         self.commands_model = persistent.commands_model;
@@ -422,6 +586,7 @@ impl Default for ThreadModel {
         Self {
             thread_id: String::new(),
             display_name: String::new(),
+            name_user_set: false,
             provider: String::new(),
             profile_name: None,
             permission_profile: None,
@@ -432,13 +597,22 @@ impl Default for ThreadModel {
             unauthenticated: false,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
+            server_queue: true,
             compose_draft: String::new(),
             closed: false,
             archived: false,
+            unread: false,
             message_ids: Vec::new(),
             transcript: Vec::new(),
             transcript_keys: Vec::new(),
+            rows_synced_with: None,
+            #[cfg(test)]
             message_rows: Vec::new(),
+            markdown_render_index: RefCell::new(
+                crate::thread_message_index::ThreadMessageIndex::default(),
+            ),
+            markdown_epoch: crate::markdown_worker::EpochCounter::new(),
+            markdown_in_flight: crate::markdown_worker::InFlightRegistry::new(),
             has_older_messages: false,
             pending_request: crate::PendingRequestItem::default(),
             terminals: Vec::new(),
@@ -449,6 +623,7 @@ impl Default for ThreadModel {
             session_modes: None,
             config_options: Vec::new(),
             available_commands: Vec::new(),
+            command_filter: String::new(),
             usage: (0, 0),
             plan: Vec::new(),
             session_title: None,
@@ -475,6 +650,15 @@ impl Model {
                     .or_insert(index);
             }
         }
+        let thread_ids = self
+            .threads
+            .iter()
+            .map(|thread| thread.thread_id.as_str())
+            .collect::<Vec<_>>();
+        self.thread_view_models
+            .retain_thread_ids(thread_ids.iter().copied());
+        self.thread_view_models
+            .ensure_for_thread_ids(thread_ids.iter().copied());
     }
 
     /// Resolve an incoming durable thread or remote session identity. The
@@ -543,6 +727,7 @@ impl Model {
                     .unwrap_or(ThreadState::Idle),
                 session_id: spec.session_id,
                 send_queue: initial.send_queues.get(idx).cloned().unwrap_or_default(),
+                server_queue: initial.server_queue,
                 ..ThreadModel::default()
             })
             .collect();
@@ -559,6 +744,7 @@ impl Model {
             threads,
             selected_thread,
             visible_indices: (0..thread_count).collect(),
+            onboarding_completed: initial.onboarding_completed,
             ..Self::default()
         };
         model.rebuild_thread_indices();
@@ -580,6 +766,8 @@ mod tests {
             thread_states: vec![],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
+            onboarding_completed: false,
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -590,6 +778,7 @@ mod tests {
         let initial = InitialState {
             threads: vec![
                 ThreadSpec {
+                    thread_id: Some("thread-1".to_owned()),
                     display_name: "Fix timeline crash".to_owned(),
                     provider: "codex".to_owned(),
                     session_id: Some("sess-1".to_owned()),
@@ -597,6 +786,7 @@ mod tests {
                     project_path: None,
                 },
                 ThreadSpec {
+                    thread_id: Some("thread-2".to_owned()),
                     display_name: "Refactor filters".to_owned(),
                     provider: "claude".to_owned(),
                     session_id: Some("sess-2".to_owned()),
@@ -610,6 +800,8 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
+            onboarding_completed: false,
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -629,6 +821,7 @@ mod tests {
     fn from_initial_state_restores_runtime_thread_fields_through_hydration() {
         let model = Model::from_initial_state(InitialState {
             threads: vec![ThreadSpec {
+                thread_id: Some("thread-1".to_owned()),
                 display_name: "Needs approval".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: Some("sess-1".to_owned()),
@@ -641,6 +834,8 @@ mod tests {
             thread_states: vec![ThreadState::Error],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
+            onboarding_completed: false,
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(
@@ -655,6 +850,7 @@ mod tests {
         let model = Model::from_initial_state(InitialState {
             threads: vec![
                 ThreadSpec {
+                    thread_id: Some("thread-first".to_owned()),
                     display_name: "First".to_owned(),
                     provider: "codex".to_owned(),
                     session_id: Some("session-first".to_owned()),
@@ -662,6 +858,7 @@ mod tests {
                     project_path: None,
                 },
                 ThreadSpec {
+                    thread_id: Some("thread-second".to_owned()),
                     display_name: "Second".to_owned(),
                     provider: "claude".to_owned(),
                     session_id: Some("session-second".to_owned()),
@@ -675,6 +872,8 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
+            onboarding_completed: false,
         });
 
         assert_eq!(model.thread_index_for_id("thread-second"), Some(1));

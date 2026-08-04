@@ -28,6 +28,7 @@ pub mod jsonl_store;
 mod list_model;
 mod local_terminal;
 mod markdown;
+mod markdown_worker;
 mod model;
 pub mod models;
 mod msg;
@@ -42,9 +43,10 @@ pub mod snapshotd_client;
 // of duplicating the SKILL.md front-matter parsing logic.
 mod skills_manager_adapter;
 pub mod skills_state;
+mod snapshotd_lifecycle;
 mod state_store;
 mod sync;
-mod snapshotd_lifecycle;
+mod thread_view;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
 // crates from this one, unable to see anything less than `pub` -- can
 // reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
@@ -68,6 +70,7 @@ pub mod test_support {
     pub use crate::agent_bridge::{fetch_daemon_project_instances, DaemonProjectInstance};
 }
 mod theme;
+mod thread_message_index;
 mod update;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec, NO_PROVIDER_REQUESTED_FALLBACK};
@@ -146,6 +149,7 @@ fn cold_start_thread_specs(
     seed_names
         .iter()
         .map(|name| ThreadSpec {
+            thread_id: None,
             display_name: (*name).to_owned(),
             provider: seed_provider.clone(),
             session_id: None,
@@ -404,8 +408,11 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
         permission_profile: defaults.permission_profile,
         background_session_default: Some(defaults.background_session),
         default_agent_id: None,
+        show_global_skills: None,
         harness: None,
         dev_mode: None,
+        snapflow_mcp_enabled: None,
+        onboarding_completed: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         let message = format!("failed to migrate panel defaults to JSON: {error}");
@@ -441,6 +448,7 @@ fn load_panel_prefs(
 struct ScopedPanelPrefs {
     defaults: PanelDefaults,
     default_agent_id: Option<String>,
+    show_global_skills: bool,
 }
 
 fn scoped_settings_path<'a>(
@@ -508,27 +516,344 @@ fn load_scoped_panel_prefs(
     Some(ScopedPanelPrefs {
         defaults: settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
         default_agent_id: resolved.default_agent_id,
+        show_global_skills: resolved.show_global_skills,
     })
 }
 
-/// Persist profile / permission / background-default / default-agent into the
-/// selected JSON tier. Existing unrelated fields (harness, dev mode, ...) are
-/// retained by the read-modify-write operation.
+/// Persist profile / permission / background-default / default-agent /
+/// show-global-skills into the selected JSON tier. Existing unrelated
+/// fields (harness, dev mode, ...) are retained by the read-modify-write
+/// operation.
+///
+/// `settings_page.slint`'s `SettingsTopTabs` "[Project | Global]" switcher
+/// (`top_tabs.slint`) shows the Project tab unconditionally -- it has no
+/// wiring to hide/disable itself when no project is currently open (i.e.
+/// `RUI_PANEL_PROJECT_ROOT` unset, so `SettingsPaths::project` is `None`).
+/// A user can therefore land on/select "Project" and hit Save with no
+/// project open at all. `load_scoped_panel_prefs` already treats that same
+/// "project scope unavailable" condition leniently -- callers fall back to
+/// `load_panel_prefs`'s Global read (see its two call sites above). Saving
+/// used to be the asymmetric case: it hard-failed with `settings scope
+/// "project" is unavailable`, surfaced to the user as "failed to save
+/// panel settings; settings scope project is unavailable" and silently
+/// discarding whatever the user just edited. Since there is no project to
+/// hold a project-scoped file in that state, fall back to writing Global
+/// instead -- symmetric with the read side, and it actually persists the
+/// user's change instead of losing it.
 fn save_panel_prefs_to_json(
     scope: &str,
     defaults: &PanelDefaults,
     default_agent_id: Option<String>,
+    show_global_skills: bool,
 ) -> Result<(), String> {
     let paths = settings_file::SettingsPaths::from_env();
-    let path = scoped_settings_path(&paths, scope)
-        .ok_or_else(|| format!("settings scope {scope:?} is unavailable"))?;
+    let effective_scope = if scope == "project" && paths.project.is_none() {
+        "global"
+    } else {
+        scope
+    };
+    let path = scoped_settings_path(&paths, effective_scope)
+        .ok_or_else(|| format!("settings scope {effective_scope:?} is unavailable"))?;
     let mut doc = settings_file::load_document(path).map_err(|error| error.to_string())?;
     doc.schema_version = 1;
     doc.default_profile = defaults.profile_name.clone();
     doc.permission_profile = defaults.permission_profile.clone();
     doc.background_session_default = Some(defaults.background_session);
     doc.default_agent_id = default_agent_id;
+    doc.show_global_skills = Some(show_global_skills);
     settings_file::save_document(path, &doc).map_err(|error| error.to_string())
+}
+
+/// Feature-flag gate for the "default profile"/"permission profile"
+/// Settings controls (`agents_view.slint`). Both are genuinely dual-tier
+/// (visible under Project and Global scope alike -- unlike the six
+/// categories gated Global-only in 6745aa0e), but until this is explicitly
+/// turned on they're hidden entirely, in both scopes. Defaults OFF (unset
+/// env var => hidden) so an unset environment never surfaces them.
+fn profile_wiring_enabled() -> bool {
+    std::env::var("PANEL_PROFILE_WIRING_ENABLED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// Feature-flag gate for in-development UI surfaces that aren't ready to
+/// ship broadly yet: the Chat Defaults "Profile" field (`agents_view.slint`,
+/// stacked additively on top of `profile_wiring_enabled` above -- both must
+/// be on for that field to show) and the whole Harness settings tab
+/// (`left_tabs.slint`'s nav item + `settings_page.slint`'s `HarnessView`
+/// mount). Named `BETA_MODE` (not `PANEL_`-prefixed like the sibling flag
+/// above) per explicit naming from the request that introduced it. Defaults
+/// OFF (unset env var => hidden) so an unset environment never surfaces
+/// either gated surface.
+fn beta_mode_enabled() -> bool {
+    std::env::var("BETA_MODE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// Verifies the Project-vs-Global tiering that `HarnessView`'s
+/// "Background sessions" toggle (`background_session_default`) is
+/// supposed to have, end to end through the exact functions the UI save
+/// path calls (`save_panel_prefs_to_json`/`load_scoped_panel_prefs`/
+/// `scoped_settings_path`) rather than re-testing `settings_file.rs`'s
+/// already-covered `merge_documents` in isolation. Mirrors
+/// `settings_file.rs`'s own env-driven `SettingsPaths::from_env` tests,
+/// and the save/restore-env-var shape `lifecycle_tests::
+/// panel_create_destroy_create_reuses_slint_platform` already uses in this
+/// file for other `RUI_*`-driven state.
+#[cfg(test)]
+mod scoped_panel_prefs_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `SettingsPaths::from_env` reads process-wide env vars, and Rust
+    /// runs `#[test]` functions in parallel by default -- without this,
+    /// this module's two tests race on `RUI_PANEL_SETTINGS_DIR`/
+    /// `RUI_PANEL_PROJECT_ROOT` and spuriously observe each other's
+    /// tempdirs. Serialize them the same way any env-var-mutating test
+    /// suite must.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard: snapshots and restores the handful of `RUI_PANEL_*` env
+    /// vars `SettingsPaths::from_env` reads, so this test can't leak state
+    /// into any test that runs after it in the same process. Holds the
+    /// serialization lock for its whole lifetime.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = env_lock();
+            let keys = [
+                "RUI_PANEL_SETTINGS_DIR",
+                "RUI_ACP_CACHE_DIR",
+                "RUI_PANEL_PROJECT_ROOT",
+                "RUI_PANEL_SETTINGS_DEFAULT",
+            ];
+            let saved = keys
+                .iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn defaults_with_background(background_session: bool) -> PanelDefaults {
+        PanelDefaults {
+            profile_name: None,
+            permission_profile: None,
+            background_session,
+            selected_thread_id: None,
+        }
+    }
+
+    /// Setting `background_session_default` under Project scope must land
+    /// only in the project JSON file, leaving a separately-read Global
+    /// value untouched -- and vice versa. This is the exact "set under one
+    /// scope, confirm the other scope's separately-read value is
+    /// unaffected" shape called for by the bug report, run through the
+    /// real UI save/load functions instead of the lower-level
+    /// `merge_documents` helper `settings_file.rs` already covers.
+    #[test]
+    fn background_session_default_persists_independently_per_scope() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        let paths = settings_file::SettingsPaths::from_env();
+        let global_path = paths.global.clone();
+        let project_path = paths.project.clone().expect("project path resolved");
+        assert_ne!(
+            global_path, project_path,
+            "project and global settings paths must never collide"
+        );
+
+        // Global starts true, Project starts unset (inherits Global).
+        save_panel_prefs_to_json("global", &defaults_with_background(true), None, true)
+            .expect("save global");
+        let mut warnings = Vec::new();
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(global_prefs.defaults.background_session);
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project (inherits global)");
+        assert!(
+            project_prefs.defaults.background_session,
+            "project scope must inherit the global value when it has no override"
+        );
+
+        // Now set Project to false: this must only touch the project
+        // file, and Global's own separately-read value must stay true.
+        save_panel_prefs_to_json("project", &defaults_with_background(false), None, true)
+            .expect("save project");
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project after override");
+        assert!(
+            !project_prefs.defaults.background_session,
+            "project override must take effect for project scope"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global after project write");
+        assert!(
+            global_prefs.defaults.background_session,
+            "a project-scope write must not affect the separately-read global value"
+        );
+
+        // And the raw files on disk confirm the write actually targeted
+        // separate paths, not the same one under two names.
+        let global_doc = settings_file::load_document(&global_path).expect("read global doc");
+        let project_doc = settings_file::load_document(&project_path).expect("read project doc");
+        assert_eq!(global_doc.background_session_default, Some(true));
+        assert_eq!(project_doc.background_session_default, Some(false));
+    }
+
+    /// Same shape, opposite direction: a Global-scope write after a
+    /// Project override exists must not clobber or be read back through
+    /// the Project file.
+    #[test]
+    fn global_write_does_not_affect_an_existing_project_override() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        save_panel_prefs_to_json("project", &defaults_with_background(true), None, true)
+            .expect("save project override");
+        save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
+            .expect("save global default");
+
+        let mut warnings = Vec::new();
+        let project_prefs =
+            load_scoped_panel_prefs("project", None, &mut warnings).expect("load project");
+        assert!(
+            project_prefs.defaults.background_session,
+            "existing project override must survive an unrelated global write"
+        );
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
+        assert!(!global_prefs.defaults.background_session);
+    }
+
+    /// Same end-to-end shape as `background_session_default_persists_
+    /// independently_per_scope`, for `show_global_skills` -- the other
+    /// setting named in the bug report (`skills_view.slint`'s "Show
+    /// global skills" toggle). Before this fix it was pure component-local
+    /// Slint UI state that never called into `save_panel_prefs_to_json`/
+    /// `load_scoped_panel_prefs` at all, so it could never have collided
+    /// on a shared file -- but it also never round-tripped through
+    /// Project/Global scope like the bug report expected. This proves the
+    /// newly-added wiring gives it the exact same per-scope isolation
+    /// `background_session_default` already has.
+    #[test]
+    fn show_global_skills_persists_independently_per_scope() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        let project_root = tempfile::tempdir().expect("project root");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::set_var("RUI_PANEL_PROJECT_ROOT", project_root.path());
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        // Global starts true, Project starts unset (inherits Global).
+        save_panel_prefs_to_json("global", &defaults_with_background(false), None, true)
+            .expect("save global");
+        let mut warnings = Vec::new();
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(global_prefs.show_global_skills);
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project (inherits global)");
+        assert!(
+            project_prefs.show_global_skills,
+            "project scope must inherit the global value when it has no override"
+        );
+
+        // Set Project to false: must only touch the project file: Global's
+        // own separately-read value must stay true.
+        save_panel_prefs_to_json("project", &defaults_with_background(false), None, false)
+            .expect("save project");
+        let project_prefs = load_scoped_panel_prefs("project", None, &mut warnings)
+            .expect("load project after override");
+        assert!(
+            !project_prefs.show_global_skills,
+            "project override must take effect for project scope"
+        );
+        let global_prefs = load_scoped_panel_prefs("global", None, &mut warnings)
+            .expect("load global after project write");
+        assert!(
+            global_prefs.show_global_skills,
+            "a project-scope write must not affect the separately-read global value"
+        );
+    }
+
+    /// Real-user-reported bug: `settings_page.slint`'s Project/Global
+    /// scope switcher (`top_tabs.slint`) shows "Project" unconditionally,
+    /// with no gating on whether a project is actually open. Saving with
+    /// scope "project" while `RUI_PANEL_PROJECT_ROOT` is unset used to hard
+    /// fail with `settings scope "project" is unavailable`, surfaced to the
+    /// user as "failed to save panel settings; settings scope project is
+    /// unavailable" -- and the user's edited value was never persisted
+    /// anywhere. This proves the fix: with no project open, a "project"
+    /// scope save falls back to Global (symmetric with
+    /// `load_scoped_panel_prefs`'s already-lenient read-side fallback) and
+    /// the value round-trips through the Global file instead of being
+    /// dropped.
+    #[test]
+    fn project_scope_save_falls_back_to_global_when_no_project_is_open() {
+        let _guard = EnvGuard::new();
+        let settings_dir = tempfile::tempdir().expect("settings dir");
+        std::env::set_var("RUI_PANEL_SETTINGS_DIR", settings_dir.path());
+        std::env::remove_var("RUI_PANEL_PROJECT_ROOT");
+        std::env::remove_var("RUI_PANEL_SETTINGS_DEFAULT");
+        std::env::remove_var("RUI_ACP_CACHE_DIR");
+
+        let paths = settings_file::SettingsPaths::from_env();
+        assert!(
+            paths.project.is_none(),
+            "test setup: no project should be open"
+        );
+
+        save_panel_prefs_to_json("project", &defaults_with_background(true), None, true)
+            .expect("save must fall back to global instead of hard-failing");
+
+        let mut warnings = Vec::new();
+        let global_prefs =
+            load_scoped_panel_prefs("global", None, &mut warnings).expect("load global");
+        assert!(
+            global_prefs.defaults.background_session,
+            "the value must have actually been persisted, into the global file"
+        );
+
+        let global_doc = settings_file::load_document(&paths.global).expect("read global doc");
+        assert_eq!(global_doc.background_session_default, Some(true));
+    }
 }
 
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
@@ -707,6 +1032,17 @@ struct PanelSingleton {
     settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
     _settings_watcher: Option<settings_file::SettingsWatcher>,
     snapshotd_registration: Option<snapshotd_client::SnapshotdRegistration>,
+    /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: shared
+    /// across every thread's background markdown render (unlike
+    /// `ThreadModel::markdown_epoch`/`markdown_in_flight`, which are
+    /// deliberately per-thread) -- a fixed-size worker pool has no
+    /// notion of which thread a job belongs to, so nothing about sharing
+    /// it risks cross-thread interference the way a shared epoch counter
+    /// would. Lives on `PanelSingleton`, not `Model`: it spawns real OS
+    /// threads, which is infrastructure this crate's own TEA doc comment
+    /// (see `model.rs`'s module doc) reserves for outside the pure
+    /// reducer, alongside `bridge`/`panel_state`.
+    markdown_render_pool: markdown_worker::RenderWorkerPool,
 }
 
 impl PanelSingleton {
@@ -735,7 +1071,16 @@ impl PanelSingleton {
         if let Some(store) = self.project_state_stores.borrow().get(&identity).cloned() {
             return Some(store);
         }
-        let path = crate::project_store::panel_state_path(&identity, &resolve_cache_dir());
+        let path = match crate::project_store::panel_state_path_from_env(
+            &identity,
+            &resolve_cache_dir(),
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("panel-rust: project state persistence unavailable: {error}");
+                return None;
+            }
+        };
         match PanelStateStore::open(path) {
             Ok(store) => {
                 let store = Arc::new(store);
@@ -860,6 +1205,33 @@ impl PanelSingleton {
             return;
         }
         self.start_send_prompt(real_idx, text, bridge);
+    }
+
+    pub(crate) fn execute_queue_mutation_real(&self, real_idx: usize, params: serde_json::Value) {
+        let Some(bridge) = &self.bridge else { return };
+        bridge.mutate_queue(real_idx, params);
+    }
+
+    /// `Effect::RecordLocalMessage`'s executor -- a `server_queue` thread's
+    /// auto-drained entry never reaches `start_send_prompt` (ACPX's own
+    /// `spawn_queue_dispatcher` sends the real `session/prompt` itself, see
+    /// `update.rs`'s `QueueChanged` handler doc comment), so this is the
+    /// queue-drain path's equivalent of `start_send_prompt`'s `push_local`
+    /// call -- records the message into the transcript without also
+    /// issuing a new prompt (one was already sent server-side).
+    pub(crate) fn execute_record_local_message_real(&self, real_idx: usize, text: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        bridge.push_local(
+            real_idx,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: text.to_string(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
     }
 
     fn start_send_prompt(&self, idx: usize, text: &str, bridge: &AgentBridge) {
@@ -998,6 +1370,7 @@ impl PanelSingleton {
             input.scope.as_str(),
             &defaults,
             non_empty(input.default_agent_id),
+            input.show_global_skills,
         ) {
             return Err(effect::EffectError::new(format!(
                 "failed to save panel settings JSON: {error}"
@@ -1039,83 +1412,45 @@ impl PanelSingleton {
         Ok(())
     }
 
-    pub(crate) fn dispatch_mcp_server_create(
+    fn dispatch_mcp_server_tool_preference_changed_async(
         &self,
-        _component: &ChatPanel,
-        name: &str,
-        command: &str,
+        server_name: &str,
+        tool_name: &str,
+        field: &str,
+        value: bool,
+        action_past_tense: &str,
     ) {
-        let Some(bridge) = &self.bridge else { return };
-        let entry = if command.is_empty() {
-            serde_json::json!({ "name": name })
-        } else {
-            serde_json::json!({ "name": name, "command": command })
-        };
-        let gw = self.settings_gateway_index();
-        bridge.create_mcp_server(gw, entry);
-    }
-
-    pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        bridge.delete_mcp_server(gw, name);
-    }
-
-    pub(crate) fn dispatch_mcp_server_enabled_changed(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-        enabled: bool,
-    ) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == name)
-        else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before its enabled state could update",
-                name
-            );
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
             return;
         };
-        entry.extra["enabled"] = serde_json::Value::Bool(enabled);
-        if !bridge.update_mcp_server(gw, entry.extra) {
-            eprintln!(
-                "panel-rust: failed to update enabled state for MCP server {:?}",
-                name
-            );
-        }
-    }
-
-    /// Registry-side "Connect" for remote MCP servers. There is no
-    /// `mcp_servers/authenticate` RPC on acpx; this persists
-    /// `auth_status`/`needs_auth` on the entry via `mcp_servers/update`
-    /// so the Connect button can clear and the status line updates on
-    /// the next settings gateway snapshot.
-    pub(crate) fn dispatch_mcp_server_authenticate(&self, _component: &ChatPanel, name: &str) {
-        let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == name)
-        else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before authenticate could run",
-                name
-            );
-            return;
-        };
-        entry.extra["auth_status"] = serde_json::Value::String("authenticated".to_owned());
-        entry.extra["needs_auth"] = serde_json::Value::Bool(false);
-        if !bridge.update_mcp_server(gw, entry.extra) {
-            eprintln!(
-                "panel-rust: failed to persist auth state for MCP server {:?}",
-                name
-            );
-        }
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let action_past_tense = action_past_tense.to_string();
+        let callback_server_name = server_name.clone();
+        let callback_tool_name = tool_name.clone();
+        let callback_action = action_past_tense.clone();
+        bridge.update_mcp_tool_preference_async(
+            gw,
+            &server_name,
+            &tool_name,
+            field,
+            value,
+            move |result| {
+                crate::effect_executor::report_mcp_server_result(
+                    result
+                        .map(|()| format!("Tool \"{callback_tool_name}\" {callback_action}"))
+                        .map_err(|err| {
+                            format!(
+                                "Failed to update tool \"{callback_tool_name}\" on MCP server \"{callback_server_name}\": {err}"
+                            )
+                        }),
+                );
+            },
+        );
     }
 
     /// Per-tool enable flag on one MCP server entry. Persists into the
@@ -1127,47 +1462,253 @@ impl PanelSingleton {
         tool_name: &str,
         enabled: bool,
     ) {
-        let Some(bridge) = &self.bridge else { return };
-        let gw = self.settings_gateway_index();
-        let Some(mut entry) = bridge
-            .list_mcp_servers(gw)
-            .into_iter()
-            .find(|entry| entry.name == server_name)
-        else {
-            eprintln!(
-                "panel-rust: MCP server {:?} disappeared before tool enable update",
-                server_name
-            );
+        self.dispatch_mcp_server_tool_preference_changed_async(
+            server_name,
+            tool_name,
+            "enabled",
+            enabled,
+            if enabled { "enabled" } else { "disabled" },
+        )
+    }
+
+    /// Per-tool deferred (lazy-load) flag -- same persisted `tools` JSON
+    /// array as the enabled toggle, different field.
+    pub(crate) fn dispatch_mcp_server_tool_deferred_changed(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+        tool_name: &str,
+        deferred: bool,
+    ) {
+        self.dispatch_mcp_server_tool_preference_changed_async(
+            server_name,
+            tool_name,
+            "deferred",
+            deferred,
+            if deferred {
+                "set to deferred"
+            } else {
+                "set to eager"
+            },
+        )
+    }
+
+    /// The seven `dispatch_mcp_server_*_async` methods below are the only
+    /// live dispatchers for "Fetch tools"/"Refresh tools" and the other
+    /// six real UI-reachable MCP settings actions (Add/Save, Remove,
+    /// enable toggle, Connect, Disconnect) -- PUI-013-style fix for the
+    /// reported "jittery lag" while toggling/acting on an MCP server: a
+    /// prior synchronous generation of these dispatchers each ended in
+    /// `AgentBridge::block_on`, which ran on the Slint UI callback thread
+    /// and froze the whole panel for the RPC's duration. These call the
+    /// matching `AgentBridge::*_async` method instead (kicks the RPC off
+    /// on the bridge's own tokio runtime) and pass a completion closure
+    /// that formats the same success/failure
+    /// message text the synchronous versions produce, then feeds it
+    /// through `effect_executor::report_mcp_server_result` -- the closure
+    /// runs on the runtime thread, not the UI thread, but `report_mcp_
+    /// server_result` already re-enters the event loop itself (`slint::
+    /// invoke_from_event_loop`), same as every other background-thread
+    /// completion in this codebase, so this is thread-safe without an
+    /// extra hop back through this type.
+    pub(crate) fn dispatch_mcp_server_create_async(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
             return;
         };
-        let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
-        if let Some(tools) = tools {
-            let mut found = false;
-            for tool in tools.iter_mut() {
-                if tool.get("name").and_then(|n| n.as_str()) == Some(tool_name) {
-                    tool["enabled"] = serde_json::Value::Bool(enabled);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                tools.push(serde_json::json!({
-                    "name": tool_name,
-                    "enabled": enabled,
-                }));
-            }
-        } else {
-            entry.extra["tools"] = serde_json::json!([{
-                "name": tool_name,
-                "enabled": enabled,
-            }]);
-        }
-        if !bridge.update_mcp_server(gw, entry.extra) {
-            eprintln!(
-                "panel-rust: failed to update tool {:?} on MCP server {:?}",
-                tool_name, server_name
+        let gw = self.settings_gateway_index();
+        let name = entry.name.clone();
+        bridge.create_mcp_server_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{name}\" created"))
+                    .map_err(|err| format!("Failed to create MCP server \"{name}\": {err}")),
             );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_update_async(
+        &self,
+        _component: &ChatPanel,
+        entry: crate::protocol_types::McpServerEntry,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = entry.name.clone();
+        bridge.update_mcp_server_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{name}\" updated"))
+                    .map_err(|err| format!("Failed to update MCP server \"{name}\": {err}")),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_delete_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.delete_mcp_server_async(gw, &name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("MCP server \"{callback_name}\" removed"))
+                    .map_err(|err| {
+                        format!("Failed to remove MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_enabled_changed_async(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+        enabled: bool,
+    ) {
+        // Built-in snapflow: panel preference + pool opener rewrite, not
+        // acpx `mcp_servers/update` (no central registry row exists).
+        if crate::agent_bridge::is_builtin_snapflow_mcp_name(name) {
+            let paths = settings_file::SettingsPaths::from_env();
+            if let Err(error) = paths.set_snapflow_mcp_enabled(enabled) {
+                crate::effect_executor::report_mcp_server_result(Err(format!(
+                    "Failed to persist snapflow MCP enabled={enabled}: {error}"
+                )));
+                return;
+            }
+            if let Some(bridge) = &self.bridge {
+                bridge.set_builtin_snapflow_mcp_enabled(enabled);
+            } else {
+                crate::agent_bridge::set_snapflow_mcp_enabled_flag(enabled);
+            }
+            crate::effect_executor::report_mcp_server_result(Ok(format!(
+                "MCP server \"snapflow\" {}",
+                if enabled { "enabled" } else { "disabled" }
+            )));
+            return;
         }
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.set_mcp_server_enabled_async(gw, &name, enabled, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| {
+                        format!(
+                            "MCP server \"{callback_name}\" {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        )
+                    })
+                    .map_err(|err| {
+                        format!(
+                            "Failed to update enabled state for MCP server \"{callback_name}\": {err}"
+                        )
+                    }),
+            );
+        });
+    }
+
+    /// Non-blocking Connect. `opener::open` (opening the returned
+    /// authorization URL in the default browser) is a fast, fire-and-forget
+    /// OS call, so it still runs synchronously inside the completion
+    /// closure -- only the network round-trip that discovers/starts the
+    /// OAuth flow moves off the UI thread.
+    pub(crate) fn dispatch_mcp_server_authenticate_async(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.authenticate_mcp_server_async(gw, &name, move |result| {
+            let outcome = match result {
+                Ok(authorization_url) => match opener::open(&authorization_url) {
+                    Ok(()) => Ok(format!("Opened browser to connect \"{callback_name}\"")),
+                    Err(error) => Err(format!(
+                        "MCP server \"{callback_name}\": failed to open browser for OAuth: {error}"
+                    )),
+                },
+                Err(err) => Err(format!(
+                    "Failed to start OAuth flow for MCP server \"{callback_name}\": {err}"
+                )),
+            };
+            crate::effect_executor::report_mcp_server_result(outcome);
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_logout_async(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let name = name.to_string();
+        let callback_name = name.clone();
+        bridge.logout_mcp_server_async(gw, &name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Disconnected \"{callback_name}\""))
+                    .map_err(|err| {
+                        format!("Failed to disconnect MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
+    }
+
+    pub(crate) fn dispatch_mcp_server_tools_fetch_async(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            crate::effect_executor::report_mcp_server_result(Err(
+                "no gateway connection".to_string()
+            ));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        let server_name = server_name.to_string();
+        let callback_name = server_name.clone();
+        bridge.fetch_mcp_server_tools_async(gw, &server_name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Fetching tools for \"{callback_name}\"..."))
+                    .map_err(|err| {
+                        format!("Failed to fetch tools for MCP server \"{callback_name}\": {err}")
+                    }),
+            );
+        });
     }
 
     pub(crate) fn dispatch_profile_create(
@@ -1188,13 +1729,27 @@ impl PanelSingleton {
             entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
         }
         let gw = self.settings_gateway_index();
-        bridge.create_profile(gw, entry);
+        let profile_name = name.to_string();
+        bridge.create_profile_async(gw, entry, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Profile \"{profile_name}\" created"))
+                    .map_err(|err| format!("Failed to create profile \"{profile_name}\": {err}")),
+            );
+        });
     }
 
     pub(crate) fn dispatch_profile_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        bridge.delete_profile(gw, name);
+        let profile_name = name.to_string();
+        bridge.delete_profile_async(gw, name, move |result| {
+            crate::effect_executor::report_mcp_server_result(
+                result
+                    .map(|()| format!("Profile \"{profile_name}\" deleted"))
+                    .map_err(|err| format!("Failed to delete profile \"{profile_name}\": {err}")),
+            );
+        });
     }
 
     pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
@@ -1202,7 +1757,18 @@ impl PanelSingleton {
         let gw = self.settings_gateway_index();
         // PUI-013: fire-and-forget so the agents/install round-trip does not
         // block the Slint UI thread (the Settings>Agents Install freeze).
-        bridge.install_agent_async(gw, agent_id);
+        let agent_name = agent_id.to_owned();
+        bridge.install_agent_async(gw, agent_id, move |result| {
+            crate::effect_executor::report_agent_result(
+                result
+                    .map(|_| format!("Agent {agent_name} is ready; try connecting again"))
+                    .map_err(|err| {
+                        format!(
+                            "Agent {agent_name} installation failed. The first run may need more time or a working npm cache: {err}"
+                        )
+                    }),
+            );
+        });
     }
 
     /// setup-followups plan, agent_settings_ordering_and_install_enable_
@@ -1216,6 +1782,18 @@ impl PanelSingleton {
         // PUI-013: fire-and-forget so the admin-plane enable/disable
         // round-trip does not block the Slint UI thread.
         bridge.set_agent_enabled_async(agent_id, enabled);
+    }
+
+    /// Opens a registry-provided official website from an agent card. Only
+    /// web URLs are accepted here; registry metadata must never turn the
+    /// card into a general local-file or command opener.
+    pub(crate) fn dispatch_agent_website_clicked(&self, website: &str) {
+        let website = website.trim();
+        if website.starts_with("https://") || website.starts_with("http://") {
+            open_md_link_target(website);
+        } else if !website.is_empty() {
+            eprintln!("panel-rust: refusing non-web agent website URL: {website}");
+        }
     }
 
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
@@ -1313,7 +1891,25 @@ impl PanelSingleton {
             )
         };
         if let Some(bridge) = self.bridge.as_ref() {
+            // project-close-session-teardown: release every thread session
+            // still bound to the project that is about to stop being
+            // active -- BEFORE `set_active_project_identity` below
+            // overwrites the bridge's own record of which project that is.
+            // "switched"/"closed"/"opened"/"created_untitled" all mean the
+            // previously active project (if any) is being left for real;
+            // "saved_as" is deliberately excluded (see `release_sessions_
+            // for_current_project`'s doc comment) since a Save-As/first-
+            // save relabels the SAME live project rather than leaving it,
+            // and releasing there would sever conversations mid-turn for
+            // no reason.
+            if reason != "saved_as" {
+                bridge.release_sessions_for_current_project();
+            }
             bridge.set_active_project_identity(&identity);
+            let default_agent_id = self.model.borrow().default_agent_id.clone();
+            if !default_agent_id.trim().is_empty() {
+                bridge.prewarm_default_agent(&default_agent_id, Some(&default_agent_id));
+            }
         }
         if let Some(registration) = self.snapshotd_registration.as_ref() {
             registration.update(path, reason, generation);
@@ -1613,14 +2209,21 @@ fn panel_rust_create_with_initial_identity(
             let identity = initial_identity
                 .as_ref()
                 .unwrap_or(&model::ProjectIdentity::None);
-            let path = crate::project_store::panel_state_path(identity, &cache_dir);
-            match PanelStateStore::open(path) {
+            let result = crate::project_store::panel_state_path_from_env(identity, &cache_dir)
+                .map_err(|error| error.to_string())
+                .and_then(|path| PanelStateStore::open(path).map_err(|error| error.to_string()));
+            match result {
                 Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
                     let message = format!("panel settings persistence unavailable: {error}");
                     eprintln!("panel-rust: {message}");
-                    startup_warnings.push(message);
-                    None
+                    // PanelStateStore is mandatory for production startup:
+                    // continuing with `None` would silently lose durable
+                    // thread/session bindings and make the ACPX client
+                    // unable to restore the selected session.  The C ABI
+                    // reports startup failure with a null handle while the
+                    // diagnostic remains visible in the host log.
+                    return std::ptr::null_mut();
                 }
             }
         };
@@ -1667,9 +2270,12 @@ fn panel_rust_create_with_initial_identity(
         // would erase the visible thread list until the user opened a
         // project. Restored records carry their own project_path, so this
         // does not invent a cwd or bind an old session to the host process.
-        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty()
-            && initial_identity.is_some()
-        {
+        // bug3_always_have_a_default_thread: previously also required
+        // `initial_identity.is_some()`, so a cold start with no project
+        // open yet seeded zero threads ("No thread" empty state). The
+        // bridge/gateway below is already constructed unconditionally;
+        // seed the same default thread here too so one is always open.
+        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
                 Ok(v) => {
@@ -1688,10 +2294,11 @@ fn panel_rust_create_with_initial_identity(
                     settings_file::non_default_sentinel(resolved.default_agent_id)
                 });
             cold_start_thread_specs(&seed_names, configured_agent_id)
-        } else if !restored_records.is_empty() {
+        } else {
             restored_records
                 .iter()
                 .map(|record| ThreadSpec {
+                    thread_id: Some(record.thread_id.clone()),
                     display_name: record.display_name.clone(),
                     provider: record.provider.clone(),
                     session_id: Some(record.session_id.clone()),
@@ -1718,8 +2325,6 @@ fn panel_rust_create_with_initial_identity(
                     project_path: record.project_path.clone(),
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
         if let Some(identity) = initial_identity.as_ref() {
             // Fresh and legacy rows in this project-local store inherit the
@@ -1749,13 +2354,23 @@ fn panel_rust_create_with_initial_identity(
         let initial_cwd = initial_identity.as_ref().and_then(|identity| {
             crate::project_store::project_store_dir(identity, &resolve_cache_dir())
         });
+        // Seed built-in snapflow MCP injection from Global settings before
+        // any pool/session is built so cold-start openers omit it when off.
+        {
+            let paths = settings_file::SettingsPaths::from_env();
+            crate::agent_bridge::set_snapflow_mcp_enabled_flag(paths.snapflow_mcp_enabled());
+        }
         let (bridge, bridge_available) =
-            match AgentBridge::new_with_thread_specs_and_initial_identity(
+            match AgentBridge::new_with_thread_specs_and_initial_identity_and_panel_state(
                 &initial_specs,
                 initial_cwd,
                 initial_identity
                     .as_ref()
                     .and_then(|identity| identity.saved_path().map(std::path::PathBuf::from)),
+                panel_state
+                    .as_ref()
+                    .expect("mandatory panel state store")
+                    .clone(),
             ) {
                 Ok(b) => (Some(b), true),
                 Err(e) => {
@@ -1800,45 +2415,36 @@ fn panel_rust_create_with_initial_identity(
             .map(|record| record.thread_id.clone())
             .chain((restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")))
             .collect();
-        // Each thread's send queue persists to its own
-        // <thread_id>.sendqueue.jsonl (see send_queue.rs's module doc) --
-        // restore it here (real disk I/O, so it belongs in this cold-start
-        // collection step, never inside update()'s pure reducer). A
-        // missing/corrupt file falls back to an empty queue still wired
-        // to persist going forward, same posture as this function's other
-        // cache reads.
-        let cache_dir = resolve_cache_dir();
-        let initial_send_queues: Vec<send_queue::SendQueue> = initial_thread_ids
-            .iter()
-            .map(|thread_id| {
-                let path = send_queue::send_queue_path(&cache_dir, thread_id);
-                send_queue::SendQueue::load(path.clone()).unwrap_or_else(|error| {
-                    eprintln!(
-                        "panel-rust: failed to restore send queue for thread {thread_id:?}: {error}"
-                    );
-                    send_queue::SendQueue::new_with_path(path)
-                })
-            })
-            .collect();
+        // ACPX owns the durable queue JSONL. The panel starts with an empty
+        // projection and hydrates it from the queue subscription; restoring
+        // a panel-local sendqueue file would create a second authority and
+        // could replay stale prompts after an ACPX restart.
+        let initial_send_queues = vec![send_queue::SendQueue::default(); initial_thread_ids.len()];
+        let onboarding_completed = settings_file::SettingsPaths::from_env()
+            .load_resolved()
+            .map(|r| r.onboarding_completed)
+            .unwrap_or(false);
         let initial = model::InitialState {
             threads: initial_specs.clone(),
             thread_ids: initial_thread_ids,
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
             send_queues: initial_send_queues,
+            onboarding_completed,
             thread_states: if bridge_available {
                 vec![ThreadState::Idle; initial_specs.len()]
             } else {
                 vec![ThreadState::Error; initial_specs.len()]
             },
             startup_warnings,
+            server_queue: true,
         };
         let mut model = model::Model::default();
+        model.profile_wiring_enabled = profile_wiring_enabled();
+        model.beta_mode_enabled = beta_mode_enabled();
         let thread_model = Rc::new(VecModel::default());
-        let messages_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
         model.thread_model = thread_model.clone();
-        model.messages_model = messages_model.clone();
         model.skills_model = skills_model.clone();
         let panel = PanelSingleton {
             window,
@@ -1870,10 +2476,27 @@ fn panel_rust_create_with_initial_identity(
                     .as_ref()
                     .and_then(|identity| identity.saved_path().map(str::to_owned)),
             ),
+            // Small fixed pool -- markdown rendering is not the only thing
+            // competing for CPU, and this is background pre-render work,
+            // not latency-critical (the synchronous path already shows
+            // correct content the same frame; this pool exists to warm
+            // the per-thread cache for a later switch, not to gate any
+            // visible render).
+            markdown_render_pool: markdown_worker::RenderWorkerPool::new(2),
         };
         // Gateway availability is panel-scoped, independent of project-open.
         // This enables the first `+` thread on the empty-project screen.
         panel.component.set_gateway_ready(bridge_available);
+        // Installed app version, shown as a small meta line under the
+        // Settings nav rail (left_tabs.slint) -- a one-shot set, same
+        // shape as gateway_ready above, since this never changes for the
+        // lifetime of the process. Sourced from Cargo.toml's own
+        // `package.version` (currently "0.1.0", not yet threaded to the
+        // repo's release tags, which are ahead at v0.1.8+ -- no build
+        // step stamps the release tag into the binary today).
+        panel
+            .component
+            .set_app_version(env!("CARGO_PKG_VERSION").into());
         if let Some(identity) = initial_identity {
             let saved_path = identity.saved_path().map(str::to_owned);
             let mut model = panel.model.borrow_mut();
@@ -1944,6 +2567,17 @@ fn panel_rust_create_with_initial_identity(
                 load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings)
             });
         panel.sync_runtime_defaults(&defaults);
+        // bug4_new_thread_default_provider: `scoped_prefs.default_agent_id`
+        // was computed above but never applied to `model.default_agent_id`
+        // (what `ThreadMsg::New` reads for a new thread's provider) -- that
+        // was previously only set via the Settings "Save" button. Apply it
+        // here too so a fresh thread respects the configured default.
+        if let Some(configured_agent_id) = scoped_prefs
+            .as_ref()
+            .and_then(|prefs| settings_file::non_default_sentinel(prefs.default_agent_id.clone()))
+        {
+            panel.model.borrow_mut().default_agent_id = configured_agent_id;
+        }
         for message in post_hydration_warnings {
             let _ = dispatch::update_persistent(
                 &panel,
@@ -2069,6 +2703,21 @@ fn panel_rust_create_with_initial_identity(
         });
 
         let component_weak = panel.component.as_weak();
+        panel.component.on_complete_onboarding(move || {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let _ = dispatch::update_persistent(
+                        panel,
+                        msg::Msg::Ui(msg::UiMsg::Chrome(msg::ChromeMsg::CompleteOnboarding)),
+                    );
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
         panel.component.on_settings_scope_changed(move |scope| {
             let Some(component) = component_weak.upgrade() else {
                 return;
@@ -2123,18 +2772,18 @@ fn panel_rust_create_with_initial_identity(
             });
 
         let component_weak = panel.component.as_weak();
-        panel.component.on_mcp_server_create(move |name, command| {
+        panel.component.on_mcp_server_submit(move |data| {
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
+            let entry = models::mcp_server_entry_from_form(&data);
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_mcp_server_create(
-                        panel,
-                        &component,
-                        name.to_string(),
-                        command.to_string(),
-                    );
+                    if data.is_edit {
+                        dispatch::dispatch_mcp_server_update(panel, &component, entry);
+                    } else {
+                        dispatch::dispatch_mcp_server_create(panel, &component, entry);
+                    }
                 }
             });
         });
@@ -2187,6 +2836,18 @@ fn panel_rust_create_with_initial_identity(
         });
 
         let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_logout(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_mcp_server_logout(panel, &component, name.to_string());
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_tool_enabled_changed(
             move |server_name, tool_name, enabled| {
                 let Some(component) = component_weak.upgrade() else {
@@ -2205,6 +2866,44 @@ fn panel_rust_create_with_initial_identity(
                 });
             },
         );
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_tool_deferred_changed(
+            move |server_name, tool_name, deferred| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tool_deferred_changed(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                            tool_name.to_string(),
+                            deferred,
+                        );
+                    }
+                });
+            },
+        );
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mcp_server_tools_fetch_requested(move |server_name| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tools_fetch_requested(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                        );
+                    }
+                });
+            });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2251,6 +2950,18 @@ fn panel_rust_create_with_initial_identity(
                         &component,
                         agent_id.to_string(),
                     );
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_agent_website_clicked(move |website| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    panel.dispatch_agent_website_clicked(website.as_str());
                 }
             });
         });
@@ -2436,16 +3147,15 @@ fn panel_rust_create_with_initial_identity(
         // into the reducer and effect executor -- see dispatch.rs's
         // doc comment.
         let component_weak = panel.component.as_weak();
-        panel.component.on_send_requested(move || {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            let text = component.get_compose_text().to_string();
-            let text = text.trim().to_owned();
+        panel.component.on_send_requested(move |text| {
+            let text = text.to_string().trim().to_owned();
             if text.is_empty() {
                 trace_host_input("send requested with empty composer");
                 return;
             }
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
             let filtered_idx = component.get_selected_thread() as usize;
             trace_host_input(format_args!(
                 "send requested selected_thread={filtered_idx} text={text:?}"
@@ -2456,6 +3166,14 @@ fn panel_rust_create_with_initial_identity(
                 // the send is dispatched.
                 if let Some(panel) = cell.borrow_mut().as_mut() {
                     dispatch::dispatch_compose_send_maybe_attach(panel, filtered_idx, text);
+                }
+            });
+        });
+
+        panel.component.on_compose_draft_changed(move |text| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_compose_draft_changed(panel, text.to_string());
                 }
             });
         });
@@ -2806,6 +3524,64 @@ fn panel_rust_create_with_initial_identity(
                 });
             });
 
+        // Compose slash-command filtering is host-managed: keep the
+        // thread's advertised command catalog immutable and publish a
+        // separate filtered VecModel copy to Slint. `@` MCP suggestions do
+        // not filter; apostrophe is the explicit bypass marker for every
+        // picker filter chain.
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mention_filter_changed(move |prefix, query| {
+                if prefix != "/" {
+                    return;
+                }
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    let panel_cell = cell.borrow();
+                    let Some(panel) = panel_cell.as_ref() else {
+                        return;
+                    };
+                    let (commands, commands_model) = {
+                        let mut model = panel.model.borrow_mut();
+                        let real = model
+                            .visible_indices
+                            .get(model.selected_thread)
+                            .copied()
+                            .or_else(|| {
+                                (!model.visible_list_synced).then_some(model.selected_thread)
+                            });
+                        let source = real
+                            .and_then(|idx| model.threads.get_mut(idx))
+                            .map(|thread| {
+                                thread.command_filter = query.to_string();
+                                thread.available_commands.clone()
+                            })
+                            .unwrap_or_default();
+                        (source, model.commands_model.clone())
+                    };
+                    let needle = query.to_lowercase();
+                    let rows = commands
+                        .into_iter()
+                        .filter(|command| {
+                            needle.is_empty()
+                                || query == "'"
+                                || command.name.to_lowercase().contains(&needle)
+                                || command.description.to_lowercase().contains(&needle)
+                        })
+                        .map(|command| crate::SkillOption {
+                            name: command.name.into(),
+                            description: command.description.into(),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>();
+                    commands_model.set_vec(rows);
+                    component.set_available_commands(slint::ModelRc::from(commands_model));
+                });
+            });
+
         let component_weak = panel.component.as_weak();
         panel.component.on_toggle_expanded(move |index| {
             let Some(_component) = component_weak.upgrade() else {
@@ -3023,6 +3799,30 @@ pub extern "C" fn panel_rust_input_hover_exit(_handle: *mut PanelHandle) -> bool
         return false;
     };
     window.window().dispatch_event(WindowEvent::PointerExited);
+    true
+}
+
+/// Forwards the host OS window's activation state (`QQuickWindow::
+/// activeChanged`, wired from `RustPanelItem`) into Slint via the real
+/// `WindowEvent::WindowActiveChanged` the platform API defines for exactly
+/// this -- see `i-slint-core`'s `Window::dispatch_event` match arm, which
+/// forwards straight to `WindowInner::set_active`. Candidate fix for a
+/// reported real-desktop bug (source-level investigation only, unconfirmed
+/// on a real machine): Slint's own internal "window active" notion never
+/// received a single update outside of VNC/fluxbox's auto-focus-on-map
+/// behavior papering over it, which may be why most input silently never
+/// reached this panel until an unrelated OS-level window-activate cycle
+/// (alt-tab away and back) "fixed" it. Mirrors `panel_rust_input_hover`'s
+/// PANEL-lookup shape exactly.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_window_active(_handle: *mut PanelHandle, active: bool) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(active));
     true
 }
 
@@ -3475,11 +4275,114 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let busy_thread_animating = {
             let model = panel.model.borrow();
             model.threads.iter().any(|thread| {
-                matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
-                    || thread.connection_status == "Connecting..."
+                !thread.archived
+                    && !thread.closed
+                    && (matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                        || thread.connection_status == "Connecting...")
             })
         };
-        let needs_paint = frame_changed || animating || busy_thread_animating;
+        // mcp_servers_spinner_repaint_gap: the Settings > MCP Servers row
+        // Spinners (Fetch tools / enable-toggle / Remove / Authenticate /
+        // Logout, mcp_servers_view.slint) use this same animation-tick()
+        // pattern but live entirely outside `model.threads` -- their busy
+        // state is `available_mcp_servers`/`mcp_operations_in_flight`,
+        // folded into per-row booleans by `models::to_mcp_server_option_
+        // rows`. Without this check they got one correct frame at
+        // click-time and then froze, same root cause as the
+        // `busy_thread_animating` case above just never extended to this
+        // model. Mirrors `to_mcp_server_option_rows`'s own `is_busy`
+        // check rather than re-deriving the Slint-side McpServerOption
+        // rows here.
+        let busy_mcp_server_animating = {
+            let model = panel.model.borrow();
+            let is_busy = |action: &str, name: &str| {
+                model
+                    .mcp_operations_in_flight
+                    .iter()
+                    .any(|key| key == &format!("{action}:{name}"))
+            };
+            model.available_mcp_servers.iter().any(|entry| {
+                is_busy("delete", &entry.name)
+                    || is_busy("enabled", &entry.name)
+                    || is_busy("authenticate", &entry.name)
+                    || is_busy("logout", &entry.name)
+                    || matches!(
+                        entry.tool_catalog,
+                        Some(crate::protocol_types::McpToolCatalog::Fetching)
+                    )
+                    || (entry.tool_catalog.is_none() && is_busy("tools_fetch", &entry.name))
+            })
+            // mcp_server_submit_spinner_repaint_gap: the Add/Edit MCP Server
+            // form's Save-button Spinner (mcp_servers_view.slint's
+            // `submit-busy`) is driven by `sync.rs`'s
+            // `mcp_server_submit_busy`, which is true for ANY in-flight
+            // `create:`/`update:` key -- not per-existing-row like the
+            // actions above (a server being created doesn't have an
+            // `available_mcp_servers` entry yet at all, so the per-entry
+            // `is_busy` closure above can never see it). Without this,
+            // that Spinner got one correct frame at Save-click time and
+            // then had its repaint cadence throttled to the idle-backoff
+            // rate (kIdlePollFps, rustpanelitem.h) while still visually
+            // spinning -- reads as a "jumping"/stepped rotation instead of
+            // smooth motion, same root cause `busy_mcp_server_animating`
+            // and `busy_recover_session_animating` were added to close for
+            // their own rows, just never extended to this one.
+                || model
+                    .mcp_operations_in_flight
+                    .iter()
+                    .any(|key| key.starts_with("create:") || key.starts_with("update:"))
+        };
+        // With zero durable threads, App mounts `legacy-chat-area` instead of
+        // a ChatViewStack delegate. That ChatArea still renders its
+        // connection-status spinner and topbar shimmer from the component-
+        // level default `connection-status == "Connecting..."`, but there is
+        // no ThreadModel for the predicate above to inspect. Include the
+        // component projection so the no-thread loading state keeps ticking
+        // without requiring mouse movement.
+        let component_connection_animating =
+            panel.component.get_connection_status().as_str() == "Connecting...";
+        // recoverable-attach-fix: Settings > Agents "Attach" (symptom #2)
+        // -- same gap `busy_mcp_server_animating` above was added to
+        // close for the MCP-servers rows: `RemoteSessionOption.busy` is
+        // real per-row state now (`recover_session_operations_in_
+        // flight`), but without an explicit busy-thread reason here the
+        // Attach button's Spinner only got one correct frame at
+        // click-time and then froze until unrelated mouse movement.
+        let busy_recover_session_animating = !panel
+            .model
+            .borrow()
+            .recover_session_operations_in_flight
+            .is_empty();
+        // agent_install_spinner_repaint_gap: Settings > Agents "Install"
+        // (agent_card.slint) is real per-agent state now
+        // (`agent_operations_in_flight`, populated by
+        // `AgentBridge::begin_agent_operation`/`install_agent_async` and
+        // folded into each catalog row's `loading` bool by
+        // `models::to_agent_card_rows` et al.) -- but without an explicit
+        // busy-thread reason here the Install button's Spinner got one
+        // correct frame at click-time and then froze until unrelated mouse
+        // movement, same root cause `busy_mcp_server_animating` and
+        // `busy_recover_session_animating` above were added to close for
+        // their own rows, just never extended to this one. Not
+        // agent-specific (e.g. not a codex-only gap): every agent's Install
+        // spinner shared this.
+        let busy_agent_operation_animating =
+            !panel.model.borrow().agent_operations_in_flight.is_empty();
+        // Pagination's chat-area Spinner is driven by Slint's
+        // `animation-tick()` rather than a keyframed `animate` block.
+        // `has_active_animations()` therefore does not report it, and an
+        // otherwise idle thread would fall back to Qt's idle poll cadence
+        // (or stop requesting redraws), freezing the older-history spinner
+        // after its first frame. Keep the host poll/render loop live for the
+        // duration of the UI-owned pagination request as well.
+        let pagination_animating = panel.component.get_loading_older_messages();
+        let busy_animation = busy_thread_animating
+            || busy_mcp_server_animating
+            || busy_recover_session_animating
+            || busy_agent_operation_animating
+            || component_connection_animating
+            || pagination_animating;
+        let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software
         // buffer. `MinimalSoftwareWindow::draw_if_needed` no-ops unless
         // Slint itself was told to redraw. `animation-tick()` bindings
@@ -3487,7 +4390,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // a busy loader froze: poll returned true, paint ran, but the
         // buffer was never re-rendered. Force the flag whenever we
         // need continuous tick-driven paint.
-        if needs_paint && (animating || busy_thread_animating) {
+        if needs_paint && (animating || busy_animation) {
             panel.window.window().request_redraw();
         }
         needs_paint
@@ -3586,6 +4489,178 @@ mod lifecycle_tests {
         assert_eq!(qt_cursor_shape_for_kind("some-future-kind"), 0);
     }
 
+    /// idle_poll_backoff evidence-gathering: `RustPanelItem::poll()`
+    /// (rustpanelitem.cpp) now backs its `QTimer` off to a slow idle
+    /// cadence whenever `panel_rust_poll`'s return value (`needs_paint`)
+    /// is false, and restores the full 60-90fps display-refresh cadence
+    /// whenever it's true -- see `RustPanelItem::applyPollCadence`'s doc
+    /// comment. This deliberately does NOT assert quiescence: a freshly
+    /// created, zero-thread panel is a poor idle fixture, because
+    /// `chat_area.slint`'s legacy (zero-thread) view renders its
+    /// connecting `Spinner` off `connection-status == "Connecting..."`,
+    /// and nothing ever writes that Slint property away from its
+    /// declared default for the zero-thread case (`sync.rs`'s
+    /// `Dirty::Connection` arm only fires via `displayed_thread_for_id`,
+    /// which requires an actual thread to be displayed). That is a real,
+    /// pre-existing, separate connection-status wiring gap for the
+    /// empty-project state -- out of scope for the poll-cadence fix this
+    /// test accompanies, which only needs `panel_rust_poll`'s existing
+    /// per-tick `needs_paint` signal to be honest, not for every fixture
+    /// to reach `false`. This test instead records concrete tick
+    /// counts/timing so idle-vs-active behavior is backed by numbers
+    /// rather than a claim.
+    #[test]
+    fn panel_rust_poll_tick_counts_on_a_freshly_created_panel() {
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        const TICKS: usize = 300; // ~5s of ticks at a 60fps active cadence
+        let mut needs_paint_count = 0usize;
+        let started = std::time::Instant::now();
+        for _ in 0..TICKS {
+            if panel_rust_poll(handle) {
+                needs_paint_count += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "idle_poll_backoff: {TICKS} panel_rust_poll ticks on a freshly-created, zero-thread \
+             panel took {elapsed:?} total ({:?}/tick); {needs_paint_count}/{TICKS} reported \
+             needs_paint == true (expected non-zero for this fixture -- see doc comment above). \
+             RustPanelItem::applyPollCadence still correctly follows whatever panel_rust_poll \
+             reports tick to tick, backing off to kIdlePollFps only on the ticks that report \
+             false.",
+            elapsed / TICKS as u32,
+        );
+
+        panel_rust_destroy(handle);
+    }
+
+    /// mcp_server_submit_spinner_repaint_gap regression: the Add/Edit MCP
+    /// Server form's Save-button Spinner (`mcp_servers_view.slint`'s
+    /// `submit-busy`, sourced from `sync.rs`'s `mcp_server_submit_busy`,
+    /// true for ANY in-flight `create:`/`update:` key in
+    /// `mcp_operations_in_flight`) was invisible to `panel_rust_poll`'s
+    /// `busy_mcp_server_animating` check -- that check only walked
+    /// `available_mcp_servers` looking for `delete:`/`enabled:`/
+    /// `authenticate:`/`logout:`/`tools_fetch:` keys per existing row, and
+    /// a server being created has no `available_mcp_servers` entry yet at
+    /// all. Left uncovered, `RustPanelItem::applyPollCadence` (rustpanel
+    /// item.cpp) would back the poll timer off to `kIdlePollFps` (8Hz)
+    /// while that Spinner was still visually mid-animation-tick-driven
+    /// rotation, reading as a jumping/stepped spin instead of smooth
+    /// motion. Confirms `panel_rust_poll` reports `needs_paint == true` on
+    /// every tick while a `create:`/`update:` key is in flight, with no
+    /// other busy signal present.
+    #[test]
+    fn panel_rust_poll_stays_busy_for_in_flight_mcp_server_create() {
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let panel = slot.as_ref().expect("panel exists");
+            panel
+                .model
+                .borrow_mut()
+                .mcp_operations_in_flight
+                .push("create:new-server".to_owned());
+        });
+
+        const TICKS: usize = 30;
+        for i in 0..TICKS {
+            assert!(
+                panel_rust_poll(handle),
+                "tick {i}/{TICKS}: panel_rust_poll returned needs_paint == false while an \
+                 mcp_operations_in_flight \"create:...\" entry was present -- the MCP Server \
+                 submit-form Spinner would be silently throttled to the idle poll cadence \
+                 while still animating"
+            );
+        }
+
+        panel_rust_destroy(handle);
+    }
+
+    /// Regression test for a real, confirmed production crash: two
+    /// identical panics captured from a live `snapflow` process, both
+    /// `i-slint-renderer-software`'s "buffer ... too small to handle a
+    /// window of size ..." assert, firing inside `RustPanelItem::paint` ->
+    /// `panel_rust_render` across the non-unwinding Qt FFI boundary (an
+    /// abort, not a recoverable panic). Root cause: `RustPanelItem::
+    /// ensureHandle()` always calls `panel_rust_create` (which resizes the
+    /// buffer AND calls `window.set_size`, converting the new physical
+    /// size to Slint's internal *logical* window-item geometry using
+    /// whatever scale factor is live *at that moment*) strictly before
+    /// `panel_rust_apply_host_appearance` (which changes that scale
+    /// factor). `ScaleFactorChanged` alone never re-derives the window
+    /// item's logical geometry, so once density changes, the render-time
+    /// assert recomputes `stale logical geometry * new factor` -- a
+    /// physical pixel count that no longer matches the buffer, which was
+    /// sized directly from the raw physical width/height `panel_rust_create`
+    /// was actually given. This reproduces that exact sequence (resize at
+    /// the old density, then a density push) and asserts a render survives
+    /// it without panicking/aborting.
+    #[test]
+    fn render_survives_a_density_change_that_follows_a_resize() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = [
+            (
+                "RUI_ACPX_CODEX_URL",
+                std::env::var("RUI_ACPX_CODEX_URL").ok(),
+            ),
+            (
+                "RUI_ACPX_CLAUDE_URL",
+                std::env::var("RUI_ACPX_CLAUDE_URL").ok(),
+            ),
+            ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+        ];
+        std::env::set_var("RUI_ACPX_CODEX_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+        // Establish the panel at some size under the default (1.0) scale
+        // factor -- mirrors `ensureHandle()`'s `panel_rust_create(w, h)`
+        // call, where w/h are already physical pixels computed from
+        // whatever devicePixelRatio was live at that moment.
+        let handle = panel_rust_create(400, 400);
+        assert!(!handle.is_null());
+        assert!(panel_rust_render(handle), "initial render must succeed");
+
+        // Now the host reports a new density (e.g. the panel moved to a
+        // higher-DPI screen) -- mirrors `ensureHandle()`'s later
+        // `panel_rust_apply_host_appearance(...)` call, made strictly
+        // after `panel_rust_create` in the same tick. Before the fix, this
+        // alone (no further resize needed) leaves the buffer's physical
+        // size fixed at 400x400 while the next render demands 400*1.25 =
+        // 500x500 physical pixels -- exactly the "buffer too small"
+        // shape of the real crash.
+        assert!(panel_rust_apply_host_appearance(
+            handle,
+            1,
+            false,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            1.0,
+            1.25,
+        ));
+
+        // Must not panic/abort -- this is the actual regression check.
+        panel_rust_render(handle);
+
+        panel_rust_destroy(handle);
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[test]
     fn panel_create_destroy_create_reuses_slint_platform() {
         // Force the bridge into its documented display-only fallback so
@@ -3667,6 +4742,76 @@ mod lifecycle_tests {
         assert!(panel_rust_render(second));
         panel_rust_destroy(second);
         assert_eq!(panel_rust_width(second), 0);
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_save_reads_the_live_component_default_agent_id_not_the_stale_model_copy() {
+        // Regression for: Settings' "make default" toggle only ever
+        // mutates the two-way-bound Slint `default-agent-id` property
+        // (agents_view.slint's `set-default` handler assigns
+        // `root.default-agent-id` locally with no callback wired back to
+        // Rust) -- there is no `SettingsMsg`/model-sync path that keeps
+        // `model.default_agent_id` live as the user edits the Settings UI.
+        // `dispatch_settings_save` (dispatch.rs) must therefore read the
+        // *component's* live getter at Save time, not `model.default_agent_id`
+        // (which stays whatever it was hydrated with -- typically empty,
+        // which then falls back to NO_PROVIDER_REQUESTED_FALLBACK/"codex"
+        // at cold start). This was regressed by 0c958f48 ("panel-rust:
+        // close remaining TEA ownership gaps"), which switched this read
+        // from `component.get_default_agent_id()` to `model.default_agent_id`
+        // without ever adding the missing UI->model sync.
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = [
+            (
+                "RUI_ACPX_CODEX_URL",
+                std::env::var("RUI_ACPX_CODEX_URL").ok(),
+            ),
+            (
+                "RUI_ACPX_CLAUDE_URL",
+                std::env::var("RUI_ACPX_CLAUDE_URL").ok(),
+            ),
+            ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+        ];
+        std::env::set_var("RUI_ACPX_CODEX_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
+        std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let panel = slot.as_ref().expect("panel exists");
+
+            // Simulate the model still holding whatever it was hydrated
+            // with (e.g. empty/stale), while the live Slint component --
+            // the actual source of truth for what the user just toggled
+            // in Settings -- holds a real configured default.
+            assert_ne!(
+                panel.model.borrow().default_agent_id,
+                "claude-acp",
+                "test setup: model must start out disagreeing with the component"
+            );
+            panel.component.set_default_agent_id("claude-acp".into());
+
+            dispatch::dispatch_settings_save(panel, &panel.component);
+
+            assert_eq!(
+                panel.model.borrow().default_agent_id,
+                "claude-acp",
+                "Save must persist the live component's default_agent_id, not a stale model copy"
+            );
+        });
+
+        panel_rust_destroy(handle);
 
         for (key, value) in previous {
             if let Some(value) = value {
@@ -3877,6 +5022,16 @@ mod keyboard_shortcut_tests {
 
     impl TestPanel {
         fn new() -> Self {
+            Self::new_with_size(240, 260)
+        }
+
+        /// Same as `new()` but with a caller-chosen window size --
+        /// provider_trigger_full_width_click_sweep_opens_popup_wide uses
+        /// a width >= 320px so `chat_input_layout.slint`'s `row2-compact` is false
+        /// and the Provider trigger renders at its normal 72..140px
+        /// width (with the full "Provider \u{203a}" label) instead of
+        /// the 56px narrow-dock variant `new()`'s 240px window forces.
+        fn new_with_size(width: u32, height: u32) -> Self {
             let cache_dir = tempfile::tempdir().expect("cache dir");
             let previous_env = [
                 (
@@ -3897,8 +5052,8 @@ mod keyboard_shortcut_tests {
             let project_path = cache_dir.path().join("test-panel.mlt");
             let project_path = project_path.to_string_lossy().into_owned();
             let handle = panel_rust_create_with_identity(
-                240,
-                260,
+                width,
+                height,
                 project_path.as_ptr(),
                 project_path.len(),
                 false,
@@ -4010,6 +5165,7 @@ mod keyboard_shortcut_tests {
             description: "".into(),
             closed: false,
             archived: false,
+            unread: false,
             provider: "".into(),
             model: "".into(),
             project_name: "".into(),
@@ -4034,6 +5190,10 @@ mod keyboard_shortcut_tests {
     fn ctrl_alt_arrows_and_ctrl_k_work_through_the_real_input_key_bridge() {
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         panel.set_threads(vec![
             thread_item("Fix timeline crash"),
@@ -4142,6 +5302,10 @@ mod keyboard_shortcut_tests {
     fn invoke_command_switches_threads_and_opens_search_without_any_focus() {
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         panel.set_threads(vec![
             thread_item("Fix timeline crash"),
@@ -4183,6 +5347,10 @@ mod keyboard_shortcut_tests {
     fn has_text_focus_reflects_real_compose_focus_state() {
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
 
         assert!(
             !panel_rust_has_text_focus(panel.handle),
@@ -4221,6 +5389,10 @@ mod keyboard_shortcut_tests {
 
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
         panel.set_threads(vec![thread_item("Fix timeline crash")]);
         component.set_selected_thread(0);
         component.set_sidebar_expanded(false);
@@ -4278,6 +5450,10 @@ mod keyboard_shortcut_tests {
 
         let panel = TestPanel::new();
         let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
         component.set_compose_text("select and copy me".into());
 
         let compose = ElementHandle::find_by_accessible_label(&component, "Compose message")
@@ -4309,6 +5485,285 @@ mod keyboard_shortcut_tests {
             "a real Ctrl+A-then-Ctrl+C chord on the compose box's full selection must reach \
              SpikePlatform::set_clipboard_text with exactly the selected text"
         );
+    }
+
+    /// Regression test for `e94f105a` (fix(panel-rust): make full
+    /// ChatInputLayout selector trigger clickable). That fix added a
+    /// `clicked` handler to `SearchableDropdown`'s `label-scroll`
+    /// TouchArea (searchable_dropdown.slint), which sits on top of
+    /// `trigger-touch` for the label region of every compose-bar
+    /// dropdown trigger (mode/config/profile/reasoning). A TouchArea
+    /// absorbs the pointer event over its bounds regardless of which
+    /// callbacks it defines, so without a `clicked` handler there,
+    /// clicks over the label silently went nowhere -- only the small
+    /// arrow-icon sliver outside `label-scroll-host`'s bounds ever
+    /// reached `trigger-touch` underneath.
+    ///
+    /// e94f105a's own commit report says it was verified only via
+    /// `cargo check` -- never a live click -- which is exactly how a
+    /// second, unrelated regression could silently re-break the same
+    /// spot later without anyone noticing (`cargo check` can't catch a
+    /// dead click zone). This test closes that gap for good: it drives
+    /// a real click through `panel_rust_input_click` (the exact FFI
+    /// entry point the shipped Qt host calls on a genuine mouse click,
+    /// not a bypassed/direct WindowEvent dispatch) at a coordinate
+    /// specifically inside the trigger's LABEL region -- not the
+    /// trigger's bounding-box center, not the arrow -- and asserts the
+    /// popup actually opens.
+    #[test]
+    fn mode_dropdown_label_region_click_opens_the_popup() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_gateway_ready(true);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "ask".into(),
+                label: "ask".into(),
+                value: "".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "code".into(),
+                label: "code".into(),
+                value: "".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_mode_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+        component.set_mode_trigger_label("ask".into());
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "ask")
+            .next()
+            .expect("mode-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+
+        // Sanity check this test actually exercises something: before any
+        // click, the popup's option rows are unmounted (invisible) and
+        // must not be found by accessible-label lookup (which skips
+        // invisible subtrees -- see ElementHandle::find_by_accessible_
+        // label's own doc comment / is_visible() gate).
+        assert!(
+            ElementHandle::find_by_accessible_label(&component, "code")
+                .next()
+                .is_none(),
+            "mode popup must start closed"
+        );
+
+        // Click well inside the LABEL region specifically: `label-scroll-
+        // host` starts at the trigger's left edge + Metrics.space-3
+        // (6px) and covers most of the trigger's width, leaving only a
+        // narrow left-padding strip and the right-side arrow/padding
+        // strip to `trigger-touch` alone (see searchable_dropdown.slint's
+        // HorizontalLayout: label-scroll-host is horizontal-stretch: 1,
+        // the arrow is horizontal-stretch: 0). 30% across the trigger's
+        // width lands solidly inside that label band across every width
+        // this trigger ever renders at (56px compact .. 140px max).
+        let x = position.x + size.width * 0.3;
+        let y = position.y + size.height / 2.0;
+        assert!(
+            panel_rust_input_click(panel.handle, x as c_uint, y as c_uint),
+            "click on the mode-dropdown trigger's label region must reach the real \
+             input-click FFI"
+        );
+
+        assert!(
+            ElementHandle::find_by_accessible_label(&component, "code")
+                .next()
+                .is_some(),
+            "clicking the trigger's label region must open the mode popup -- if this fails, \
+             e94f105a's label-scroll `clicked` handler has regressed (or the whole-trigger \
+             fix was never actually complete)"
+        );
+    }
+
+    /// Follow-up on fb5b8b57 (test(panel-rust): live-verify e94f105a's
+    /// whole-trigger dropdown click fix), which live-tested a single
+    /// point 30% across the trigger's width. A later report claimed
+    /// clicking directly on the rendered "Provider" glyphs (as opposed to
+    /// an arbitrary point inside the label region's bounding box) still
+    /// does not open the dropdown. Rather than guess at one more point,
+    /// this sweeps the ENTIRE trigger width in 4%-of-width steps (25
+    /// points) and asserts every single one opens the popup via the real
+    /// `panel_rust_input_click` FFI entry point -- the same one the
+    /// shipped Qt host calls on a genuine mouse click. This is the
+    /// 56px-wide `row2-compact` narrow-dock trigger variant (the default
+    /// `TestPanel::new()` window is 240px wide, well under
+    /// chat_input_layout.slint's 320px `row2-compact` threshold); see
+    /// `..._wide` below for the normal 72px+ variant with the full
+    /// "Provider \u{203a}" label.
+    ///
+    /// Result at this branch's tip: every sampled point across the full
+    /// width opens the popup -- no dead zone was found under the
+    /// rendered label glyphs specifically, or anywhere else on the
+    /// trigger. This reaffirms fb5b8b57's finding with much finer
+    /// resolution than its single sample point.
+    #[test]
+    fn provider_trigger_full_width_click_sweep_opens_popup() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+        component.set_selected_provider_unavailable(false);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "claude-acp".into(),
+                label: "claude-acp".into(),
+                value: "claude".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "codex-acp".into(),
+                label: "codex-acp".into(),
+                value: "codex".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_profile_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+        // profile-trigger-label empty => trigger-label falls back to
+        // "Provider \u{203a}" per chat_input_layout.slint line 187.
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "Provider \u{203a}")
+            .next()
+            .expect("profile-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+        eprintln!(
+            "DIAG trigger absolute_position=({}, {}) size=({}, {})",
+            position.x, position.y, size.width, size.height
+        );
+
+        let y = position.y + size.height / 2.0;
+        let mut frac = 0.02_f32;
+        while frac < 1.0 {
+            let x = position.x + size.width * frac;
+            let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                !opened_before,
+                "popup must be closed before each sweep click"
+            );
+
+            let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            assert!(
+                ffi_ok,
+                "click at frac={frac} (rel_x={:.1}px) must reach the real input-click FFI",
+                x - position.x
+            );
+            let popup_opened = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                popup_opened,
+                "click at frac={frac} (rel_x={:.1}px) did not open the popup -- dead zone found \
+                 under the trigger at this x offset",
+                x - position.x
+            );
+
+            // Reset for next sample: click the exact same point again --
+            // toggle-popup() is symmetric, so this closes it back up
+            // without selecting a row (row-touch sits inside the popup
+            // at a totally different y, not at this trigger's y).
+            let closed_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            let still_open = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                closed_ok && !still_open,
+                "failed to re-close popup after sweep click at frac={frac}"
+            );
+            frac += 0.04;
+        }
+    }
+
+    /// Same sweep as `provider_trigger_full_width_click_sweep_opens_popup`
+    /// but at a window width >= 320px so `row2-compact` is false and the
+    /// trigger renders with the full "Provider \u{203a}" label at its
+    /// normal 72..140px width, not the 56px narrow-dock variant.
+    #[test]
+    fn provider_trigger_full_width_click_sweep_opens_popup_wide() {
+        use slint::ModelRc;
+
+        let panel = TestPanel::new_with_size(800, 400);
+        let component = panel.component();
+        component.set_gateway_ready(true);
+        component.set_sidebar_expanded(false);
+        component.set_agent_catalog_fetched(false);
+
+        let entries = vec![
+            DropdownEntry {
+                id: "claude-acp".into(),
+                label: "claude-acp".into(),
+                value: "claude".into(),
+                is_header: false,
+                is_current: true,
+            },
+            DropdownEntry {
+                id: "codex-acp".into(),
+                label: "codex-acp".into(),
+                value: "codex".into(),
+                is_header: false,
+                is_current: false,
+            },
+        ];
+        component.set_profile_dropdown_entries(ModelRc::new(VecModel::from(entries)));
+
+        let trigger = ElementHandle::find_by_accessible_label(&component, "Provider \u{203a}")
+            .next()
+            .expect("profile-dropdown trigger must be accessible by its trigger-label");
+        let position = trigger.absolute_position();
+        let size = trigger.size();
+
+        let y = position.y + size.height / 2.0;
+        let mut frac = 0.02_f32;
+        while frac < 1.0 {
+            let x = position.x + size.width * frac;
+            let opened_before = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                !opened_before,
+                "popup must be closed before each sweep click"
+            );
+
+            let ffi_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            assert!(
+                ffi_ok,
+                "click at frac={frac} (rel_x={:.1}px) must reach the real input-click FFI",
+                x - position.x
+            );
+            let popup_opened = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                popup_opened,
+                "click at frac={frac} (rel_x={:.1}px) did not open the popup -- dead zone found \
+                 under the trigger at this x offset",
+                x - position.x
+            );
+
+            let closed_ok = panel_rust_input_click(panel.handle, x as c_uint, y as c_uint);
+            let still_open = ElementHandle::find_by_accessible_label(&component, "codex-acp")
+                .next()
+                .is_some();
+            assert!(
+                closed_ok && !still_open,
+                "failed to re-close popup after sweep click at frac={frac}"
+            );
+            frac += 0.04;
+        }
     }
 }
 

@@ -61,6 +61,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::ThreadListDiff(ops) => {
             apply_thread_ops(model, ops);
+            apply_thread_view_ops(model);
             // Phase 19: section counters (active vs archived) follow every
             // thread-list rebuild.
             let archived = model
@@ -104,7 +105,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             // `thread_id` with empty `ops` carries no actual instruction
             // to apply; skip it entirely rather than let it fall through.
             if !thread_id.is_empty() || !ops.is_empty() {
-                apply_message_ops(model, thread_id, ops);
+                apply_thread_message_ops(model, thread_id, ops);
             }
             sync_has_older_messages(model, component, thread_id);
             if !thread_id.is_empty() {
@@ -116,22 +117,43 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             message_id,
             delta,
         } => {
-            apply_message_streaming(model, thread_id, message_id, delta);
+            apply_thread_message_streaming(model, thread_id, message_id, delta);
             sync_has_older_messages(model, component, thread_id);
-        }
-        Dirty::MessageListInstall { thread_id } => {
-            install_message_list_snapshot(model, thread_id);
-            sync_has_older_messages(model, component, thread_id);
-            if !thread_id.is_empty() {
-                trace_transcript_tail(model, thread_id);
-            }
         }
         Dirty::MessageRowPatch { thread_id, index } => {
-            apply_message_row_patch(model, thread_id, *index);
+            apply_thread_message_row_patch(model, thread_id, *index);
         }
         Dirty::Connection { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_connection_status(thread.connection_status.clone().into());
+            // Bug fix (same class as Dirty::PendingRequest, e30b6d2c): this
+            // used `thread_for_id` (any thread by id), so a *background*
+            // thread's connection-status change clobbered the singleton
+            // `connection_status` Slint property even though it's only
+            // ever read as "the displayed thread's connection status".
+            // Gate on `displayed_thread_for_id` like the other per-thread
+            // singleton-property syncs in this file.
+            if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_connection_status(thread.connection_status.clone().into());
+                }
+            }
+        }
+        Dirty::ProviderSwitch { thread_id } => {
+            // Same displayed-thread gate as Connection above: a
+            // background thread's provider-probe finishing must not
+            // clobber the singleton pulse property for whatever thread is
+            // actually on screen.
+            if displayed_thread_for_id(model, thread_id).is_some() {
+                component.set_selected_provider_switching(chat_view_provider_switching(model));
+            }
+        }
+        Dirty::ThreadAttaching { thread_id } => {
+            // Same displayed-thread gate as ProviderSwitch/Connection
+            // above: a background thread's first-attach resolving must
+            // not clobber the singleton pulse property for whatever
+            // thread is actually on screen.
+            if displayed_thread_for_id(model, thread_id).is_some() {
+                component
+                    .set_selected_first_attach_in_flight(chat_view_first_attach_in_flight(model));
             }
         }
         Dirty::Toast => {
@@ -165,10 +187,31 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::PendingRequest { thread_id } => {
             // Empty id = transition clear on thread switch (leak_audit §2.3).
+            //
+            // Bug fix: this used `thread_for_id` (any thread by id), so a
+            // *background* thread's pending-request change -- e.g. its
+            // request resolving while a different thread is displayed --
+            // clobbered the singleton `pending_request` Slint property even
+            // though that property is only ever read as "the displayed
+            // thread's pending request" (see `shown-pending`/`status-
+            // needs-attention` in chat_area.slint). Concretely: viewing
+            // thread A with a live approval card up, thread B (background)
+            // resolves its own unrelated request, and this handler fired
+            // for B's `thread_id`, finding no match against A only by
+            // accident of iteration order -- or worse, matching and
+            // overwriting A's real pending state with B's (now-cleared)
+            // one, silently dropping A's approval indicator. Gate on
+            // `displayed_thread_for_id` like every other per-thread
+            // singleton-property sync in this file (see
+            // `sync_has_older_messages`, `Dirty::Error`'s `for_displayed`)
+            // so only the currently-displayed thread's pending request can
+            // ever reach the component.
             if thread_id.is_empty() {
                 component.set_pending_request(crate::PendingRequestItem::default());
-            } else if let Some(thread) = thread_for_id(model, thread_id) {
-                component.set_pending_request(thread.pending_request.clone());
+            } else if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                if let Some(thread) = model.threads.get(idx) {
+                    component.set_pending_request(thread.pending_request.clone());
+                }
             }
         }
         Dirty::Terminal { .. } => {
@@ -225,6 +268,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_default(model.background_default);
             component.set_default_agent_id(model.default_agent_id.clone().into());
             component.set_dev_mode(model.dev_mode);
+            component.set_onboarding_completed(model.onboarding_completed);
+            component.set_show_global_skills(model.show_global_skills);
+            component.set_profile_wiring_enabled(model.profile_wiring_enabled);
+            component.set_beta_mode_enabled(model.beta_mode_enabled);
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);
@@ -255,7 +302,23 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::SkillEditor => sync_skill_editor_state(model, component),
         Dirty::Capabilities { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
+            // Bug fix (same class as Dirty::PendingRequest, e30b6d2c): this
+            // used `thread_for_id` (any thread by id), so a *background*
+            // thread's capability change (mode/reasoning/fast-mode options,
+            // profile/model dropdowns, plan entries, live session title,
+            // context-usage ring) clobbered these singleton `ChatPanel`
+            // properties even though every one of them is only ever read
+            // as "the displayed thread's" value -- e.g. viewing thread A,
+            // background thread B's config_options resolve or its plan
+            // updates, and this handler fired for B's `thread_id` and
+            // overwrote A's on-screen mode label / plan list / context
+            // ring / session title with B's state. Gate on
+            // `displayed_thread_for_id` like the other per-thread
+            // singleton-property syncs in this file.
+            if let Some(idx) = displayed_thread_for_id(model, thread_id) {
+                let Some(thread) = model.threads.get(idx) else {
+                    return;
+                };
                 component.set_mode_trigger_label(
                     crate::models::current_mode_name(&thread.session_modes).into(),
                 );
@@ -379,6 +442,7 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
                 || existing.project_instance_live != row.item.project_instance_live
                 || existing.profile_name != row.item.profile_name
                 || existing.has_session != row.item.has_session
+                || existing.unread != row.item.unread
         })
         .unwrap_or(true);
     if needs_write {
@@ -391,10 +455,85 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
     }
 }
 
+/// Reconcile the Slint-facing durable thread -> message-model records.
+///
+/// The outer record list may reorder as the sidebar changes, but each record's
+/// `messages` field points at the registry-owned `Rc<VecModel<MessageItem>>`.
+/// A switch therefore selects another existing model; it never copies rows
+/// from one model into another.
+fn apply_thread_view_ops(model: &Model) {
+    let desired = model
+        .thread_rows
+        .iter()
+        .map(|row| row.thread_id.clone())
+        .collect::<Vec<_>>();
+    let mut keys = model.thread_views_model_keys.borrow_mut();
+
+    while model.thread_views_model.row_count() > desired.len() {
+        model
+            .thread_views_model
+            .remove(model.thread_views_model.row_count() - 1);
+        keys.pop();
+    }
+
+    for (index, thread_id) in desired.iter().enumerate() {
+        let owner_id = model
+            .thread_index_for_id(thread_id)
+            .and_then(|idx| model.threads.get(idx))
+            .map(|thread| thread.thread_id.as_str())
+            .unwrap_or(thread_id.as_str());
+        apply_thread_message_ops(model, owner_id, &[]);
+        let Some(messages) = model.thread_view_models.get(owner_id) else {
+            continue;
+        };
+        if std::env::var_os("RUI_THREAD_VIEW_TRACE").is_some() {
+            eprintln!(
+                "thread-view model thread={} owner={} identity={:p} rows={}",
+                thread_id,
+                owner_id,
+                std::rc::Rc::as_ptr(&messages),
+                messages.row_count()
+            );
+        }
+        let item = crate::ThreadViewItem {
+            thread_id: thread_id.clone().into(),
+            messages: slint::ModelRc::from(messages),
+            tool_groups: model
+                .thread_view_models
+                .tool_groups(owner_id)
+                .unwrap_or_default(),
+            compose_text: model
+                .thread_index_for_id(owner_id)
+                .and_then(|thread_index| model.threads.get(thread_index))
+                .map(|thread| thread.compose_draft.clone().into())
+                .unwrap_or_default(),
+        };
+        if index < model.thread_views_model.row_count() {
+            if keys.get(index).map(String::as_str) != Some(thread_id.as_str()) {
+                model.thread_views_model.set_row_data(index, item);
+            }
+        } else {
+            model.thread_views_model.push(item);
+        }
+        if index < keys.len() {
+            keys[index] = thread_id.clone();
+        } else {
+            keys.push(thread_id.clone());
+        }
+    }
+}
+
 fn thread_for_id<'a>(model: &'a Model, thread_id: &str) -> Option<&'a crate::model::ThreadModel> {
     model
         .thread_index_for_id(thread_id)
         .and_then(|index| model.threads.get(index))
+}
+
+/// Normalize a durable-thread or session alias to the registry key that owns
+/// the retained view. Dirty events may carry either identity, while the
+/// per-thread model registry is intentionally keyed only by durable id.
+fn owner_thread_id(model: &Model, thread_id: &str) -> Option<String> {
+    thread_for_id(model, thread_id).map(|thread| thread.thread_id.clone())
 }
 
 fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
@@ -405,20 +544,13 @@ fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
 }
 
 fn sync_message_snapshot(model: &Model, thread_id: &str) {
-    // Same ownership gate as the three apply_* siblings — do not even build
-    // a diff for a thread that does not own the shared list.
-    if !thread_owns_shared_list(model, thread_id) {
-        return;
-    }
-    let Some(idx) = displayed_thread_for_id(model, thread_id) else {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
         return;
     };
-    let Some(thread) = model.threads.get(idx) else {
-        return;
-    };
-    let old_keys = model.message_model_keys.borrow().clone();
-    let ops = crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &thread.message_rows);
-    apply_message_ops(model, thread_id, &ops);
+    // The retained per-thread model is the previous projection. Reconcile it
+    // in place against the current transcript; no Rust row-cache copy is
+    // needed to service a snapshot notification.
+    apply_thread_message_ops(model, &owner_id, &[]);
 }
 
 fn sync_has_older_messages(model: &Model, component: &ChatPanel, thread_id: &str) {
@@ -439,6 +571,7 @@ fn sync_has_older_messages(model: &Model, component: &ChatPanel, thread_id: &str
 ///
 /// Do not add a fourth apply path without calling this — that is how the
 /// insert leak slipped past the streaming-only fix.
+#[cfg(test)]
 fn thread_owns_shared_list(model: &Model, thread_id: &str) -> bool {
     if thread_id.is_empty() {
         // Empty id = explicit clear / transition sentinel handled by caller.
@@ -455,23 +588,57 @@ fn thread_owns_shared_list(model: &Model, thread_id: &str) -> bool {
 /// Choke point for mutations of the shared on-screen message model. Keeping
 /// the ownership proof attached to the writer prevents a new streaming,
 /// patch, or ops path from accidentally updating another thread's list.
+#[cfg(test)]
 struct GuardedMessagesModel<'a> {
     model: &'a Model,
 }
 
+#[cfg(test)]
 impl<'a> GuardedMessagesModel<'a> {
     fn for_thread(model: &'a Model, thread_id: &str) -> Option<Self> {
         thread_owns_shared_list(model, thread_id).then_some(Self { model })
     }
 }
 
+#[cfg(test)]
 fn apply_message_streaming(model: &Model, thread_id: &str, message_id: &str, delta: &str) {
+    apply_thread_message_streaming(model, thread_id, message_id, delta);
     let Some(guard) = GuardedMessagesModel::for_thread(model, thread_id) else {
         return;
     };
     apply_message_streaming_owned(guard.model, message_id, delta);
 }
 
+fn apply_thread_message_streaming(model: &Model, thread_id: &str, message_id: &str, delta: &str) {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
+        return;
+    };
+    let Some(messages) = model.thread_view_models.get(&owner_id) else {
+        return;
+    };
+    let candidates = [
+        format!("assistant:{message_id}"),
+        format!("thought:{message_id}"),
+        format!("user:{message_id}"),
+        format!("tool:{message_id}"),
+    ];
+    let index = candidates
+        .iter()
+        .find_map(|key| model.thread_view_models.row_index_for(&owner_id, key));
+    let Some(index) = index else {
+        return;
+    };
+    let Some(mut row) = messages.row_data(index) else {
+        return;
+    };
+    row.text = format!("{}{}", row.text, delta).into();
+    messages.set_row_data(index, row.clone());
+    model
+        .thread_view_models
+        .update_tool_group_row(&owner_id, index, row);
+}
+
+#[cfg(test)]
 fn apply_message_streaming_owned(model: &Model, message_id: &str, delta: &str) {
     let candidates = [
         format!("assistant:{message_id}"),
@@ -494,6 +661,7 @@ fn apply_message_streaming_owned(model: &Model, message_id: &str, delta: &str) {
     model.messages_model.set_row_data(index, row);
 }
 
+#[cfg(test)]
 fn thread_matches_owner(model: &Model, thread_id: &str) -> bool {
     let Some(owner) = model.list_owner_thread_id.as_deref() else {
         return false;
@@ -503,7 +671,12 @@ fn thread_matches_owner(model: &Model, thread_id: &str) -> bool {
 
 /// Atomic full install of the shared message list for `thread_id`.
 /// Clears the list when `thread_id` is empty (transition clear).
+#[cfg(test)]
 pub(crate) fn install_message_list_snapshot(model: &Model, thread_id: &str) {
+    // Keep the owning per-thread model warm even while this legacy shared
+    // install path is still active. The destination is the thread's own
+    // model, never another thread's live model.
+    apply_thread_message_ops(model, thread_id, &[]);
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -541,13 +714,33 @@ pub(crate) fn install_message_list_snapshot(model: &Model, thread_id: &str) {
     keys.extend(desired_keys);
 }
 
+#[cfg(test)]
 pub(crate) fn apply_message_row_patch(model: &Model, thread_id: &str, index: usize) {
+    apply_thread_message_row_patch(model, thread_id, index);
     let Some(guard) = GuardedMessagesModel::for_thread(model, thread_id) else {
         return;
     };
     apply_message_row_patch_owned(guard.model, thread_id, index);
 }
 
+fn apply_thread_message_row_patch(model: &Model, thread_id: &str, index: usize) {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
+        return;
+    };
+    if let Some(messages) = model.thread_view_models.get(&owner_id) {
+        if let Some(mut row) = messages.row_data(index) {
+            // Expand/collapse is selected-view UI state. The reducer updates
+            // the scalar flag and this sync boundary applies it to the
+            // owning retained row without reconstructing the transcript.
+            if let Some(expanded) = model.expanded.get(index) {
+                row.expanded = *expanded;
+            }
+            messages.set_row_data(index, row);
+        }
+    }
+}
+
+#[cfg(test)]
 fn apply_message_row_patch_owned(model: &Model, thread_id: &str, index: usize) {
     let Some(idx) = displayed_thread_for_id(model, thread_id) else {
         return;
@@ -682,13 +875,161 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
+    apply_thread_message_ops(model, thread_id, ops);
     let Some(guard) = GuardedMessagesModel::for_thread(model, thread_id) else {
         return;
     };
     apply_message_ops_owned(guard.model, thread_id, ops);
 }
 
+/// Apply message operations to the model owned by `thread_id`. This path has
+/// no selected-thread gate, so a hidden thread can continue streaming into
+/// its retained ChatView without touching the selected thread.
+pub(crate) fn apply_thread_message_ops(
+    model: &Model,
+    thread_id: &str,
+    ops: &[RowOp<crate::MessageItem>],
+) {
+    let Some(owner_id) = owner_thread_id(model, thread_id) else {
+        return;
+    };
+    let Some(messages) = model.thread_view_models.get(&owner_id) else {
+        return;
+    };
+    let (desired_keys, desired_rows) = projected_thread_rows(model, &owner_id);
+    let mut keys = model.thread_view_models.keys(&owner_id).unwrap_or_default();
+
+    for op in ops {
+        match op {
+            RowOp::Insert { at, row } => {
+                let at = (*at).min(messages.row_count()).min(keys.len());
+                messages.insert(at, row.clone());
+                keys.insert(at, desired_keys.get(at).cloned().unwrap_or_default());
+            }
+            RowOp::Remove { at } => {
+                if *at < messages.row_count() && *at < keys.len() {
+                    messages.remove(*at);
+                    keys.remove(*at);
+                }
+            }
+            RowOp::Move { from, to } => {
+                if *from < messages.row_count()
+                    && *to <= messages.row_count()
+                    && *from < keys.len()
+                    && *to <= keys.len()
+                {
+                    let row = messages.remove(*from);
+                    messages.insert(*to, row);
+                    let key = keys.remove(*from);
+                    keys.insert(*to, key);
+                }
+            }
+        }
+    }
+
+    while messages.row_count() > desired_rows.len() {
+        messages.remove(messages.row_count() - 1);
+    }
+    while keys.len() > desired_keys.len() {
+        keys.pop();
+    }
+    for key in desired_keys.iter().skip(keys.len()) {
+        keys.push(key.clone());
+    }
+    for (index, key) in desired_keys.iter().enumerate() {
+        if index < keys.len() {
+            keys[index] = key.clone();
+        }
+    }
+    for (index, row) in desired_rows.into_iter().enumerate() {
+        if index < messages.row_count() {
+            let same = messages
+                .row_data(index)
+                .is_some_and(|existing| message_row_view_eq(&existing, &row));
+            if !same {
+                messages.set_row_data(index, row);
+            }
+        } else {
+            messages.push(row);
+        }
+    }
+    model.thread_view_models.set_keys(&owner_id, keys);
+    let current_rows = (0..messages.row_count())
+        .filter_map(|index| messages.row_data(index))
+        .collect::<Vec<_>>();
+    model
+        .thread_view_models
+        .reconcile_tool_groups(&owner_id, &desired_keys, &current_rows);
+    let fingerprints = desired_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, key)| messages.row_data(index).map(|row| (key.clone(), row)))
+        .collect::<Vec<_>>();
+    model
+        .thread_view_models
+        .set_content_hashes(&owner_id, fingerprints);
+    if std::env::var_os("RUI_THREAD_VIEW_TRACE").is_some() {
+        if let Some(messages) = model.thread_view_models.get(&owner_id) {
+            eprintln!(
+                "thread-view rows thread={} ops={} rows={}",
+                owner_id,
+                ops.len(),
+                messages.row_count()
+            );
+        }
+    }
+}
+
+/// Build the current UI projection directly from durable thread state. The
+/// previous projection, when needed for presentation flags, is read from the
+/// retained per-thread Slint model itself; production has no Rust row cache.
+fn projected_thread_rows(model: &Model, owner_id: &str) -> (Vec<String>, Vec<crate::MessageItem>) {
+    if owner_id.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(thread) = thread_for_id(model, owner_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    #[cfg(test)]
+    if !thread.message_rows.is_empty() {
+        // Legacy unit fixtures seed the retired cache directly. Keep that
+        // compatibility seam test-only; production never compiles or reads
+        // this field.
+        return (thread.transcript_keys.clone(), thread.message_rows.clone());
+    }
+    let transcript = thread.transcript.clone();
+    let queue = thread.send_queue.clone();
+    let in_flight = matches!(
+        thread.state,
+        crate::models::ThreadState::Loading | crate::models::ThreadState::Cancelling
+    );
+    let (mut rows, keys) = crate::models::message_rows_for_thread_with_state(
+        transcript,
+        &[],
+        &queue,
+        in_flight,
+        &mut thread.markdown_render_index.borrow_mut(),
+    );
+    if let (Some(old_keys), Some(old_rows)) = (
+        model.thread_view_models.keys(owner_id),
+        model.thread_view_models.rows(owner_id),
+    ) {
+        let mut expanded_by_key = std::collections::HashMap::new();
+        for (key, row) in old_keys.iter().zip(old_rows.iter()) {
+            expanded_by_key.insert(key.as_str(), row.expanded);
+        }
+        for (key, row) in keys.iter().zip(rows.iter_mut()) {
+            if let Some(expanded) = expanded_by_key.get(key.as_str()) {
+                row.expanded = *expanded;
+            }
+        }
+    }
+    (keys, rows)
+}
+
+#[cfg(test)]
 fn apply_message_ops_owned(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
@@ -882,9 +1223,13 @@ fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::mod
         &model.agent_catalog,
         current,
     ));
-    // Compose trigger shows provider/agent id, not raw profile name.
+    // Compose trigger shows provider/agent id, not raw profile name. See
+    // `models::resolve_provider_trigger_label`'s doc comment for why this
+    // falls back to `thread.provider` instead of calling
+    // `current_provider_trigger_label` directly.
     component.set_profile_trigger_label(
-        crate::models::current_provider_trigger_label(&profile_rows, current).into(),
+        crate::models::resolve_provider_trigger_label(&profile_rows, current, &thread.provider)
+            .into(),
     );
     component.set_active_thread_has_session(thread.session_id.is_some());
 }
@@ -926,10 +1271,17 @@ fn sync_model_dropdown_for_provider(
 /// so the no-fallback behavior is unit-testable without constructing a
 /// live `ChatPanel` (see this module's tests for the regression pin).
 fn sync_commands_model(model: &Model, thread: &crate::model::ThreadModel) {
+    let needle = thread.command_filter.to_lowercase();
+    let bypass = needle.is_empty() || thread.command_filter == "'";
     model.commands_model.set_vec(
         thread
             .available_commands
             .iter()
+            .filter(|command| {
+                bypass
+                    || command.name.to_lowercase().contains(&needle)
+                    || command.description.to_lowercase().contains(&needle)
+            })
             .map(|command| crate::SkillOption {
                 name: command.name.clone().into(),
                 description: command.description.clone().into(),
@@ -937,6 +1289,123 @@ fn sync_commands_model(model: &Model, thread: &crate::model::ThreadModel) {
             })
             .collect::<Vec<_>>(),
     );
+}
+
+/// Filters the central-registry MCP server list down to the entries that
+/// still need their own settings row, excluding whichever one(s) match
+/// the built-in daemon's own name(s)
+/// (`agent_bridge::is_builtin_snapflow_mcp_name` -- `"snapflow"` or its
+/// wire alias `"snapshotd"`). Extracted as a pure, `ChatPanel`-free
+/// function so the dedup this exists for (see
+/// [`reconcile_settings_models`]'s call site comment) is unit-testable
+/// without a live Slint platform.
+fn registry_mcp_servers_excluding_builtin(
+    servers: &[crate::protocol_types::McpServerEntry],
+) -> Vec<crate::protocol_types::McpServerEntry> {
+    servers
+        .iter()
+        .filter(|server| !crate::agent_bridge::is_builtin_snapflow_mcp_name(&server.name))
+        .cloned()
+        .collect()
+}
+
+/// Merges the real, registry-synced `"snapflow"`/`"snapshotd"` entry's
+/// live-fetched tool state onto the synthetic built-in row, if the watcher
+/// (`agent_bridge::ensure_snapshotd_watcher_started`) has synced one yet.
+///
+/// Real, live-found bug (mcp-servers-settings follow-up): the synthetic
+/// row from `models::builtin_snapshotd_option` has no registry entry of
+/// its own, so it always renders `tool_fetch_status: ""` and `tools: []`
+/// by construction -- but `mcp_servers/tools_fetch` (fired by the Fetch
+/// button on that exact row) actually targets the *real* registry entry
+/// the watcher synced (see `agent_bridge::builtin_snapflow_registry_
+/// entry`'s doc comment), and `registry_mcp_servers_excluding_builtin`
+/// deliberately drops that real entry from the displayed list so it isn't
+/// rendered a second time. Without this merge, a completed fetch had
+/// nowhere to land: the user would see the one-shot "Fetching tools for
+/// snapflow..." toast, the backend probe would succeed, and the row would
+/// still show "No tools discovered yet" forever. Extracted as a pure,
+/// `ChatPanel`-free function so this is unit-testable without a live
+/// Slint platform, same convention as
+/// [`registry_mcp_servers_excluding_builtin`].
+fn merge_builtin_snapshotd_tool_state(
+    builtin: &mut crate::McpServerOption,
+    registry_servers: &[crate::protocol_types::McpServerEntry],
+    busy_keys: &[String],
+) {
+    let Some(real_entry) = registry_servers
+        .iter()
+        .find(|server| crate::agent_bridge::is_builtin_snapflow_mcp_name(&server.name))
+    else {
+        return;
+    };
+    let Some(real_row) =
+        crate::models::to_mcp_server_option_rows(vec![real_entry.clone()], busy_keys)
+            .into_iter()
+            .next()
+    else {
+        return;
+    };
+    builtin.tools = real_row.tools;
+    builtin.tool_fetch_status = real_row.tool_fetch_status;
+    builtin.tool_fetch_error = real_row.tool_fetch_error;
+    builtin.tools_search_blob = real_row.tools_search_blob;
+}
+
+/// True when the currently selected thread's provider has a stored
+/// pool-acquire probe failure (`Model::provider_errors`, populated from
+/// `AgentEvent::ProviderProbe` on a provider-picker toggle -- see
+/// `update_frame`'s `ProviderProbe` arm). Keyed off the *selected*
+/// thread's provider specifically, not "any provider_errors entry
+/// exists" -- a stale probe failure for a provider the user has since
+/// switched away from (or a different thread's provider) must not block
+/// Send on an unrelated, healthy thread. Extracted as a pure,
+/// `ChatPanel`-free function so it's unit-testable without a live Slint
+/// platform, same convention as
+/// [`registry_mcp_servers_excluding_builtin`].
+fn selected_provider_unavailable(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.provider_errors.contains_key(&thread.provider))
+}
+
+/// True while the currently selected/displayed thread's provider has a
+/// `probe_provider_selection` acquire+release round-trip in flight
+/// (`Model::provider_probes_in_flight`, populated in `SettingsMsg::
+/// ProfileSelected`'s reducer arm and cleared in `update_frame`'s
+/// `ProviderProbe` arm on Ok *or* Err). Drives the chat-view pulsing
+/// "Switching provider..." indicator (`ChatArea.provider-switching`) --
+/// deliberately loading-only: the probe's *error* text still flows only
+/// through the existing `provider_errors` map / toast
+/// (`selected_provider_unavailable` above, `show_toast` in `update_frame`),
+/// not duplicated into a second chat-view-local error surface. Same
+/// "keyed off the selected thread's own provider, not any in-flight probe
+/// anywhere" contract as `selected_provider_unavailable`, and same pure,
+/// `ChatPanel`-free shape so it's unit-testable without a live Slint
+/// platform.
+fn chat_view_provider_switching(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.provider_probes_in_flight.contains(&thread.provider))
+}
+
+/// True while the currently selected/displayed thread's FIRST real ACP
+/// session attach (deferred to first send -- `dispatch::dispatch_compose_
+/// send_maybe_attach`) is in flight (`Model::first_attach_in_flight`,
+/// populated by `EffectResultMsg::SessionAttachStarted` and cleared either
+/// by `update_frame`'s `frame.thread_list_snapshot` fold on success or by
+/// `SessionAttached`'s `Err` arm / `AgentEvent::Error` on failure). Drives
+/// the chat-view pulsing "Starting new thread..." indicator
+/// (`ChatArea.first-attach-in-flight`) -- same "keyed off the selected
+/// thread's own identity, not any in-flight attach anywhere" contract as
+/// `chat_view_provider_switching` above (there keyed by provider, here by
+/// thread_id since this is inherently a per-thread transition), and same
+/// pure, `ChatPanel`-free shape so it's unit-testable without a live
+/// Slint platform.
+fn chat_view_first_attach_in_flight(model: &Model) -> bool {
+    crate::update::selected_real_index(model)
+        .and_then(|idx| model.threads.get(idx))
+        .is_some_and(|thread| model.first_attach_in_flight.contains(&thread.thread_id))
 }
 
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
@@ -958,34 +1427,80 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     // non-blocking; the control-socket poll runs on its own thread.
     let mut mcp_rows = Vec::new();
     let mut mcp_keys: Vec<String> = Vec::new();
-    if let Some(builtin) =
+    if let Some(mut builtin) =
         crate::models::builtin_snapshotd_option(crate::agent_bridge::snapshotd_mcp_addr())
     {
+        // See `merge_builtin_snapshotd_tool_state`'s doc comment: the
+        // watcher-synced real "snapflow" registry entry is what
+        // `mcp_servers/tools_fetch` actually targets, and its live-fetched
+        // tool state must land on this synthetic row or a completed fetch
+        // has nowhere to surface.
+        merge_builtin_snapshotd_tool_state(
+            &mut builtin,
+            &model.available_mcp_servers,
+            &model.mcp_operations_in_flight,
+        );
         mcp_keys.push(builtin.name.to_string());
         mcp_rows.push(builtin);
     }
+    // `model.available_mcp_servers` can legitimately contain an entry under
+    // the built-in daemon's own name(s) (`agent_bridge::
+    // is_builtin_snapflow_mcp_name` -- `"snapflow"` or its wire alias
+    // `"snapshotd"`) once the watcher's registry sync lands, *in addition*
+    // to the synthetic row prepended above (whose tool state that entry
+    // was just merged into, if present). Left unfiltered, both would
+    // render, showing two rows for the same daemon (found live: PUI-015
+    // mcp-servers-settings follow-up). The synthetic row stays the single
+    // *display* source of truth for this row (it's always present,
+    // non-removable, and reflects the live toggle even before any
+    // registry sync succeeds), so the registry row itself is excluded
+    // here rather than rendered a second time.
+    let extra_mcp_servers = registry_mcp_servers_excluding_builtin(&model.available_mcp_servers);
     mcp_rows.extend(crate::models::to_mcp_server_option_rows(
-        model.available_mcp_servers.clone(),
+        extra_mcp_servers.clone(),
+        &model.mcp_operations_in_flight,
     ));
-    mcp_keys.extend(
-        model
-            .available_mcp_servers
-            .iter()
-            .map(|server| server.name.clone()),
-    );
+    mcp_keys.extend(extra_mcp_servers.iter().map(|server| server.name.clone()));
     crate::list_model::reconcile(
         &model.mcp_servers_model,
         &mut model.mcp_server_model_keys.borrow_mut(),
         &mcp_keys,
         &mcp_rows,
     );
+    // Total real tools discovered across every server's reconciled list
+    // (`mcp_tools_from_entry` already merges live-fetched + persisted
+    // rows) -- shown as a summary next to the "MCP Servers" section
+    // header, computed here rather than in Slint since it has no
+    // array-sum/reduce.
+    let mcp_tools_total_count: i32 = mcp_rows
+        .iter()
+        .map(|row| row.tools.row_count() as i32)
+        .sum();
 
+    // Settings > Project is an installed-agent view. Filter the UI model at
+    // reconciliation time so hidden catalog entries do not consume grid
+    // rows or leave an incorrect non-empty state. Keep model.agent_catalog
+    // untouched: the complete gateway catalog is still needed by profile
+    // resolution and Global settings. Re-running this on every Settings
+    // snapshot also picks up install/uninstall/status changes immediately.
+    let visible_agents: Vec<_> = model
+        .agent_catalog
+        .iter()
+        .filter(|agent| {
+            model.settings_scope != "project"
+                || matches!(
+                    &agent.status,
+                    crate::protocol_types::AgentStatus::Installed
+                        | crate::protocol_types::AgentStatus::InstalledNoSession
+                )
+        })
+        .cloned()
+        .collect();
     let agent_rows = crate::models::to_agent_catalog_entry_rows(
-        model.agent_catalog.clone(),
+        visible_agents.clone(),
         &model.agent_operations_in_flight,
     );
-    let agent_keys: Vec<String> = model
-        .agent_catalog
+    let agent_keys: Vec<String> = visible_agents
         .iter()
         .map(|agent| agent.id.clone())
         .collect();
@@ -999,6 +1514,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let session_rows = crate::models::to_remote_session_option_rows(
         model.recoverable_sessions.clone(),
         &model.recovery_provider,
+        &model.recover_session_operations_in_flight,
     );
     let session_keys: Vec<String> = model
         .recoverable_sessions
@@ -1014,7 +1530,19 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
 
     component.set_available_profiles(slint::ModelRc::from(model.profiles_model.clone()));
     component.set_available_mcp_servers(slint::ModelRc::from(model.mcp_servers_model.clone()));
+    component.set_mcp_tools_total_count(mcp_tools_total_count);
+    // Only one add/edit form can be open at a time, so "any create/update
+    // in flight" is an accurate proxy for "the visible form's own submit
+    // is in flight" without needing to match a specific server name (see
+    // `McpServersView.submit-busy`'s own doc comment).
+    let mcp_server_submit_busy = model
+        .mcp_operations_in_flight
+        .iter()
+        .any(|key| key.starts_with("create:") || key.starts_with("update:"));
+    component.set_mcp_server_submit_busy(mcp_server_submit_busy);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
+    component.set_agent_catalog_fetched(model.agent_catalog_fetched);
+    component.set_selected_provider_unavailable(selected_provider_unavailable(model));
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),
     ));
@@ -1036,9 +1564,39 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
             {
                 sync_profile_picker(model, component, thread);
             }
+            // mcp-servers-settings follow-up: same reasoning as the
+            // profile-picker resync just above -- a thread switch can
+            // land on a thread whose OWN provider probe is (or isn't)
+            // in flight, and nothing else re-fires for a pure selection
+            // change, so recompute the singleton pulse property here too.
+            component.set_selected_provider_switching(chat_view_provider_switching(model));
+            // mcp-servers-settings follow-up: same reasoning again -- a
+            // thread switch can land on a thread whose OWN first-attach
+            // is (or isn't) in flight.
+            component
+                .set_selected_first_attach_in_flight(chat_view_first_attach_in_flight(model));
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());
+            let selected_id = crate::update::selected_real_index(model)
+                .and_then(|idx| model.threads.get(idx))
+                .map(|thread| thread.thread_id.as_str());
+            if let Some(selected_id) = selected_id {
+                let row_index = model
+                    .thread_views_model_keys
+                    .borrow()
+                    .iter()
+                    .position(|key| key == selected_id);
+                if let Some(row_index) = row_index {
+                    if let Some(mut item) = model.thread_views_model.row_data(row_index) {
+                        let draft: slint::SharedString = model.compose_text.clone().into();
+                        if item.compose_text != draft {
+                            item.compose_text = draft;
+                            model.thread_views_model.set_row_data(row_index, item);
+                        }
+                    }
+                }
+            }
         }
         ScalarField::SettingsOpen => {
             component.set_settings_open(model.settings_open);
@@ -1116,11 +1674,13 @@ pub(crate) fn sync_language(language: &str) {
 
 pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_threads(slint::ModelRc::from(model.thread_model.clone()));
-    component.set_messages(slint::ModelRc::from(model.messages_model.clone()));
+    apply_thread_view_ops(model);
+    component.set_thread_views(slint::ModelRc::from(model.thread_views_model.clone()));
     component.set_available_skills(slint::ModelRc::from(model.skills_model.clone()));
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
     component.set_open_terminal_tabs(slint::ModelRc::from(model.open_terminals_model.clone()));
+    component.set_onboarding_completed(model.onboarding_completed);
     reconcile_settings_models(model, component);
 }
 
@@ -1140,6 +1700,293 @@ mod tests {
     use super::*;
     use crate::models::VisibleThreadItem;
     use std::rc::Rc;
+
+    /// Regression test for a real, live-found duplicate-row bug (PUI-015
+    /// mcp-servers-settings follow-up): `reconcile_settings_models`
+    /// always prepends a synthetic, non-removable `"snapflow"` row from
+    /// `models::builtin_snapshotd_option`, but the background watcher
+    /// (`agent_bridge::ensure_snapshotd_watcher_started`) separately
+    /// syncs a *real* `"snapflow"` row into the central registry so
+    /// `mcp_servers/tools_fetch` has a target to query. Once that sync
+    /// lands, `model.available_mcp_servers` legitimately contains an
+    /// entry under one of `agent_bridge::is_builtin_snapflow_mcp_name`'s
+    /// aliases too -- without filtering, Settings would render two rows
+    /// for the same built-in daemon. This pins
+    /// `registry_mcp_servers_excluding_builtin` (the fix) to actually
+    /// drop both aliased names, using the exact dual-name equivalence
+    /// `is_builtin_snapflow_mcp_name` already defines, while leaving
+    /// unrelated user-added servers untouched.
+    #[test]
+    fn registry_mcp_servers_excluding_builtin_drops_both_builtin_aliases_only() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
+
+        let http_entry = |name: &str| McpServerEntry {
+            name: name.to_string(),
+            enabled: true,
+            config: McpServerConfig::Http {
+                url: format!("http://127.0.0.1:1/{name}"),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+            auth_status: None,
+            tool_catalog: None,
+            extra: Default::default(),
+        };
+
+        let servers = vec![
+            http_entry("snapflow"),
+            http_entry("snapshotd"),
+            http_entry("my-custom-server"),
+        ];
+
+        let filtered = registry_mcp_servers_excluding_builtin(&servers);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["my-custom-server"],
+            "both built-in aliases must be excluded so the synthetic prepended row \
+             (models::builtin_snapshotd_option) is the only row rendered for the \
+             built-in daemon -- a real registry sync must never produce a second, \
+             visually-duplicate 'snapflow' row"
+        );
+    }
+
+    /// Regression test for the "Fetching tools for snapflow..." toast
+    /// firing but the row never actually showing the fetched tools (real
+    /// user report, mcp-servers-settings follow-up part 2): once the
+    /// watcher-synced real "snapflow" registry entry has a `Ready`
+    /// `tool_catalog` (a completed `mcp_servers/tools_fetch`),
+    /// `merge_builtin_snapshotd_tool_state` must copy that fetched tool
+    /// list, status, and search blob onto the synthetic built-in row --
+    /// otherwise the real result is computed successfully but has nowhere
+    /// to land, since `registry_mcp_servers_excluding_builtin` drops the
+    /// real entry from the displayed list entirely.
+    #[test]
+    fn merge_builtin_snapshotd_tool_state_surfaces_a_completed_fetch() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry, McpToolCatalog, McpToolInfo};
+
+        let real_entry = McpServerEntry {
+            name: "snapflow".to_string(),
+            enabled: true,
+            config: McpServerConfig::Http {
+                url: "http://127.0.0.1:9/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+            auth_status: None,
+            tool_catalog: Some(McpToolCatalog::Ready {
+                tools: vec![McpToolInfo {
+                    name: "render_frame".to_string(),
+                    description: Some("Renders a video frame".to_string()),
+                }],
+            }),
+            extra: Default::default(),
+        };
+
+        let mut builtin = crate::models::builtin_snapshotd_option(Some("127.0.0.1:9".to_string()))
+            .expect("builtin row present when reachable");
+        // Sanity: the synthetic row starts with no tool state of its own,
+        // same defaults `models::builtin_snapshotd_option` always sets.
+        assert_eq!(builtin.tool_fetch_status.as_str(), "");
+        assert_eq!(builtin.tools.row_count(), 0);
+
+        merge_builtin_snapshotd_tool_state(&mut builtin, &[real_entry], &[]);
+
+        assert_eq!(
+            builtin.tool_fetch_status.as_str(),
+            "ready",
+            "a completed fetch on the real registry entry must surface on the \
+             synthetic row's fetch status, not stay stuck empty"
+        );
+        assert_eq!(builtin.tools.row_count(), 1);
+        assert_eq!(
+            builtin.tools.row_data(0).unwrap().name.as_str(),
+            "render_frame"
+        );
+        assert!(builtin.tools_search_blob.as_str().contains("render_frame"));
+    }
+
+    /// A still-in-flight fetch (`Fetching` catalog state, or no catalog yet
+    /// but a matching `tools_fetch:<name>` busy key) must also reach the
+    /// synthetic row -- this is what lets the Fetch button's spinner and
+    /// the "Fetching tools from server…" inline row actually show while
+    /// the real probe against the registry entry is still running.
+    #[test]
+    fn merge_builtin_snapshotd_tool_state_surfaces_in_flight_fetch() {
+        use crate::protocol_types::{McpServerConfig, McpServerEntry};
+
+        let real_entry = McpServerEntry {
+            name: "snapflow".to_string(),
+            enabled: true,
+            config: McpServerConfig::Http {
+                url: "http://127.0.0.1:9/mcp".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+            auth_status: None,
+            tool_catalog: None,
+            extra: Default::default(),
+        };
+
+        let mut builtin = crate::models::builtin_snapshotd_option(Some("127.0.0.1:9".to_string()))
+            .expect("builtin row present when reachable");
+
+        merge_builtin_snapshotd_tool_state(
+            &mut builtin,
+            &[real_entry],
+            &["tools_fetch:snapflow".to_string()],
+        );
+
+        assert_eq!(
+            builtin.tool_fetch_status.as_str(),
+            "fetching",
+            "an in-flight tools_fetch kickoff (no catalog yet, but a matching busy \
+             key) must show as 'fetching' on the synthetic row so the Fetch \
+             button spinner and inline status text actually activate"
+        );
+    }
+
+    /// No real registry entry synced yet (watcher hasn't run, or no
+    /// gateway existed when it last ticked): the synthetic row must keep
+    /// its placeholder defaults rather than panicking or clearing
+    /// something that was never there.
+    #[test]
+    fn merge_builtin_snapshotd_tool_state_is_a_no_op_without_a_real_entry() {
+        let mut builtin = crate::models::builtin_snapshotd_option(Some("127.0.0.1:9".to_string()))
+            .expect("builtin row present when reachable");
+
+        merge_builtin_snapshotd_tool_state(&mut builtin, &[], &[]);
+
+        assert_eq!(builtin.tool_fetch_status.as_str(), "");
+        assert_eq!(builtin.tools.row_count(), 0);
+    }
+
+    fn model_with_one_thread(provider: &str) -> Model {
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-0".to_owned(),
+            provider: provider.to_owned(),
+            ..Default::default()
+        });
+        model.selected_thread = 0;
+        model
+    }
+
+    /// Regression test for the provider-toggle pool-auth-probe feature
+    /// (`AgentEvent::ProviderProbe` -> `Model::provider_errors`): Send
+    /// must be gated on the *selected* thread's own provider, not on
+    /// `provider_errors` being non-empty anywhere -- a stored failure for
+    /// a provider the selected thread isn't even using must not block
+    /// Send on that thread.
+    #[test]
+    fn selected_provider_unavailable_is_keyed_to_the_selected_threads_own_provider() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !selected_provider_unavailable(&model),
+            "no stored provider error yet -- Send must stay enabled"
+        );
+
+        model
+            .provider_errors
+            .insert("some-other-provider".to_owned(), "auth failed".to_owned());
+        assert!(
+            !selected_provider_unavailable(&model),
+            "a stored error for a provider the selected thread isn't using must not \
+             block Send on this thread"
+        );
+
+        model
+            .provider_errors
+            .insert("codex-acp".to_owned(), "auth failed".to_owned());
+        assert!(
+            selected_provider_unavailable(&model),
+            "a stored error for the selected thread's own provider must block Send"
+        );
+
+        model.provider_errors.remove("codex-acp");
+        assert!(
+            !selected_provider_unavailable(&model),
+            "clearing the selected thread's provider error must re-enable Send"
+        );
+    }
+
+    /// mcp-servers-settings follow-up: same "keyed off the selected
+    /// thread's own provider" contract as
+    /// `selected_provider_unavailable_is_keyed_to_the_selected_threads_own_provider`
+    /// above, for the sibling loading signal that drives the chat-view
+    /// pulsing "Switching provider..." indicator.
+    #[test]
+    fn chat_view_provider_switching_is_keyed_to_the_selected_threads_own_provider() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !chat_view_provider_switching(&model),
+            "no probe in flight yet -- no pulse"
+        );
+
+        model
+            .provider_probes_in_flight
+            .insert("some-other-provider".to_owned());
+        assert!(
+            !chat_view_provider_switching(&model),
+            "an in-flight probe for a provider the selected thread isn't using must not \
+             pulse this thread's chat view"
+        );
+
+        model
+            .provider_probes_in_flight
+            .insert("codex-acp".to_owned());
+        assert!(
+            chat_view_provider_switching(&model),
+            "an in-flight probe for the selected thread's own provider must pulse"
+        );
+
+        model.provider_probes_in_flight.remove("codex-acp");
+        assert!(
+            !chat_view_provider_switching(&model),
+            "clearing the in-flight marker must stop the pulse"
+        );
+    }
+
+    /// mcp-servers-settings follow-up: same "keyed off the selected
+    /// thread's own identity" contract as
+    /// `chat_view_provider_switching_is_keyed_to_the_selected_threads_own_provider`
+    /// above, for the sibling first-attach loading signal that drives the
+    /// chat-view pulsing "Starting new thread..." indicator -- here keyed
+    /// by thread_id rather than provider, since a first-attach is
+    /// inherently a per-thread transition.
+    #[test]
+    fn chat_view_first_attach_in_flight_is_keyed_to_the_selected_threads_own_thread_id() {
+        let mut model = model_with_one_thread("codex-acp");
+        assert!(
+            !chat_view_first_attach_in_flight(&model),
+            "no attach in flight yet -- no pulse"
+        );
+
+        model
+            .first_attach_in_flight
+            .insert("some-other-thread".to_owned());
+        assert!(
+            !chat_view_first_attach_in_flight(&model),
+            "an in-flight attach for a thread that isn't selected must not pulse this \
+             thread's chat view"
+        );
+
+        model.first_attach_in_flight.insert("thread-0".to_owned());
+        assert!(
+            chat_view_first_attach_in_flight(&model),
+            "an in-flight attach for the selected thread's own id must pulse"
+        );
+
+        model.first_attach_in_flight.remove("thread-0");
+        assert!(
+            !chat_view_first_attach_in_flight(&model),
+            "clearing the in-flight marker must stop the pulse"
+        );
+    }
 
     #[test]
     fn thread_row_ops_apply_to_the_persistent_model_and_key_cache() {
@@ -1355,9 +2202,6 @@ mod tests {
                 crate::dirty::Dirty::MessagesDiff { thread_id, ops } => {
                     apply_message_ops(&model, thread_id, ops);
                 }
-                crate::dirty::Dirty::MessageListInstall { thread_id } => {
-                    install_message_list_snapshot(&model, thread_id);
-                }
                 _ => {}
             }
         }
@@ -1467,12 +2311,79 @@ mod tests {
     }
 
     #[test]
+    fn thread_row_pushes_an_unread_to_read_transition_when_nothing_else_changed() {
+        // Regression: apply_thread_selection_switch (update.rs) clears
+        // ThreadModel.unread and returns Dirty::ThreadRow for the newly
+        // displayed thread, but apply_thread_row's `needs_write` comparison
+        // used to omit `unread` from the field list entirely. When opening
+        // a thread flips unread true -> false with every other display
+        // field identical (the common real case: no other content changed
+        // at the moment of selection), `needs_write` came back `false` and
+        // `set_row_data` was skipped -- the Slint-side ThreadItem.unread
+        // stayed `true` and the sidebar status dot never left its unread
+        // color, even though model.threads[idx].unread was correctly
+        // cleared on the Rust side. update.rs's own
+        // `selecting_an_unread_thread_marks_it_read` test only asserts the
+        // Rust-side flag and never calls apply_thread_row, so it could not
+        // catch this: the gap was entirely in sync.rs's projection step.
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-0".to_owned(),
+            display_name: "Fix timeline crash".to_owned(),
+            state: crate::models::ThreadState::Idle,
+            unread: true,
+            ..crate::model::ThreadModel::default()
+        });
+        model.thread_model.push(crate::ThreadItem {
+            name: "Fix timeline crash".into(),
+            status: "idle".into(),
+            // `open` is hardcoded to `true` by every real
+            // `visible_thread_row` call, so it must already be `true` here
+            // too -- otherwise the pre-existing `open` mismatch alone would
+            // force `needs_write`, masking whether the `unread` field is
+            // actually compared.
+            open: true,
+            unread: true,
+            ..crate::ThreadItem::default()
+        });
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned()];
+        model.visible_indices = vec![0];
+        model.thread_rows.push(VisibleThreadItem {
+            session_id: None,
+            agent_detected: None,
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            item: crate::ThreadItem {
+                name: "Fix timeline crash".into(),
+                status: "idle".into(),
+                open: true,
+                unread: true,
+                ..crate::ThreadItem::default()
+            },
+        });
+
+        // Same "becoming displayed clears unread" step apply_thread_selection_switch
+        // performs, in isolation.
+        model.threads[0].unread = false;
+        apply_thread_row(&model, 0);
+
+        let row = model.thread_model.row_data(0).unwrap();
+        assert!(
+            !row.unread,
+            "opening a thread must clear the Slint-side unread flag even when \
+             no other display field changed"
+        );
+    }
+
+    #[test]
     fn message_streaming_delta_resolves_by_stable_id_not_position() {
         let mut model = Model::default();
         model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-1".to_owned(),
             session_id: Some("thread-1".to_owned()),
             ..crate::model::ThreadModel::default()
         });
+        model.rebuild_thread_indices();
         model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "hello".into(),
@@ -1513,14 +2424,17 @@ mod tests {
         let mut model = Model::default();
         model.threads.extend([
             crate::model::ThreadModel {
+                thread_id: "displayed-thread".to_owned(),
                 session_id: Some("displayed-thread".to_owned()),
                 ..crate::model::ThreadModel::default()
             },
             crate::model::ThreadModel {
+                thread_id: "background-thread".to_owned(),
                 session_id: Some("background-thread".to_owned()),
                 ..crate::model::ThreadModel::default()
             },
         ]);
+        model.rebuild_thread_indices();
         model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "displayed".into(),
@@ -1528,9 +2442,25 @@ mod tests {
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:shared-id".to_owned()];
 
+        let background = model
+            .thread_view_models
+            .get("background-thread")
+            .expect("background thread owns a retained model");
+        background.push(crate::MessageItem {
+            text: "displayed".into(),
+            ..crate::MessageItem::default()
+        });
+        model
+            .thread_view_models
+            .set_keys("background-thread", vec!["assistant:shared-id".to_owned()]);
+
         apply_message_streaming(&model, "background-thread", "shared-id", " must not appear");
 
         assert_eq!(model.messages_model.row_data(0).unwrap().text, "displayed");
+        assert_eq!(
+            background.row_data(0).unwrap().text,
+            "displayed must not appear"
+        );
     }
 
     #[test]
@@ -1960,6 +2890,7 @@ mod tests {
     fn message_snapshot_reconciles_rows_without_replacing_the_model() {
         let mut model = Model::default();
         model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-1".to_owned(),
             session_id: Some("thread-1".to_owned()),
             transcript_keys: vec!["assistant:m-1".to_owned()],
             message_rows: vec![crate::MessageItem {
@@ -1968,19 +2899,25 @@ mod tests {
             }],
             ..crate::model::ThreadModel::default()
         });
+        model.rebuild_thread_indices();
         model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "old".into(),
             ..crate::MessageItem::default()
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:m-1".to_owned()];
-        let model_identity = model.messages_model.clone();
+        let model_identity = model
+            .thread_view_models
+            .get("thread-1")
+            .expect("thread owns a retained message model");
 
         sync_message_snapshot(&model, "thread-1");
 
-        assert!(std::rc::Rc::ptr_eq(&model_identity, &model.messages_model));
-        assert_eq!(*model.message_model_keys.borrow(), vec!["assistant:m-1"]);
-        assert_eq!(model.messages_model.row_data(0).unwrap().text, "updated");
+        assert!(std::rc::Rc::ptr_eq(
+            &model_identity,
+            &model.thread_view_models.get("thread-1").unwrap()
+        ));
+        assert_eq!(model_identity.row_data(0).unwrap().text, "updated");
     }
 
     #[test]
@@ -2000,6 +2937,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/some-local-skill"),
                 scope: crate::skills_state::SkillScope::Global,
                 started_from: None,
+                is_dev_only: false,
             },
             crate::skills_state::SkillEntry {
                 name: "another-skill".to_owned(),
@@ -2007,6 +2945,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/another-skill"),
                 scope: crate::skills_state::SkillScope::Project,
                 started_from: None,
+                is_dev_only: false,
             },
         ];
         let thread = crate::model::ThreadModel {
@@ -2037,6 +2976,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/some-local-skill"),
             scope: crate::skills_state::SkillScope::Global,
             started_from: None,
+            is_dev_only: false,
         }];
         let thread = crate::model::ThreadModel {
             available_commands: vec![crate::protocol_types::AvailableCommandInfo {

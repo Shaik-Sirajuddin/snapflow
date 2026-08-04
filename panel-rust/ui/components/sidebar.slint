@@ -4,6 +4,7 @@ import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
 import { NavItem } from "../base/nav_item.slint";
+import { Toggle } from "../base/toggle.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
 import { TextUtil } from "../base/text_util.slint";
@@ -23,6 +24,13 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // PUI-016 fix: was a local property on the conditionally-instantiated
+    // `archived-section` (`if root.expanded : archived-section := ...`)
+    // below -- Slint destroys/recreates conditional elements, so every
+    // sidebar collapse/reopen (root.expanded false->true) silently reset
+    // this back to its `false` default, losing the user's collapse choice.
+    // Hoisted here (always-present) so it survives.
+    property <bool> archived-collapsed: true;
     // Project identity is independent from the panel-level ACPX server
     // connection. A gateway-backed panel can create an unscoped first chat.
     in property <bool> project-open: false;
@@ -65,6 +73,7 @@ export component Sidebar inherits Rectangle {
     callback search-submitted(string, bool, bool);
     callback settings-requested();
     callback skills-settings-requested();
+    callback global-skills-toggled(bool);
 
     // Skill-manager sidebar mode -- `sidebar_skill_tree_and_new_skill_flow`
     // phase. `skill-mode` sibling-swaps the thread list for a skill list
@@ -74,7 +83,7 @@ export component Sidebar inherits Rectangle {
     in property <[SkillOption]> skills: [];
     // Project skills are the primary list. This control adds global skills
     // to the current project view; it is not a mutually-exclusive scope tab.
-    property <bool> show-global-skills: false;
+    in-out property <bool> show-global-skills: false;
     in-out property <string> search-query: "";
     // Fired with the user-entered name and selected scope once the
     // dialog is confirmed; Rust creates the scaffolded SKILL.md and
@@ -121,6 +130,17 @@ export component Sidebar inherits Rectangle {
         if (root.rename-thread-index >= 0 && root.rename-focus-target == "sidebar") {
             root.rename-focus-index = root.rename-thread-index;
         }
+    }
+
+    // settings_search_reparse_on_clear: the Rust-side filtered thread
+    // list (`visible_indices`) only rebuilds when `search-changed` fires,
+    // which previously only happened from the TextInput's `edited` event
+    // (a real keystroke) -- a programmatic clear of `search-query` (e.g.
+    // closing the search UI) bypassed that, leaving the filtered list
+    // stuck on the last typed query. React to the property itself so any
+    // change, not just typed edits, re-syncs it.
+    changed search-query => {
+        root.search-changed(root.search-query);
     }
 
     // Per-thread identity accent -- deliberately the one departure from
@@ -396,41 +416,32 @@ export component Sidebar inherits Rectangle {
             height: 32px;
             background: Theme.bg-sidebar;
             HorizontalLayout {
+                width: parent.width;
                 padding-left: Metrics.space-5;
                 padding-right: Metrics.space-5;
                 padding-bottom: Metrics.space-2;
                 spacing: Metrics.space-2;
                 cross-axis-alignment: center;
-                show-global-skills-touch := TouchArea {
-                    mouse-cursor: pointer;
+                Text {
+                    text: "Show global skills";
+                    color: Theme.text-secondary;
+                    font-size: 10px * Theme.font-scale;
+                    font-weight: root.show-global-skills ? 700 : 400;
+                    vertical-alignment: center;
                     horizontal-stretch: 0;
-                    accessible-role: button;
-                    accessible-label: root.show-global-skills
-                        ? "Hide global skills"
-                        : "Show global skills";
-                    accessible-action-default => { root.show-global-skills = !root.show-global-skills; }
-                    clicked => { root.show-global-skills = !root.show-global-skills; }
-                    Rectangle {
-                        height: 24px;
-                        background: root.show-global-skills || show-global-skills-touch.has-hover
-                            ? Theme.bg-primary-container
-                            : transparent;
-                        animate background { duration: 100ms; }
-                        border-radius: Theme.radius-sm;
-                        HorizontalLayout {
-                            padding-left: Metrics.space-2;
-                            padding-right: Metrics.space-2;
-                            spacing: Metrics.space-1;
-                            Text {
-                                text: "Show global skills";
-                                color: root.show-global-skills || show-global-skills-touch.has-hover
-                                    ? Theme.text-primary
-                                    : Theme.text-secondary;
-                                font-size: 10px * Theme.font-scale;
-                                font-weight: root.show-global-skills ? 700 : 400;
-                                vertical-alignment: center;
-                            }
-                        }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                }
+                Toggle {
+                    horizontal-stretch: 0;
+                    checked: root.show-global-skills;
+                    toggle-accessible-label: "Show global skills";
+                    toggled(new-checked) => {
+                        root.show-global-skills = new-checked;
+                        root.global-skills-toggled(new-checked);
                     }
                 }
             }
@@ -551,7 +562,7 @@ export component Sidebar inherits Rectangle {
             min-height: 0px;
             spacing: 0px;
 
-            // --- Active (and, when collapsed, all) threads -------------
+            // --- Active threads -----------------------------------------
             // Phase 19: sized to content (scrolling past the cap) so the
             // stretch spacer below pins the Archived section to the
             // BOTTOM of the rail instead of it trailing the active rows.
@@ -588,9 +599,11 @@ export component Sidebar inherits Rectangle {
                     }
                     for thread[i] in threads : row-wrap := VerticalLayout {
                         spacing: 0px;
-                        // Expanded: hide archived here (they live below).
-                        // Collapsed: keep every thread so rail icons remain.
-                        property <bool> show-here: !root.expanded || !thread.archived;
+                        // Archived threads belong only to the expanded
+                        // Archived section. Keep them out of this list in
+                        // both modes so collapsed layout height and row
+                        // positions are based solely on active threads.
+                        property <bool> show-here: !thread.archived;
                         active-row := SidebarThreadRow {
                             height: row-wrap.show-here
                                 ? (root.expanded && thread.model != "" ? 52px : 44px)
@@ -609,7 +622,7 @@ export component Sidebar inherits Rectangle {
                             pending-close-index <=> root.pending-close-index;
                             pending-delete-index <=> root.pending-delete-index;
                             accent-color: root.thread-accent(i);
-                            show-archived-badge: true;
+                            show-archived-badge: false;
                             show-archive-action: true;
                             row-selected => { root.thread-selected(i); }
                             collapse-if-expanded => {
@@ -650,7 +663,6 @@ export component Sidebar inherits Rectangle {
                 // PUI-016: collapsible archived section. Header click toggles;
                 // the arrow at the row end points down when collapsed (expand)
                 // and up when expanded (collapse).
-                property <bool> archived-collapsed: false;
                 vertical-stretch: 0;
                 spacing: 0px;
                 // Header + up to ~3 model-rows of content.
@@ -691,13 +703,13 @@ export component Sidebar inherits Rectangle {
                             source: @image-url("../assets/icons/arrow-down.svg");
                             size: 12px;
                             color: Theme.text-muted;
-                            transform-rotation: archived-section.archived-collapsed ? 0deg : 180deg;
+                            transform-rotation: root.archived-collapsed ? 0deg : 180deg;
                         }
                     }
                     TouchArea {
                         mouse-cursor: pointer;
                         clicked => {
-                            archived-section.archived-collapsed = !archived-section.archived-collapsed;
+                            root.archived-collapsed = !root.archived-collapsed;
                         }
                     }
                 }
@@ -707,10 +719,10 @@ export component Sidebar inherits Rectangle {
                     // Grow with content up to 3 rows, then scroll.
                     // Prefer content height; cap via max-height only (do not
                     // also bind `height` -- Slint rejects height+max-height).
-                    preferred-height: archived-section.archived-collapsed ? 0px : archived-thread-col.preferred-height;
-                    max-height: archived-section.archived-collapsed ? 0px : 156px;
+                    preferred-height: root.archived-collapsed ? 0px : archived-thread-col.preferred-height;
+                    max-height: root.archived-collapsed ? 0px : 156px;
                     min-height: 0px;
-                    visible: !archived-section.archived-collapsed && archived-thread-col.preferred-height > 0px;
+                    visible: !root.archived-collapsed && archived-thread-col.preferred-height > 0px;
                     viewport-height: archived-thread-col.preferred-height;
                     // PUI-009 review finding: same spacing-accumulation
                     // pattern as active-thread-col above (fixed there

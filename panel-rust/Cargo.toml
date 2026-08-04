@@ -1,5 +1,15 @@
 [package]
 name = "panel-rust"
+# Development placeholder only -- do not read this as the shipped app
+# version. The real, user-facing version (shown in Settings via
+# env!("CARGO_PKG_VERSION"), see src/lib.rs) is stamped here from the
+# release git tag (vX.Y.Z) by each tag-triggered build workflow's own
+# "Stamp Cargo.toml version from release tag" step
+# (.github/workflows/build-linux.yml / build-macos.yml /
+# build-windows.yml), which overwrites this line just before compiling,
+# for both the standalone panel-rust job and the shotcut-rebrand job that
+# actually ships. Bumping this value has no effect on release builds and
+# is unnecessary; it only matters for local `cargo build`/`cargo run`.
 version = "0.1.0"
 edition = "2021"
 description = "Real chat-panel crate. Renders a Slint UI (software renderer, CPU pixel buffer) driven by live ACPX gateway session data (via acpx-client directly, see src/gateway_actor.rs), exposed via a C ABI for a Qt QQuickItem to composite. See src/agent_bridge.rs for how the async agent connections are bridged onto panel-rust's single required OS thread, and its module docs for the jsonl cache / live-reload contract."
@@ -33,12 +43,13 @@ textwrap = "0.16"
 # gateway_actor.rs) -- acpx-client is now this crate's only ACP/ACPX SDK
 # dependency, used directly rather than through a second crate boundary.
 acpx-client = { path = "../acpx/acpx-client" }
+acpx-proto = { path = "../acpx/acpx-proto" }
 # Vendor(custom-agent-format)-scoped skill store + symlink/copy sync engine.
 # NOT an acpx crate (no acpx dependency of its own) -- a standalone sibling
 # at lib/skills-manager/, wired in the same path-dependency style as
 # acpx-client above. See memory/acpx/gen/plans/acpx-skills/README.md.
 skills-manager = { path = "../lib/skills-manager" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std", "net"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,6 +70,9 @@ uuid = { version = "1", features = ["v4"] }
 # system-sqlite behavior in effect without needing a vcpkg/choco install
 # step. Linux and macOS are unaffected by this override.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Use the native process creation FILETIME for snapshotd external-instance
+# identity, preventing Windows PID reuse from impersonating a prior GUI.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

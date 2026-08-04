@@ -145,30 +145,36 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
         "expected no servers yet, got {initial:?}"
     );
 
-    let created = handle
-        .create_mcp_server(serde_json::json!({
-            "name": "central-fs",
-            "command": "mcp-central-fs"
-        }))
+    let stdio_entry = |command: &str| {
+        panel_rust::protocol_types::McpServerEntry::new(
+            "central-fs",
+            panel_rust::protocol_types::McpServerConfig::Stdio {
+                command: command.to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+                timeout: None,
+            },
+        )
+    };
+
+    handle
+        .create_mcp_server(stdio_entry("mcp-central-fs"))
         .await
         .expect("create_mcp_server");
-    assert_eq!(created["name"], "central-fs");
 
     let after_create = handle.list_mcp_servers().await.expect("list_mcp_servers");
     assert_eq!(after_create.len(), 1);
-    assert_eq!(after_create[0].command.as_deref(), Some("mcp-central-fs"));
+    assert_eq!(after_create[0].name, "central-fs");
+    assert_eq!(after_create[0].command(), Some("mcp-central-fs"));
 
     handle
-        .update_mcp_server(serde_json::json!({
-            "name": "central-fs",
-            "command": "mcp-central-fs-v2"
-        }))
+        .update_mcp_server(stdio_entry("mcp-central-fs-v2"))
         .await
         .expect("update_mcp_server");
     let after_update = handle.list_mcp_servers().await.expect("list_mcp_servers");
     assert_eq!(after_update.len(), 1);
     assert_eq!(
-        after_update[0].command.as_deref(),
+        after_update[0].command(),
         Some("mcp-central-fs-v2"),
         "expected update to have replaced the entry, not appended a second one"
     );
@@ -184,6 +190,235 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
     );
 }
 
+/// Real end-to-end proof of the settings-only `tools/list` preview
+/// feature (`mcp_servers/tools_fetch` + `mcp_servers/list`'s `tool_
+/// catalog` merge, `acpx_core::mcp_client`/`Router::spawn_mcp_tools_
+/// fetch`) -- routed through the *real* `AcpxThreadHandle` SDK path
+/// (`fetch_mcp_server_tools`/`list_mcp_servers`), not `acpx_core::mcp_
+/// client::probe` called directly the way `acpx-core`'s own unit tests
+/// do. Proves the whole chain connects: the RPC kickoff, the detached
+/// background probe, the in-memory catalog cache, and `mcp_servers/
+/// list`'s merge, all reached through `rui-acpx-client`. Uses the same
+/// real `snapflowd-mcp` binary `snapflowd_mcp_availability_flips_when_
+/// the_process_is_killed_mid_turn` above speaks raw MCP JSON-RPC to
+/// directly -- here the probe itself is done entirely by acpx-server,
+/// this test only observes the result.
+#[tokio::test]
+async fn fetch_mcp_server_tools_reports_snapflowd_mcps_real_tool_catalog() {
+    let script_dir = tempfile::tempdir().expect("script tempdir");
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
+    let handle = spawn_acpx_thread(gateway.base_url.clone());
+
+    let global_dir = tempfile::tempdir().expect("global dir tempdir");
+    std::fs::create_dir_all(global_dir.path().join("release")).expect("skill dir");
+    std::fs::write(
+        global_dir.path().join("release").join("SKILL.md"),
+        "---\nname: release\ndescription: release process\n---\n",
+    )
+    .expect("write SKILL.md");
+
+    handle
+        .create_mcp_server(panel_rust::protocol_types::McpServerEntry::new(
+            "snapflowd-tools-preview",
+            panel_rust::protocol_types::McpServerConfig::Stdio {
+                command: snapflowd_mcp_bin().to_string_lossy().into_owned(),
+                args: vec![
+                    "--global-dir".to_string(),
+                    global_dir.path().to_string_lossy().into_owned(),
+                ],
+                env: Default::default(),
+                timeout: None,
+            },
+        ))
+        .await
+        .expect("create_mcp_server");
+
+    // Never fetched yet -- no tool_catalog at all on the freshly created
+    // entry, distinct from an empty/fetching/errored one.
+    let before_fetch = handle.list_mcp_servers().await.expect("list_mcp_servers");
+    let entry = before_fetch
+        .iter()
+        .find(|e| e.name == "snapflowd-tools-preview")
+        .expect("just-created entry should be listed");
+    assert_eq!(entry.tool_catalog, None);
+
+    handle
+        .fetch_mcp_server_tools("snapflowd-tools-preview")
+        .await
+        .expect("fetch_mcp_server_tools kickoff");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut ready_tools = None;
+    while std::time::Instant::now() < deadline {
+        let servers = handle.list_mcp_servers().await.expect("list_mcp_servers");
+        let entry = servers
+            .iter()
+            .find(|e| e.name == "snapflowd-tools-preview")
+            .expect("entry should still be listed while polling");
+        match &entry.tool_catalog {
+            Some(panel_rust::protocol_types::McpToolCatalog::Ready { tools }) => {
+                ready_tools = Some(tools.clone());
+                break;
+            }
+            Some(panel_rust::protocol_types::McpToolCatalog::Error { message }) => {
+                panic!("real tools/list probe against snapflowd-mcp failed: {message}");
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let tools = ready_tools.expect(
+        "expected mcp_servers/list to report a ready real tool catalog for \
+         \"snapflowd-tools-preview\" within the timeout",
+    );
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    for expected in [
+        "list_skills",
+        "read_skill",
+        "list_skill_files",
+        "read_skill_file",
+    ] {
+        assert!(
+            tool_names.contains(&expected),
+            "expected the real snapflowd-mcp tool catalog to include {expected}, got {tool_names:?}"
+        );
+    }
+    assert_eq!(
+        tool_names.len(),
+        4,
+        "expected exactly the real 4 snapflowd-mcp tools, got {tool_names:?}"
+    );
+}
+
+/// Real, minimal HTTP-transport MCP responder -- one JSON-RPC request per
+/// POST, direct JSON response (the non-SSE half of the streamable-HTTP
+/// convention `acpx_core::mcp_client::probe_http` implements), same
+/// hand-rolled `tokio::net::TcpListener` style `spawn_stub_oauth_server`
+/// above already uses. Stands in for a real remote MCP server so the
+/// HTTP-transport probe path can be proven through the actual RPC/actor
+/// chain, not just `acpx-core`'s own unit test (which only proves
+/// `probe_http` in isolation, never routed through a real gateway).
+async fn spawn_stub_http_mcp_server(tool_names: &'static [&'static str]) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub http mcp server");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                let body: serde_json::Value =
+                    serde_json::from_str(body_str).unwrap_or(serde_json::Value::Null);
+                let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+
+                let resp_body = if method == "initialize" {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"protocolVersion": "2024-11-05", "capabilities": {}}
+                    })
+                } else if method == "tools/list" {
+                    let tools: Vec<serde_json::Value> = tool_names
+                        .iter()
+                        .map(|name| serde_json::json!({"name": name}))
+                        .collect();
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}})
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32601, "message": "unknown method"}
+                    })
+                };
+                let body_bytes = serde_json::to_vec(&resp_body).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body_bytes.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(&body_bytes).await;
+            });
+        }
+    });
+
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+/// Same proof as `fetch_mcp_server_tools_reports_snapflowd_mcps_real_
+/// tool_catalog` above, but for the HTTP transport half of `mcp_client::
+/// probe` -- a real remote MCP server (not stdio), reached through the
+/// same real RPC/actor chain (`AcpxThreadHandle::fetch_mcp_server_tools`
+/// + polled `list_mcp_servers`). Closes the coverage gap flagged after
+/// the initial stdio-only e2e test: `probe_http` was previously only
+/// proven in isolation (`acpx-core`'s own unit tests against a raw TCP
+/// stub), never routed through a real gateway dispatch.
+#[tokio::test]
+async fn fetch_mcp_server_tools_reports_a_real_http_transport_tool_catalog() {
+    let script_dir = tempfile::tempdir().expect("script tempdir");
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
+    let handle = spawn_acpx_thread(gateway.base_url.clone());
+
+    let mcp_url = spawn_stub_http_mcp_server(&["search_docs", "fetch_page"]).await;
+
+    handle
+        .create_mcp_server(panel_rust::protocol_types::McpServerEntry::new(
+            "http-tools-preview",
+            panel_rust::protocol_types::McpServerConfig::Http {
+                url: mcp_url,
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+        ))
+        .await
+        .expect("create_mcp_server");
+
+    handle
+        .fetch_mcp_server_tools("http-tools-preview")
+        .await
+        .expect("fetch_mcp_server_tools kickoff");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut ready_tools = None;
+    while std::time::Instant::now() < deadline {
+        let servers = handle.list_mcp_servers().await.expect("list_mcp_servers");
+        let entry = servers
+            .iter()
+            .find(|e| e.name == "http-tools-preview")
+            .expect("entry should still be listed while polling");
+        match &entry.tool_catalog {
+            Some(panel_rust::protocol_types::McpToolCatalog::Ready { tools }) => {
+                ready_tools = Some(tools.clone());
+                break;
+            }
+            Some(panel_rust::protocol_types::McpToolCatalog::Error { message }) => {
+                panic!("real http tools/list probe failed: {message}");
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let tools = ready_tools.expect(
+        "expected mcp_servers/list to report a ready real tool catalog for \
+         \"http-tools-preview\" within the timeout",
+    );
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(tool_names, vec!["search_docs", "fetch_page"]);
+}
+
 #[tokio::test]
 async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_session_new() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
@@ -191,10 +426,15 @@ async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_sessi
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     handle
-        .create_mcp_server(serde_json::json!({
-            "name": "central-fs",
-            "command": "mcp-central-fs"
-        }))
+        .create_mcp_server(panel_rust::protocol_types::McpServerEntry::new(
+            "central-fs",
+            panel_rust::protocol_types::McpServerConfig::Stdio {
+                command: "mcp-central-fs".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+                timeout: None,
+            },
+        ))
         .await
         .expect("create_mcp_server");
 
@@ -452,5 +692,258 @@ fn snapflowd_mcp_availability_flips_when_the_process_is_killed_mid_turn() {
         post_kill_reply.is_none(),
         "expected no reply once the MCP process was killed mid-turn (availability must \
          flip to unavailable), got {post_kill_reply:?}"
+    );
+}
+
+/// Percent-decodes a query-string value -- same minimal implementation as
+/// `acpx_core::oauth`'s own private `percent_decode` (duplicated here
+/// rather than exposed as a public API just for one test file).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A minimal stand-in MCP OAuth 2.1 authorization server -- implements
+/// exactly the four endpoints `acpx_core::oauth`'s real flow calls
+/// (RFC 8414 metadata, RFC 7591 dynamic client registration, an
+/// `/authorize` endpoint that immediately 302s back to whatever
+/// `redirect_uri`/`state` it was given -- standing in for "the user logs
+/// in and approves" with no actual login UI, and a `/token` endpoint that
+/// always issues the same fixed test token). Deliberately *not* a mock of
+/// `acpx_core::oauth` itself -- this is a real HTTP server real requests
+/// go to, proving the actual discovery/DCR/PKCE/exchange code paths work
+/// end to end, not just that they're wired to call *something*.
+async fn spawn_stub_oauth_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub oauth server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let origin_for_task = origin.clone();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            let origin = origin_for_task.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = request.lines().next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path_and_query = parts.next().unwrap_or("");
+                let path = path_and_query.split('?').next().unwrap_or("");
+                let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
+
+                if method == "GET" && path == "/authorize" {
+                    let mut redirect_uri = String::new();
+                    let mut state = String::new();
+                    for pair in query.split('&') {
+                        if let Some((key, value)) = pair.split_once('=') {
+                            let value = percent_decode(value);
+                            match key {
+                                "redirect_uri" => redirect_uri = value,
+                                "state" => state = value,
+                                _ => {}
+                            }
+                        }
+                    }
+                    let location = format!("{redirect_uri}?code=test-auth-code&state={state}");
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+
+                let (status, body) = match (method, path) {
+                    ("GET", "/.well-known/oauth-protected-resource") => ("404 Not Found", String::new()),
+                    ("GET", "/.well-known/oauth-authorization-server") => (
+                        "200 OK",
+                        format!(
+                            r#"{{"authorization_endpoint":"{origin}/authorize","token_endpoint":"{origin}/token","registration_endpoint":"{origin}/register"}}"#
+                        ),
+                    ),
+                    ("POST", "/register") => (
+                        "200 OK",
+                        r#"{"client_id":"test-client-id"}"#.to_string(),
+                    ),
+                    ("POST", "/token") => (
+                        "200 OK",
+                        r#"{"access_token":"test-access-token","refresh_token":"test-refresh-token","expires_in":3600}"#.to_string(),
+                    ),
+                    _ => ("404 Not Found", String::new()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    (origin, handle)
+}
+
+/// Real end-to-end proof of the MCP OAuth 2.1 flow
+/// (`mcp_servers/authenticate`/`mcp_servers/logout`, `acpx_core::oauth`)
+/// through the actual compiled `acpx-server` binary and a real (stand-in)
+/// authorization server -- discovery, dynamic client registration, PKCE,
+/// the loopback redirect listener, and token exchange all run for real
+/// over real HTTP, only the authorization server's "user logs in and
+/// approves" step is stood in for (immediate redirect, no login UI).
+#[tokio::test]
+async fn mcp_server_oauth_flow_completes_through_a_real_authorization_server() {
+    let (auth_server_origin, _stub_handle) = spawn_stub_oauth_server().await;
+    let script_dir = tempfile::tempdir().expect("script tempdir");
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
+    let handle = spawn_acpx_thread(gateway.base_url.clone());
+
+    // The MCP server's own URL is the stub's origin -- discovery falls
+    // back to treating the resource's own origin as the authorization
+    // server when there's no RFC 9728 protected-resource-metadata (the
+    // stub 404s that endpoint on purpose, exercising that fallback path).
+    handle
+        .create_mcp_server(panel_rust::protocol_types::McpServerEntry::new(
+            "oauth-test",
+            panel_rust::protocol_types::McpServerConfig::Http {
+                url: format!("{auth_server_origin}/mcp"),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+        ))
+        .await
+        .expect("create_mcp_server");
+
+    let authorization_url = handle
+        .authenticate_mcp_server("oauth-test")
+        .await
+        .expect("authenticate_mcp_server");
+    assert!(
+        authorization_url.starts_with(&format!("{auth_server_origin}/authorize")),
+        "expected the authorization_url to point at the stub's /authorize endpoint, got {authorization_url}"
+    );
+    assert!(
+        authorization_url.contains("code_challenge_method=S256"),
+        "expected PKCE parameters in the authorization_url, got {authorization_url}"
+    );
+
+    // Simulate the browser completing the flow: follow the authorization
+    // URL (the stub immediately 302s back to acpx's own loopback
+    // listener's redirect_uri with a code+state), then follow that
+    // redirect too -- this is the real HTTP request the loopback listener
+    // in `acpx_core::oauth::start_loopback_listener` is waiting on.
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("http client");
+    let auth_response = http_client
+        .get(&authorization_url)
+        .send()
+        .await
+        .expect("GET authorization_url");
+    assert_eq!(auth_response.status(), reqwest::StatusCode::FOUND);
+    let redirect_location = auth_response
+        .headers()
+        .get("location")
+        .expect("Location header on the stub's authorize redirect")
+        .to_str()
+        .expect("valid header string")
+        .to_string();
+    let _ = http_client.get(&redirect_location).send().await;
+
+    // The rest of the flow (state verification, token exchange, token
+    // persistence, and the `auth_status` flip) completes in a detached
+    // background task server-side -- poll until it lands or time out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut authenticated = false;
+    while std::time::Instant::now() < deadline {
+        let servers = handle.list_mcp_servers().await.expect("list_mcp_servers");
+        if let Some(server) = servers.iter().find(|s| s.name == "oauth-test") {
+            if server.auth_status == Some(panel_rust::protocol_types::McpAuthStatus::Authenticated)
+            {
+                authenticated = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        authenticated,
+        "expected MCP server \"oauth-test\" to become authenticated within the timeout"
+    );
+
+    // Restart persistence: this is the actual "durable by default" claim
+    // (`acpx-server`'s `default_db_path`) for OAuth tokens specifically --
+    // kill this gateway process and spawn a fresh one pointed at the same
+    // `ACPX_DB_PATH` (`script_dir` is unchanged, so `GatewayProcess::spawn`
+    // resolves to the same db file), then confirm the server survives with
+    // its authenticated status intact, not just re-created empty.
+    drop(gateway);
+    let restarted_gateway =
+        GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
+    let restarted_handle = spawn_acpx_thread(restarted_gateway.base_url.clone());
+    let servers_after_restart = restarted_handle
+        .list_mcp_servers()
+        .await
+        .expect("list_mcp_servers after restart");
+    let server_after_restart = servers_after_restart
+        .iter()
+        .find(|s| s.name == "oauth-test")
+        .expect("oauth-test must survive a gateway restart");
+    assert_eq!(
+        server_after_restart.auth_status,
+        Some(panel_rust::protocol_types::McpAuthStatus::Authenticated),
+        "expected the OAuth token loaded from disk on restart to still read as authenticated"
+    );
+    let handle = restarted_handle;
+
+    // Logout reverts it.
+    handle
+        .logout_mcp_server("oauth-test")
+        .await
+        .expect("logout_mcp_server");
+    let servers = handle.list_mcp_servers().await.expect("list_mcp_servers");
+    let server = servers
+        .iter()
+        .find(|s| s.name == "oauth-test")
+        .expect("server still present after logout");
+    assert_ne!(
+        server.auth_status,
+        Some(panel_rust::protocol_types::McpAuthStatus::Authenticated),
+        "expected logout to clear the authenticated status"
     );
 }

@@ -159,6 +159,28 @@ if ((Resolve-Path $BinDir -ErrorAction SilentlyContinue).Path -ne (Resolve-Path 
 # $BinDir (snapflowd.exe) and Snapflow\ (snapflow.exe) rather than
 # copying/symlinking snapflow.exe out on its own.
 $snapflowAppDir = Get-ChildItem -Path $InstallDir -Directory -Filter "Snapflow*" -ErrorAction SilentlyContinue | Select-Object -First 1
+$snapshotBinPath = $null
+if ($snapflowAppDir) {
+    $candidate = Join-Path $snapflowAppDir.FullName "snapflow.exe"
+    if (Test-Path $candidate) { $snapshotBinPath = $candidate }
+}
+if (-not $snapshotBinPath) {
+    $snapshotBinPath = (Get-ChildItem -Path $InstallDir -Recurse -File -Filter "snapflow.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+}
+if ($snapshotBinPath) {
+    # Persist the installed production FfiBackend-linked GUI path. This is
+    # what snapshotd uses for `launch --gui`; without it an installed daemon
+    # falls back to source-checkout discovery and cannot launch the packaged
+    # child binary.
+    $runtimeConfigDir = Join-Path $env:APPDATA "Snapflow"
+    $runtimeConfigFile = Join-Path $runtimeConfigDir "runtime.env"
+    New-Item -ItemType Directory -Path $runtimeConfigDir -Force | Out-Null
+    $existing = if (Test-Path $runtimeConfigFile) { Get-Content $runtimeConfigFile | Where-Object { $_ -notmatch '^SNAPSHOT_BIN_PATH=' } } else { @() }
+    @($existing + "SNAPSHOT_BIN_PATH=$snapshotBinPath") | Set-Content -Path $runtimeConfigFile -Encoding utf8
+    Info "Configured production snapshot child -> $snapshotBinPath"
+} else {
+    Write-Warning "no snapflow.exe found in the installed bundle; daemon launch --gui requires SNAPSHOT_BIN_PATH"
+}
 $pathDirs = @($BinDir)
 if ($snapflowAppDir) { $pathDirs += $snapflowAppDir.FullName }
 

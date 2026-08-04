@@ -7,9 +7,20 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 // Ratio is 0.0..1.0; token counts are display-only (Rust/host may leave
 // them at 0 until real session accounting is wired).
 //
-// Hover card paints UPWARD out of this 24px band (same as SearchableDropdown
-// popups). Hosts that clip the row-2 strip must include `has-hover` in their
-// clip gate — see chat_input_layout.slint `row2-host.clip`.
+// The hover card itself is rendered by the host (chat_input_layout.slint),
+// NOT here. It used to live inline as a child of this component, painted
+// UPWARD out of the 24px band the same way SearchableDropdown's popup does
+// -- which required the row-2 pan host to flip its `clip` off entirely
+// whenever `has-hover` was true (context_ring_hover_left_overflow). That
+// host also horizontally pans an overflowing control strip to keep the
+// trailing ring reachable; disabling clip for the card also unclipped
+// whatever OTHER controls (Provider/Mode/etc.) were currently panned out
+// of view to the left, so they rendered past the panel's own left edge,
+// overlapping the sidebar's Settings footer underneath. Exposing `pct` /
+// `ring-color` (`out`, not private) lets the host render the card as its
+// own top-level, absolute-positioned sibling instead -- same pattern as
+// this composer's `/`/`@`/`#` mention popup -- so it never needs the pan
+// host's clip disabled at all.
 export component ContextRing inherits Rectangle {
     in property <float> ratio: 0.0;
     in property <int> used-tokens: 0;
@@ -20,13 +31,11 @@ export component ContextRing inherits Rectangle {
     in property <length> size: 24px;
     // Opens the future context-breakdown surface (host may no-op).
     callback context-view-requested();
-    // Re-exported so the compose row host can disable clipping while the
-    // hover card is visible (otherwise the card is painted above the ring
-    // and immediately cut off by row2-host's closed-state clip).
+    // Read by the host to know when to show its own hover card overlay.
     out property <bool> has-hover: hit.has-hover;
 
-    property <int> pct: Math.round(Math.min(1.0, Math.max(0.0, ratio)) * 100);
-    property <color> ring-color:
+    out property <int> pct: Math.round(Math.min(1.0, Math.max(0.0, ratio)) * 100);
+    out property <color> ring-color:
         pct >= 90 ? Theme.text-secondary
         : pct >= 70 ? Theme.bg-primary
         : Theme.text-muted;
@@ -37,10 +46,18 @@ export component ContextRing inherits Rectangle {
     preferred-height: size;
     horizontal-stretch: 0;
     vertical-stretch: 0;
-    // Hover card is a free-positioned child outside this box — never clip it.
-    clip: false;
-    // Inset for the percentage so it doesn't touch the ring stroke.
-    property <length> num-pad: size * 0.18;
+    // Inset for the percentage so it doesn't touch the ring stroke. Kept
+    // small and independent of `size`: this used to be `size * 0.18`,
+    // which shrinks the percent Text's own box down to ~64% of the ring
+    // diameter (15.36px of 24px) -- narrower than "100%" needs even at
+    // Theme's default font-scale (6px * 1.3 base ~= 7.8px, ~18.7px wide),
+    // so the digits overflowed/clipped their box before any accessibility
+    // scaling was involved. The Text below is already horizontal/vertical
+    // centered, so centering alone keeps it clear of the stroke without
+    // needing the box narrowed at all -- this pad is now just a minimum
+    // clearance from the 2px stroke, not a fraction of the ring's own
+    // diameter that shrinks along with (or worse than) growing content.
+    property <length> num-pad: 1px;
 
     // Track (full circle).
     Rectangle {
@@ -70,7 +87,11 @@ export component ContextRing inherits Rectangle {
         border-color: root.ring-color.with-alpha(0.35 + 0.55 * Math.min(1.0, ratio));
         background: transparent;
     }
-    // Percentage — smaller type + padded inset so it clears the ring.
+    // Percentage — smaller type, centered. Box spans the full ring (minus
+    // the minimal stroke-clearance pad above) rather than a size-fraction
+    // inset, so 1/2/3-digit values ("5%".."100%") always have room to lay
+    // out at Theme.font-scale without clipping; centering (not box-shrink)
+    // is what keeps the glyphs off the stroke.
     Text {
         text: root.pct + "%";
         color: Theme.text-primary;
@@ -79,6 +100,8 @@ export component ContextRing inherits Rectangle {
         font-family: Theme.font-mono;
         horizontal-alignment: center;
         vertical-alignment: center;
+        overflow: clip;
+        min-width: 0px;
         x: root.num-pad;
         y: root.num-pad;
         width: parent.width - 2 * root.num-pad;
@@ -97,52 +120,6 @@ export component ContextRing inherits Rectangle {
         clicked => { root.context-view-requested(); }
         changed has-hover => {
             CursorHost.kind = self.has-hover ? "pointer" : "default";
-        }
-    }
-
-    // Hover card: used / full context. Mounted always (`visible:`) like
-    // SearchableDropdown's popup-panel so id/out-property stay stable and
-    // hosts can react to has-hover for clip gating without recreating the
-    // element every hover edge.
-    hover-card := Rectangle {
-        visible: hit.has-hover;
-        // The ring lives at the bottom-right end of the compose controls.
-        // Open upward and align the card's right edge to the ring so it
-        // cannot spill off the chat's bottom or right edge.
-        x: parent.width - self.width;
-        y: -self.height - 8px;
-        z: 9000;
-        width: 168px;
-        height: 64px;
-        background: Theme.bg-card;
-        border-width: 1px;
-        border-color: Theme.border-strong;
-        border-radius: Theme.radius-md;
-        drop-shadow-blur: 10px;
-        drop-shadow-color: #000000.with-alpha(0.35);
-        drop-shadow-offset-y: 2px;
-        VerticalLayout {
-            padding: 8px;
-            spacing: 3px;
-            Text {
-                text: Strings.session-context;
-                color: Theme.text-secondary;
-                font-size: 9px * Theme.font-scale;
-                font-weight: 700;
-                font-family: Theme.font-mono;
-            }
-            Text {
-                text: root.used-tokens + " / " + root.limit-tokens + " tokens";
-                color: Theme.text-primary;
-                font-size: 11px * Theme.font-scale;
-                font-family: Theme.font-sans;
-            }
-            Text {
-                text: root.pct + "% used";
-                color: root.ring-color;
-                font-size: 10px * Theme.font-scale;
-                font-family: Theme.font-mono;
-            }
         }
     }
 }

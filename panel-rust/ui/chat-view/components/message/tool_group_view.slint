@@ -2,6 +2,9 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Badge } from "../../../base/badge.slint";
 import { Icon } from "../../../base/icon.slint";
+import { IconButton } from "../../../base/icon_button.slint";
+import { MessageItem } from "../../../types.slint";
+import { ToolEventRow } from "./tool_event_row.slint";
 
 // Grouped / scrollable container box for tool calls and MCP calls.
 // Provides:
@@ -10,10 +13,25 @@ import { Icon } from "../../../base/icon.slint";
 // 3. Capped height (defaults to 230px, approx 5 tool calls height), automatically
 //    becoming internally scrollable via Flickable when content exceeds the cap.
 export component ToolGroupView inherits Rectangle {
+    in property <[MessageItem]> messages: [];
+    in property <int> group-start: 0;
+    in property <int> group-length: 0;
+    in property <bool> group-local: false;
+    in property <length> row-cap-height: 90px;
     in property <string> label: "TOOL USE";
+    in property <bool> mcp-variant: false;
     in property <int> item-count: 0;
     // Capped height for ~5 tool calls (~44px per row * 5 + padding)
     in property <length> max-visible-height: 230px;
+    // Rough per-row height used only to guess whether the index rail
+    // (below) is worth showing at all -- deliberately a static estimate,
+    // NOT a read of body-layout's real (wrapped) preferred-height: the
+    // rail sits beside `flickable` in the same HorizontalLayout, so its
+    // own visibility affects flickable's width, which affects wrapped
+    // text height, which affects body-layout.preferred-height -- gating
+    // the rail's `if` on that value directly is a real binding loop
+    // (confirmed at compile time), not just a style choice.
+    in property <length> approx-row-height: 44px;
     in property <length> scrollbar-item-width: 3px;
     in property <bool> show-header: true;
     in property <bool> loading: false;
@@ -24,15 +42,17 @@ export component ToolGroupView inherits Rectangle {
     in-out property <bool> expanded: default-expanded;
     in-out property <bool> maximized: false;
     callback open-group-full-view();
+    callback toggle-expanded(int);
+    callback open-full-view(string, string, string, bool, bool);
 
     // Active tool call index computed from viewport position
     property <int> current-index: (root.item-count <= 1 || body-layout.preferred-height <= 0px) ? 0 :
         min(root.item-count - 1, max(0, Math.floor((- flickable.viewport-y + 20px) / (body-layout.preferred-height / max(1, root.item-count)))));
 
     // Left-rail vertical pulse animation during active loading execution
-    property <float> pulse-opacity: root.loading ? (0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms))) : 0.0;
+    property <float> pulse-opacity: root.loading ? (0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period))) : 0.0;
 
-    background: Theme.bg-agent-bubble;
+    background: root.mcp-variant ? Theme.bg-tertiary : Theme.bg-agent-bubble;
     border-color: transparent;
     border-width: 0px;
     border-radius: Theme.radius-md;
@@ -93,56 +113,38 @@ export component ToolGroupView inherits Rectangle {
             }
 
             // Top-right Fullscreen Popup Button in Header
-            TouchArea {
-                width: 22px;
-                height: 22px;
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: root.maximized
+            IconButton {
+                btn-width: 22px;
+                btn-height: 22px;
+                active: root.maximized;
+                button-accessible-label: root.maximized
                     ? "Close full view of tool group"
                     : "Open tool group in full view";
-                accessible-action-default => { self.clicked(); }
                 clicked => {
                     root.maximized = !root.maximized;
                     root.expanded = true;
                     root.open-group-full-view();
                 }
 
-                Rectangle {
-                    background: root.maximized ? Theme.bg-tertiary : (parent.has-hover ? Theme.bg-sidebar : transparent);
-                    border-radius: Theme.radius-sm;
-                    animate background { duration: 120ms; }
-
-                    Icon {
-                        source: @image-url("../../../assets/icons/maximize-2.svg");
-                        size: 14px;
-                        color: Theme.text-primary;
-                    }
+                Icon {
+                    source: @image-url("../../../assets/icons/maximize-2.svg");
+                    size: 14px;
+                    color: Theme.text-primary;
                 }
             }
 
             // Top-right Expand / Collapse Toggle Button in Header with smooth rotation animation
-            TouchArea {
-                width: 22px;
-                height: 22px;
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: root.expanded ? "Collapse tool group" : "Expand tool group";
-                accessible-action-default => { self.clicked(); }
+            IconButton {
+                btn-width: 22px;
+                btn-height: 22px;
+                button-accessible-label: root.expanded ? "Collapse tool group" : "Expand tool group";
                 clicked => { root.expanded = !root.expanded; }
-
-                Rectangle {
-                    background: parent.has-hover ? Theme.bg-sidebar : transparent;
-                    border-radius: Theme.radius-sm;
-                    animate background { duration: 120ms; }
-
-                    Icon {
-                        source: @image-url("../../../assets/icons/arrow-down.svg");
-                        size: 13px;
-                        color: Theme.text-secondary;
-                        transform-rotation: root.expanded ? 0deg : 180deg;
-                        animate transform-rotation { duration: 180ms; easing: ease-in-out; }
-                    }
+                Icon {
+                    source: @image-url("../../../assets/icons/arrow-down.svg");
+                    size: 13px;
+                    color: Theme.text-secondary;
+                    transform-rotation: root.expanded ? 0deg : 180deg;
+                    animate transform-rotation { duration: 180ms; easing: ease-in-out; }
                 }
             }
         }
@@ -187,11 +189,44 @@ export component ToolGroupView inherits Rectangle {
                 body-layout := VerticalLayout {
                     spacing: 0px;
                     @children
+                    // Retained threads provide a group-local model, so this
+                    // repeater visits only the group's rows. The flat-model
+                    // fallback keeps the legacy start/length gate.
+                    for sub-msg[sub-idx] in root.messages : ToolEventRow {
+                        visible: root.group-local || (sub-idx >= root.group-start && sub-idx < root.group-start + root.group-length);
+                        height: self.visible ? self.preferred-height : 0px;
+                        horizontal-stretch: self.visible ? 1 : 0;
+                        vertical-stretch: 0;
+                        in-group: true;
+                        kind: sub-msg.kind;
+                        first-use: sub-msg.first-use;
+                        text: sub-msg.text;
+                        cap-height: root.row-cap-height;
+                        raw-input: sub-msg.raw-input;
+                        raw-output: sub-msg.raw-output;
+                        expanded: sub-msg.expanded;
+                        index: sub-msg.index;
+                        mcp-variant: root.mcp-variant;
+                        toggle-expanded(idx) => { root.toggle-expanded(idx); }
+                        open-full-view(title, input, output, term, mcp) => {
+                            root.open-full-view(title, input, output, term, mcp);
+                        }
+                    }
                 }
             }
 
-            // Fixed index scrollbar rail mapping directly to each tool call item
-            if root.item-count > 1 : VerticalLayout {
+            // Fixed index scrollbar rail mapping directly to each tool call item.
+            // Only meaningful once the content is likely to actually
+            // overflow max-visible-height -- item-count > 1 alone (e.g.
+            // exactly 2 short tool calls that both fit on screen) used to
+            // draw 2 tick marks for a box that was never scrollable to
+            // begin with. Uses the static `approx-row-height` estimate,
+            // not a live geometry read (see that property's doc comment
+            // for why: reading body-layout.preferred-height here is a
+            // real binding loop, since this rail's own visibility
+            // affects flickable's width, which feeds back into
+            // body-layout's wrapped-text preferred-height).
+            if root.item-count > 1 && (root.item-count * root.approx-row-height) > root.max-visible-height : VerticalLayout {
                 width: root.scrollbar-item-width;
                 alignment: center;
                 spacing: 3px;

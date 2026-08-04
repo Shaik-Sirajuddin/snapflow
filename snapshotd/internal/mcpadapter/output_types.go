@@ -25,7 +25,10 @@
 // so that's what the output schema must describe.
 package mcpadapter
 
-import "snapshotd/internal/registry"
+import (
+	"snapshotd/internal/registry"
+	"time"
+)
 
 // ProjectList is the {"items": [...]} wrapper for daemon.listProjects'
 // []registry.Project response. registry.Project has no `json` struct
@@ -37,17 +40,33 @@ type ProjectList struct {
 	Items []registry.Project `json:"items"`
 }
 
-// ProcessInstanceList is the {"items": [...]} wrapper for daemon.list's
-// []registry.ProcessInstance response -- same no-json-tags caveat as
-// ProjectList.
+// ProcessInstanceList is the response for daemon.list. It includes the
+// active filter echo and both daemon-owned and externally launched rows.
 type ProcessInstanceList struct {
-	Items []registry.ProcessInstance `json:"items"`
+	Active *bool                     `json:"active"`
+	Items  []ProcessInstanceListItem `json:"items"`
+}
+
+type ProcessInstanceListItem struct {
+	ID          string    `json:"id"`
+	Kind        string    `json:"kind"`
+	ProjectID   string    `json:"projectId,omitempty"`
+	ProjectPath string    `json:"projectPath,omitempty"`
+	PID         int       `json:"pid"`
+	SocketPath  string    `json:"socketPath,omitempty"`
+	Status      string    `json:"status"`
+	Active      bool      `json:"active"`
+	Managed     bool      `json:"managed"`
+	Headless    bool      `json:"headless,omitempty"`
+	StartedAt   time.Time `json:"startedAt,omitempty"`
+	LastSeenAt  time.Time `json:"lastSeenAt,omitempty"`
 }
 
 // Track mirrors sap-rust's backend::Track.
 type Track struct {
 	Index     int    `json:"index"`
 	Kind      string `json:"kind"`
+	Name      string `json:"name,omitempty"`
 	Muted     bool   `json:"muted"`
 	Hidden    bool   `json:"hidden"`
 	Locked    bool   `json:"locked"`

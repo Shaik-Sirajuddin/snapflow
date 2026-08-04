@@ -36,6 +36,7 @@ export component HarnessView inherits Rectangle {
 
         SettingsRowGroup {
             width: parent.width;
+            cross-axis-alignment: start;
             SettingsRow {
                 label: "Background sessions";
                 hint: root.background-default ? "Enabled" : "Disabled";
@@ -43,6 +44,34 @@ export component HarnessView inherits Rectangle {
                     checked: root.background-default;
                     toggle-accessible-label: "Toggle background session default";
                     toggled(new-checked) => { root.background-default = new-checked; }
+                }
+            }
+            SettingsRow {
+                label: "Background session override";
+                hint: root.background-override-set
+                    ? (root.background-override ? "Enabled" : "Disabled")
+                    : "Not set";
+                Toggle {
+                    checked: root.background-override-set;
+                    toggle-accessible-label: "Toggle background session override";
+                    toggled(new-checked) => {
+                        root.background-override-set = new-checked;
+                        if (new-checked) {
+                            // Initialize a newly enabled per-thread override
+                            // from the current default instead of surprising
+                            // the user with an implicit disabled session.
+                            root.background-override = root.background-default;
+                        }
+                    }
+                }
+            }
+            if root.background-override-set : SettingsRow {
+                label: "Selected chat background";
+                hint: root.background-override ? "Enabled" : "Disabled";
+                Toggle {
+                    checked: root.background-override;
+                    toggle-accessible-label: "Toggle selected chat background session";
+                    toggled(new-checked) => { root.background-override = new-checked; }
                 }
             }
         }

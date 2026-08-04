@@ -1,0 +1,58 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Subtle, full-width, no-background status row shown in place of real
+// content while a turn is in flight and nothing from the agent has
+// arrived yet (models.rs's synthetic "pending" row -- Phase 18,
+// send_feedback_and_empty_states). Same pulsing-dots animation regardless
+// of what `label` says; `label` defaults to a generic in-progress message
+// but the caller can pass the last known API error instead, so one
+// component covers both the steady-state "still working" case and a
+// transient-error case without a second, near-duplicate component.
+export component PendingStatusRow inherits HorizontalLayout {
+    in property <string> label: "thinking...";
+
+    horizontal-stretch: 1;
+    preferred-width: 0px;
+    // Zero gap by request: label first, then the pulsing dots immediately
+    // after it, no dead room between them (matches chat_area.slint's
+    // now-removed inline pending row this component replaced).
+    spacing: 0px;
+    height: 20px;
+    cross-axis-alignment: center;
+
+    // Shared app-wide pulse cadence (metrics.slint) -- every
+    // animation-tick()-driven loader uses the same period instead of a
+    // one-off literal per call site.
+    property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period));
+
+    Text {
+        text: root.label;
+        color: Theme.text-muted;
+        opacity: 0.7;
+        font-size: 9px * Theme.font-scale;
+        font-italic: true;
+        vertical-alignment: center;
+        overflow: elide;
+        // No horizontal-stretch here (Text's own default is already
+        // non-stretch) -- keeps the default short "waiting for
+        // response"/"thinking..." label packed tight against the dots
+        // with no dead space between them, per this branch's zero-gap
+        // reorder fix. A `last-error` string can be arbitrarily long
+        // though, so cap its natural width at a fixed constant (NOT
+        // derived from `root.width`/`parent.width` -- that looked
+        // tempting for a tighter bound but creates a real binding loop
+        // back through the enclosing chat_area.slint message-column
+        // layout, confirmed by `cargo check --lib`/the Slint build
+        // script failing on exactly that cycle) so it elides with "..."
+        // instead of bleeding past the row uncontained.
+        width: min(self.preferred-width, 260px);
+    }
+    Text {
+        text: "\u{2022} \u{2022} \u{2022}";
+        color: Theme.text-muted;
+        opacity: root.pulse;
+        font-size: 11px * Theme.font-scale;
+        vertical-alignment: center;
+    }
+}

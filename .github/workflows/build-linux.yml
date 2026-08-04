@@ -40,6 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and git dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-linux-v1-${{ hashFiles('panel-rust/Cargo.lock', 'acpx/Cargo.lock', 'sap-rust/Cargo.lock', 'lib/skills-manager/Cargo.lock') }}
+          restore-keys: cargo-linux-v1-
       # yeslogic-fontconfig-sys (pulled in by slint's renderer chain) needs
       # fontconfig's pkg-config file, which ubuntu-latest doesn't have by
       # default.
@@ -52,7 +60,26 @@ jobs:
       - name: Build acpx-server (test dependency)
         working-directory: acpx
         run: cargo build -p acpx-server
+      # panel-rust/Cargo.toml's package.version is a dev placeholder (see
+      # its own comment) -- the real, user-facing version shown in
+      # Settings (env!("CARGO_PKG_VERSION"), see lib.rs) is stamped here
+      # from the release tag itself, so it's never manually kept in sync.
+      # Only the `[package]` version line matches (it's the first
+      # `version = "..."` in the file, before any dependency table).
+      - name: Stamp Cargo.toml version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
       - run: cargo build --release
+      - name: Verify native daemon transport and SAP protocol tests
+        run: |
+          cargo test --lib snapshotd_client --no-default-features
+          cargo test --manifest-path ../sap-rust/Cargo.toml --quiet
+      - name: Build SAP Linux static library (compile-time transport variant)
+        run: cargo build --manifest-path ../sap-rust/Cargo.toml --release
       # panel-rust's agent_bridge tests spawn real acpx-server + mock-agent
       # subprocesses per test; at full default parallelism, concurrent spawn
       # races cause spurious "crash backoff"/connection-refused failures
@@ -73,6 +100,10 @@ jobs:
         with:
           name: panel-rust-staticlib
           path: panel-rust/target/release/libpanel_rust.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap-rust-staticlib
+          path: sap-rust/target/release/libsap_rust.a
 
   snapshotd:
     runs-on: ubuntu-latest
@@ -89,6 +120,8 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd ./cmd/snapshotd
+      - name: Verify native AF_UNIX transport and endpoint consumers
+        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       - name: Run go test ./... (advisory -- known flaky/pre-existing failures, see workflow header)
         continue-on-error: true
         run: go test ./...
@@ -108,22 +141,35 @@ jobs:
       # ${CMAKE_SOURCE_DIR}/../sap-rust and .../../panel-rust (sibling
       # crates, not part of the shotcut-rebrand checkout itself). Now that
       # shotcut's sap-rust-mlt-backend branch (the panel-rust/AI chat-panel
-      # integration) is merged into rebrand/snapflow, panel-rust needs to
+      # integration) is merged into the fork's master branch, panel-rust needs to
       # be present too -- and panel-rust itself depends on
       # ../acpx/acpx-client, so that whole workspace comes along as well.
       - uses: actions/checkout@v4
         with:
           path: multi-media-main
 
+      # See the panel-rust job's identical step above -- this is the
+      # checkout that actually ships (Corrosion compiles this panel-rust
+      # source tree into the real Snapflow binary below), so it needs the
+      # same tag-derived version stamp for Settings' displayed version to
+      # be correct in the real, released app.
+      - name: Stamp panel-rust/Cargo.toml version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" multi-media-main/panel-rust/Cargo.toml
+          grep -m1 '^version = ' multi-media-main/panel-rust/Cargo.toml
+
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry --
       # it started life as a local-only git worktree on the dev machine, now
-      # pushed to Shaik-Sirajuddin/shotcut.git's rebrand/snapflow branch), so
+      # pushed to Shaik-Sirajuddin/shotcut.git's master branch), so
       # check it out separately rather than expecting it in this repo's own
       # checkout.
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: rebrand/snapflow
+          ref: master
           path: shotcut-rebrand
 
       # Caches build-shotcut.sh's vendored dependencies (FFmpeg/x264/x265/
@@ -138,7 +184,29 @@ jobs:
         uses: actions/cache@v4
         with:
           path: shotcut-rebrand/scripts/Snapflow
-          key: shotcut-deps-linux-${{ hashFiles('shotcut-rebrand/scripts/build-snapflow.sh') }}
+          key: shotcut-deps-linux-v2-${{ hashFiles('shotcut-rebrand/scripts/build-snapflow.sh', 'shotcut-rebrand/CMakeLists.txt') }}
+          restore-keys: shotcut-deps-linux-v2-
+
+      # Ccache is complementary to the dependency cache above: it reuses
+      # unchanged C/C++ translation units from the final Shotcut build while
+      # still compiling any changed source for the exact tagged release.
+      # The compiler/toolchain image is part of the key so objects are never
+      # reused across incompatible build environments.
+      - name: Cache Linux C/C++ compiler outputs
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-v1-qt6.10.3-ubuntu22.04-${{ hashFiles('shotcut-rebrand/scripts/build-snapflow.sh', 'shotcut-rebrand/CMakeLists.txt', 'multi-media-main/panel-rust/Cargo.lock', 'multi-media-main/sap-rust/Cargo.lock', 'multi-media-main/acpx/Cargo.lock') }}
+          restore-keys: ccache-linux-v1-qt6.10.3-ubuntu22.04-
+
+      - name: Cache Cargo registry and git dependencies for GUI build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry
+            .cargo/git
+          key: cargo-linux-v1-${{ hashFiles('multi-media-main/panel-rust/Cargo.lock', 'multi-media-main/acpx/Cargo.lock', 'multi-media-main/sap-rust/Cargo.lock', 'multi-media-main/lib/skills-manager/Cargo.lock') }}
+          restore-keys: cargo-linux-v1-
 
       # A cache "hit" from actions/cache only means the archive round-tripped
       # intact -- it does not guarantee the tree it contains is actually a
@@ -162,7 +230,7 @@ jobs:
             echo "effective_cache_hit=${{ steps.cache-deps.outputs.cache-hit }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build snapflow (from this fork's rebrand/snapflow branch)
+      - name: Build snapflow (from this fork's master branch)
         env:
           DEPS_CACHE_HIT: ${{ steps.verify-deps.outputs.effective_cache_hit }}
         run: |
@@ -175,53 +243,70 @@ jobs:
             echo "CLEANUP=0"
             echo "SNAPFLOW_VERSION=\"$VERSION\""
             echo "SNAPFLOW_HEAD=0"
-            echo "SNAPFLOW_REVISION=origin/rebrand/snapflow"
+            echo "SNAPFLOW_REVISION=origin/master"
             echo "SNAPFLOW_REPO=https://github.com/Shaik-Sirajuddin/shotcut.git"
-            # The docker image's entrypoint hardcodes /root/shotcut as the
-            # mount point (and its own default INSTALL_DIR=$HOME/snapflow
-            # would otherwise write build output outside the mount) --
-            # keep everything inside the one mounted directory so the
-            # final .txz actually lands back on the runner's filesystem.
-            echo "INSTALL_DIR=/root/shotcut"
-            echo "SOURCE_DIR=/root/shotcut/src"
+            # Keep the build in a writable path. Hosted Docker runners use a
+            # rootless user namespace where /root is not traversable; using
+            # /tmp avoids the pre-build mkdir failure while keeping all
+            # generated output inside the mounted checkout.
+            echo "INSTALL_DIR=/tmp/shotcut"
+            echo "SOURCE_DIR=/tmp/shotcut/src"
           } > build-snapflow.conf
-          docker run \
-            -v "$PWD:/root/shotcut" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/root/sap-rust-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/root/panel-rust-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/root/acpx-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/lib:/root/lib-src:ro" \
+          mkdir -p "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/.cargo/registry" "$GITHUB_WORKSPACE/.cargo/git"
+          # Actual root cause of this whole saga (found after the docker-cp
+          # workaround below already got the build most of the way through):
+          # commit cbee6630 added --user 0:0 to force the container to run
+          # as real root, which is what made every /root/* mount and write
+          # work. The very next commit (fe542d7c) moved ccache/cargo state
+          # to /tmp but dropped --user 0:0 in the process -- every Linux
+          # build since (no v0.1.15-24 Linux release ever succeeded) has
+          # been running as this image's non-root default user, which
+          # explains both "mkdir: cannot create directory '/root': Permission
+          # denied" (v0.1.17) and the mystery of bind mounts past the first
+          # four -v flags never showing up inside the container. Restoring
+          # --user 0:0 addresses that at the source; the docker-cp source
+          # staging below is kept regardless since it's proven reliable.
+          #
+          # docker cp needs its destination's parent to already exist in
+          # the (not-yet-started) container -- pre-create it on the host
+          # side of the already-working $PWD:/tmp/shotcut mount.
+          mkdir -p "$PWD/src"
+          CID=$(docker create \
+            --user 0:0 \
+            --workdir /tmp/shotcut \
+            -v "$PWD:/tmp/shotcut" \
+            -v "$GITHUB_WORKSPACE/.ccache:/tmp/ccache" \
+            -v "$GITHUB_WORKSPACE/.cargo/registry:/tmp/cargo/registry" \
+            -v "$GITHUB_WORKSPACE/.cargo/git:/tmp/cargo/git" \
             -e "DEPS_CACHE_HIT=$DEPS_CACHE_HIT" \
             "$IMAGE_NAME" \
             -c '
               set -e
-              # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
-              # ../panel-rust (sibling crates, see corrosion_import_crate)
-              # via Corrosion, which needs a real Rust toolchain -- not
-              # present in this image by default. panel-rust itself
-              # depends on ../acpx/acpx-client, so that whole workspace
-              # needs to land at the same relative sibling position too.
-              # Unconditional (cheap local copies) regardless of dep-cache
-              # state, since snapflow itself always needs these siblings.
-              mkdir -p /root/shotcut/src
-              if [ ! -d /root/shotcut/src/sap-rust ]; then
-                cp -r /root/sap-rust-src /root/shotcut/src/sap-rust
-              fi
-              if [ ! -d /root/shotcut/src/panel-rust ]; then
-                cp -r /root/panel-rust-src /root/shotcut/src/panel-rust
-              fi
-              if [ ! -d /root/shotcut/src/acpx ]; then
-                cp -r /root/acpx-src /root/shotcut/src/acpx
-              fi
-              # panel-rust/Cargo.toml declares `skills-manager = { path =
-              # "../lib/skills-manager" }`, so lib/ must land as a sibling of
-              # panel-rust too, or cargo aborts before compiling with
-              # "failed to load source for dependency `skills-manager`".
-              # Missed when the skills-manager crate was introduced.
-              if [ ! -d /root/shotcut/src/lib ]; then
-                cp -r /root/lib-src /root/shotcut/src/lib
-              fi
-              export PATH="/root/.cargo/bin:$PATH"
+              # Install ccache inside the container rather than shipping the
+              # runner-host binary in -- a docker-cp-ed host ccache binary
+              # failed with "error while loading shared libraries:
+              # libhiredis.so.1.1.0: cannot open shared object file" since
+              # that lib lives on the runner host, not in this image. Self
+              # -contained apt install avoids the host/container mismatch.
+              apt-get update -qq && apt-get install -y -qq ccache
+              # Use compiler-wrapper symlinks so both autotools and
+              # CMake/Ninja sub-builds benefit without changing the forks
+              # build script. All new state is under /tmp because hosted
+              # Docker runs rootless and /root is not writable there.
+              mkdir -p /tmp/ccache-bin /tmp/ccache /tmp/cargo /tmp/rustup
+              CCACHE_BIN="$(command -v ccache)"
+              for compiler in cc gcc c++ g++; do
+                ln -sf "$CCACHE_BIN" "/tmp/ccache-bin/$compiler"
+              done
+              ln -sf "$CCACHE_BIN" /tmp/ccache-bin/ccache
+              export PATH="/tmp/ccache-bin:$PATH"
+              export CCACHE_DIR=/tmp/ccache
+              export CCACHE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              export CARGO_HOME=/tmp/cargo
+              export RUSTUP_HOME=/tmp/rustup
+              ccache --set-config=compiler_check=content
+              ccache --zero-stats || true
+              export PATH="/tmp/cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               fi
@@ -236,13 +321,38 @@ jobs:
               # the 45-90 min part and rarely change -- skip rebuilding them
               # entirely on a cache hit (see the actions/cache step above).
               # snapflow itself is our own source (this checkout + the
-              # sap-rust/panel-rust siblings just copied in) and always
-              # changes, so it always builds fresh, every run, cached or not.
+              # sap-rust/panel-rust siblings, docker-cp-ed in below) and
+              # always changes, so it always builds fresh, every run,
+              # cached or not.
               if [ "$DEPS_CACHE_HIT" != "true" ]; then
-                SNAPFLOW_DEPS_ONLY=1 /root/shotcut/build-shotcut.sh
+                SNAPFLOW_DEPS_ONLY=1 /tmp/shotcut/build-shotcut.sh
               fi
-              SNAPFLOW_ONLY=1 /root/shotcut/build-shotcut.sh
-            '
+              SNAPFLOW_ONLY=1 /tmp/shotcut/build-shotcut.sh
+              ccache --show-stats || true
+            ')
+          # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
+          # ../panel-rust (sibling crates, see corrosion_import_crate) via
+          # Corrosion. panel-rust itself depends on ../acpx/acpx-client, so
+          # that whole workspace comes along too, and lib/ since panel-rust
+          # /Cargo.toml declares `skills-manager = { path =
+          # "../lib/skills-manager" }`. docker cp writes directly into the
+          # (not-yet-started) container's filesystem -- unrelated machinery
+          # to bind mounts, so it isn't affected by whatever silently drops
+          # `-v` mounts past the first four on this runner (confirmed across
+          # three separate release tags: v0.1.18 checkout paths, v0.1.19
+          # freshly-copied paths, v0.1.20/21 with and without :ro -- always
+          # the same four mounts fail, `docker cp` sidesteps the mechanism
+          # entirely rather than chasing the exact cause further).
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/sap-rust" "$CID:/tmp/shotcut/src/sap-rust"
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/panel-rust" "$CID:/tmp/shotcut/src/panel-rust"
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/acpx" "$CID:/tmp/shotcut/src/acpx"
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/lib" "$CID:/tmp/shotcut/src/lib"
+          docker start --attach "$CID" || true
+          STATUS=$(docker wait "$CID")
+          docker rm -f "$CID" >/dev/null 2>&1 || true
+          if [ "$STATUS" != "0" ]; then
+            exit 1
+          fi
           mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
 
       - uses: actions/upload-artifact@v4
@@ -265,7 +375,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: rebrand/snapflow
+          ref: master
           path: shotcut-rebrand
           sparse-checkout: |
             packaging/linux
@@ -279,6 +389,15 @@ jobs:
           cp dist/snapflowd-linux-x86_64/snapflowd "$OUT/bin/snapflowd"
           chmod +x "$OUT/bin/snapflowd"
           tar -xJf dist/shotcut-rebrand-linux-x86_64/snapflow-linux-x86_64-*.txz -C "$OUT"
+          # snapshotd launch --gui must have the real production
+          # FfiBackend-linked child in the shipped bundle. The installer
+          # persists this wrapper as SNAPSHOT_BIN_PATH; fail packaging rather
+          # than publishing a daemon that can never launch a project.
+          test -x "$OUT/Snapflow.app/snapflow" || {
+            echo "production snapshot child missing from Snapflow bundle" >&2
+            find "$OUT" -maxdepth 4 -type f -name 'snapflow*' -print >&2 || true
+            exit 1
+          }
           cp dist/panel-rust-staticlib/libpanel_rust.a "$OUT/bin/libpanel_rust.a"
           cp shotcut-rebrand/packaging/linux/org.snapflow.Snapflow.desktop "$OUT/share/applications/"
           cp shotcut-rebrand/packaging/linux/icons/128x128/org.snapflow.Snapflow.png "$OUT/share/icons/"

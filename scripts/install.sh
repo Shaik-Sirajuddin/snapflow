@@ -93,6 +93,18 @@ read_runtime_value() {
   [ -f "$runtime_config_file" ] || return 0
   sed -n "s/^$1=//p" "$runtime_config_file" | head -n1
 }
+persist_runtime_value() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp "${runtime_config_file}.XXXXXX")"
+  {
+    if [ -f "$runtime_config_file" ]; then
+      grep -v "^${key}=" "$runtime_config_file" || true
+    fi
+    printf '%s=%s\n' "$key" "$value"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$runtime_config_file"
+}
 runtime_home="${SNAPSHOTD_HOME:-$(read_runtime_value SNAPSHOTD_HOME)}"
 runtime_home="${runtime_home:-$HOME/.snapshotd}"
 runtime_mcp_addr="${SNAPSHOTD_MCP_SSE_ADDR:-$(read_runtime_value SNAPSHOTD_MCP_SSE_ADDR)}"
@@ -277,6 +289,12 @@ case "$platform" in
     if [ -n "$app_dir" ] && [ -x "$app_dir/snapflow" ]; then
       ln -sf "$app_dir/snapflow" "$BIN_DIR/snapflow"
       info "Linked snapflow -> $BIN_DIR/snapflow"
+      # snapshotd launches the real production FfiBackend-linked GUI as its
+      # project child. Persist the installed wrapper path so `snapflowd
+      # launch --gui` works outside a source checkout without requiring users
+      # to export SNAPSHOT_BIN_PATH manually.
+      persist_runtime_value SNAPSHOT_BIN_PATH "$app_dir/snapflow"
+      info "Configured production snapshot child -> $app_dir/snapflow"
     fi
     # The daemon discovers its packaged ACPX gateway beside snapflowd, while
     # the GUI discovers the same binary beside its own executable. Expose one
@@ -323,6 +341,13 @@ case "$platform" in
         rm -rf "/Applications/$(basename "$app")"
         cp -R "$app" /Applications/
         info "Installed $(basename "$app") to /Applications"
+        mac_snapshot_bin="$(find "/Applications/$(basename "$app")/Contents/MacOS" -maxdepth 1 -type f -perm -111 | head -n1)"
+        if [ -n "$mac_snapshot_bin" ]; then
+          persist_runtime_value SNAPSHOT_BIN_PATH "$mac_snapshot_bin"
+          info "Configured production snapshot child -> $mac_snapshot_bin"
+        else
+          echo "warning: no executable found in the installed Snapflow.app; daemon launch --gui requires SNAPSHOT_BIN_PATH" >&2
+        fi
         echo "note: this build is unsigned -- right-click the app and choose Open the first time to bypass Gatekeeper." >&2
       fi
       hdiutil detach "$mount_point" -quiet

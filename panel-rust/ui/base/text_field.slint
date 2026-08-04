@@ -14,6 +14,14 @@ export component TextField inherits Rectangle {
     in-out property <string> text: "";
     in property <string> field-accessible-label: "";
     in property <length> field-font-size: 11px;
+    // Ghost hint text shown when `text` is empty -- same convention
+    // `FilterSearchBar`/`Select`/`SearchableDropdown` already use for
+    // their own placeholder text. This component never had one before,
+    // so every plain-text form built on it (MCP server name/command/
+    // args/url/headers/timeout/oauth-client-id, agent default-profile/
+    // permission-profile) rendered as a blank, unlabeled box with no
+    // inline guidance about what to type.
+    in property <string> placeholder: "";
     callback edited();
     // See FilterSearchBar.input-has-focus's doc comment: real keystrokes
     // only reach any editable Slint surface when *something* in the
@@ -31,6 +39,21 @@ export component TextField inherits Rectangle {
     border-width: 1px;
     border-color: Theme.border-default;
     border-radius: Theme.radius-sm;
+
+    // Plain `Text`, not interactive -- a bare `Text` element has no
+    // `TouchArea` of its own, so it never intercepts clicks; they always
+    // reach `field-input` beneath/behind it.
+    if root.placeholder != "" && root.text == "" : Text {
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-size: root.field-font-size * Theme.font-scale;
+        x: Metrics.pad-md;
+        y: 0px;
+        width: parent.width - 2 * Metrics.pad-md;
+        height: parent.height;
+        vertical-alignment: center;
+        overflow: elide;
+    }
 
     field-input := TextInput {
         accessible-label: root.field-accessible-label;

@@ -49,12 +49,23 @@ fn acpx_server_bin() -> PathBuf {
 /// Slint MCP server, this test only needs *a* compiled host, not a specific
 /// one. Override with `SHOTCUT_BIN` if neither default path matches.
 fn shotcut_bin() -> PathBuf {
-    if let Ok(over) = std::env::var("SHOTCUT_BIN") {
-        return PathBuf::from(over);
+    if let Ok(path) = std::env::var("SNAPFLOW_BIN_OVERRIDE") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return p;
+        }
     }
     let snapflow = repo_root().join("shotcut-rebrand/build-local/src/snapflow");
     if snapflow.exists() {
         return snapflow;
+    }
+    if let Ok(shared) = repo_root()
+        .join("../../shotcut-rebrand/build-local/src/snapflow")
+        .canonicalize()
+    {
+        if shared.exists() {
+            return shared;
+        }
     }
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
 }
@@ -135,7 +146,14 @@ impl LiveUiHarness {
         let display = free_x_display();
         let display_str = format!(":{display}");
         let xvfb = Command::new("Xvfb")
-            .args([&display_str, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+            .args([
+                &display_str,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -201,7 +219,11 @@ impl LiveUiHarness {
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())
-            .args(["--appdata", state_dir.join("shotcut").to_str().unwrap(), "--noupgrade"])
+            .args([
+                "--appdata",
+                state_dir.join("shotcut").to_str().unwrap(),
+                "--noupgrade",
+            ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
             .env("SLINT_MCP_PORT", mcp_port.to_string())
@@ -293,7 +315,10 @@ impl LiveUiHarness {
 
     async fn element_tree(&self, window_handle: &Value) -> Vec<Value> {
         let root_handle = self
-            .tool_call("get_window_properties", json!({"windowHandle": window_handle}))
+            .tool_call(
+                "get_window_properties",
+                json!({"windowHandle": window_handle}),
+            )
             .await["rootElementHandle"]
             .clone();
         let tree = self
@@ -316,7 +341,11 @@ impl LiveUiHarness {
         self.element_tree(window_handle)
             .await
             .into_iter()
-            .find(|e| e["accessibleLabel"].as_str().is_some_and(|l| l.starts_with(prefix)))
+            .find(|e| {
+                e["accessibleLabel"]
+                    .as_str()
+                    .is_some_and(|l| l.starts_with(prefix))
+            })
     }
 
     async fn click_by_exact_label(&self, window_handle: &Value, label: &str) {
@@ -378,12 +407,14 @@ impl LiveUiHarness {
         // + button) only exists in the accessibility tree once expanded --
         // confirmed live: it is simply absent from get_element_tree before
         // this click, not just hidden/disabled.
-        self.click_by_exact_label(window_handle, "Expand thread sidebar").await;
+        self.click_by_exact_label(window_handle, "Expand thread sidebar")
+            .await;
         self.click_by_exact_label(window_handle, "New thread").await;
         self.click_by_exact_label(window_handle, "Provider ›").await;
 
         let filter = wait_for(Duration::from_secs(10), || async {
-            self.find_by_exact_label(window_handle, "Search providers...").await
+            self.find_by_exact_label(window_handle, "Search providers...")
+                .await
         })
         .await;
         self.click_element(&filter["handle"]).await;
@@ -399,11 +430,13 @@ impl LiveUiHarness {
         // Confirm the trigger now shows the id we picked before moving on --
         // catches a dropdown selection that silently no-ops.
         wait_for(Duration::from_secs(5), || async {
-            self.find_by_label_prefix(window_handle, &format!("{provider_id} \u{203a}")).await
+            self.find_by_label_prefix(window_handle, &format!("{provider_id} \u{203a}"))
+                .await
         })
         .await;
 
-        self.click_by_exact_label(window_handle, "Collapse thread sidebar").await;
+        self.click_by_exact_label(window_handle, "Collapse thread sidebar")
+            .await;
     }
 
     /// Types `text` into the compose box and clicks Send, then waits for
@@ -411,12 +444,14 @@ impl LiveUiHarness {
     /// happens is the test's real signal, not a fixed sleep.
     async fn send_and_expect_a_reply(&self, window_handle: &Value, text: &str) {
         let compose = wait_for(Duration::from_secs(10), || async {
-            self.find_by_exact_label(window_handle, "Compose message").await
+            self.find_by_exact_label(window_handle, "Compose message")
+                .await
         })
         .await;
         self.click_element(&compose["handle"]).await;
         self.type_text(window_handle, text).await;
-        self.click_by_exact_label(window_handle, "Send message").await;
+        self.click_by_exact_label(window_handle, "Send message")
+            .await;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -467,8 +502,12 @@ where
 async fn provider_matrix_codex_acp_selects_and_sends_without_crashing() {
     let harness = LiveUiHarness::spawn().await;
     let window = harness.window_handle().await;
-    harness.select_provider_for_new_thread(&window, "codex-acp").await;
-    harness.send_and_expect_a_reply(&window, "diagnostic ping via codex-acp").await;
+    harness
+        .select_provider_for_new_thread(&window, "codex-acp")
+        .await;
+    harness
+        .send_and_expect_a_reply(&window, "diagnostic ping via codex-acp")
+        .await;
 }
 
 /// Matrix row 2/3: `claude-acp`, the other provider `normalize_provider`
@@ -477,8 +516,12 @@ async fn provider_matrix_codex_acp_selects_and_sends_without_crashing() {
 async fn provider_matrix_claude_acp_selects_and_sends_without_crashing() {
     let harness = LiveUiHarness::spawn().await;
     let window = harness.window_handle().await;
-    harness.select_provider_for_new_thread(&window, "claude-acp").await;
-    harness.send_and_expect_a_reply(&window, "diagnostic ping via claude-acp").await;
+    harness
+        .select_provider_for_new_thread(&window, "claude-acp")
+        .await;
+    harness
+        .send_and_expect_a_reply(&window, "diagnostic ping via claude-acp")
+        .await;
 }
 
 /// Matrix row 3/3: `grok-build` -- the real, live-detected registry id for
@@ -496,6 +539,10 @@ async fn provider_matrix_claude_acp_selects_and_sends_without_crashing() {
 async fn provider_matrix_grok_build_selects_and_sends_without_crashing() {
     let harness = LiveUiHarness::spawn().await;
     let window = harness.window_handle().await;
-    harness.select_provider_for_new_thread(&window, "grok-build").await;
-    harness.send_and_expect_a_reply(&window, "diagnostic ping via grok-build").await;
+    harness
+        .select_provider_for_new_thread(&window, "grok-build")
+        .await;
+    harness
+        .send_and_expect_a_reply(&window, "diagnostic ping via grok-build")
+        .await;
 }

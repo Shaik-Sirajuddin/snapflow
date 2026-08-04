@@ -148,7 +148,7 @@ pub async fn register_custom_agent(
 ) {
     wait_for_admin(admin_port);
     let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
-    admin
+    let result = admin
         .create_custom_agent(&CustomAgentSpec {
             id: agent_id.to_owned(),
             name: agent_id.to_owned(),
@@ -157,8 +157,21 @@ pub async fn register_custom_agent(
             env,
             cwd: None,
         })
-        .await
-        .expect("admin/agents/custom create");
+        .await;
+    // Idempotent: a caller that spawns a *second* `acpx-server` pointed at
+    // the same durable `ACPX_DB_PATH` (e.g. a restart-persistence check --
+    // see `gateway_actor_mcp_agents_e2e_test.rs`'s `mcp_server_oauth_flow_
+    // completes_through_a_real_authorization_server`) re-registers the
+    // exact same custom agent against a store that already durably
+    // persisted it from the first spawn. That is a real, expected outcome
+    // of "this survives a restart," not a caller error, so a 409 here
+    // means the registration this call wanted already exists -- treat it
+    // the same as success rather than panicking every restart-persistence
+    // test that reuses this helper.
+    if let Err(acpx_client::ext::admin::AdminClientError::Response { status: 409, .. }) = &result {
+        return;
+    }
+    result.expect("admin/agents/custom create");
 }
 
 /// Registers a shell-script backend under `agent_id` -- the shape the

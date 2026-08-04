@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
+import { Spinner } from "spinner.slint";
 
 // Layer 3 (base) -- the repeated hand-rolled "small pill button" pattern
 // found across `components/`: a fixed-size `Rectangle` with a
@@ -32,6 +33,13 @@ export component Button inherits Rectangle {
     in property <color> fg: primary ? Theme.text-on-primary : Theme.text-primary;
     in property <color> border-col: Theme.border-default;
     in property <length> border-w: primary ? 0px : 1px;
+    // Shows a `Spinner` in place of `label` and ignores `clicked` while
+    // true -- for a button whose action dispatches a real background RPC
+    // (see `AgentBridge::mcp_operations_in_flight`'s doc comment), so a
+    // second click can't fire a duplicate request while the first is
+    // still in flight. Default `false` is the exact previous behavior
+    // for every call site that doesn't set it.
+    in property <bool> busy: false;
     callback clicked();
 
     width: btn-width;
@@ -47,16 +55,17 @@ export component Button inherits Rectangle {
     border-color: border-col;
     border-width: border-w;
     border-radius: Theme.radius-sm;
+    opacity: root.busy ? 0.7 : 1.0;
 
     touch := TouchArea {
-        mouse-cursor: pointer;
+        mouse-cursor: root.busy ? default : pointer;
         accessible-role: button;
         accessible-label: root.button-accessible-label;
-        accessible-action-default => { root.clicked(); }
-        clicked => { root.clicked(); }
+        accessible-action-default => { if (!root.busy) { root.clicked(); } }
+        clicked => { if (!root.busy) { root.clicked(); } }
         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
-    Text {
+    if !root.busy : Text {
         text: root.label;
         color: root.fg;
         font-family: Theme.font-sans;
@@ -64,5 +73,9 @@ export component Button inherits Rectangle {
         font-weight: root.font-weight;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+    if root.busy : Spinner {
+        size: 12px;
+        stroke: root.fg;
     }
 }

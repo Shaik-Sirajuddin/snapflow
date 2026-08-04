@@ -94,7 +94,11 @@ func TestScanAndPingRejectsWrongChallenge(t *testing.T) {
 
 func TestScanAndPingRejectsStaleAndWrongChallengeCandidates(t *testing.T) {
 	temp := t.TempDir()
-	stale := Descriptor{Endpoint: filepath.Join(temp, "missing.sock"), PID: 999999, ProcessStart: "old", InstanceNonce: "old", ProtocolVersion: protocolVersion}
+	staleEndpoint := filepath.Join(temp, "missing.sock")
+	if err := os.WriteFile(staleEndpoint, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := Descriptor{Endpoint: staleEndpoint, PID: 999999, ProcessStart: "old", InstanceNonce: "old", ProtocolVersion: protocolVersion}
 	data, _ := json.Marshal(stale)
 	if err := os.WriteFile(filepath.Join(temp, "stale.json"), data, 0o600); err != nil {
 		t.Fatal(err)
@@ -105,6 +109,12 @@ func TestScanAndPingRejectsStaleAndWrongChallengeCandidates(t *testing.T) {
 	candidates, err := ScanAndPing(temp)
 	if err != nil || len(candidates) != 0 {
 		t.Fatalf("expected no candidates: candidates=%+v err=%v", candidates, err)
+	}
+	if _, err := os.Stat(filepath.Join(temp, "stale.json")); !os.IsNotExist(err) {
+		t.Fatalf("dead descriptor should be pruned, stat err=%v", err)
+	}
+	if _, err := os.Stat(staleEndpoint); !os.IsNotExist(err) {
+		t.Fatalf("dead endpoint under the daemon runtime should be pruned, stat err=%v", err)
 	}
 	_ = time.Second // keep the test's deadline vocabulary explicit for future fake peers
 }
