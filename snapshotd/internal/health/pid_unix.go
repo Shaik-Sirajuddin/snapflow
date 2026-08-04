@@ -33,8 +33,9 @@ func PIDAlive(pid int) bool {
 
 // ProcessStartIdentity returns the kernel start-time identity used with a PID
 // to prevent PID reuse from impersonating a previously registered process.
-// Linux exposes this in /proc; other Unix platforms retain a conservative
-// PID-only fallback until their native process identity is wired in.
+// Linux exposes this in /proc and Darwin via kern.proc.pid; other Unix
+// platforms retain a conservative PID-only fallback until their native API is
+// wired in.
 func ProcessStartIdentity(pid int) (string, error) {
 	if pid <= 0 {
 		return "", fmt.Errorf("invalid pid %d", pid)
@@ -50,7 +51,7 @@ func ProcessStartIdentity(pid int) (string, error) {
 		}
 		return fields[21], nil
 	}
-	return strconv.Itoa(pid), nil
+	return processStartIdentityNonLinux(pid)
 }
 
 // ProcessIdentityMatches verifies both liveness and process start identity.
