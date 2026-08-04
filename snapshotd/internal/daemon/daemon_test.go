@@ -276,12 +276,18 @@ func TestDaemon_ResolveProjectInstanceUsesReadyExternalSAPSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
+	sapSocket := filepath.Join(t.TempDir(), "manual.sap.sock")
+	listener, err := net.Listen("unix", sapSocket)
+	if err != nil {
+		t.Fatalf("listen SAP fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close(); _ = os.Remove(sapSocket) })
 	external, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
 		InstanceNonce: "manual-instance",
 		PID:           os.Getpid(),
 		ProcessStart:  mustProcessStart(t),
 		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
-		SAPSocketPath: filepath.Join(t.TempDir(), "manual.sap.sock"),
+		SAPSocketPath: sapSocket,
 	})
 	if err != nil {
 		t.Fatalf("register external instance: %v", err)
@@ -322,6 +328,27 @@ func TestDaemon_ResolveProjectInstanceIgnoresExpiredExternalSAPSocket(t *testing
 	}
 	if _, _, err := d.resolveProjectInstance(project.ID); err == nil {
 		t.Fatal("expired external instance must not resolve")
+	}
+}
+
+func TestDaemon_ResolveProjectInstanceIgnoresNonResponsiveExternalSAPSocket(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	project, err := d.CreateProject(context.Background(), CreateProjectParams{Name: "dead-external"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	_, err = d.RegisterExternalInstance(context.Background(), RegisterExternalInstanceParams{
+		InstanceNonce: "dead-external-instance",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+		SAPSocketPath: filepath.Join(t.TempDir(), "dead.sap.sock"),
+	})
+	if err != nil {
+		t.Fatalf("register advisory external instance: %v", err)
+	}
+	if _, _, err := d.resolveProjectInstance(project.ID); err == nil || !strings.Contains(err.Error(), "no running") {
+		t.Fatalf("non-responsive external endpoint must fail closed, got %v", err)
 	}
 }
 
@@ -460,6 +487,19 @@ func TestDaemon_RegisterExternalInstanceRejectsProcessIdentityMismatch(t *testin
 	}
 	if !strings.Contains(err.Error(), "identity does not match") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDaemon_RegisterExternalInstanceRejectsDiscoverySocketAsSAP(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	_, err := d.RegisterExternalInstance(context.Background(), RegisterExternalInstanceParams{
+		InstanceNonce: "discovery-socket-as-sap",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		SAPSocketPath: filepath.Join(d.Cfg.HomeDir, "apps", "239658.sock"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "app discovery socket") {
+		t.Fatalf("expected discovery endpoint to be rejected as SAP, got %v", err)
 	}
 }
 

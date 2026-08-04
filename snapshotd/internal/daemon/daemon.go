@@ -97,6 +97,11 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	if !health.ProcessIdentityMatches(p.PID, p.ProcessStart) {
 		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: pid/processStart identity does not match a live process")
 	}
+	if p.SAPSocketPath != "" {
+		if err := d.rejectDiscoveryEndpoint(p.SAPSocketPath); err != nil {
+			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: SAP endpoint: %w", err)
+		}
+	}
 	projectPath := ""
 	if p.ProjectPath != "" {
 		abs, err := canonicalExternalPath(p.ProjectPath)
@@ -145,6 +150,38 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 		return ExternalInstanceResult{}, err
 	}
 	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease}, nil
+}
+
+// validateExternalSAPEndpoint prevents the discovery/control endpoint from
+// being accidentally advertised as SAP.  The two protocols deliberately use
+// different framing and must remain separate: an app-discovery socket is
+// never a valid project-control endpoint.  Registration is allowed to omit a
+// SAP path while a GUI is still starting; when routing, however, the path
+// must be outside the daemon's discovery directory and be responsive.
+func (d *Daemon) validateExternalSAPEndpoint(path string) error {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "." || clean == "" {
+		return fmt.Errorf("path is empty")
+	}
+	if err := d.rejectDiscoveryEndpoint(clean); err != nil {
+		return err
+	}
+	if !health.SocketResponsive(clean, time.Second) {
+		return fmt.Errorf("path %q is not accepting SAP connections", path)
+	}
+	return nil
+}
+
+func (d *Daemon) rejectDiscoveryEndpoint(path string) error {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "." || clean == "" {
+		return fmt.Errorf("path is empty")
+	}
+	appsDir := filepath.Clean(filepath.Join(d.Cfg.HomeDir, "apps"))
+	if clean == appsDir || strings.HasPrefix(clean, appsDir+string(filepath.Separator)) {
+		return fmt.Errorf("path %q is an app discovery socket, not a SAP endpoint", path)
+	}
+	return nil
 }
 
 // handoffDaemonProjectToGUI drains a daemon-owned instance before publishing
@@ -520,6 +557,9 @@ func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error
 			in.SAPSocketPath == "" ||
 			(!in.LeaseExpiresAt.IsZero() && !in.LeaseExpiresAt.After(now)) ||
 			externalProjectRoot(in.ProjectPath) != filepath.Clean(project.RootDir) {
+			continue
+		}
+		if err := d.validateExternalSAPEndpoint(in.SAPSocketPath); err != nil {
 			continue
 		}
 		// External registrations use their own local SAP endpoint and do not
