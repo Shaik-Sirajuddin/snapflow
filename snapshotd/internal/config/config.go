@@ -320,19 +320,43 @@ func discoverAcpxServerBinPath() string {
 	return fallback
 }
 
-// discoverShotcutBinPath is the primary lookup: the real, production
-// FfiBackend-linked Qt binary (`shotcut`, built by
-// `cmake -S shotcut -B <builddir> && ninja` per shotcut/CMakeLists.txt's
-// corrosion_import_crate(... FEATURES real_ffi) integration -- see
-// sap-rust/README.md's "Real FFI" section). Searches a small set of
-// `shotcut/build*/src/shotcut` glob candidates under each ancestor root,
-// preferring a build dir name containing "release" over any other match,
-// so a plain `cmake -B shotcut/build-real-ffi` (or similarly named)
-// checkout is found without extra configuration.
+// exeSuffix is the platform executable suffix used by packaged binaries.
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
+// discoverShotcutBinPath locates the real production Snapflow executable,
+// including the Linux packaged layout: bin/snapflowd alongside
+// Snapflow.app/snapflow (the environment-setting wrapper).
 func discoverShotcutBinPath(roots []string) string {
+	suffix := exeSuffix()
+	if execPath, err := os.Executable(); err == nil {
+		execDir := filepath.Dir(execPath)
+		for _, candidate := range []string{
+			filepath.Join(execDir, "snapflow"+suffix),
+			filepath.Join(execDir, "..", "Snapflow", "snapflow"+suffix),
+			filepath.Join(execDir, "..", "Snapflow.app", "snapflow"+suffix),
+			filepath.Join(execDir, "..", "Snapflow.app", "bin", "snapflow"+suffix),
+		} {
+			if fileExists(candidate) {
+				return candidate
+			}
+		}
+		if matches, err := filepath.Glob(filepath.Join(execDir, "..", "*.app", "Contents", "MacOS", "Snapflow")); err == nil {
+			for _, candidate := range matches {
+				if fileExists(candidate) {
+					return candidate
+				}
+			}
+		}
+	}
+
 	var fallback string
 	for _, root := range roots {
-		matches, err := filepath.Glob(filepath.Join(root, "shotcut", "build*", "src", "shotcut"))
+		matches, err := filepath.Glob(filepath.Join(root, "shotcut", "build*", "src", "snapflow"+suffix))
 		if err != nil {
 			continue
 		}
@@ -352,14 +376,19 @@ func discoverShotcutBinPath(roots []string) string {
 	return fallback
 }
 
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 // discoverSnapshotBinPath implements the "default/dev config points at the
 // real, production child binary" requirement. It searches a handful of
 // directories derived from both the current working directory and the
 // running executable's own location (each walked a few levels up).
 //
-// Preference order: the real Qt/`real_ffi` `shotcut` binary
+// Preference order: the real Qt/`real_ffi` `snapflow` binary
 // (discoverShotcutBinPath) first -- that is the one production backend
-// (FfiBackend, calling into a real live Shotcut process; see
+// (FfiBackend, calling into a real live Snapflow process; see
 // sap-rust/README.md). Only if no such build is found does this fall back
 // to the standalone `sap-rust/target/{release,debug}/sap-rust` binary,
 // which as of the MltBackend removal only runs MockBackend (no real
@@ -380,13 +409,14 @@ func discoverSnapshotBinPath() string {
 		roots = append(roots, ancestors(filepath.Dir(exe), 4)...)
 	}
 
-	if shotcutBin := discoverShotcutBinPath(roots); shotcutBin != "" {
-		return shotcutBin
+	if snapflowBin := discoverShotcutBinPath(roots); snapflowBin != "" {
+		return snapflowBin
 	}
 
+	suffix := exeSuffix()
 	for _, root := range roots {
 		for _, variant := range []string{"release", "debug"} {
-			candidate := filepath.Join(root, "sap-rust", "target", variant, "sap-rust")
+			candidate := filepath.Join(root, "sap-rust", "target", variant, "sap-rust"+suffix)
 			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 				return candidate
 			}
@@ -397,9 +427,9 @@ func discoverSnapshotBinPath() string {
 	// error message (from procmgr.Launch's os.Stat check) still names a
 	// sensible, repo-shaped path instead of an empty string.
 	if exe, err := os.Executable(); err == nil {
-		return filepath.Join(filepath.Dir(exe), "..", "sap-rust", "target", "debug", "sap-rust")
+		return filepath.Join(filepath.Dir(exe), "..", "sap-rust", "target", "debug", "sap-rust"+suffix)
 	}
-	return filepath.Join("..", "sap-rust", "target", "debug", "sap-rust")
+	return filepath.Join("..", "sap-rust", "target", "debug", "sap-rust"+suffix)
 }
 
 // ancestors returns dir followed by up to depth of its parent directories.
