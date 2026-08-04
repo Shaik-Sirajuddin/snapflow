@@ -147,6 +147,14 @@ impl GatewayWsClient {
         self.notifications.subscribe()
     }
 
+    /// Whether the reader observed this socket close.  Gateway reconnect
+    /// coordination uses this to avoid opening a second socket when several
+    /// subscribers notice the same disconnect concurrently.
+    pub fn is_disconnected(&self) -> bool {
+        self.is_disconnected
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Returns a receiver for notifications belonging only to `session_id`.
     /// The raw subscription remains available for low-level gateway/admin
     /// consumers, but session actors must use this demultiplexed channel.

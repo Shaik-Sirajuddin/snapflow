@@ -16,6 +16,7 @@ use crate::protocol_types::{
 use acpx_client::pool::{OpenSpec, PoolKey, ProjectSessionPool, SessionLease};
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1209,6 +1210,31 @@ fn forward_updates(
     }
 }
 
+/// Forward turn updates while suppressing exact duplicate wire frames.  A
+/// subscribed WS receives the normal live stream, but a reconnect race can
+/// also leave the same frame in the RPC response's `_acpx.updates` bundle.
+/// The set is scoped to one prompt turn, so identical text in two legitimate
+/// turns is never collapsed.
+fn forward_updates_dedup(
+    updates: &[serde_json::Value],
+    active_session_id: Option<&str>,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    suppress_user_echo: bool,
+    seen: &mut HashSet<String>,
+) {
+    let mut unique = Vec::with_capacity(updates.len());
+    for update in updates {
+        let Ok(key) = serde_json::to_string(update) else {
+            unique.push(update.clone());
+            continue;
+        };
+        if seen.insert(key) {
+            unique.push(update.clone());
+        }
+    }
+    forward_updates(&unique, active_session_id, event_tx, suppress_user_echo);
+}
+
 fn parse_session_steer(
     value: &serde_json::Value,
 ) -> Option<crate::protocol_types::SessionSteerEvent> {
@@ -1408,6 +1434,27 @@ mod forward_updates_user_echo_tests {
             }
             _ => panic!("expected AgentEvent::Message"),
         }
+    }
+
+    #[test]
+    fn prompt_update_dedup_drops_live_and_bundle_duplicate() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let update = agent_message_chunk_update("s1", "reply");
+        let mut seen = HashSet::new();
+        forward_updates_dedup(
+            std::slice::from_ref(&update),
+            Some("s1"),
+            &tx,
+            true,
+            &mut seen,
+        );
+        // The same wire frame arriving from `_acpx.updates` after the live
+        // subscription must not append the chunk a second time.
+        forward_updates_dedup(&[update], Some("s1"), &tx, true, &mut seen);
+        drop(tx);
+        let event = rx.try_recv().expect("first chunk should forward");
+        assert!(matches!(event, AgentEvent::Message(message) if message.text == "reply"));
+        assert!(rx.try_recv().is_err(), "duplicate frame must be suppressed");
     }
 }
 
@@ -2686,11 +2733,18 @@ async fn run_thread_actor(
                 });
                 let prompt = client.call_with_updates("session/prompt", params, None);
                 tokio::pin!(prompt);
+                // A subscribed WebSocket normally receives turn updates live,
+                // while HTTP/degraded mode returns them in `_acpx.updates`.
+                // During reconnect/subscription races a frame can appear in
+                // both paths; suppress exact duplicate frames before they
+                // reach conversation::merge_text, where duplicate chunks
+                // would otherwise become `texttext`.
+                let mut seen_prompt_updates = HashSet::new();
                 let outcome = loop {
                     tokio::select! {
                         update = live_rx.recv() => {
                             if let Some(update) = update {
-                                forward_updates(&[update], Some(&sid), &event_tx, true);
+                                forward_updates_dedup(&[update], Some(&sid), &event_tx, true, &mut seen_prompt_updates);
                             }
                         }
                         result = &mut prompt => break result,
@@ -2698,7 +2752,13 @@ async fn run_thread_actor(
                 };
                 match outcome {
                     Ok((result, updates)) => {
-                        forward_updates(&updates, Some(&sid), &event_tx, true);
+                        forward_updates_dedup(
+                            &updates,
+                            Some(&sid),
+                            &event_tx,
+                            true,
+                            &mut seen_prompt_updates,
+                        );
                         // A resumed WS subscription can receive a burst of
                         // final notifications just after the prompt response.
                         // Keep draining until the stream is briefly quiet,
@@ -2712,7 +2772,13 @@ async fn run_thread_actor(
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
                                 Ok(Some(update)) => {
-                                    forward_updates(&[update], Some(&sid), &event_tx, true);
+                                    forward_updates_dedup(
+                                        &[update],
+                                        Some(&sid),
+                                        &event_tx,
+                                        true,
+                                        &mut seen_prompt_updates,
+                                    );
                                     wait = std::time::Duration::from_millis(75);
                                 }
                                 Ok(None) | Err(_) => break,

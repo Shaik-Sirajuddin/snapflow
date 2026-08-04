@@ -84,6 +84,10 @@ pub struct Gateway {
     // runtime -- and it lets `mode()`/`subscribe()` stay synchronous
     // (matching their existing signatures; no ripple to every caller).
     websocket: RwLock<Option<Arc<GatewayWsClient>>>,
+    /// Serializes reconnect attempts from the session and out-of-band
+    /// forwarders. Without this, both observers can create independent fresh
+    /// sockets for one disconnect and continue receiving duplicate updates.
+    reconnect_lock: tokio::sync::Mutex<()>,
     session_replays: Mutex<HashMap<String, SessionReplay>>,
     queue_subscriptions: Mutex<HashSet<String>>,
 }
@@ -154,6 +158,7 @@ impl Gateway {
             base_url,
             http,
             websocket: RwLock::new(websocket),
+            reconnect_lock: tokio::sync::Mutex::new(()),
             session_replays: Mutex::new(HashMap::new()),
             queue_subscriptions: Mutex::new(HashSet::new()),
         }
@@ -165,6 +170,7 @@ impl Gateway {
             http: GatewayClient::new(base_url.clone()),
             base_url,
             websocket: RwLock::new(None),
+            reconnect_lock: tokio::sync::Mutex::new(()),
             session_replays: Mutex::new(HashMap::new()),
             queue_subscriptions: Mutex::new(HashSet::new()),
         }
@@ -205,6 +211,16 @@ impl Gateway {
     /// afterward (`false` leaves this `Gateway` in HTTP-degraded mode,
     /// same as a fresh `connect()` whose initial handshake failed).
     pub async fn reconnect(&self) -> bool {
+        let _reconnect_guard = self.reconnect_lock.lock().await;
+        // Another observer may have completed the reconnect while this
+        // caller was waiting for the single-flight gate. Reuse that socket
+        // instead of opening a second live subscription.
+        if self
+            .current_websocket()
+            .is_some_and(|client| !client.is_disconnected())
+        {
+            return true;
+        }
         for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
             let attempt_result = tokio::time::timeout(
                 RECONNECT_ATTEMPT_TIMEOUT,
