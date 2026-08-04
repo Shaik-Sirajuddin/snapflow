@@ -252,25 +252,25 @@ jobs:
             echo "SNAPFLOW_HEAD=0"
             echo "SNAPFLOW_REVISION=origin/master"
             echo "SNAPFLOW_REPO=https://github.com/Shaik-Sirajuddin/shotcut.git"
-            # The docker image's entrypoint hardcodes /root/shotcut as the
-            # mount point (and its own default INSTALL_DIR=$HOME/snapflow
-            # would otherwise write build output outside the mount) --
-            # keep everything inside the one mounted directory so the
-            # final .txz actually lands back on the runner's filesystem.
-            echo "INSTALL_DIR=/root/shotcut"
-            echo "SOURCE_DIR=/root/shotcut/src"
+            # Keep the build in a writable path. Hosted Docker runners use a
+            # rootless user namespace where /root is not traversable; using
+            # /tmp avoids the pre-build mkdir failure while keeping all
+            # generated output inside the mounted checkout.
+            echo "INSTALL_DIR=/tmp/shotcut"
+            echo "SOURCE_DIR=/tmp/shotcut/src"
           } > build-snapflow.conf
           mkdir -p "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/.cargo/registry" "$GITHUB_WORKSPACE/.cargo/git"
           docker run \
-            -v "$PWD:/root/shotcut" \
+            --workdir /tmp/shotcut \
+            -v "$PWD:/tmp/shotcut" \
             -v "$GITHUB_WORKSPACE/.ccache:/tmp/ccache" \
             -v "$GITHUB_WORKSPACE/.cargo/registry:/tmp/cargo/registry" \
             -v "$GITHUB_WORKSPACE/.cargo/git:/tmp/cargo/git" \
             -v "$(command -v ccache):/tmp/ccache-host-bin:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/root/sap-rust-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/root/panel-rust-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/root/acpx-src:ro" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/lib:/root/lib-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/tmp/sap-rust-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/tmp/panel-rust-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/tmp/acpx-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/lib:/tmp/lib-src:ro" \
             -e "DEPS_CACHE_HIT=$DEPS_CACHE_HIT" \
             "$IMAGE_NAME" \
             -c '
@@ -299,23 +299,23 @@ jobs:
               # needs to land at the same relative sibling position too.
               # Unconditional (cheap local copies) regardless of dep-cache
               # state, since snapflow itself always needs these siblings.
-              mkdir -p /root/shotcut/src
-              if [ ! -d /root/shotcut/src/sap-rust ]; then
-                cp -r /root/sap-rust-src /root/shotcut/src/sap-rust
+              mkdir -p /tmp/shotcut/src
+              if [ ! -d /tmp/shotcut/src/sap-rust ]; then
+                cp -r /tmp/sap-rust-src /tmp/shotcut/src/sap-rust
               fi
-              if [ ! -d /root/shotcut/src/panel-rust ]; then
-                cp -r /root/panel-rust-src /root/shotcut/src/panel-rust
+              if [ ! -d /tmp/shotcut/src/panel-rust ]; then
+                cp -r /tmp/panel-rust-src /tmp/shotcut/src/panel-rust
               fi
-              if [ ! -d /root/shotcut/src/acpx ]; then
-                cp -r /root/acpx-src /root/shotcut/src/acpx
+              if [ ! -d /tmp/shotcut/src/acpx ]; then
+                cp -r /tmp/acpx-src /tmp/shotcut/src/acpx
               fi
               # panel-rust/Cargo.toml declares `skills-manager = { path =
               # "../lib/skills-manager" }`, so lib/ must land as a sibling of
               # panel-rust too, or cargo aborts before compiling with
               # "failed to load source for dependency `skills-manager`".
               # Missed when the skills-manager crate was introduced.
-              if [ ! -d /root/shotcut/src/lib ]; then
-                cp -r /root/lib-src /root/shotcut/src/lib
+              if [ ! -d /tmp/shotcut/src/lib ]; then
+                cp -r /tmp/lib-src /tmp/shotcut/src/lib
               fi
               export PATH="/tmp/cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
