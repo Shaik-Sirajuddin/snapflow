@@ -4,6 +4,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash -s -- --asset /path/to/snapflow-linux-x86_64.tar.gz
 #
 # Env overrides:
 #   SNAPFLOW_VERSION      release tag to install (default: latest)
@@ -12,8 +13,48 @@
 #   SNAPFLOW_ASSET_URL    skip the GitHub API lookup and install this tarball URL directly
 #                         (mainly for testing against a non-published build)
 #   SNAPFLOW_SKIP_SERVICE set to 1 to skip systemd/launchd service setup
+#
+# Command-line options:
+#   --asset PATH|URL      install a local tarball or URL without an environment override
+#   --help                show this help
 
 set -euo pipefail
+
+usage() {
+  printf '%s\n' \
+    'Snapflow installer' \
+    '' \
+    'Usage:' \
+    '  curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash' \
+    '  curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash -s -- --asset /path/to/snapflow-linux-x86_64.tar.gz' \
+    '' \
+    'Options:' \
+    '  --asset PATH|URL  install a local tarball or URL without an environment override' \
+    '  --help             show this help' \
+    '' \
+    'Environment overrides:' \
+    '  SNAPFLOW_VERSION, SNAPFLOW_INSTALL_DIR, SNAPFLOW_BIN_DIR,' \
+    '  SNAPFLOW_ASSET_URL, SNAPFLOW_SKIP_SERVICE'
+}
+
+asset_arg=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --asset)
+      [ "$#" -ge 2 ] || { echo "error: --asset requires a local tarball path or URL" >&2; exit 2; }
+      asset_arg="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1 (use --help)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 REPO="Shaik-Sirajuddin/snapflow"
 VERSION="${SNAPFLOW_VERSION:-latest}"
@@ -82,8 +123,17 @@ esac
 # snapflowd has no --version flag today, so this compares against a plain
 # version-stamp file written at install time instead of querying the binary.
 resolve_asset_url() {
-  if [ -n "${SNAPFLOW_ASSET_URL:-}" ]; then
-    printf '%s' "$SNAPFLOW_ASSET_URL"
+  local requested_asset="${asset_arg:-${SNAPFLOW_ASSET_URL:-}}"
+  if [ -n "$requested_asset" ]; then
+    # A local path is converted to a file:// URL so the rest of the download
+    # and optional .sha256 verification path stays identical to release
+    # installs. URL arguments (http(s), file, etc.) are passed through.
+    if [[ "$requested_asset" != *://* ]]; then
+      [ -f "$requested_asset" ] || die "local asset does not exist: $requested_asset"
+      requested_asset="$(cd "$(dirname "$requested_asset")" && pwd)/$(basename "$requested_asset")"
+      requested_asset="file://$requested_asset"
+    fi
+    printf '%s' "$requested_asset"
     return
   fi
 
