@@ -254,9 +254,7 @@ impl AgentRequestHub {
         let targets = {
             let mut pending = self.pending.lock().await;
             let subscribers = self.subscribers.lock().await;
-            let Some(session) = subscribers.get(gateway_session_id) else {
-                return None;
-            };
+            let session = subscribers.get(gateway_session_id)?;
             let targets = session
                 .iter()
                 .map(|(client_id, subscriber)| (client_id.clone(), subscriber.request_tx.clone()))

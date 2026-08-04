@@ -3011,7 +3011,7 @@ async fn run_thread_actor(
                         None,
                     )
                     .await
-                    .and_then(|value| {
+                    .map(|value| {
                         let output = value
                             .get("output")
                             .and_then(|v| v.as_str())
@@ -3030,12 +3030,12 @@ async fn run_thread_actor(
                                     status.get("signal").and_then(|v| v.as_i64()).map(|v| v as i32),
                                 )
                             });
-                        Ok(TerminalOutputEvent {
+                        TerminalOutputEvent {
                             terminal_id: terminal_id.clone(),
                             output,
                             truncated,
                             exit_status,
-                        })
+                        }
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
