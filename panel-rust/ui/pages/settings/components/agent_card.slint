@@ -4,7 +4,7 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { AgentLogo } from "../components/agent_logo.slint";
 import { Button } from "../../../base/button.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { LinkText } from "../../../base/link_text.slint";
 import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
 
 // Grid tile for the Agents view -- one per catalog entry (auto-discovered
@@ -38,10 +38,9 @@ export component AgentCard inherits Rectangle {
     in property <string> agent-id;
     in property <string> agent-name;
     in property <string> website: "";
-    // Display-ready host portion of `website` (e.g. "openai.com"),
-    // computed Rust-side in `models::website_domain` -- see that
-    // function's doc comment for why (Slint has no string-split
-    // primitive). Shown in the website row instead of the raw URL.
+    // Display-ready host portion supplied by the agent catalog. Kept as a
+    // separate input for compatibility with the Agents view's accessible
+    // website binding; the compact card still labels the link uniformly.
     in property <string> website-domain: "";
     // settings_scope_visibility_gate: "project" | "global". Install and
     // enable/disable are both admin-plane/registry actions with no
@@ -94,18 +93,7 @@ export component AgentCard inherits Rectangle {
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: +16px over the original 136px for the new Enabled toggle
     // row (only present once installed).
-    //
-    // REGRESSION FIX: `dc426978` (the commit that first added the
-    // website row below) briefly made this conditional --
-    // `root.website != "" ? 174px : 152px` -- so cards visibly differed
-    // in height depending on whether an agent had a registry website.
-    // Every card in this file must stay one fixed height regardless of
-    // content (the bottom-pinned action row relies on the `vertical-
-    // stretch: 1` spacer Rectangle below absorbing any slack, e.g. when
-    // the website row is absent) -- 174px is the max-content case (with
-    // the website row) so nothing overflows; cards without a website
-    // just get a taller stretch spacer instead of a shorter card.
-    height: 174px;
+    height: root.website != "" ? 174px : 152px;
     // Same tertiary tone the search box uses so cards read as one
     // consistent surface with the rest of this page's chrome; the default
     // card gets the primary-container tint to stand out. No hover tint on
@@ -168,49 +156,13 @@ export component AgentCard inherits Rectangle {
             }
         }
 
-        // Website row: [globe icon] domain text  …  [external-link icon],
-        // the external-link icon anchored to the row's far/top-right end
-        // via the domain Text's horizontal-stretch. The whole row is
-        // clickable (not just the domain text) since neither icon has
-        // its own affordance otherwise.
         if root.website != "" : Rectangle {
-            height: Metrics.icon-sm + Metrics.space-1;
+            height: 16px;
             width: parent.width;
-            website-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: root.website-domain;
-                accessible-action-default => { root.website-clicked(); }
+            LinkText {
+                text: "Official website";
+                font-size: 10px * Theme.font-scale;
                 clicked => { root.website-clicked(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            HorizontalLayout {
-                width: parent.width;
-                height: parent.height;
-                spacing: Metrics.space-2;
-                Icon {
-                    size: Metrics.icon-sm;
-                    color: website-touch.has-hover ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary;
-                    animate color { duration: 100ms; }
-                    source: @image-url("../../../assets/icons/globe.svg");
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: root.website-domain;
-                    color: website-touch.has-hover ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary;
-                    animate color { duration: 100ms; }
-                    font-size: 9px * Theme.font-scale;
-                    horizontal-stretch: 1;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-                Icon {
-                    size: Metrics.icon-sm;
-                    color: website-touch.has-hover ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary;
-                    animate color { duration: 100ms; }
-                    source: @image-url("../../../assets/icons/external-link.svg");
-                    vertical-alignment: center;
-                }
             }
         }
 

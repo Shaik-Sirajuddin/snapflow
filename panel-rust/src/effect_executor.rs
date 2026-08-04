@@ -549,7 +549,20 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     panel.execute_send_prompt_real(real_index, &text);
                 }
             }
-            Effect::ProbeProvider { real_index, provider, profile_name } => {
+            Effect::RecordLocalMessage { thread_id, text } => {
+                let real_index = panel.model.borrow().thread_index_for_id(&thread_id);
+                if let Some(real_index) = real_index {
+                    panel.execute_record_local_message_real(real_index, &text);
+                }
+            }
+            Effect::MutateQueue { real_index, params } => {
+                panel.execute_queue_mutation_real(real_index, params);
+            }
+            Effect::ProbeProvider {
+                real_index,
+                provider,
+                profile_name,
+            } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // stale-provider-switch-pulse fix: a `false` return
                     // means `probe_provider_selection` hit its deliberate
@@ -885,16 +898,20 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 }
             }
             Effect::ArchiveThread {
-                thread_id,
+                real_index,
                 archived,
             } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // Keep main's toggle-capable archive (archived=false
                     // resumes) and adopt the audit branch's failure surfacing
                     // into Dirty::Error via StateEffectFailed.
-                    if !bridge.set_thread_archived_by_id(&thread_id, archived) {
+                    let thread_id = bridge
+                        .thread_binding(real_index)
+                        .map(|binding| binding.thread_id)
+                        .unwrap_or_default();
+                    if !bridge.set_thread_archived(real_index, archived) {
                         let message =
-                            format!("failed to set thread {thread_id} archived={archived}");
+                            format!("failed to set thread {real_index} archived={archived}");
                         eprintln!("panel-rust: {message}");
                         let _ = update_persistent(
                             panel,
@@ -1205,10 +1222,7 @@ mod skill_editor_path_tests {
 
         // The fix: write `path` (== content_path) directly, no re-join.
         std::fs::write(&md_path, "new content").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&md_path).unwrap(),
-            "new content"
-        );
+        assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "new content");
     }
 
     // Sibling regression to the two tests above, but for the reactive-sync
@@ -1252,7 +1266,7 @@ mod skill_editor_path_tests {
         assert_eq!(fixed_source_dir, dir);
         assert!(
             fixed_source_dir.join("SKILL.md").is_file(),
-                "the fix (path.parent()) resolves to a directory that \
+            "the fix (path.parent()) resolves to a directory that \
              genuinely contains SKILL.md, so register_skill's guard \
              passes"
         );

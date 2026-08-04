@@ -7,6 +7,9 @@ pub enum PersistenceError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("io error preparing sqlite storage directory: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("json (de)serialization error: {0}")]
     Json(#[from] serde_json::Error),
 

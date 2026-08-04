@@ -1309,24 +1309,7 @@ func (d *Daemon) awaitLiveExternalProject(ctx context.Context, projectID string)
 				continue
 			}
 			if instance.SAPSocketPath == "" {
-				// Permanent, not transient: SAP exposure is opt-in via env
-				// vars set only at process launch (procmgr.go), so a
-				// process that came up without them can never grow a SAP
-				// socket later -- retrying here (like the pendingGUI loop
-				// below does for a not-yet-responsive socket) would only
-				// spin until externalSAPReadyTimeout for no reason. Record
-				// this once so the permanently-blocked state is
-				// diagnosable from the audit trail instead of only from a
-				// one-shot RPC error, and fail with a message that tells
-				// the caller what actually fixes it: this specific GUI
-				// window was not launched by snapshotd and must be closed
-				// (or the project reopened via the daemon) before MCP can
-				// reach it -- launching a competing headless instance
-				// instead is not safe, since both processes would be able
-				// to write the same project files concurrently.
-				_ = d.Reg.AuditOnce(projectID, registry.AuditExternalNoSAP,
-					fmt.Sprintf("instance=%s pid=%d", instance.ID, instance.PID))
-				return false, fmt.Errorf("daemon: project %s is open in a GUI window (pid %d) that was not launched by snapshotd and has no SAP control socket -- close that window (or reopen the project through snapshotd) before MCP can control it", projectID, instance.PID)
+				return false, fmt.Errorf("daemon: external GUI owns project %s but has no SAP socket", projectID)
 			}
 			if health.SocketResponsive(instance.SAPSocketPath, 100*time.Millisecond) {
 				return d.hasLiveExternalProject(ctx, projectID)

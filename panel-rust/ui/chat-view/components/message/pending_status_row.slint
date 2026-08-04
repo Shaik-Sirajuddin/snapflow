@@ -14,8 +14,10 @@ export component PendingStatusRow inherits HorizontalLayout {
 
     horizontal-stretch: 1;
     preferred-width: 0px;
-    // Small gap between label and dots for improved readability.
-    spacing: Metrics.space-1;
+    // Zero gap by request: label first, then the pulsing dots immediately
+    // after it, no dead room between them (matches chat_area.slint's
+    // now-removed inline pending row this component replaced).
+    spacing: 0px;
     height: 20px;
     cross-axis-alignment: center;
 

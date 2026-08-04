@@ -4,7 +4,9 @@
 
 pub mod admin;
 pub mod mcp_servers;
+pub mod permission_profiles;
 pub mod profiles;
 pub mod prompt;
 pub mod registry;
+pub mod session_stream;
 pub mod sessions;

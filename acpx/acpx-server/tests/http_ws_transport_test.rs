@@ -680,6 +680,85 @@ async fn ws_round_trips_a_request() {
 }
 
 #[tokio::test]
+async fn ws_queue_subscription_fans_out_authoritative_mutations() {
+    let directory = tempfile::tempdir().expect("queue tempdir");
+    let router = Router::new("stand-in-agent")
+        .with_queue_store(acpx_core::QueueStore::new(directory.path()));
+    let addr = spawn_server(Arc::new(Mutex::new(router))).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("ws connect");
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "acpx/sessions/queue/subscribe",
+                "params": {"sessionIds": ["session-ws"]}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("subscribe queue stream");
+    let subscribe = socket
+        .next()
+        .await
+        .expect("subscribe response")
+        .expect("subscribe frame");
+    let subscribe = match subscribe {
+        WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        other => panic!("expected subscribe response, got {other:?}"),
+    };
+    assert_eq!(subscribe["sessionIds"], json!(["session-ws"]));
+    assert_eq!(subscribe["snapshots"][0]["queue"], json!([]));
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/queue",
+                "params": {
+                    "sessionId": "session-ws",
+                    "operation": "enqueue",
+                    "text": "from-ws",
+                    "idempotencyKey": "ws-client-1"
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("enqueue through websocket");
+
+    let mut saw_response = false;
+    let mut saw_event = false;
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), socket.next())
+            .await
+            .expect("queue websocket frame timeout")
+            .expect("queue websocket closed")
+            .expect("queue websocket frame error");
+        let body = match frame {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected queue JSON frame, got {other:?}"),
+        };
+        if body["sessionId"] == json!("session-ws") && body["accepted"] == json!(true) {
+            saw_response = body["queue"][0]["text"] == json!("from-ws");
+        }
+        if body["method"] == json!("acpx/session/queue") {
+            saw_event = body["params"]["sessionId"] == json!("session-ws")
+                && body["params"]["queue"][0]["text"] == json!("from-ws");
+        }
+    }
+    assert!(
+        saw_response,
+        "missing authoritative queue mutation response"
+    );
+    assert!(saw_event, "missing fan-out queue notification");
+}
+
+#[tokio::test]
 async fn ws_rejects_an_over_limit_subscriber_without_disrupting_the_existing_stream() {
     let mut router =
         Router::new("stand-in-agent").with_notification_hub(NotificationHub::with_limits(16, 1));

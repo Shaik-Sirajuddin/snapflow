@@ -38,10 +38,10 @@
 //! Phase 1 and Phase 3 of that plan (keyed identity + frame-projection
 //! reuse), landed in this pass.
 
+use slint::ModelRc;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use slint::ModelRc;
 
 /// One row's bookkeeping: where it currently sits in the projected row
 /// list, a fingerprint of the source text last used to build it, and the
@@ -229,7 +229,11 @@ impl ThreadMessageIndex {
     /// O(1) amortized: overwrite `key`'s per-block incremental render
     /// cache with a freshly-diffed one. No-op if `key` has no entry yet --
     /// same "record first" rule as `set_rendered_blocks`.
-    pub fn set_block_cache(&mut self, key: &str, cache: Vec<(u64, crate::models::MarkdownBlockData)>) {
+    pub fn set_block_cache(
+        &mut self,
+        key: &str,
+        cache: Vec<(u64, crate::models::MarkdownBlockData)>,
+    ) {
         if let Some(entry) = self.by_key.get_mut(key) {
             entry.block_cache = cache;
         }
@@ -241,7 +245,9 @@ impl ThreadMessageIndex {
     /// write entirely once there's nothing left to free, instead of
     /// paying a `HashMap` write on every idle poll tick forever.
     pub fn block_cache_is_empty(&self, key: &str) -> bool {
-        self.by_key.get(key).is_none_or(|e| e.block_cache.is_empty())
+        self.by_key
+            .get(key)
+            .is_none_or(|e| e.block_cache.is_empty())
     }
 
     /// O(1) amortized: drop `key`'s per-block incremental cache.
@@ -409,16 +415,25 @@ mod tests {
         // as tokens stream in, same key, same row_index, different text.
         let mut idx = ThreadMessageIndex::default();
         idx.record("assistant:1", 3, "partial");
-        assert_eq!(idx.check("assistant:1", "partial text grew"), RowChange::Changed(3));
+        assert_eq!(
+            idx.check("assistant:1", "partial text grew"),
+            RowChange::Changed(3)
+        );
     }
 
     #[test]
     fn record_after_changed_makes_the_next_check_unchanged() {
         let mut idx = ThreadMessageIndex::default();
         idx.record("assistant:1", 0, "partial");
-        assert_eq!(idx.check("assistant:1", "partial more"), RowChange::Changed(0));
+        assert_eq!(
+            idx.check("assistant:1", "partial more"),
+            RowChange::Changed(0)
+        );
         idx.record("assistant:1", 0, "partial more");
-        assert_eq!(idx.check("assistant:1", "partial more"), RowChange::Unchanged(0));
+        assert_eq!(
+            idx.check("assistant:1", "partial more"),
+            RowChange::Unchanged(0)
+        );
     }
 
     #[test]
@@ -428,7 +443,10 @@ mod tests {
         idx.record("assistant:1", 1, "world");
         idx.record("assistant:1", 1, "world changed");
         assert_eq!(idx.check("user:1", "hello"), RowChange::Unchanged(0));
-        assert_eq!(idx.check("assistant:1", "world changed"), RowChange::Unchanged(1));
+        assert_eq!(
+            idx.check("assistant:1", "world changed"),
+            RowChange::Unchanged(1)
+        );
     }
 
     #[test]
@@ -635,7 +653,10 @@ mod tests {
         );
         // The brand-new row has nothing rendered yet.
         assert!(idx2.rendered_blocks_for("user:2").is_none());
-        assert_eq!(idx2.check("assistant:1", "hello world"), RowChange::Unchanged(1));
+        assert_eq!(
+            idx2.check("assistant:1", "hello world"),
+            RowChange::Unchanged(1)
+        );
     }
 
     #[test]

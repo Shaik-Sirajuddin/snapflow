@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         native_auth_method_id = ?config.native_auth_method_id,
         program = %config.default_acp_command.program,
         args = ?config.default_acp_command.args,
+        storage_dir = %config.storage_dir.display(),
         http_bind_addr = ?config.http_bind_addr,
         admin_bind_addr = ?config.admin_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
@@ -99,6 +100,12 @@ async fn main() -> anyhow::Result<()> {
         .with_session_process_isolation(config.session_process_isolation)
         .with_on_demand_recovery_enabled(config.startup_session_recovery_enabled)
         .with_process_reader_demux(config.process_reader_demux)
+        .with_transcript_store(acpx_core::TranscriptStore::new(
+            config.storage_dir.join("transcripts"),
+        ))
+        .with_queue_store(acpx_core::QueueStore::new(
+            config.storage_dir.join("queues"),
+        ))
         .with_notification_hub(NotificationHub::with_stream_retention(
             256,
             config.max_subscribers_per_session,

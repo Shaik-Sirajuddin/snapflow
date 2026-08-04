@@ -67,6 +67,10 @@ pub struct InitialState {
     /// the same as `threads`/`thread_ids`; a missing/short entry falls
     /// back to an empty in-memory-only queue.
     pub send_queues: Vec<crate::send_queue::SendQueue>,
+    /// ACPX owns queue persistence and dispatch for production sessions.
+    /// Kept explicit so pure reducer tests can continue to exercise the
+    /// legacy local queue contract.
+    pub server_queue: bool,
     pub onboarding_completed: bool,
 }
 
@@ -119,6 +123,7 @@ pub struct ThreadModel {
     /// showed nothing at all, indistinguishable from a hang.
     pub agent_content_this_turn: bool,
     pub send_queue: SendQueue,
+    pub server_queue: bool,
     /// Per-thread compose draft (leak_audit_report §2.5 / §4.2). The
     /// global `Model::compose_text` is only the *active* buffer for the
     /// displayed thread; switching saves/restores via this field.
@@ -592,6 +597,7 @@ impl Default for ThreadModel {
             unauthenticated: false,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
+            server_queue: true,
             compose_draft: String::new(),
             closed: false,
             archived: false,
@@ -602,7 +608,9 @@ impl Default for ThreadModel {
             rows_synced_with: None,
             #[cfg(test)]
             message_rows: Vec::new(),
-            markdown_render_index: RefCell::new(crate::thread_message_index::ThreadMessageIndex::default()),
+            markdown_render_index: RefCell::new(
+                crate::thread_message_index::ThreadMessageIndex::default(),
+            ),
             markdown_epoch: crate::markdown_worker::EpochCounter::new(),
             markdown_in_flight: crate::markdown_worker::InFlightRegistry::new(),
             has_older_messages: false,
@@ -719,6 +727,7 @@ impl Model {
                     .unwrap_or(ThreadState::Idle),
                 session_id: spec.session_id,
                 send_queue: initial.send_queues.get(idx).cloned().unwrap_or_default(),
+                server_queue: initial.server_queue,
                 ..ThreadModel::default()
             })
             .collect();
@@ -757,6 +766,7 @@ mod tests {
             thread_states: vec![],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
             onboarding_completed: false,
         });
         assert!(model.threads.is_empty());
@@ -788,6 +798,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
             onboarding_completed: false,
         };
         let model = Model::from_initial_state(initial);
@@ -820,6 +831,7 @@ mod tests {
             thread_states: vec![ThreadState::Error],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
             onboarding_completed: false,
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
@@ -855,6 +867,7 @@ mod tests {
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
             startup_warnings: vec![],
             send_queues: vec![],
+            server_queue: true,
             onboarding_completed: false,
         });
 

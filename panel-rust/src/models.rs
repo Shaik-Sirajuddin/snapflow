@@ -772,7 +772,13 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                     .unwrap_or_default()
                     .into(),
                 text: m.text.clone().into(),
-                markdown_lines: markdown_lines_for(&mut render_index, &i.to_string(), i, kind, &m.text),
+                markdown_lines: markdown_lines_for(
+                    &mut render_index,
+                    &i.to_string(),
+                    i,
+                    kind,
+                    &m.text,
+                ),
                 markdown_blocks: markdown_blocks_for(
                     &mut render_index,
                     &i.to_string(),
@@ -1072,10 +1078,7 @@ pub fn message_rows_for_thread_with_state(
     // real "thinking" row had already landed -- rendering both "Agent is
     // working..." and "Thinking" at once instead of the pending
     // placeholder yielding to the real one, as intended.
-    let last_is_user = rows
-        .last()
-        .map(|row| row.kind == "user")
-        .unwrap_or(false);
+    let last_is_user = rows.last().map(|row| row.kind == "user").unwrap_or(false);
     if generation_in_flight && last_is_user {
         rows.push(MessageItem {
             kind: "pending".into(),
@@ -1404,7 +1407,9 @@ pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
 /// Permission-mode selector rows (dedicated compose dropdown) -- same
 /// shape as [`to_reasoning_dropdown_entries`], filtering on
 /// [`is_permission_mode_option_id`] instead.
-pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+pub fn to_permission_mode_dropdown_entries(
+    options: Vec<ConfigOptionInfo>,
+) -> ModelRc<DropdownEntry> {
     let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
         if is_permission_mode_option_id(&option.id) {
@@ -1417,7 +1422,10 @@ pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> Mo
 /// Trigger label for the permission-mode dropdown (current value name, or
 /// ""), same shape as [`current_reasoning_trigger_label`].
 pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> String {
-    for option in options.iter().filter(|o| is_permission_mode_option_id(&o.id)) {
+    for option in options
+        .iter()
+        .filter(|o| is_permission_mode_option_id(&o.id))
+    {
         let Some(cur) = option.current_value.as_ref() else {
             continue;
         };
@@ -2245,7 +2253,9 @@ fn parse_kv_lines(text: &str, sep: char) -> std::collections::HashMap<String, St
 /// shell-style quoting/escaping); `timeout` is parsed as whole seconds,
 /// `None` on empty/invalid input rather than erroring, since 0 is a
 /// meaningless timeout and the field is optional.
-pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_types::McpServerEntry {
+pub fn mcp_server_entry_from_form(
+    data: &McpServerFormData,
+) -> crate::protocol_types::McpServerEntry {
     use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
 
     let timeout = data.timeout.trim().parse::<u64>().ok();
@@ -2266,11 +2276,7 @@ pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_t
     } else {
         McpServerConfig::Stdio {
             command: data.command.trim().to_string(),
-            args: data
-                .args
-                .split_whitespace()
-                .map(str::to_string)
-                .collect(),
+            args: data.args.split_whitespace().map(str::to_string).collect(),
             env: parse_kv_lines(&data.env, '='),
             timeout,
         }
@@ -2291,11 +2297,7 @@ pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption>
     // Live injection gate (Settings toggle) — not always-on once the
     // user has disabled snapflow; still show the row so they can re-enable.
     let enabled = crate::agent_bridge::snapflow_mcp_enabled();
-    let status = if enabled {
-        "connected"
-    } else {
-        "disconnected"
-    };
+    let status = if enabled { "connected" } else { "disconnected" };
     let status_line = if enabled {
         "built-in daemon · injected into sessions"
     } else {
@@ -2363,9 +2365,18 @@ fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<Mc
             let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            let enabled = tool.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-            let deferred = tool.get("deferred").and_then(|v| v.as_bool()).unwrap_or(false);
-            let token_usage = tool.get("token_usage").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let enabled = tool
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let deferred = tool
+                .get("deferred")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let token_usage = tool
+                .get("token_usage")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
             preferences.insert(name.to_string(), (enabled, deferred, token_usage));
         }
     }
@@ -2375,8 +2386,10 @@ fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<Mc
 
     if let Some(crate::protocol_types::McpToolCatalog::Ready { tools }) = &entry.tool_catalog {
         for tool in tools {
-            let (enabled, deferred, token_usage) =
-                preferences.get(&tool.name).copied().unwrap_or((true, false, 0));
+            let (enabled, deferred, token_usage) = preferences
+                .get(&tool.name)
+                .copied()
+                .unwrap_or((true, false, 0));
             seen.insert(tool.name.clone());
             rows.push(McpToolOption {
                 name: tool.name.clone().into(),
@@ -2916,8 +2929,14 @@ mod tests {
         let rows = to_mcp_server_option_rows(vec![entry], &[]);
         let tools: Vec<_> = rows[0].tools.iter().collect();
         assert_eq!(tools.len(), 2);
-        let read_file = tools.iter().find(|t| t.name == "read_file").expect("read_file row");
-        assert!(!read_file.enabled, "persisted preference must override the live default");
+        let read_file = tools
+            .iter()
+            .find(|t| t.name == "read_file")
+            .expect("read_file row");
+        assert!(
+            !read_file.enabled,
+            "persisted preference must override the live default"
+        );
         assert!(read_file.deferred);
         assert_eq!(read_file.token_usage, 42);
         let vanished = tools
@@ -2946,7 +2965,10 @@ mod tests {
         });
         let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "error");
-        assert_eq!(rows[0].tool_fetch_error.as_str(), "process exited before responding");
+        assert_eq!(
+            rows[0].tool_fetch_error.as_str(),
+            "process exited before responding"
+        );
     }
 
     /// Never-fetched entries (no `tool_catalog` at all) must not be
@@ -2981,8 +3003,7 @@ mod tests {
                 timeout: None,
             },
         );
-        let rows =
-            to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
+        let rows = to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "fetching");
     }
 
@@ -3155,10 +3176,7 @@ mod tests {
                     Some("Bearer xyz")
                 );
                 assert_eq!(timeout, None, "blank timeout must parse to None, not 0");
-                assert_eq!(
-                    oauth.map(|o| o.client_id),
-                    Some("client-abc".to_string())
-                );
+                assert_eq!(oauth.map(|o| o.client_id), Some("client-abc".to_string()));
             }
             other => panic!("expected Http config, got {other:?}"),
         }
@@ -3892,7 +3910,10 @@ mod transcript_model_tests {
         let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
         let a = markdown_lines_for(&mut render_index, "k1", 0, "agent", "# First");
         let b = markdown_lines_for(&mut render_index, "k2", 1, "agent", "# Second");
-        assert_ne!(a.row_data(0).unwrap().plain_text, b.row_data(0).unwrap().plain_text);
+        assert_ne!(
+            a.row_data(0).unwrap().plain_text,
+            b.row_data(0).unwrap().plain_text
+        );
     }
 
     #[test]
@@ -4012,7 +4033,14 @@ mod transcript_model_tests {
         // Streamed in growing partial calls, then settled (repeat call
         // with unchanged text) -- matches a real short agent reply.
         markdown_blocks_for(&mut render_index, "k", 0, "agent", "Just one short", false);
-        markdown_blocks_for(&mut render_index, "k", 0, "agent", "Just one short line, nothing", false);
+        markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "Just one short line, nothing",
+            false,
+        );
         let settled = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
         let settled_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
 
@@ -4079,7 +4107,14 @@ mod transcript_model_tests {
         let text = "First paragraph of the message.\n\nSecond paragraph, a bit longer than the first one to be realistic.\n\nFinal short line.";
         let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
         // Tick 1: streaming arrives (simulated as a few growing calls).
-        markdown_blocks_for(&mut render_index, "k", 0, "agent", "First paragraph of the message.", false);
+        markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "First paragraph of the message.",
+            false,
+        );
         markdown_blocks_for(
             &mut render_index,
             "k",
@@ -4122,8 +4157,14 @@ mod transcript_model_tests {
         let grown_text = format!("{first_text}\n\nThird paragraph.");
         let grown = build_markdown_block_data_incremental(&grown_text, false, &first);
         assert_eq!(grown.len(), 3);
-        assert_eq!(grown[0].0, first[0].0, "unchanged block keeps the same source hash");
-        assert_eq!(grown[1].0, first[1].0, "unchanged block keeps the same source hash");
+        assert_eq!(
+            grown[0].0, first[0].0,
+            "unchanged block keeps the same source hash"
+        );
+        assert_eq!(
+            grown[1].0, first[1].0,
+            "unchanged block keeps the same source hash"
+        );
 
         // Prove the *data itself* -- not just the hash -- was reused
         // rather than recomputed: tamper with the cached entry's content
@@ -4152,7 +4193,10 @@ mod transcript_model_tests {
         // property of the diff: hash mismatch always means rebuild.
         let step1 = build_markdown_block_data_incremental("Hel", false, &[]);
         let step2 = build_markdown_block_data_incremental("Hello world", false, &step1);
-        assert_ne!(step1[0].0, step2[0].0, "growing text changes the block's source hash");
+        assert_ne!(
+            step1[0].0, step2[0].0,
+            "growing text changes the block's source hash"
+        );
         // Rebuilt data reflects the new, longer text, not the stale
         // cached entry -- `StyledText` derives `PartialEq`, so comparing
         // against a fresh direct build (bypassing the incremental path
@@ -4214,7 +4258,11 @@ mod transcript_model_tests {
         // matches a real turn-ended/settled message being re-projected on
         // every subsequent idle poll tick).
         let cached = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
-        assert_eq!(cached.row_count(), 2, "still returns the correct rendered rows");
+        assert_eq!(
+            cached.row_count(),
+            2,
+            "still returns the correct rendered rows"
+        );
         assert!(
             render_index.block_cache_is_empty("k"),
             "settling (a whole-message cache hit) must free the now-redundant per-block cache"
@@ -4248,12 +4296,19 @@ mod transcript_model_tests {
         let first = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
         let second = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
         let third = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
-        assert_eq!(first, second, "settled repeat calls return the identical cached ModelRc");
-        assert_eq!(second, third, "settled repeat calls return the identical cached ModelRc");
+        assert_eq!(
+            first, second,
+            "settled repeat calls return the identical cached ModelRc"
+        );
+        assert_eq!(
+            second, third,
+            "settled repeat calls return the identical cached ModelRc"
+        );
     }
 
     #[test]
-    fn build_markdown_block_data_incremental_pays_no_more_hashing_than_segment_blocks_already_needs() {
+    fn build_markdown_block_data_incremental_pays_no_more_hashing_than_segment_blocks_already_needs(
+    ) {
         // Cold-start / never-before-seen-message sanity check: with an
         // empty `prev` cache (exactly the state for a message the thread
         // is rendering for the very first time, e.g. cold hydration of a
@@ -4264,8 +4319,14 @@ mod transcript_model_tests {
         let text = "# Heading\n\nA paragraph with `code` and **bold**.\n\n```\nfn main() {}\n```";
         let direct = build_markdown_block_data(text, false);
         let incremental: Vec<MarkdownBlockData> =
-            build_markdown_block_data_incremental(text, false, &[]).into_iter().map(|(_, d)| d).collect();
-        assert_eq!(direct, incremental, "cold start (empty prev cache) must match the non-incremental builder exactly");
+            build_markdown_block_data_incremental(text, false, &[])
+                .into_iter()
+                .map(|(_, d)| d)
+                .collect();
+        assert_eq!(
+            direct, incremental,
+            "cold start (empty prev cache) must match the non-incremental builder exactly"
+        );
     }
 
     #[test]

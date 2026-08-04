@@ -174,7 +174,8 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
     let after_update = handle.list_mcp_servers().await.expect("list_mcp_servers");
     assert_eq!(after_update.len(), 1);
     assert_eq!(
-        after_update[0].command(), Some("mcp-central-fs-v2"),
+        after_update[0].command(),
+        Some("mcp-central-fs-v2"),
         "expected update to have replaced the entry, not appended a second one"
     );
 
@@ -272,7 +273,12 @@ async fn fetch_mcp_server_tools_reports_snapflowd_mcps_real_tool_catalog() {
          \"snapflowd-tools-preview\" within the timeout",
     );
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    for expected in ["list_skills", "read_skill", "list_skill_files", "read_skill_file"] {
+    for expected in [
+        "list_skills",
+        "read_skill",
+        "list_skill_files",
+        "read_skill_file",
+    ] {
         assert!(
             tool_names.contains(&expected),
             "expected the real snapflowd-mcp tool catalog to include {expected}, got {tool_names:?}"
@@ -887,7 +893,8 @@ async fn mcp_server_oauth_flow_completes_through_a_real_authorization_server() {
     while std::time::Instant::now() < deadline {
         let servers = handle.list_mcp_servers().await.expect("list_mcp_servers");
         if let Some(server) = servers.iter().find(|s| s.name == "oauth-test") {
-            if server.auth_status == Some(panel_rust::protocol_types::McpAuthStatus::Authenticated) {
+            if server.auth_status == Some(panel_rust::protocol_types::McpAuthStatus::Authenticated)
+            {
                 authenticated = true;
                 break;
             }
@@ -906,7 +913,8 @@ async fn mcp_server_oauth_flow_completes_through_a_real_authorization_server() {
     // resolves to the same db file), then confirm the server survives with
     // its authenticated status intact, not just re-created empty.
     drop(gateway);
-    let restarted_gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
+    let restarted_gateway =
+        GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let restarted_handle = spawn_acpx_thread(restarted_gateway.base_url.clone());
     let servers_after_restart = restarted_handle
         .list_mcp_servers()

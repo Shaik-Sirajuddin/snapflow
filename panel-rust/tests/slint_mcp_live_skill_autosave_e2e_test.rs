@@ -168,15 +168,21 @@ impl LiveSkillHarness {
         if let Some((name, content)) = preseed {
             let skill_dir = global_skills_dir.join(name);
             std::fs::create_dir_all(&skill_dir).expect("create preseeded skill dir");
-            std::fs::write(skill_dir.join("SKILL.md"), content)
-                .expect("write preseeded SKILL.md");
+            std::fs::write(skill_dir.join("SKILL.md"), content).expect("write preseeded SKILL.md");
             preseeded_skill_dir = Some(skill_dir);
         }
 
         let display = free_x_display();
         let display_str = format!(":{display}");
         let xvfb = Command::new("Xvfb")
-            .args([&display_str, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+            .args([
+                &display_str,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -264,7 +270,11 @@ impl LiveSkillHarness {
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())
-            .args(["--appdata", state_dir.join("shotcut").to_str().unwrap(), "--noupgrade"])
+            .args([
+                "--appdata",
+                state_dir.join("shotcut").to_str().unwrap(),
+                "--noupgrade",
+            ])
             .env("DISPLAY", &display_str)
             .env("QSG_RENDER_LOOP", "basic")
             .env("SLINT_MCP_PORT", mcp_port.to_string())
@@ -354,7 +364,10 @@ impl LiveSkillHarness {
 
     async fn element_tree(&self, window_handle: &Value) -> Vec<Value> {
         let root_handle = self
-            .tool_call("get_window_properties", json!({"windowHandle": window_handle}))
+            .tool_call(
+                "get_window_properties",
+                json!({"windowHandle": window_handle}),
+            )
             .await["rootElementHandle"]
             .clone();
         let tree = self
@@ -447,7 +460,8 @@ impl LiveSkillHarness {
     async fn open_skill_sidebar(&self, window_handle: &Value) {
         self.click_by_exact_label(window_handle, "Expand thread sidebar")
             .await;
-        self.click_by_exact_label(window_handle, "Show skills").await;
+        self.click_by_exact_label(window_handle, "Show skills")
+            .await;
     }
 
     /// Real "New skill" click-through dialog flow -- exercises the
@@ -456,7 +470,8 @@ impl LiveSkillHarness {
     async fn create_skill_via_ui(&self, window_handle: &Value, name: &str) {
         self.click_by_exact_label(window_handle, "New skill").await;
         let field = wait_for(Duration::from_secs(10), || async {
-            self.find_by_exact_label(window_handle, "New skill name").await
+            self.find_by_exact_label(window_handle, "New skill name")
+                .await
         })
         .await;
         self.click_element(&field).await;
@@ -563,7 +578,9 @@ async fn live_new_skill_autosave_persists_content_and_reactive_sync_does_not_fai
         let window = harness.window_handle().await;
 
         harness.open_skill_sidebar(&window).await;
-        harness.create_skill_via_ui(&window, "autosave e2e new skill").await;
+        harness
+            .create_skill_via_ui(&window, "autosave e2e new skill")
+            .await;
 
         eprintln!(
             "[debug] labels after create: {:?}",

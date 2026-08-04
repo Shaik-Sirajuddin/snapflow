@@ -162,7 +162,12 @@ unsafe impl Send for FfiBackend {}
 /// on the forking thread) even though it alone was insufficient --
 /// confirmed by hand: wired in, rebuilt, retested, and the stall still
 /// reproduced at the identical byte offset on all 3 watchdog attempts.
-#[cfg(unix)]
+// `close_range` is a Linux-only syscall wrapper (glibc >= 2.34) -- it does
+// not exist in the `libc` crate on macOS/BSD, so the fd-cleanup step below
+// is Linux-only. The dma-buf/sync-fence wedge this guards against is itself
+// Linux-specific (see doc comment above), so no macOS/BSD equivalent is
+// needed here; those platforms still get the signal-mask/disposition reset.
+#[cfg(target_os = "linux")]
 fn reset_child_signals(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
@@ -186,6 +191,20 @@ fn reset_child_signals(cmd: &mut Command) {
                 libc::c_uint::MAX,
                 libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
             );
+            Ok(())
+        });
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn reset_child_signals(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             Ok(())
         });
     }

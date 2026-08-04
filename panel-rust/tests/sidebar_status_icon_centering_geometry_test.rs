@@ -43,9 +43,8 @@ fn collapsed_status_dot_is_centered_in_the_rail() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
-    panel.set_threads(std::rc::Rc::new(slint::VecModel::from(vec![thread_item(
-        "Thread A",
-    )])).into());
+    panel
+        .set_threads(std::rc::Rc::new(slint::VecModel::from(vec![thread_item("Thread A")])).into());
     panel.set_selected_thread(0);
     // Sidebar starts collapsed by default; assert that explicitly so this
     // test fails loudly (not silently) if that default ever changes.
@@ -73,8 +72,8 @@ fn collapsed_status_dot_is_centered_in_the_rail() {
     // in sidebar_thread_row.slint. Grab the innermost 6x6 dot by type name
     // uniqueness within the row -- there's only one visible status glyph
     // per row for an idle, non-error thread.
-    let rows = ElementHandle::find_by_element_type_name(&panel, "SidebarThreadRow")
-        .collect::<Vec<_>>();
+    let rows =
+        ElementHandle::find_by_element_type_name(&panel, "SidebarThreadRow").collect::<Vec<_>>();
     assert_eq!(rows.len(), 1, "expected exactly one thread row");
     let row = &rows[0];
 

@@ -174,8 +174,7 @@ pub struct PkcePair {
 /// `hex_encode`/`hex_decode` precedent for "one small internal use isn't
 /// worth a new crate."
 fn base64_url_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
@@ -553,9 +552,14 @@ mod tests {
             registration_endpoint: None,
         };
         let pkce = generate_pkce_pair();
-        let url =
-            build_authorization_url(&metadata, "client-123", "http://127.0.0.1:9999/callback", "state-abc", &pkce)
-                .unwrap();
+        let url = build_authorization_url(
+            &metadata,
+            "client-123",
+            "http://127.0.0.1:9999/callback",
+            "state-abc",
+            &pkce,
+        )
+        .unwrap();
         assert!(url.contains("client_id=client-123"));
         assert!(url.contains("state=state-abc"));
         assert!(url.contains("code_challenge_method=S256"));
@@ -589,7 +593,9 @@ mod tests {
             use tokio::io::AsyncWriteExt;
             let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
             stream
-                .write_all(b"GET /callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .write_all(
+                    b"GET /callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                )
                 .await
                 .unwrap();
         });

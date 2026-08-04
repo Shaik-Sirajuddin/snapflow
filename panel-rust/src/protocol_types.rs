@@ -155,9 +155,43 @@ fn has_oversized_string(value: &serde_json::Value) -> bool {
 
 /// Events flowing out of a bound thread's gateway actor, consumed from
 /// `AcpxThreadHandle::take_events`.
+/// Server-owned queue snapshot delivered on the separate ACPX queue stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItemInfo {
+    pub queue_entry_id: String,
+    pub idempotency_key: String,
+    pub text: String,
+    pub state: String,
+    pub position: u32,
+}
+
+/// Outcome of a relayed agent request. `selected=false` tells a connected
+/// panel that another client won the approval race and its card is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentResolutionEvent {
+    pub relay_id: String,
+    pub selected: bool,
+    pub late: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSteerEvent {
+    pub session_id: String,
+    pub state: String,
+    pub queue_entry_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Message(ChatMessage),
+    HistoryPage {
+        messages: Vec<ChatMessage>,
+        next_cursor: Option<String>,
+    },
+    QueueChanged {
+        items: Vec<QueueItemInfo>,
+        paused: bool,
+    },
     /// A prompt turn finished; carries the ACP stop reason as a
     /// human-readable tag (`"end_turn"`, `"cancelled"`, etc.) rather
     /// than re-exporting the wire enum.
@@ -175,6 +209,8 @@ pub enum AgentEvent {
     /// acpx gateway's WS transport (see `acpx_core::agent_relay`'s
     /// module doc comment).
     PermissionRequest(AgentRequestEvent),
+    AgentResolution(AgentResolutionEvent),
+    SessionSteer(SessionSteerEvent),
     /// A live output-buffer push from a `terminal/create`d command, via
     /// the gateway's `acpx/terminal_output` notification (see
     /// `acpx_core::router::spawn_terminal_output_stream`'s doc comment

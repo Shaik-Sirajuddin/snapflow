@@ -60,7 +60,7 @@ pub enum Effect {
         real_index: usize,
     },
     ArchiveThread {
-        thread_id: String,
+        real_index: usize,
         archived: bool,
     },
     RenameThread {
@@ -82,6 +82,25 @@ pub enum Effect {
     SendPrompt {
         thread_id: String,
         text: String,
+    },
+    /// Records `text` into the thread's transcript as a real, permanent
+    /// user-role message -- `AgentBridge::push_local`'s exact effect, but
+    /// without also issuing a new `session/prompt` the way `SendPrompt`
+    /// does. Exists for a `server_queue` thread's auto-drain: ACPX's own
+    /// `spawn_queue_dispatcher` already sends the real prompt server-side
+    /// once the drained entry's queue row vanishes (see `update.rs`'s
+    /// `QueueChanged` handler), so nothing else ever performs the
+    /// immediate-send path's optimistic local transcript append for that
+    /// message -- this effect is that missing step.
+    RecordLocalMessage {
+        thread_id: String,
+        text: String,
+    },
+    /// Mutate the ACPX server-owned FIFO. The server broadcasts the
+    /// resulting authoritative queue projection back to every client.
+    MutateQueue {
+        real_index: usize,
+        params: serde_json::Value,
     },
     /// Probe a provider/profile selection without attaching a real chat
     /// session. The bridge performs a pool acquire/release asynchronously
@@ -326,8 +345,7 @@ pub enum EffectResultMsg {
     /// call fails, NO slot was ever pushed, so leaving the row in place
     /// (the `SessionAttached` Err pattern) permanently shifts every later
     /// real_index one off from its actual bridge slot -- e.g. a later
-    /// `ArchiveThread { thread_id }` effect resolves the durable slot rather
-    /// than a mutable row index, so it cannot land on a DIFFERENT
+    /// `ArchiveThread { real_index }` effect lands on a DIFFERENT
     /// thread's slot than the one the user archived. The fold for this
     /// variant removes the orphaned row instead, restoring alignment.
     ThreadCreationFailed {

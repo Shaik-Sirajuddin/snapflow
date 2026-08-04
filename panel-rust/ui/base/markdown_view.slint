@@ -151,35 +151,6 @@ export component MarkdownView inherits VerticalLayout {
                     default-color: Theme.text-primary;
                     link-color: Theme.md-link;
                     horizontal-alignment: left;
-                    // Resize-rewrap fix: without an explicit stretch
-                    // factor, StyledText (like plain `Text`) defaults to
-                    // `horizontal-stretch: 0` -- see this file's own
-                    // header comment on why a zero-stretch child of a
-                    // (default `alignment: stretch`) HorizontalLayout
-                    // does NOT fill the row. Instead it's sized to its
-                    // own preferred/implicit width (computed once from
-                    // its content at whatever width was available then,
-                    // i.e. the *previous* container width) and the whole
-                    // packed block gets centered in the row. That
-                    // preferred size does not get recomputed just
-                    // because the window/bubble is resized -- only a
-                    // `text` content change (which recomputes implicit
-                    // size) or an explicit width the layout forces on it
-                    // does. Net effect: the message keeps its old wrap
-                    // points after a resize instead of reflowing to the
-                    // new width. `horizontal-stretch: 1` (matching every
-                    // other text-rendering path in this file: the
-                    // fallback TextInput above, the wrapped-line `run`
-                    // elements below, and the code-block wrapper) makes
-                    // the layout hand this element the row's live
-                    // width every layout pass, so live-width-driven
-                    // wrapping tracks a resize like all the sibling
-                    // paths already do. `min-width: 0px` keeps the
-                    // implicit natural (unwrapped) width from acting as
-                    // a floor that would otherwise stop the row from
-                    // ever shrinking below it.
-                    horizontal-stretch: 1;
-                    min-width: 0px;
                     link-clicked(link) => { root.link-activated(link); }
                 }
             }

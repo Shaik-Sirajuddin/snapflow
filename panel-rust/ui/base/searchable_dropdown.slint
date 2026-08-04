@@ -316,19 +316,6 @@ export component SearchableDropdown inherits Rectangle {
             label-scroll := TouchArea {
                 width: 100%;
                 height: 100%;
-                mouse-cursor: root.enabled ? pointer : default;
-                // This TouchArea is declared (and therefore hit-tested)
-                // above `trigger-touch` for every pixel under the label,
-                // since it covers label-scroll-host's full bounds -- most
-                // of the trigger's clickable area. A TouchArea absorbs
-                // pointer events it overlaps regardless of which callbacks
-                // it defines, so without its own `clicked` handler here,
-                // clicks anywhere over the label silently went nowhere and
-                // only the untouched arrow-icon sliver (outside
-                // label-scroll-host) ever reached `trigger-touch` below.
-                // Mirror trigger-touch's open/close so the whole visual
-                // button responds, not just the arrow.
-                clicked => { root.toggle-popup(); }
                 scroll-event(e) => {
                     if (label-scroll-host.overflow > 0px) {
                         label-scroll-host.pan = max(-label-scroll-host.overflow,

@@ -163,6 +163,55 @@ pub struct ProfilesListResult {
     pub profiles: Vec<ProfileSchema>,
 }
 
+/// Gateway-owned, agent-independent permission profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProfileType {
+    AgentFullAccess,
+    Readonly,
+    NotAllowed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PermissionProfile {
+    pub profile_type: PermissionProfileType,
+    pub allow_fs_access: bool,
+    pub allow_terminal_access: bool,
+    pub permission_policy: PermissionPolicySchema,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PermissionProfilesListResult {
+    pub profiles: Vec<PermissionProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionPermissionProfileParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "profileType", skip_serializing_if = "Option::is_none")]
+    pub profile_type: Option<PermissionProfileType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<PermissionProfileOverrides>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PermissionProfileOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_fs_access: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_terminal_access: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_policy: Option<PermissionPolicySchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionPermissionProfileResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub profile: PermissionProfile,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +294,17 @@ mod tests {
         let router_literal = serde_json::json!({"profiles": []});
         let result: ProfilesListResult = serde_json::from_value(router_literal.clone()).unwrap();
         assert_eq!(serde_json::to_value(&result).unwrap(), router_literal);
+    }
+
+    #[test]
+    fn permission_profile_wire_shape_is_stable() {
+        let value = serde_json::json!({
+            "profile_type": "readonly",
+            "allow_fs_access": true,
+            "allow_terminal_access": false,
+            "permission_policy": "auto_reject"
+        });
+        let profile: PermissionProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(profile).unwrap(), value);
     }
 }

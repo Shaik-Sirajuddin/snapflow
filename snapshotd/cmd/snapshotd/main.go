@@ -30,17 +30,6 @@ import (
 	"snapshotd/internal/sdp"
 )
 
-// progName is the command name this binary was actually invoked as (e.g.
-// "snapflowd" on a real install -- build-linux.yml/build-macos.yml/
-// build-windows.yml all do `go build -o dist/snapflowd ./cmd/snapshotd`,
-// per scripts/install.sh's own "Renamed from snapshotd -> snapflowd"
-// comment). Usage/help/error text below derives the displayed command name
-// from this instead of a hardcoded "snapshotd" literal, so it can't drift
-// out of sync with whatever name the binary is actually built/invoked
-// under (dev builds, `go run`, e2e test binaries, and the real packaged
-// snapflowd install can all legitimately differ here).
-var progName = filepath.Base(os.Args[0])
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -88,26 +77,25 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `%[1]s - Snapshot Daemon Protocol (SDP) process manager + MCP proxy
+	fmt.Fprintln(os.Stderr, `snapshotd - Snapshot Daemon Protocol (SDP) process manager + MCP proxy
 
 Usage:
-  %[1]s serve [--headless-default]   start the daemon (registry, session manager, process manager, SDP control socket, MCP/SSE endpoint)
-  %[1]s status                       connect to a running daemon and print its state
-  %[1]s stop                         ask a running daemon to shut down gracefully
-  %[1]s launch <projectId>           convenience wrapper around daemon.launch
-  %[1]s list                         list known process instances (bare daemon.list)
-  %[1]s listProjects                 list known projects (bare daemon.listProjects)
-  %[1]s close <instanceId>           stop one running process instance (bare daemon.close)
-  %[1]s mcp status                   show the MCP listener's bind address and auth state
-  %[1]s mcp restart [--bind ADDR]    rebind the MCP listener (default 127.0.0.1:7777; a
+  snapshotd serve [--headless-default]   start the daemon (registry, session manager, process manager, SDP control socket, MCP/SSE endpoint)
+  snapshotd status                       connect to a running daemon and print its state
+  snapshotd stop                         ask a running daemon to shut down gracefully
+  snapshotd launch <projectId>           convenience wrapper around daemon.launch
+  snapshotd list                         list known process instances (bare daemon.list)
+  snapshotd listProjects                 list known projects (bare daemon.listProjects)
+  snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
+  snapshotd mcp status                   show the MCP listener's bind address and auth state
+  snapshotd mcp restart [--bind ADDR]    rebind the MCP listener (default 127.0.0.1:7777; a
                                           non-loopback ADDR, e.g. 0.0.0.0:7777, is refused unless
                                           mcp auth set has already been run)
-  %[1]s mcp auth set --user U --password P
+  snapshotd mcp auth set --user U --password P
                                           set/replace the MCP listener's Basic Auth credentials
-  %[1]s mcp install-config get       print the MCP endpoint + credentials for a client config
-  %[1]s install                      print what installing a system service would do (not implemented for real)  %[1]s doctor                       check ACP Node/npm (global-first, then product bundle)
-	  %[1]s runtime install node [--force]  install official Node into product runtime/ (if global missing)
-`, progName)
+  snapshotd mcp install-config get       print the MCP endpoint + credentials for a client config
+  snapshotd install                      print what installing a system service would do (not implemented for real)  snapshotd doctor                       check ACP Node/npm (global-first, then product bundle)
+	  snapshotd runtime install node [--force]  install official Node into product runtime/ (if global missing)`)
 }
 
 func cmdServe(cfg config.Config, args []string) error {
@@ -233,7 +221,7 @@ func cmdServe(cfg config.Config, args []string) error {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", "signal", sig.String())
 	case <-d.StopRequested():
-		logger.Info("stop requested via daemon.stop", "cmd", progName+" stop")
+		logger.Info("stop requested via daemon.stop (snapshotd stop)")
 	case err := <-sdpErrCh:
 		if err != nil {
 			logger.Error("SDP server exited", "err", err)
@@ -281,7 +269,7 @@ func cmdStatus(cfg config.Config, args []string) error {
 		return fmt.Errorf("daemon.list: %w", err)
 	}
 
-	fmt.Printf("%s control socket: %s\n", progName, cfg.ControlSocketPath)
+	fmt.Printf("snapshotd control socket: %s\n", cfg.ControlSocketPath)
 	fmt.Printf("projects: %d\n", len(projects))
 	for _, p := range projects {
 		enc, _ := json.Marshal(p)
@@ -314,7 +302,7 @@ func cmdStop(cfg config.Config, args []string) error {
 	if err := c.Call("daemon.stop", map[string]any{}, nil); err != nil {
 		return fmt.Errorf("daemon.stop: %w", err)
 	}
-	fmt.Printf("%s is shutting down\n", progName)
+	fmt.Println("snapshotd is shutting down")
 	return nil
 }
 
@@ -323,7 +311,7 @@ func cmdLaunch(cfg config.Config, args []string) error {
 	gui := fs.Bool("gui", false, "launch with a visible GUI instead of headless/offscreen (daemon.launch defaults to headless=1 per 08-lifecycle-and-cli.md)")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: %s launch [--gui] <projectPath>", progName)
+		return fmt.Errorf("usage: snapshotd launch [--gui] <projectPath>")
 	}
 	projectPath := fs.Arg(0)
 
@@ -398,7 +386,7 @@ func cmdClose(cfg config.Config, args []string) error {
 	fs := flag.NewFlagSet("close", flag.ExitOnError)
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: %s close <instanceId>", progName)
+		return fmt.Errorf("usage: snapshotd close <instanceId>")
 	}
 	instanceID := fs.Arg(0)
 
@@ -418,7 +406,7 @@ func cmdClose(cfg config.Config, args []string) error {
 // cmdMCP dispatches `snapshotd mcp <status|restart|auth|install-config>`.
 func cmdMCP(cfg config.Config, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: %s mcp <status|restart|auth|install-config>", progName)
+		return fmt.Errorf("usage: snapshotd mcp <status|restart|auth|install-config>")
 	}
 	switch args[0] {
 	case "status":
@@ -478,7 +466,7 @@ func cmdMCPRestart(cfg config.Config, args []string) error {
 
 func cmdMCPAuth(cfg config.Config, args []string) error {
 	if len(args) < 1 || args[0] != "set" {
-		return fmt.Errorf("usage: %s mcp auth set --user U --password P", progName)
+		return fmt.Errorf("usage: snapshotd mcp auth set --user U --password P")
 	}
 	fs := flag.NewFlagSet("mcp auth set", flag.ExitOnError)
 	user := fs.String("user", "", "Basic Auth username")
@@ -489,7 +477,7 @@ func cmdMCPAuth(cfg config.Config, args []string) error {
 		*password = os.Getenv("SNAPSHOTD_MCP_PASSWORD")
 	}
 	if *user == "" || *password == "" {
-		return fmt.Errorf("usage: %s mcp auth set --user U [--password P | $SNAPSHOTD_MCP_PASSWORD] (both required)", progName)
+		return fmt.Errorf("usage: snapshotd mcp auth set --user U [--password P | $SNAPSHOTD_MCP_PASSWORD] (both required)")
 	}
 
 	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
@@ -502,7 +490,7 @@ func cmdMCPAuth(cfg config.Config, args []string) error {
 	if err := c.Call("daemon.mcpAuthSet", map[string]any{"user": *user, "password": *password}, &status); err != nil {
 		return fmt.Errorf("daemon.mcpAuthSet: %w", err)
 	}
-	fmt.Printf("MCP auth updated; run `%s mcp restart` to bind beyond 127.0.0.1 if desired\n", progName)
+	fmt.Println("MCP auth updated; run `snapshotd mcp restart` to bind beyond 127.0.0.1 if desired")
 	enc, _ := json.MarshalIndent(status, "", "  ")
 	fmt.Println(string(enc))
 	return nil
@@ -510,7 +498,7 @@ func cmdMCPAuth(cfg config.Config, args []string) error {
 
 func cmdMCPInstallConfig(cfg config.Config, args []string) error {
 	if len(args) < 1 || args[0] != "get" {
-		return fmt.Errorf("usage: %s mcp install-config get", progName)
+		return fmt.Errorf("usage: snapshotd mcp install-config get")
 	}
 
 	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
@@ -532,25 +520,24 @@ func cmdInstall(cfg config.Config, args []string) error {
 	// Honest stub: this sandbox/environment must not touch host system
 	// services. Print exactly what a real implementation would do instead of
 	// silently pretending to succeed.
-	fmt.Printf(`%[1]s install: NOT IMPLEMENTED for real in this build.
+	fmt.Println(`snapshotd install: NOT IMPLEMENTED for real in this build.
 
 A real implementation would, per 08-lifecycle-and-cli.md:
-  - on Linux: write a systemd unit (e.g. /etc/systemd/system/%[1]s.service)
-    running "%[1]s serve" as a long-lived service, then "systemctl enable
-    --now %[1]s"
+  - on Linux: write a systemd unit (e.g. /etc/systemd/system/snapshotd.service)
+    running "snapshotd serve" as a long-lived service, then "systemctl enable
+    --now snapshotd"
   - on macOS: write a launchd plist under /Library/LaunchDaemons and load it
-  - on Windows: register a Windows Service wrapping "%[1]s serve"
+  - on Windows: register a Windows Service wrapping "snapshotd serve"
 
 None of that is performed here -- this command intentionally only prints
 this description and exits 0, so it is never mistaken for having actually
-modified host service configuration.
-`, progName)
+modified host service configuration.`)
 	return nil
 }
 
 func cmdDoctor(cfg config.Config, args []string) error {
 	if len(args) != 0 {
-		return fmt.Errorf("usage: %s doctor", progName)
+		return fmt.Errorf("usage: snapshotd doctor")
 	}
 	fmt.Print(acpnode.DoctorReport())
 	// The Node/npm report above was the only thing `doctor` checked; it
@@ -584,7 +571,7 @@ func controlSocketDoctorLine(socketPath string) string {
 
 func cmdRuntime(cfg config.Config, args []string) error {
 	if len(args) < 2 || args[0] != "install" || args[1] != "node" {
-		return fmt.Errorf("usage: %s runtime install node [--force]", progName)
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
 	}
 	force := false
 	for _, arg := range args[2:] {
@@ -592,7 +579,7 @@ func cmdRuntime(cfg config.Config, args []string) error {
 			force = true
 			continue
 		}
-		return fmt.Errorf("usage: %s runtime install node [--force]", progName)
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
 	}
 	if err := acpnode.Ensure(force); err != nil {
 		return err

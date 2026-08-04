@@ -27,23 +27,12 @@ gemini-cli.svg  --  "Google Gemini"  (Google)
   Native brand color baked into the SVG (fill #8E75B2). Rendered un-colorized.
 
 codex.svg  --  OpenAI mark, standing in for "Codex"  (OpenAI)
-  Source : Simple Icons, pinned pre-removal release (icon slug: openai)
-           https://cdn.jsdelivr.net/npm/simple-icons@11/icons/openai.svg
-  SUBSTITUTION: there is no distinct "Codex" brand mark, so this is OpenAI's
-           own hexagonal-knot logomark, used as the closest official mark for
-           the `codex` agent. Simple Icons removed the "openai" icon from its
-           current/latest release (trademark request), so this is pulled from
-           a pinned older published version rather than the `@latest` CDN
-           alias -- `https://cdn.simpleicons.org/openai` 404s today.
-  PRIOR BUG (fixed 2026-08-02): this file previously held a byte-identical
-           copy of openai/codex's own `codex-rs/skills/.../openai-docs/
-           assets/openai-small.svg` -- despite the filename, that asset is a
-           generic open-book/docs glyph from the Codex repo's docs-sample
-           fixtures, not OpenAI's brand mark. It rendered as a book icon on
-           the Codex agent card once `agent_logo.slint`'s id-matching was
-           fixed to actually reach this branch (previously it silently fell
-           back to the sparkles placeholder, which is why the wrong asset
-           went unnoticed). Replaced with the real logomark above.
+  Source : openai/codex (the Codex CLI's own repository -- first-party)
+           https://raw.githubusercontent.com/openai/codex/main/codex-rs/skills/src/assets/samples/openai-docs/assets/openai-small.svg
+  SUBSTITUTION: there is no distinct "Codex" brand mark. Simple Icons no longer
+           carries an OpenAI icon (removed upstream). This is OpenAI's own
+           logomark, taken directly from the Codex product repository, used as
+           the closest official mark for the `codex` agent.
   License: subject to OpenAI's brand/trademark terms. Monochrome SVG
            (fill="currentColor"); rendered colorized to the theme text color.
 

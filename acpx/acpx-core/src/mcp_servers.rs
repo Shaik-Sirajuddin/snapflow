@@ -90,7 +90,9 @@ impl McpServerStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
-        self.servers.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.servers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn create(&self, entry: Value) -> Result<(), McpServerStoreError> {
