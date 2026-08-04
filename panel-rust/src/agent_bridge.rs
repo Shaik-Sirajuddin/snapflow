@@ -105,6 +105,10 @@ pub struct BridgeEvent {
 /// position, so restoring a subset of threads cannot silently switch agents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadSpec {
+    /// Stable PanelStateStore identity. `None` is reserved for legacy/test
+    /// constructors; production restore always supplies this so a renamed
+    /// thread cannot be split into a synthetic slug and a durable row.
+    pub thread_id: Option<String>,
     pub display_name: String,
     pub provider: String,
     pub session_id: Option<String>,
@@ -143,6 +147,7 @@ fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
     thread_names
         .iter()
         .map(|name| ThreadSpec {
+            thread_id: None,
             display_name: (*name).to_owned(),
             provider: NO_PROVIDER_REQUESTED_FALLBACK.to_owned(),
             session_id: None,
@@ -4312,7 +4317,11 @@ impl AgentBridge {
             &legacy_thread_ids,
         );
         for (idx, spec) in thread_specs.iter().enumerate() {
-            let thread_id = slug(&spec.display_name);
+            let thread_id = spec
+                .thread_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| slug(&spec.display_name));
 
             // Cold-start seed: read whatever this thread's jsonl file
             // already holds -- of any prior shape/length -- *before*
@@ -8469,6 +8478,7 @@ mod tests {
     fn rebind_project_path_moves_only_the_renamed_projects_threads() {
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-a".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8476,6 +8486,7 @@ mod tests {
                 project_path: Some("/projects/a/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-b".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8483,6 +8494,7 @@ mod tests {
                 project_path: Some("/projects/b/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "unscoped".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8538,6 +8550,7 @@ mod tests {
     #[test]
     fn rebind_project_path_with_an_empty_old_path_touches_no_thread() {
         let specs = vec![ThreadSpec {
+            thread_id: None,
             display_name: "unscoped".to_owned(),
             provider: "codex".to_owned(),
             session_id: None,
@@ -8578,6 +8591,7 @@ mod tests {
     fn release_sessions_for_current_project_never_marks_threads_permanently_closed() {
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-a".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8585,6 +8599,7 @@ mod tests {
                 project_path: Some("/projects/a/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-b".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8592,6 +8607,7 @@ mod tests {
                 project_path: Some("/projects/b/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "unscoped".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8642,6 +8658,7 @@ mod tests {
     fn release_sessions_for_current_project_releases_unscoped_threads_on_every_switch() {
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "on-a".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -8649,6 +8666,7 @@ mod tests {
                 project_path: Some("/projects/a/timeline.mlt".to_owned()),
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "unscoped".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -11390,6 +11408,7 @@ done
         let claude_url = claude_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Thread".to_owned(),
                 provider: "codex-acp".to_owned(),
                 session_id: None,
@@ -11397,6 +11416,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Thread".to_owned(),
                 provider: "claude-acp".to_owned(),
                 session_id: None,
@@ -11485,6 +11505,7 @@ done
         let claude_url = claude_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Thread".to_owned(),
                 provider: "codex-acp".to_owned(),
                 session_id: None,
@@ -11492,6 +11513,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Thread".to_owned(),
                 provider: "claude-acp".to_owned(),
                 session_id: None,
@@ -11577,6 +11599,7 @@ done
         let gemini_url = gemini_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Thread".to_owned(),
                 provider: "codex-acp".to_owned(),
                 session_id: None,
@@ -11584,6 +11607,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Thread".to_owned(),
                 provider: "claude-acp".to_owned(),
                 session_id: None,
@@ -11591,6 +11615,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Gemini Thread".to_owned(),
                 provider: "gemini-acp".to_owned(),
                 session_id: None,
@@ -11681,6 +11706,7 @@ done
         let claude_url = claude_gateway.base_url.clone();
         let specs = vec![
             ThreadSpec {
+                thread_id: None,
                 display_name: "Codex Seed".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: None,
@@ -11688,6 +11714,7 @@ done
                 project_path: None,
             },
             ThreadSpec {
+                thread_id: None,
                 display_name: "Claude Seed".to_owned(),
                 provider: "claude".to_owned(),
                 session_id: None,

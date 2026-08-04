@@ -149,6 +149,7 @@ fn cold_start_thread_specs(
     seed_names
         .iter()
         .map(|name| ThreadSpec {
+            thread_id: None,
             display_name: (*name).to_owned(),
             provider: seed_provider.clone(),
             session_id: None,
@@ -2286,6 +2287,7 @@ fn panel_rust_create_with_initial_identity(
             restored_records
                 .iter()
                 .map(|record| ThreadSpec {
+                    thread_id: Some(record.thread_id.clone()),
                     display_name: record.display_name.clone(),
                     provider: record.provider.clone(),
                     session_id: Some(record.session_id.clone()),

@@ -778,6 +778,7 @@ mod tests {
         let initial = InitialState {
             threads: vec![
                 ThreadSpec {
+                    thread_id: Some("thread-1".to_owned()),
                     display_name: "Fix timeline crash".to_owned(),
                     provider: "codex".to_owned(),
                     session_id: Some("sess-1".to_owned()),
@@ -785,6 +786,7 @@ mod tests {
                     project_path: None,
                 },
                 ThreadSpec {
+                    thread_id: Some("thread-2".to_owned()),
                     display_name: "Refactor filters".to_owned(),
                     provider: "claude".to_owned(),
                     session_id: Some("sess-2".to_owned()),
@@ -819,6 +821,7 @@ mod tests {
     fn from_initial_state_restores_runtime_thread_fields_through_hydration() {
         let model = Model::from_initial_state(InitialState {
             threads: vec![ThreadSpec {
+                thread_id: Some("thread-1".to_owned()),
                 display_name: "Needs approval".to_owned(),
                 provider: "codex".to_owned(),
                 session_id: Some("sess-1".to_owned()),
@@ -847,6 +850,7 @@ mod tests {
         let model = Model::from_initial_state(InitialState {
             threads: vec![
                 ThreadSpec {
+                    thread_id: Some("thread-first".to_owned()),
                     display_name: "First".to_owned(),
                     provider: "codex".to_owned(),
                     session_id: Some("session-first".to_owned()),
@@ -854,6 +858,7 @@ mod tests {
                     project_path: None,
                 },
                 ThreadSpec {
+                    thread_id: Some("thread-second".to_owned()),
                     display_name: "Second".to_owned(),
                     provider: "claude".to_owned(),
                     session_id: Some("session-second".to_owned()),

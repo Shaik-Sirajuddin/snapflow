@@ -6666,6 +6666,7 @@ mod tests {
             Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
                 crate::model::InitialState {
                     threads: vec![crate::agent_bridge::ThreadSpec {
+                        thread_id: Some("thread-1".to_owned()),
                         display_name: "fresh".to_owned(),
                         provider: "codex".to_owned(),
                         session_id: None,
@@ -6737,6 +6738,7 @@ mod tests {
             Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
                 crate::model::InitialState {
                     threads: vec![crate::agent_bridge::ThreadSpec {
+                        thread_id: Some("thread:0".to_owned()),
                         display_name: "Chat".to_owned(),
                         provider: "claude".to_owned(),
                         session_id: None,
