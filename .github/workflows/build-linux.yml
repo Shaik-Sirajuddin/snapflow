@@ -320,24 +320,35 @@ jobs:
               # needs to land at the same relative sibling position too.
               # Unconditional (cheap local copies) regardless of dep-cache
               # state, since snapflow itself always needs these siblings.
+              # lib/ is included too since panel-rust/Cargo.toml declares
+              # `skills-manager = { path = "../lib/skills-manager" }`.
+              #
+              # The read-only source bind mounts (/tmp/*-src) have twice been
+              # observed missing at exactly this point on hosted runners --
+              # "cp: cannot stat .../*-src: No such file or directory" --
+              # even though `docker inspect`/local repro of the identical
+              # image and flags never reproduces it, pointing at a transient
+              # runner-side mount race rather than a real config bug. Wait
+              # briefly for each mount to actually appear before copying, and
+              # dump diagnostics if it never does, instead of failing instantly.
               mkdir -p /tmp/shotcut/src
-              if [ ! -d /tmp/shotcut/src/sap-rust ]; then
-                cp -r /tmp/sap-rust-src /tmp/shotcut/src/sap-rust
-              fi
-              if [ ! -d /tmp/shotcut/src/panel-rust ]; then
-                cp -r /tmp/panel-rust-src /tmp/shotcut/src/panel-rust
-              fi
-              if [ ! -d /tmp/shotcut/src/acpx ]; then
-                cp -r /tmp/acpx-src /tmp/shotcut/src/acpx
-              fi
-              # panel-rust/Cargo.toml declares `skills-manager = { path =
-              # "../lib/skills-manager" }`, so lib/ must land as a sibling of
-              # panel-rust too, or cargo aborts before compiling with
-              # "failed to load source for dependency `skills-manager`".
-              # Missed when the skills-manager crate was introduced.
-              if [ ! -d /tmp/shotcut/src/lib ]; then
-                cp -r /tmp/lib-src /tmp/shotcut/src/lib
-              fi
+              for pair in sap-rust-src:sap-rust panel-rust-src:panel-rust acpx-src:acpx lib-src:lib; do
+                src="/tmp/${pair%%:*}"
+                dst="/tmp/shotcut/src/${pair##*:}"
+                if [ ! -d "$dst" ]; then
+                  tries=0
+                  while [ ! -d "$src" ] && [ "$tries" -lt 10 ]; do
+                    tries=$((tries + 1))
+                    sleep 1
+                  done
+                  if [ ! -d "$src" ]; then
+                    echo "::error::$src never appeared after ${tries}s; /tmp contents:"
+                    ls -la /tmp
+                    exit 1
+                  fi
+                  cp -r "$src" "$dst"
+                fi
+              done
               export PATH="/tmp/cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
