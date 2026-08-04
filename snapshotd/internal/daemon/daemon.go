@@ -390,7 +390,7 @@ func (d *Daemon) ReconcileExternalInstances(ctx context.Context) ([]registry.Ext
 	now := time.Now().UTC()
 	for i := range instances {
 		if instances[i].Status == registry.ExternalStatusOpen &&
-			(instances[i].LeaseExpiresAt.Before(now) || !health.PIDAlive(instances[i].PID)) {
+			(instances[i].LeaseExpiresAt.Before(now) || !health.ProcessIdentityMatches(instances[i].PID, instances[i].ProcessStart)) {
 			instances[i].Status = registry.ExternalStatusStale
 			instances[i].UpdatedAt = now
 			if err := d.Reg.SaveExternalInstance(&instances[i]); err != nil {
@@ -555,6 +555,7 @@ func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error
 	for _, in := range externalInstances { // newest first, per ListExternalInstances
 		if in.Status != registry.ExternalStatusOpen ||
 			in.SAPSocketPath == "" ||
+			!health.ProcessIdentityMatches(in.PID, in.ProcessStart) ||
 			(!in.LeaseExpiresAt.IsZero() && !in.LeaseExpiresAt.After(now)) ||
 			externalProjectRoot(in.ProjectPath) != filepath.Clean(project.RootDir) {
 			continue
