@@ -208,6 +208,13 @@ jobs:
           key: cargo-linux-v1-${{ hashFiles('multi-media-main/panel-rust/Cargo.lock', 'multi-media-main/acpx/Cargo.lock', 'multi-media-main/sap-rust/Cargo.lock', 'multi-media-main/lib/skills-manager/Cargo.lock') }}
           restore-keys: cargo-linux-v1-
 
+      # The hosted Docker runner uses a rootless user namespace, so the
+      # build image cannot reliably apt-get or write under /root. Install the
+      # small ccache binary on the runner and mount it into the container;
+      # the build itself remains in the image's existing toolchain.
+      - name: Install ccache on runner for GUI build
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ccache
+
       # A cache "hit" from actions/cache only means the archive round-tripped
       # intact -- it does not guarantee the tree it contains is actually a
       # complete, working deps build. Confirmed for real (run 29985095679):
@@ -255,11 +262,11 @@ jobs:
           } > build-snapflow.conf
           mkdir -p "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/.cargo/registry" "$GITHUB_WORKSPACE/.cargo/git"
           docker run \
-            --user 0:0 \
             -v "$PWD:/root/shotcut" \
-            -v "$GITHUB_WORKSPACE/.ccache:/root/.cache/ccache" \
-            -v "$GITHUB_WORKSPACE/.cargo/registry:/root/.cargo/registry" \
-            -v "$GITHUB_WORKSPACE/.cargo/git:/root/.cargo/git" \
+            -v "$GITHUB_WORKSPACE/.ccache:/tmp/ccache" \
+            -v "$GITHUB_WORKSPACE/.cargo/registry:/tmp/cargo/registry" \
+            -v "$GITHUB_WORKSPACE/.cargo/git:/tmp/cargo/git" \
+            -v "$(command -v ccache):/tmp/ccache-host-bin:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/root/sap-rust-src:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/root/panel-rust-src:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/root/acpx-src:ro" \
@@ -268,19 +275,20 @@ jobs:
             "$IMAGE_NAME" \
             -c '
               set -e
-              # The build image does not guarantee ccache is installed. Use
-              # compiler-wrapper symlinks so both autotools and CMake/Ninja
-              # sub-builds benefit without changing the fork's build script.
-              if ! command -v ccache >/dev/null 2>&1; then
-                apt-get update -qq && apt-get install -y -qq ccache
-              fi
-              mkdir -p /root/ccache-bin /root/.cache/ccache
+              # Use compiler-wrapper symlinks so both autotools and
+              # CMake/Ninja sub-builds benefit without changing the fork's
+              # build script. All new state is under /tmp because hosted
+              # Docker runs rootless and /root is not writable there.
+              mkdir -p /tmp/ccache-bin /tmp/ccache /tmp/cargo /tmp/rustup
               for compiler in cc gcc c++ g++; do
-                ln -sf "$(command -v ccache)" "/root/ccache-bin/$compiler"
+                ln -sf /tmp/ccache-host-bin "/tmp/ccache-bin/$compiler"
               done
-              export PATH="/root/ccache-bin:$PATH"
-              export CCACHE_DIR=/root/.cache/ccache
+              ln -sf /tmp/ccache-host-bin /tmp/ccache-bin/ccache
+              export PATH="/tmp/ccache-bin:$PATH"
+              export CCACHE_DIR=/tmp/ccache
               export CCACHE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              export CARGO_HOME=/tmp/cargo
+              export RUSTUP_HOME=/tmp/rustup
               ccache --set-config=compiler_check=content
               ccache --zero-stats || true
               # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
@@ -309,7 +317,7 @@ jobs:
               if [ ! -d /root/shotcut/src/lib ]; then
                 cp -r /root/lib-src /root/shotcut/src/lib
               fi
-              export PATH="/root/.cargo/bin:$PATH"
+              export PATH="/tmp/cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               fi
