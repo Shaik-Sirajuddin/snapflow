@@ -2780,8 +2780,26 @@ fn spawn_gateway_process(
     // for an agent that is, in fact, installed. Augmenting PATH here with a
     // real login shell's resolved PATH (once per process, cached) closes
     // that gap without needing the operator to launch from a terminal.
-    if let Some(path) = augmented_gateway_path() {
-        cmd.env("PATH", path);
+    // Match snapshotd/acpnode's global-first -> bundled fallback policy.
+    // Desktop launches often inherit a PATH with no node/npm/npx even though
+    // the official Snapflow Node bundle is installed.  Merely augmenting
+    // PATH with a login shell (the old behavior) leaves acpx-registry's
+    // `resolve_npm_bin()` and acpx-core's `which()` resolving bare commands,
+    // so a clean release reports `failed to spawn backend process` on the
+    // first agent use.  Publish the same prefix marker and PATH that the Go
+    // daemon uses when its bundled runtime wins.
+    let gateway_path = augmented_gateway_path()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    cmd.env("PATH", &gateway_path);
+    cmd.env_remove("SNAPFLOW_ACP_NODE_HOME");
+    if !system_node_toolchain_available(&gateway_path) {
+        if let Some(home) = bundled_node_home() {
+            let bundled_bin = home.join("bin");
+            let path = prepend_path_entry(&bundled_bin, &gateway_path);
+            cmd.env("SNAPFLOW_ACP_NODE_HOME", &home);
+            cmd.env("PATH", path);
+        }
     }
     // Gateway stderr goes to a per-provider log file in the cache dir,
     // NOT /dev/null: acpx-server's tracing output AND every backend
@@ -3214,6 +3232,25 @@ fn merge_path_entries(current: &str, extra: Vec<String>) -> Option<String> {
     }
 }
 
+/// Prefix one directory onto a platform-native PATH.  `merge_path_entries`
+/// deliberately emits a Unix-shaped string because it is only used by the
+/// login-shell probe above; the gateway environment is also built on Windows,
+/// where joining with a literal `:` would make the bundled npm invisible.
+fn prepend_path_entry(entry: &Path, current: &str) -> String {
+    let mut paths = vec![entry.to_path_buf()];
+    paths.extend(std::env::split_paths(current));
+    std::env::join_paths(paths)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| {
+            let separator = if cfg!(windows) { ';' } else { ':' };
+            if current.is_empty() {
+                entry.to_string_lossy().into_owned()
+            } else {
+                format!("{}{separator}{current}", entry.to_string_lossy())
+            }
+        })
+}
+
 /// Resolves PATH the same way an interactive login shell would (sourcing
 /// `.bashrc`/`.zshrc`/`.profile`/etc, where nvm/uv/etc typically export
 /// their bin dirs) rather than trusting whatever PATH this process itself
@@ -3260,6 +3297,99 @@ fn login_shell_path_entries() -> Vec<String> {
 #[cfg(not(unix))]
 fn augmented_gateway_path() -> Option<String> {
     None
+}
+
+/// Return true when one PATH resolves a complete, runnable Node toolchain.
+/// Keep this global-first check intentionally small and synchronous: it runs
+/// once per gateway launch and mirrors `acpnode.systemOK`'s node/npm/npx
+/// requirement without importing the Go daemon's resolver into panel-rust.
+fn system_node_toolchain_available(path: &str) -> bool {
+    let find = |name: &str| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| executable_file(candidate))
+    };
+    let Some(node) = find("node") else {
+        return false;
+    };
+    let Some(npm) = find("npm") else {
+        return false;
+    };
+    let Some(npx) = find("npx") else {
+        return false;
+    };
+    std::process::Command::new(node)
+        .arg("--version")
+        .env("PATH", path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+        && std::process::Command::new(npm)
+            .arg("--version")
+            .env("PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        && executable_file(&npx)
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn executable_prefix(home: &Path) -> bool {
+    ["node", "npm", "npx"]
+        .iter()
+        .all(|name| executable_file(&home.join("bin").join(name)))
+}
+
+/// Resolve the official bundled Node layout used by `snapshotd/internal/
+/// acpnode`: an explicit `SNAPFLOW_ACP_NODE_HOME` wins, otherwise the
+/// installed product root (`SNAPFLOW_INSTALL_DIR` or
+/// `$HOME/.local/share/snapflow`) contributes `runtime/node`.
+fn bundled_node_home() -> Option<PathBuf> {
+    let home = bundled_node_home_from(
+        nonempty_env_path("SNAPFLOW_ACP_NODE_HOME"),
+        nonempty_env_path("SNAPFLOW_INSTALL_DIR"),
+        nonempty_env_path("HOME").or_else(|| nonempty_env_path("USERPROFILE")),
+    )?;
+    executable_prefix(&home).then_some(home)
+}
+
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn bundled_node_home_from(
+    override_home: Option<PathBuf>,
+    install_dir: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    override_home.or_else(|| {
+        install_dir
+            .or_else(|| user_home.map(|home| home.join(".local/share/snapflow")))
+            .map(|dir| dir.join("runtime/node"))
+    })
 }
 
 fn self_spawned_admin_creds() -> &'static Mutex<HashMap<String, (String, String)>> {
@@ -8457,6 +8587,63 @@ mod tests {
             merge_path_entries("", vec!["/usr/bin".to_owned()]),
             Some("/usr/bin".to_owned())
         );
+    }
+
+    #[test]
+    fn prepend_path_entry_uses_native_path_list_separator() {
+        let current =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).expect("native PATH");
+        let prefixed =
+            prepend_path_entry(Path::new("/bundle/node/bin"), &current.to_string_lossy());
+        let entries: Vec<_> = std::env::split_paths(&prefixed).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/bundle/node/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn bundled_node_home_prefers_explicit_override() {
+        let resolved = bundled_node_home_from(
+            Some(PathBuf::from("/opt/snapflow/runtime/node")),
+            Some(PathBuf::from("/opt/other")),
+            Some(PathBuf::from("/home/tester")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/opt/snapflow/runtime/node")));
+    }
+
+    #[test]
+    fn bundled_node_home_defaults_to_install_dir_runtime_node() {
+        let resolved = bundled_node_home_from(
+            None,
+            Some(PathBuf::from("/opt/snapflow")),
+            Some(PathBuf::from("/home/tester")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/opt/snapflow/runtime/node")));
+    }
+
+    #[test]
+    fn bundled_node_prefix_requires_node_npm_and_npx() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        for name in ["node", "npm", "npx"] {
+            let path = bin.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("executable");
+            }
+        }
+        assert!(executable_prefix(temp.path()));
+        std::fs::remove_file(bin.join("npx")).expect("remove npx");
+        assert!(!executable_prefix(temp.path()));
     }
 
     fn exited_buffer() -> TerminalBuffer {
