@@ -68,6 +68,11 @@ type Daemon struct {
 	// so a PID+signal-based `stop` command can never work there.
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// externalMu serializes external ownership claims and resolver snapshots.
+	// Handoff must drain a daemon-owned SAP instance before another GUI claim
+	// can become visible; without this lock concurrent registrations could both
+	// observe and race the same headless child.
+	externalMu sync.Mutex
 }
 
 type RegisterExternalInstanceParams struct {
@@ -91,6 +96,8 @@ type discardSink struct{}
 func (discardSink) Notify(string, json.RawMessage) {}
 
 func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExternalInstanceParams) (ExternalInstanceResult, error) {
+	d.externalMu.Lock()
+	defer d.externalMu.Unlock()
 	if strings.TrimSpace(p.InstanceNonce) == "" || p.PID <= 0 || strings.TrimSpace(p.ProcessStart) == "" {
 		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: instanceNonce, pid, and processStart are required")
 	}
@@ -280,6 +287,8 @@ type UpdateExternalProjectParams struct {
 }
 
 func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectParams) (registry.ExternalInstance, error) {
+	d.externalMu.Lock()
+	defer d.externalMu.Unlock()
 	instance, err := d.Reg.GetExternalInstance(p.InstanceID)
 	if err != nil {
 		return registry.ExternalInstance{}, err

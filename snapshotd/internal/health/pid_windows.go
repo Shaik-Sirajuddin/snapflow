@@ -22,8 +22,10 @@ func PIDAlive(pid int) bool {
 	return true
 }
 
-// Windows has no portable start-time identity in this small health package;
-// keep the wire contract usable while conservatively requiring a live PID.
+// Windows currently uses the PID string as the processStart wire identity,
+// matching panel-rust's non-Linux fallback. This is an existence check rather
+// than a creation-time check; a native GetProcessTimes identity can replace
+// it later without changing the registration schema.
 func ProcessStartIdentity(pid int) (string, error) {
 	if !PIDAlive(pid) {
 		return "", fmt.Errorf("pid %d is not alive", pid)
@@ -32,9 +34,6 @@ func ProcessStartIdentity(pid int) (string, error) {
 }
 
 func ProcessIdentityMatches(pid int, start string) bool {
-	if pid != os.Getpid() {
-		return false
-	}
 	actual, err := ProcessStartIdentity(pid)
 	return err == nil && actual == start
 }
