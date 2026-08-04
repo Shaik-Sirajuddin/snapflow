@@ -339,13 +339,11 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// request that spawned it -- explicit cleanup (Close, or the
 	// ConnectTimeout failure path below) is the only thing that should kill
 	// it.
+	// Managed GUI processes publish SAP before loading a project. The first
+	// project.select is the sole authoritative open, so never mark the child as
+	// pre-opened based on filesystem presence (doing so would make the SAP
+	// backend skip the open while the GUI is still untitled).
 	preopened := false
-	if opts.ProjectRoot != "" && opts.MltFileName != "" {
-		projectPath := filepath.Join(opts.ProjectRoot, opts.MltFileName)
-		if info, statErr := os.Stat(projectPath); statErr == nil && !info.IsDir() {
-			preopened = true
-		}
-	}
 	cmd := exec.Command(m.BinPath)
 	headlessVal := "0"
 	if opts.Headless {
