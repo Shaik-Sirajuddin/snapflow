@@ -238,6 +238,13 @@ enum Command {
         terminal_id: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    /// Re-fetch a terminal's whole output snapshot after reconnect so a
+    /// client does not depend on a notification that may have occurred while
+    /// its WebSocket was down.
+    RefreshTerminalOutput {
+        terminal_id: String,
+        resp: oneshot::Sender<Result<TerminalOutputEvent, AcpxThreadError>>,
+    },
     /// `session/set_config_option` -- see [`AcpxThreadHandle::
     /// set_config_option`]'s doc comment.
     SetConfigOption {
@@ -693,6 +700,15 @@ impl AcpxThreadHandle {
     ) -> Result<(), AcpxThreadError> {
         let terminal_id = terminal_id.into();
         self.call(|resp| Command::KillTerminal { terminal_id, resp })
+            .await
+    }
+
+    pub async fn refresh_terminal_output(
+        &self,
+        terminal_id: impl Into<String>,
+    ) -> Result<TerminalOutputEvent, AcpxThreadError> {
+        let terminal_id = terminal_id.into();
+        self.call(|resp| Command::RefreshTerminalOutput { terminal_id, resp })
             .await
     }
 
@@ -2982,6 +2998,46 @@ async fn run_thread_actor(
                 let params = serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
                 let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
+            }
+            Command::RefreshTerminalOutput { terminal_id, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let result = client
+                    .call(
+                        "terminal/output",
+                        serde_json::json!({"sessionId": sid, "terminalId": terminal_id}),
+                        None,
+                    )
+                    .await
+                    .and_then(|value| {
+                        let output = value
+                            .get("output")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let truncated = value
+                            .get("truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let exit_status = value
+                            .get("exitStatus")
+                            .filter(|v| !v.is_null())
+                            .map(|status| {
+                                (
+                                    status.get("exitCode").and_then(|v| v.as_i64()).map(|v| v as i32),
+                                    status.get("signal").and_then(|v| v.as_i64()).map(|v| v as i32),
+                                )
+                            });
+                        Ok(TerminalOutputEvent {
+                            terminal_id: terminal_id.clone(),
+                            output,
+                            truncated,
+                            exit_status,
+                        })
+                    });
+                let _ = resp.send(result.map_err(Into::into));
             }
             Command::SetConfigOption {
                 config_id,

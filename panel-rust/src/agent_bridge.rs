@@ -3417,12 +3417,44 @@ fn spawn_event_forwarder(
                     let handle = slot_for_task.handle.clone();
                     let events_out = events_out.clone();
                     let thread_index = idx;
+                    let slot = slot_for_task.clone();
+                    let panel_state = panel_state_for_task.clone();
+                    let store = store_for_task.clone();
+                    let terminal_ids = slot
+                        .terminal_order
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle.paginate_history(None).await {
+                        let page_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.paginate_history(None),
+                        )
+                        .await;
+                        if let Err(error) = match page_result {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => Err("timed out".to_owned()),
+                        } {
                             events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
                                 thread_index,
                                 event: AgentEvent::Error(format!("history refresh after reconnect failed: {error}")),
                             });
+                        }
+                        for terminal_id in terminal_ids {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                handle.refresh_terminal_output(terminal_id.clone()),
+                            )
+                            .await;
+                            if let Ok(Ok(output)) = result {
+                                store_terminal_output(&slot, &output);
+                                persist_runtime_snapshot(store.as_ref(), panel_state.as_deref(), &slot);
+                                events_out.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent {
+                                    thread_index,
+                                    event: AgentEvent::TerminalOutput(output),
+                                });
+                            }
                         }
                     });
                 }
