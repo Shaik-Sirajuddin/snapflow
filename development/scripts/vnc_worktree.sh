@@ -213,6 +213,15 @@ cmd_start() {
     label="$(worktree_label "$worktree_dir")"
     state_dir="$(state_dir_for "$worktree_dir")"
 
+    # Opportunistic registry hygiene: every `start` kicks off a port-registry
+    # gc (drops reservations whose recorded pid is no longer alive -- e.g.
+    # leftovers from a crashed session or a `start` that never reached a
+    # matching `clean`) in the background. Async and best-effort on purpose:
+    # this worktree's own launch below never blocks on or fails because of
+    # it, and `gc` only ever removes provably-dead entries, so it's safe to
+    # race against reservations this same `start` is about to make.
+    ( "$REG" gc >/tmp/vnc-worktree-registry-gc.log 2>&1 & disown ) || true
+
     # Self-heal: every `start` first tears down whatever this worktree
     # previously had running, so re-running `up` (or `up` after a crash)
     # never accumulates orphaned snapshotd/acpx/shotcut processes from an
