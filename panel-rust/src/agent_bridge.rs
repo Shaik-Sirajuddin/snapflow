@@ -75,7 +75,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -178,6 +178,9 @@ struct ThreadSlot {
     oldest_loaded_index: Mutex<usize>,
     /// Server continuation cursor for remote transcript pagination.
     history_cursor: Mutex<Option<String>>,
+    /// Prevent repeated UI clicks from issuing concurrent pages with the
+    /// same cursor; cleared after the remote request settles or times out.
+    history_page_in_flight: AtomicBool,
     /// Live interactive requests (`session/request_permission`,
     /// `fs/read_text_file`, `fs/write_text_file`, `terminal/create`)
     /// awaiting a UI decision -- populated by
@@ -4231,6 +4234,7 @@ impl AgentBridge {
                 older_available: Mutex::new(older_available),
                 oldest_loaded_index: Mutex::new(oldest_loaded_index),
                 history_cursor: Mutex::new(None),
+                history_page_in_flight: AtomicBool::new(false),
                 pending_requests: Mutex::new(runtime_snapshot.pending_requests),
                 usage: Mutex::new((0, 0)),
                 terminal_buffers: Mutex::new(
@@ -5062,6 +5066,7 @@ impl AgentBridge {
             older_available: Mutex::new(older_available),
             oldest_loaded_index: Mutex::new(oldest_loaded_index),
             history_cursor: Mutex::new(None),
+            history_page_in_flight: AtomicBool::new(false),
             pending_requests: Mutex::new(runtime_snapshot.pending_requests),
             usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(
@@ -5499,6 +5504,7 @@ impl AgentBridge {
             older_available: Mutex::new(false),
             oldest_loaded_index: Mutex::new(0),
             history_cursor: Mutex::new(None),
+            history_page_in_flight: AtomicBool::new(false),
             pending_requests: Mutex::new(Vec::new()),
             usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(HashMap::new()),
@@ -7293,11 +7299,30 @@ impl AgentBridge {
             {
                 return false;
             }
+            if slot
+                .history_page_in_flight
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return false;
+            }
             let handle = Arc::clone(&slot.handle);
+            let slot_for_task = Arc::clone(slot);
             self.runtime.handle().spawn(async move {
-                if let Err(error) = handle.paginate_history(before).await {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    handle.paginate_history(before),
+                )
+                .await;
+                if let Err(error) = match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => Err("timed out".to_owned()),
+                } {
                     eprintln!("panel-rust: remote history pagination failed: {error}");
                 }
+                slot_for_task
+                    .history_page_in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
             });
             return true;
         }
