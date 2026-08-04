@@ -88,12 +88,52 @@ die() { echo "error: $*" >&2; exit 1; }
 worktree_label() {
     # branch name if available, else the directory basename -- matches
     # the label already used in ports.json (e.g.
-    # "worktree-main-vnc-view-test").
-    git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || basename "$1"
+    # "worktree-main-vnc-view-test"). Sanitized for use in filesystem
+    # paths (log files, state dirs): branch names with slashes (e.g.
+    # "codex/snapflow-session-derived-state") otherwise silently break
+    # every "$label"-based log/file path built elsewhere in this script
+    # and in port_registry.sh -- redirects into a nonexistent nested dir
+    # fail, so e.g. Xvnc never launches even though vnc-start reports a
+    # port. Mirrors vnc_shared_init.sh's worktree_id() sanitization.
+    local raw
+    raw="$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || basename "$1")"
+    printf '%s' "$raw" | sed 's#[^A-Za-z0-9_.-]#-#g'
 }
 
 state_dir_for() {
     echo "/tmp/vnc-worktree-$(worktree_label "$1")"
+}
+
+# snapshotd's SNAPSHOTD_HOME must stay short: it's the parent of AF_UNIX
+# socket paths (control.sock, and per-project run/<12hex>.sock -- see
+# snapshotd/internal/config/config.go's RunDir/ControlSocketPath and
+# procmgr.go's maxSockPathLen guard) which are capped at ~108 bytes
+# (sun_path) on Linux. state_dir_for() above embeds the full sanitized
+# branch name (e.g. "codex-snapflow-session-derived-state"), which is fine
+# for ordinary log/state paths but repeatedly blew past the socket limit
+# once nested under snapshotd-scratch/snapshotd-home/run/<12hex>.sock --
+# confirmed live in snapshotd_stdout.log as
+# `procmgr: socket path ... exceeds Unix domain socket path length limits`.
+# Route SNAPSHOTD_HOME through a short, deterministic hash of the worktree
+# path instead (same sha256sum|cut -c1-N pattern as vnc_shared_init.sh's
+# worktree_id()) so the prefix is short and safe regardless of branch name
+# length, while staying per-worktree (not globally shared, so concurrent
+# worktrees never collide on the same daemon).
+#
+# Returns the short scratch ROOT, not the home dir itself --
+# snapshotd_test_instance.py's ensure_daemon() unconditionally computes
+# `snapshotd_home = scratch_root / "snapshotd-home"` from whatever
+# scratch_root it's handed (memory/team/testing/snapshotd_test_instance.py
+# ~line 406); it does NOT accept or respect a pre-set SNAPSHOTD_HOME. The
+# python ensure_daemon() call below and the SNAPSHOTD_HOME exported to the
+# GUI process both derive from this same root so they always agree on
+# where the real daemon's control.sock actually lives -- computing two
+# independently-named short paths here would silently point the GUI at a
+# directory the actual daemon never binds to.
+snapshotd_scratch_for() {
+    local hash
+    hash="$(printf '%s' "$1" | sha256sum | cut -c1-10)"
+    echo "/tmp/sd-$hash"
 }
 
 ensure_shared_build_points_at() {
@@ -270,7 +310,7 @@ sys.path.insert(0, "$SCRIPT_DIR")
 sys.path.insert(0, str(Path("$REPO_ROOT") / "memory" / "team" / "testing"))
 from snapshotd_test_instance import ensure_daemon, load_instance
 import os
-scratch = Path("$state_dir") / "snapshotd-scratch"
+scratch = Path("$(snapshotd_scratch_for "$worktree_dir")")
 scratch.mkdir(parents=True, exist_ok=True)
 # The daemon owns the gateway for this worktree. Give it the exact worktree
 # acpx binary, reserved gateway bind, and worktree-scoped config path.
@@ -311,7 +351,8 @@ PY
     # control socket, not by guessing the configured TCP address. Propagate
     # the worktree-scoped daemon home so systemd/manual GUI launches probe
     # the same control.sock that ensure_daemon started.
-    local snapshotd_home="$state_dir/snapshotd-scratch/snapshotd-home"
+    local snapshotd_home
+    snapshotd_home="$(snapshotd_scratch_for "$worktree_dir")/snapshotd-home"
     mkdir -p "$snapshotd_home/run"
     local admin_token
     admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null)" || die "daemon-managed acpx admin token was not created"
@@ -590,6 +631,12 @@ cmd_clean() {
     fi
     quiet_step "release-worktree-$label" "$REG" release-worktree "$label"
     rm -rf "$state_dir"
+    # snapshotd's scratch root (ensure_daemon's instance record/lock plus
+    # snapshotd-home/control.sock+run/*.sock) now lives outside state_dir
+    # (short /tmp/sd-<hash> root, kept clear of the AF_UNIX sun_path limit --
+    # see snapshotd_scratch_for()). Clean it up explicitly since it's no
+    # longer nested under state_dir.
+    rm -rf "$(snapshotd_scratch_for "$worktree_dir")"
     echo "cleaned $label ($state_dir)"
 }
 
