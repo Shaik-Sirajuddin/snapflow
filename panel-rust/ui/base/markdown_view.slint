@@ -151,6 +151,13 @@ export component MarkdownView inherits VerticalLayout {
                     default-color: Theme.text-primary;
                     link-color: Theme.md-link;
                     horizontal-alignment: left;
+                    // Keep the native StyledText on the live row width.
+                    // Without an explicit stretch/min-width override, its
+                    // implicit content width can remain the old width after
+                    // a window resize, leaving the markdown clipped instead
+                    // of reflowing to the new bubble width.
+                    horizontal-stretch: 1;
+                    min-width: 0px;
                     link-clicked(link) => { root.link-activated(link); }
                 }
             }
