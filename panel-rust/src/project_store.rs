@@ -8,6 +8,16 @@
 use crate::model::ProjectIdentity;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PanelStatePathError {
+    #[error("RUI_PANEL_STATE_PATH must not be empty")]
+    EmptyOverride,
+    #[error("RUI_PANEL_STATE_PATH must be an absolute path, got {0:?}")]
+    RelativeOverride(String),
+    #[error("RUI_PANEL_STATE_PATH must not name a directory, got {0:?}")]
+    DirectoryOverride(String),
+}
+
 /// Normalize an existing saved path so symlink and relative-path spellings
 /// cannot fork one project's store. Nonexistent paths remain unchanged for
 /// the host's subsequent save/open flow.
@@ -37,6 +47,43 @@ pub fn panel_state_path(identity: &ProjectIdentity, staging_root: &Path) -> Path
     project_store_dir(identity, staging_root)
         .unwrap_or_else(|| staging_root.to_path_buf())
         .join("panel-state.sqlite3")
+}
+
+/// Resolve the durable PanelStateStore database path.  An explicit
+/// `RUI_PANEL_STATE_PATH` is an exact database-file override and must be
+/// absolute so a host cannot accidentally redirect state relative to an
+/// arbitrary working directory.  Without the override, state remains
+/// automatically isolated by project identity under the normal cache root.
+pub fn panel_state_path_from_env(
+    identity: &ProjectIdentity,
+    staging_root: &Path,
+) -> Result<PathBuf, PanelStatePathError> {
+    resolve_panel_state_path(
+        std::env::var_os("RUI_PANEL_STATE_PATH").map(|value| value.to_string_lossy().into_owned()),
+        identity,
+        staging_root,
+    )
+}
+
+fn resolve_panel_state_path(
+    override_path: Option<String>,
+    identity: &ProjectIdentity,
+    staging_root: &Path,
+) -> Result<PathBuf, PanelStatePathError> {
+    let Some(raw) = override_path else {
+        return Ok(panel_state_path(identity, staging_root));
+    };
+    if raw.is_empty() {
+        return Err(PanelStatePathError::EmptyOverride);
+    }
+    let path = PathBuf::from(&raw);
+    if !path.is_absolute() {
+        return Err(PanelStatePathError::RelativeOverride(raw));
+    }
+    if path.is_dir() {
+        return Err(PanelStatePathError::DirectoryOverride(raw));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -118,6 +165,47 @@ mod tests {
             Some("project-a")
         );
         assert_eq!(b.defaults().unwrap().profile_name, None);
+    }
+
+    #[test]
+    fn explicit_panel_state_path_must_be_absolute() {
+        let result = resolve_panel_state_path(
+            Some("relative/state.sqlite3".into()),
+            &ProjectIdentity::None,
+            Path::new("/global"),
+        );
+        assert_eq!(
+            result,
+            Err(PanelStatePathError::RelativeOverride(
+                "relative/state.sqlite3".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn explicit_panel_state_path_overrides_project_derivation() {
+        let result = resolve_panel_state_path(
+            Some("/var/lib/snapflow/panel-state.sqlite3".into()),
+            &ProjectIdentity::Untitled("u-1".into()),
+            Path::new("/global"),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            PathBuf::from("/var/lib/snapflow/panel-state.sqlite3")
+        );
+    }
+
+    #[test]
+    fn empty_panel_state_path_override_is_rejected() {
+        assert_eq!(
+            resolve_panel_state_path(
+                Some(String::new()),
+                &ProjectIdentity::None,
+                Path::new("/global"),
+            ),
+            Err(PanelStatePathError::EmptyOverride)
+        );
     }
 
     #[cfg(unix)]

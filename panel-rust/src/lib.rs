@@ -1070,7 +1070,16 @@ impl PanelSingleton {
         if let Some(store) = self.project_state_stores.borrow().get(&identity).cloned() {
             return Some(store);
         }
-        let path = crate::project_store::panel_state_path(&identity, &resolve_cache_dir());
+        let path = match crate::project_store::panel_state_path_from_env(
+            &identity,
+            &resolve_cache_dir(),
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("panel-rust: project state persistence unavailable: {error}");
+                return None;
+            }
+        };
         match PanelStateStore::open(path) {
             Ok(store) => {
                 let store = Arc::new(store);
@@ -2188,14 +2197,21 @@ fn panel_rust_create_with_initial_identity(
             let identity = initial_identity
                 .as_ref()
                 .unwrap_or(&model::ProjectIdentity::None);
-            let path = crate::project_store::panel_state_path(identity, &cache_dir);
-            match PanelStateStore::open(path) {
+            let result = crate::project_store::panel_state_path_from_env(identity, &cache_dir)
+                .map_err(|error| error.to_string())
+                .and_then(|path| PanelStateStore::open(path).map_err(|error| error.to_string()));
+            match result {
                 Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
                     let message = format!("panel settings persistence unavailable: {error}");
                     eprintln!("panel-rust: {message}");
-                    startup_warnings.push(message);
-                    None
+                    // PanelStateStore is mandatory for production startup:
+                    // continuing with `None` would silently lose durable
+                    // thread/session bindings and make the ACPX client
+                    // unable to restore the selected session.  The C ABI
+                    // reports startup failure with a null handle while the
+                    // diagnostic remains visible in the host log.
+                    return std::ptr::null_mut();
                 }
             }
         };
