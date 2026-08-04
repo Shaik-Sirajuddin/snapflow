@@ -322,9 +322,9 @@ jobs:
               # always changes, so it always builds fresh, every run,
               # cached or not.
               if [ "$DEPS_CACHE_HIT" != "true" ]; then
-                SNAPFLOW_DEPS_ONLY=1 /root/shotcut/build-shotcut.sh
+                SNAPFLOW_DEPS_ONLY=1 /tmp/shotcut/build-shotcut.sh
               fi
-              SNAPFLOW_ONLY=1 /root/shotcut/build-shotcut.sh
+              SNAPFLOW_ONLY=1 /tmp/shotcut/build-shotcut.sh
               ccache --show-stats || true
             ')
           # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
