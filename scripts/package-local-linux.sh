@@ -50,6 +50,19 @@ require_file "$daemon_bin"
 require_file "$acpx_bin"
 [ -d "$app_dir" ] || { echo "error: packaged GUI runtime not found: $app_dir" >&2; exit 1; }
 
+# The local CMake build links the GUI against CuteLogger from the sibling
+# build directory.  The regular release bundler installs this library into
+# Snapflow.app/lib, but a local package must do that explicitly or the binary
+# carries a host-only RUNPATH and fails on another machine.  Keep this lookup
+# relative to --gui so custom build directories continue to work.
+gui_dir="$(cd "$(dirname "$gui_bin")" && pwd)"
+cute_logger_bin="$gui_dir/../CuteLogger/libCuteLogger.so"
+[ -f "$cute_logger_bin" ] || {
+  echo "error: local GUI dependency not found: $cute_logger_bin" >&2
+  echo "       build CuteLogger alongside the GUI or pass a release GUI binary" >&2
+  exit 1
+}
+
 mkdir -p "$output_dir"
 stage="$(mktemp -d "${TMPDIR:-/tmp}/snapflow-local-bundle.XXXXXX")"
 cleanup() { rm -rf "$stage"; }
@@ -63,6 +76,7 @@ echo "==> copying packaged GUI runtime"
 cp -a "$app_dir" "$bundle/Snapflow.app"
 install -Dm755 "$gui_bin" "$bundle/Snapflow.app/bin/snapflow"
 install -Dm755 "$acpx_bin" "$bundle/Snapflow.app/bin/acpx-server"
+install -Dm755 "$cute_logger_bin" "$bundle/Snapflow.app/lib/libCuteLogger.so"
 install -Dm755 "$daemon_bin" "$bundle/bin/snapflowd"
 install -Dm755 "$repo_root/scripts/lib/acp-node-runtime.sh" "$bundle/scripts/lib/acp-node-runtime.sh"
 
