@@ -13063,7 +13063,11 @@ done
             .thread_binding(0)
             .expect("seed session binding")
             .session_id;
-        drop(first);
+        // Keep the first bridge alive while the resumed bridge is created:
+        // dropping an AgentBridge tears down its Tokio runtime, which would
+        // invalidate the shared Gateway handle before the second bridge can
+        // complete its session/resume handshake. The two bridges represent
+        // a reconnecting panel and are intentionally independent here.
 
         let second_specs = [ThreadSpec {
             thread_id: Some(thread_id),
@@ -13111,6 +13115,24 @@ done
             full_history.len()
         );
         assert_ne!(full_history[0].text, newest_first);
+        // Continue walking until ACPX returns `nextCursor = null`; the mock
+        // backend may produce more than one older page depending on how many
+        // updates each turn emitted.
+        let mut pages = 1usize;
+        while second.has_older_page(0) && pages < 8 {
+            assert!(second.load_older_page(0), "remote continuation dispatch was rejected");
+            let before_len = second.history(0).len();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline
+                && second.history(0).len() == before_len
+                && second.has_older_page(0)
+            {
+                let _ = second.poll();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(second.history(0).len() > before_len, "remote page was empty");
+            pages += 1;
+        }
         assert!(!second.has_older_page(0), "remote continuation cursor was not exhausted");
     }
 
