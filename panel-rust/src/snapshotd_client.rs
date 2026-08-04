@@ -690,15 +690,26 @@ fn process_start_identity() -> String {
     format!("{}", std::process::id())
 }
 
+/// Return the SAP endpoint explicitly supplied by the SAP host.
+///
+/// This intentionally does not derive a value from the discovery endpoint
+/// (`~/.snapshotd/apps/<pid>.sock`).  That socket only answers `app.discover`
+/// and speaks SDP discovery JSON; it is not a SAP server.  A real direct GUI
+/// owner must have Qt/Shotcut's embedded `sap_start_server` publish one of
+/// these variables before registration.  Daemon-launched children receive
+/// them from snapshotd's process manager.
 fn sap_endpoint_from_env() -> Option<String> {
-    std::env::var("SNAPSHOT_SAP_ENDPOINT")
-        .ok()
+    select_sap_endpoint(
+        std::env::var("SNAPSHOT_SAP_ENDPOINT").ok().as_deref(),
+        std::env::var("SNAPSHOT_SAP_SOCKET").ok().as_deref(),
+    )
+}
+
+fn select_sap_endpoint(endpoint: Option<&str>, socket: Option<&str>) -> Option<String> {
+    endpoint
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("SNAPSHOT_SAP_SOCKET")
-                .ok()
-                .filter(|value| !value.is_empty())
-        })
+        .or_else(|| socket.filter(|value| !value.is_empty()))
+        .map(str::to_owned)
 }
 
 impl SnapshotdControlClient {
@@ -1070,6 +1081,23 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[test]
+    fn sap_endpoint_selection_never_falls_back_to_discovery_socket() {
+        // The app discovery socket is deliberately not an input to this
+        // helper.  Only an endpoint explicitly published by the SAP host can
+        // be registered as `sapSocketPath`.
+        assert_eq!(select_sap_endpoint(None, None), None);
+        assert_eq!(
+            select_sap_endpoint(Some("/run/project.sock"), Some("/tmp/legacy.sock")),
+            Some("/run/project.sock".to_owned())
+        );
+        assert_eq!(
+            select_sap_endpoint(None, Some("/tmp/legacy.sock")),
+            Some("/tmp/legacy.sock".to_owned())
+        );
+        assert_eq!(select_sap_endpoint(Some(""), Some("")), None);
+    }
 
     #[tokio::test]
     async fn frames_registration_and_context_calls_over_unix_jsonl() {
