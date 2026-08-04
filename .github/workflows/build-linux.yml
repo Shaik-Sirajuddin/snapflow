@@ -208,13 +208,6 @@ jobs:
           key: cargo-linux-v1-${{ hashFiles('multi-media-main/panel-rust/Cargo.lock', 'multi-media-main/acpx/Cargo.lock', 'multi-media-main/sap-rust/Cargo.lock', 'multi-media-main/lib/skills-manager/Cargo.lock') }}
           restore-keys: cargo-linux-v1-
 
-      # The hosted Docker runner uses a rootless user namespace, so the
-      # build image cannot reliably apt-get or write under /root. Install the
-      # small ccache binary on the runner and mount it into the container;
-      # the build itself remains in the image's existing toolchain.
-      - name: Install ccache on runner for GUI build
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ccache
-
       # A cache "hit" from actions/cache only means the archive round-tripped
       # intact -- it does not guarantee the tree it contains is actually a
       # complete, working deps build. Confirmed for real (run 29985095679):
@@ -286,15 +279,23 @@ jobs:
             "$IMAGE_NAME" \
             -c '
               set -e
+              # Install ccache inside the container rather than shipping the
+              # runner-host binary in -- a docker-cp-ed host ccache binary
+              # failed with "error while loading shared libraries:
+              # libhiredis.so.1.1.0: cannot open shared object file" since
+              # that lib lives on the runner host, not in this image. Self
+              # -contained apt install avoids the host/container mismatch.
+              apt-get update -qq && apt-get install -y -qq ccache
               # Use compiler-wrapper symlinks so both autotools and
               # CMake/Ninja sub-builds benefit without changing the forks
               # build script. All new state is under /tmp because hosted
               # Docker runs rootless and /root is not writable there.
               mkdir -p /tmp/ccache-bin /tmp/ccache /tmp/cargo /tmp/rustup
+              CCACHE_BIN="$(command -v ccache)"
               for compiler in cc gcc c++ g++; do
-                ln -sf /tmp/ccache-host-bin "/tmp/ccache-bin/$compiler"
+                ln -sf "$CCACHE_BIN" "/tmp/ccache-bin/$compiler"
               done
-              ln -sf /tmp/ccache-host-bin /tmp/ccache-bin/ccache
+              ln -sf "$CCACHE_BIN" /tmp/ccache-bin/ccache
               export PATH="/tmp/ccache-bin:$PATH"
               export CCACHE_DIR=/tmp/ccache
               export CCACHE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -343,7 +344,6 @@ jobs:
           docker cp "$GITHUB_WORKSPACE/multi-media-main/panel-rust" "$CID:/tmp/shotcut/src/panel-rust"
           docker cp "$GITHUB_WORKSPACE/multi-media-main/acpx" "$CID:/tmp/shotcut/src/acpx"
           docker cp "$GITHUB_WORKSPACE/multi-media-main/lib" "$CID:/tmp/shotcut/src/lib"
-          docker cp "$(command -v ccache)" "$CID:/tmp/ccache-host-bin"
           docker start --attach "$CID" || true
           STATUS=$(docker wait "$CID")
           docker rm -f "$CID" >/dev/null 2>&1 || true
