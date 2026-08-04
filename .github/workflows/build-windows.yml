@@ -167,11 +167,11 @@ jobs:
 
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry
       # -- pushed separately to Shaik-Sirajuddin/shotcut.git's
-      # rebrand/snapflow branch), so check it out on its own.
+      # master branch), so check it out on its own.
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: rebrand/snapflow
+          ref: master
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
