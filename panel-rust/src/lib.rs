@@ -4355,11 +4355,20 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // spinner shared this.
         let busy_agent_operation_animating =
             !panel.model.borrow().agent_operations_in_flight.is_empty();
+        // Pagination's chat-area Spinner is driven by Slint's
+        // `animation-tick()` rather than a keyframed `animate` block.
+        // `has_active_animations()` therefore does not report it, and an
+        // otherwise idle thread would fall back to Qt's idle poll cadence
+        // (or stop requesting redraws), freezing the older-history spinner
+        // after its first frame. Keep the host poll/render loop live for the
+        // duration of the UI-owned pagination request as well.
+        let pagination_animating = panel.component.get_loading_older_messages();
         let busy_animation = busy_thread_animating
             || busy_mcp_server_animating
             || busy_recover_session_animating
             || busy_agent_operation_animating
-            || component_connection_animating;
+            || component_connection_animating
+            || pagination_animating;
         let needs_paint = frame_changed || animating || busy_animation;
         // Critical: Qt's `requestRepaint` only re-blits the software
         // buffer. `MinimalSoftwareWindow::draw_if_needed` no-ops unless
