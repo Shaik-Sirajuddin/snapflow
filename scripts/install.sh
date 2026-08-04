@@ -194,6 +194,40 @@ else
   echo "warning: no .sha256 found for this asset, skipping checksum verification" >&2
 fi
 
+# Extract into a private staging directory first.  This lets us reject a
+# bundle whose ELF dependencies cannot run on this host before replacing a
+# working installation.  In particular, a release built against a newer
+# glibc/Qt can otherwise leave the desktop launcher pointing at a binary that
+# fails immediately, while the old bundle is only available as a manual
+# `.prev` rollback.
+staging_dir="$tmp_dir/install"
+mkdir -p "$staging_dir"
+tar -xzf "$archive" -C "$staging_dir" --strip-components=1
+
+validate_linux_bundle() {
+  local candidate_root="$1"
+  local candidate_app diagnostics
+  candidate_app="$(find "$candidate_root" -mindepth 1 -maxdepth 1 -iname 'snapflow*' -type d | head -n1)"
+  [ -n "$candidate_app" ] || return 0
+  [ -x "$candidate_app/bin/snapflow" ] || return 0
+
+  # ldd reports both missing shared objects and required symbol versions.  A
+  # package may intentionally rely on host libraries, so only these two
+  # loader diagnostics are fatal; ordinary ldd warnings are left alone.
+  diagnostics="$(LD_LIBRARY_PATH="$candidate_app/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    ldd "$candidate_app/bin/snapflow" 2>&1 || true)"
+  if printf '%s\n' "$diagnostics" | grep -Eq 'not found|version .+ not found'; then
+    echo "error: Snapflow bundle is not compatible with this host; refusing to replace $INSTALL_DIR." >&2
+    printf '%s\n' "$diagnostics" | grep -E 'not found|version .+ not found' >&2 || true
+    echo "note: install a build compiled for this OS/runtime, or keep the current installation." >&2
+    return 1
+  fi
+}
+
+if [ "$platform" = "linux" ]; then
+  validate_linux_bundle "$staging_dir" || exit 1
+fi
+
 # On an upgrade (not a fresh install), keep exactly one backup of the
 # previous bundle before wiping it -- not a version history, just a
 # bounded safety net so a botched extraction (disk full mid-write, a
@@ -210,8 +244,7 @@ if [ -d "$INSTALL_DIR" ]; then
 fi
 
 info "Extracting to $INSTALL_DIR..."
-mkdir -p "$INSTALL_DIR"
-tar -xzf "$archive" -C "$INSTALL_DIR" --strip-components=1
+mv "$staging_dir" "$INSTALL_DIR"
 echo "$target_version" > "$VERSION_FILE"
 
 mkdir -p "$BIN_DIR"
