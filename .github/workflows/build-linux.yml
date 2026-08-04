@@ -287,7 +287,7 @@ jobs:
             -c '
               set -e
               # Use compiler-wrapper symlinks so both autotools and
-              # CMake/Ninja sub-builds benefit without changing the fork's
+              # CMake/Ninja sub-builds benefit without changing the forks
               # build script. All new state is under /tmp because hosted
               # Docker runs rootless and /root is not writable there.
               mkdir -p /tmp/ccache-bin /tmp/ccache /tmp/cargo /tmp/rustup
@@ -317,7 +317,7 @@ jobs:
               # the 45-90 min part and rarely change -- skip rebuilding them
               # entirely on a cache hit (see the actions/cache step above).
               # snapflow itself is our own source (this checkout + the
-              # sap-rust/panel-rust siblings, docker cp'd in below) and
+              # sap-rust/panel-rust siblings, docker-cp-ed in below) and
               # always changes, so it always builds fresh, every run,
               # cached or not.
               if [ "$DEPS_CACHE_HIT" != "true" ]; then
