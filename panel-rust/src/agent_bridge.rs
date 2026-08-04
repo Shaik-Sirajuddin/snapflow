@@ -1123,6 +1123,34 @@ fn seed_thread_from_cache(
     (messages, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot)
 }
 
+/// One-time compatibility migration for Panel-owned runtime state.  Older
+/// releases stored this snapshot beside transcript JSONL; production now
+/// ignores transcript files, but importing the runtime sidecar prevents
+/// pending approvals, terminal buffers, and archive flags from disappearing
+/// on the first upgrade.  Existing SQLite rows always win.
+fn migrate_legacy_runtime_snapshots(
+    panel_state: Option<&PanelStateStore>,
+    legacy_dir: Option<&Path>,
+    thread_ids: &[String],
+) {
+    let Some(panel_state) = panel_state else { return };
+    let Some(legacy_dir) = legacy_dir.filter(|path| path.is_dir()) else { return };
+    let Ok(store) = JsonlStore::open(legacy_dir.to_path_buf()) else { return };
+    for thread_id in thread_ids {
+        let already_present = panel_state
+            .runtime_snapshot(thread_id)
+            .ok()
+            .flatten()
+            .is_some();
+        if already_present { continue; }
+        let Ok(snapshot) = store.runtime_snapshot(thread_id) else { continue; };
+        let Ok(json) = serde_json::to_string(&snapshot) else { continue; };
+        if let Err(error) = panel_state.save_runtime_snapshot(thread_id, &json) {
+            eprintln!("panel-rust: legacy runtime snapshot migration failed for {thread_id}: {error}");
+        }
+    }
+}
+
 /// Compares a local cache trailer with metadata from the backend-selected
 /// `session/list`. A failed/unsupported list is deliberately non-fatal:
 /// reattachment remains available and the next successful reconciliation can
@@ -4133,7 +4161,7 @@ impl AgentBridge {
             gateway_setters.entry(url.clone()).or_default();
         }
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
-        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial_cwd));
+        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial_cwd.clone()));
         let session_project_path_override = Arc::new(Mutex::new(initial_project_path));
 
         // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
@@ -4143,6 +4171,15 @@ impl AgentBridge {
         // rest of the process's life, well past this guard's drop.
         let _guard = runtime.enter();
         let server_owned_persistence = cache_dir.is_none();
+        let legacy_thread_ids: Vec<String> = thread_specs
+            .iter()
+            .map(|spec| slug(&spec.display_name))
+            .collect();
+        migrate_legacy_runtime_snapshots(
+            panel_state.as_deref(),
+            initial_cwd.as_deref(),
+            &legacy_thread_ids,
+        );
         for (idx, spec) in thread_specs.iter().enumerate() {
             let thread_id = slug(&spec.display_name);
 
