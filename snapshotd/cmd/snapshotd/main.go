@@ -30,6 +30,10 @@ import (
 	"snapshotd/internal/sdp"
 )
 
+// progName is the invoked binary name used in CLI diagnostics and usage
+// strings (for example, snapflowd in packaged builds).
+var progName = filepath.Base(os.Args[0])
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
