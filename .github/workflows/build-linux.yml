@@ -255,6 +255,7 @@ jobs:
           } > build-snapflow.conf
           mkdir -p "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/.cargo/registry" "$GITHUB_WORKSPACE/.cargo/git"
           docker run \
+            --user 0:0 \
             -v "$PWD:/root/shotcut" \
             -v "$GITHUB_WORKSPACE/.ccache:/root/.cache/ccache" \
             -v "$GITHUB_WORKSPACE/.cargo/registry:/root/.cargo/registry" \
