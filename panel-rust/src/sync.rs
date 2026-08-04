@@ -1500,7 +1500,10 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         visible_agents.clone(),
         &model.agent_operations_in_flight,
     );
-    let agent_keys: Vec<String> = visible_agents.iter().map(|agent| agent.id.clone()).collect();
+    let agent_keys: Vec<String> = visible_agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect();
     crate::list_model::reconcile(
         &model.agent_catalog_model,
         &mut model.agent_catalog_model_keys.borrow_mut(),

@@ -109,11 +109,10 @@ jobs:
       run:
         working-directory: shotcut-rebrand
     steps:
-      # This repo, for sap-rust and panel-rust -- shotcut-rebrand/
-      # CMakeLists.txt builds both via Corrosion at
-      # ${CMAKE_SOURCE_DIR}/../sap-rust and .../../panel-rust (sibling
-      # crates, not part of the shotcut-rebrand checkout itself), so both
-      # need to land as siblings of the shotcut-rebrand checkout below.
+      # This repo, for sap-rust -- shotcut-rebrand/CMakeLists.txt builds it
+      # via Corrosion at ${CMAKE_SOURCE_DIR}/../sap-rust (a sibling crate,
+      # not part of the shotcut-rebrand checkout itself), so it needs to
+      # land as a sibling of the shotcut-rebrand checkout below.
       - uses: actions/checkout@v4
         with:
           path: multi-media-main
@@ -129,19 +128,9 @@ jobs:
           ref: rebrand/snapflow
           path: shotcut-rebrand
 
-      - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
+      - name: Place sap-rust as a sibling of shotcut-rebrand
         working-directory: ${{ github.workspace }}
-        run: |
-          cp -r multi-media-main/sap-rust sap-rust
-          cp -r multi-media-main/panel-rust panel-rust
-          cp -r multi-media-main/acpx acpx
-          # panel-rust/Cargo.toml declares `skills-manager = { path =
-          # "../lib/skills-manager" }`, so the lib/ workspace has to land as a
-          # sibling too or cargo fails before compiling anything with
-          # "failed to load source for dependency `skills-manager`" (same gap
-          # already fixed for build-windows.yml/build-linux.yml -- see those
-          # workflows' equivalent copy steps).
-          cp -r multi-media-main/lib lib
+        run: cp -r multi-media-main/sap-rust sap-rust
 
       - name: Install build deps from Homebrew (prebuilt, no from-source ffmpeg/mlt compile)
         run: |

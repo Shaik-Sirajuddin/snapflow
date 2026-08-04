@@ -1498,4 +1498,3 @@ mod tests {
         assert_eq!(heal_open_markers("just plain text"), "just plain text");
     }
 }
-

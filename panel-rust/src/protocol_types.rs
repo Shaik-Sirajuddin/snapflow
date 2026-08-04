@@ -69,6 +69,32 @@ pub struct ChatMessage {
     pub raw_output: Option<serde_json::Value>,
 }
 
+/// Server-owned queue snapshot delivered on the separate ACPX queue stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItemInfo {
+    pub queue_entry_id: String,
+    pub idempotency_key: String,
+    pub text: String,
+    pub state: String,
+    pub position: u32,
+}
+
+/// Outcome of a relayed agent request. `selected=false` tells a connected
+/// panel that another client won the approval race and its card is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentResolutionEvent {
+    pub relay_id: String,
+    pub selected: bool,
+    pub late: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSteerEvent {
+    pub session_id: String,
+    pub state: String,
+    pub queue_entry_id: Option<String>,
+}
+
 /// Longest single JSON string leaf kept inside a tool call's
 /// `rawInput`/`rawOutput` payload.
 ///
@@ -155,32 +181,6 @@ fn has_oversized_string(value: &serde_json::Value) -> bool {
 
 /// Events flowing out of a bound thread's gateway actor, consumed from
 /// `AcpxThreadHandle::take_events`.
-/// Server-owned queue snapshot delivered on the separate ACPX queue stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueItemInfo {
-    pub queue_entry_id: String,
-    pub idempotency_key: String,
-    pub text: String,
-    pub state: String,
-    pub position: u32,
-}
-
-/// Outcome of a relayed agent request. `selected=false` tells a connected
-/// panel that another client won the approval race and its card is stale.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentResolutionEvent {
-    pub relay_id: String,
-    pub selected: bool,
-    pub late: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSteerEvent {
-    pub session_id: String,
-    pub state: String,
-    pub queue_entry_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Message(ChatMessage),
