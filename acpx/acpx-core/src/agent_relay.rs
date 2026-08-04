@@ -164,24 +164,25 @@ impl AgentRequestHub {
         let (resolution_tx, resolution_rx) = mpsc::channel(AGENT_REQUEST_QUEUE_CAPACITY);
         let gateway_session_id = gateway_session_id.into();
         let client_id = client_id.into();
-        self.subscribers
-            .lock()
-            .await
-            .entry(gateway_session_id.clone())
-            .or_default()
-            .insert(client_id.clone(), Subscriber {
-                request_tx: tx.clone(),
-                resolution_tx,
-            });
-
-        // Replay unresolved requests after registering the subscriber.  The
-        // pending lock makes this race-safe with a concurrent response: a
-        // relay removed before this scan is never replayed.
+        // Register and replay under the same pending -> subscribers lock
+        // order used by relay/unsubscribe/resolve. This closes the window
+        // where a live delivery and the replay scan could both enqueue the
+        // same envelope to a reconnecting client.
         let now = Instant::now();
         let replay = {
             let mut pending = self.pending.lock().await;
-            pending
-                .retain(|_, entry| entry.deadline > now);
+            pending.retain(|_, entry| entry.deadline > now);
+            let mut subscribers = self.subscribers.lock().await;
+            subscribers
+                .entry(gateway_session_id.clone())
+                .or_default()
+                .insert(
+                    client_id.clone(),
+                    Subscriber {
+                        request_tx: tx.clone(),
+                        resolution_tx,
+                    },
+                );
             pending
                 .iter_mut()
                 .filter(|(_, entry)| entry.gateway_session_id == gateway_session_id)
@@ -247,28 +248,32 @@ impl AgentRequestHub {
         request: serde_json::Value,
         timeout: Duration,
     ) -> Option<serde_json::Value> {
-        let targets = {
-            let subscribers = self.subscribers.lock().await;
-            subscribers
-                .get(gateway_session_id)?
-                .iter()
-                .map(|(client_id, subscriber)| (client_id.clone(), subscriber.request_tx.clone()))
-                .collect::<Vec<_>>()
-        };
         let relay_id = fresh_relay_id();
         let (reply_tx, reply_rx) = oneshot::channel();
         let deadline = Instant::now() + timeout;
-        let client_ids = targets.iter().map(|(id, _)| id.clone()).collect();
-        self.pending.lock().await.insert(
-            relay_id.clone(),
-            PendingRelay {
-                gateway_session_id: gateway_session_id.to_string(),
-                client_ids,
-                request: request.clone(),
-                deadline,
-                reply_tx,
-            },
-        );
+        let targets = {
+            let mut pending = self.pending.lock().await;
+            let subscribers = self.subscribers.lock().await;
+            let Some(session) = subscribers.get(gateway_session_id) else {
+                return None;
+            };
+            let targets = session
+                .iter()
+                .map(|(client_id, subscriber)| (client_id.clone(), subscriber.request_tx.clone()))
+                .collect::<Vec<_>>();
+            let client_ids = targets.iter().map(|(id, _)| id.clone()).collect();
+            pending.insert(
+                relay_id.clone(),
+                PendingRelay {
+                    gateway_session_id: gateway_session_id.to_string(),
+                    client_ids,
+                    request: request.clone(),
+                    deadline,
+                    reply_tx,
+                },
+            );
+            targets
+        };
         let mut delivered = false;
         for (client_id, sender) in targets {
             let envelope = AgentRequestEnvelope {
@@ -476,28 +481,37 @@ mod tests {
         });
         let original = first.requests.recv().await.expect("original request");
         hub.unsubscribe_client("gw-1", "client-a").await;
-        assert!(!hub
-            .resolve_from_client(
+        assert!(
+            !hub.resolve_from_client(
                 &original.relay_id,
                 Some("client-a"),
                 serde_json::json!({"stale": true}),
             )
-            .await);
+            .await
+        );
 
         let mut replacement = hub.subscribe_with_client("gw-1", "client-b").await;
         let replay = replacement.requests.recv().await.expect("replayed request");
         assert_eq!(replay.relay_id, original.relay_id);
         assert_eq!(replay.request, original.request);
         assert_eq!(replay.client_id, "client-b");
+        assert!(
+            replacement.requests.try_recv().is_err(),
+            "replay must enqueue exactly one envelope"
+        );
 
-        assert!(hub
-            .resolve_from_client(
+        assert!(
+            hub.resolve_from_client(
                 &replay.relay_id,
                 Some("client-b"),
                 serde_json::json!({"approved": true}),
             )
-            .await);
-        assert_eq!(relay_task.await.unwrap(), Some(serde_json::json!({"approved": true})));
+            .await
+        );
+        assert_eq!(
+            relay_task.await.unwrap(),
+            Some(serde_json::json!({"approved": true}))
+        );
     }
 
     #[tokio::test]
