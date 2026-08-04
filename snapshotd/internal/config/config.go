@@ -373,6 +373,26 @@ func discoverShotcutBinPath(roots []string) string {
 			}
 		}
 	}
+	// Installed release bundles keep the production real_ffi GUI beside
+	// snapflowd rather than under a repository's shotcut/build*/ tree.  Prefer
+	// the Linux wrapper (it establishes the bundled loader/plugin environment)
+	// over the raw binary; on macOS and Windows use the app's executable.
+	for _, root := range roots {
+		candidates := []string{
+			filepath.Join(root, "Snapflow.app", "snapflow"),
+			filepath.Join(root, "Snapflow.app", "Contents", "MacOS", "Snapflow"),
+			filepath.Join(root, "Snapflow.app", "Contents", "MacOS", "snapflow"),
+			filepath.Join(root, "Snapflow", "snapflow.exe"),
+			filepath.Join(root, "Snapflow", "snapflow"),
+		}
+		for _, candidate := range candidates {
+			info, err := os.Stat(candidate)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			return candidate
+		}
+	}
 	return fallback
 }
 
