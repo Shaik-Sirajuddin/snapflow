@@ -57,6 +57,7 @@ require_file "$acpx_bin"
 # relative to --gui so custom build directories continue to work.
 gui_dir="$(cd "$(dirname "$gui_bin")" && pwd)"
 cute_logger_bin="$gui_dir/../CuteLogger/libCuteLogger.so"
+[ -f "$cute_logger_bin" ] || cute_logger_bin="$app_dir/lib/libCuteLogger.so"
 [ -f "$cute_logger_bin" ] || {
   echo "error: local GUI dependency not found: $cute_logger_bin" >&2
   echo "       build CuteLogger alongside the GUI or pass a release GUI binary" >&2

@@ -109,7 +109,9 @@ var ErrAlreadyBound = errors.New("sapproxy: session already bound to a project")
 // projectID on the shared pooled connection for that project, registers
 // sink to receive that project's fanned-out notifications for sessionID
 // (replacing any previous project binding that sessionID had), and returns
-// sap-rust's real project.select result verbatim.
+// sap-rust's real project.select result verbatim. The binding is committed
+// only after project.select succeeds; a failed/expired select must not leave
+// a session looking bound or retain its notification sink.
 func (r *Router) Bind(ctx context.Context, sessionID, projectID string, sink Sink) (json.RawMessage, error) {
 	r.mu.Lock()
 	if prevProject, ok := r.sessionProject[sessionID]; ok && prevProject != projectID {
@@ -123,6 +125,15 @@ func (r *Router) Bind(ctx context.Context, sessionID, projectID string, sink Sin
 		return nil, err
 	}
 
+	params, _ := json.Marshal(map[string]string{"projectId": projectID})
+	result, err := pc.conn.Call(ctx, "project.select", params)
+	if err != nil {
+		return nil, err
+	}
+
+	// Publish the session binding only after the server has accepted the
+	// selection. This ordering prevents a timeout from leaking state into the
+	// router when the caller retries or closes the session.
 	r.mu.Lock()
 	r.sessionProject[sessionID] = projectID
 	r.mu.Unlock()
@@ -130,9 +141,7 @@ func (r *Router) Bind(ctx context.Context, sessionID, projectID string, sink Sin
 	pc.mu.Lock()
 	pc.sinks[sessionID] = sink
 	pc.mu.Unlock()
-
-	params, _ := json.Marshal(map[string]string{"projectId": projectID})
-	return pc.conn.Call(ctx, "project.select", params)
+	return result, nil
 }
 
 // Call forwards an opaque, already-bound method call to the SAP connection

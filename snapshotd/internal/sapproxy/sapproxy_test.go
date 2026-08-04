@@ -22,6 +22,9 @@ import (
 // for tests against the real binary when it's built.
 type fakeSapServer struct {
 	token string
+	// selectDelay lets timeout tests model a live SAP server that accepts the
+	// socket but does not complete project.select before the caller deadline.
+	selectDelay time.Duration
 
 	mu       sync.Mutex
 	tracks   map[string][]string      // projectID -> track kinds
@@ -108,6 +111,9 @@ func (s *fakeSapServer) handleConn(nc net.Conn) {
 				respond(nil, "unauthenticated")
 				continue
 			}
+			if s.selectDelay > 0 {
+				time.Sleep(s.selectDelay)
+			}
 			var p struct {
 				ProjectID string `json:"projectId"`
 			}
@@ -159,6 +165,30 @@ func (s *fakeSapServer) handleConn(nc net.Conn) {
 		default:
 			respond(nil, "method not found: "+req.Method)
 		}
+	}
+}
+
+func TestRouter_BindTimeoutDoesNotLeakSessionBinding(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fake.sock")
+	srv := newFakeSapServer("tok-123")
+	srv.selectDelay = 100 * time.Millisecond
+	srv.serve(t, sock)
+
+	router := NewRouter(func(projectID string) (string, string, error) {
+		return sock, "tok-123", nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := router.Bind(ctx, "session-timeout", "proj-1", &recordingSink{}); err == nil {
+		t.Fatal("expected project.select timeout")
+	}
+
+	// A failed select must not make subsequent opaque calls appear bound. In
+	// particular, daemon save-before-close retries should not inherit a stale
+	// binding from an expired handshake.
+	if _, err := router.Call(context.Background(), "session-timeout", "edit.listTracks", nil); err == nil {
+		t.Fatal("expected unbound session after project.select timeout")
 	}
 }
 
