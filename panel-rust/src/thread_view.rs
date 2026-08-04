@@ -19,6 +19,7 @@ struct ThreadMessageState {
     tool_groups: Rc<VecModel<crate::ToolGroupItem>>,
     tool_group_models: RefCell<HashMap<String, Rc<VecModel<MessageItem>>>>,
     tool_group_slots: RefCell<Vec<Option<(String, usize)>>>,
+    tool_group_slot_keys: RefCell<Vec<Option<String>>>,
     keys: RefCell<Vec<String>>,
     row_index: RefCell<HashMap<String, usize>>,
     content_hash: RefCell<HashMap<String, u64>>,
@@ -38,6 +39,7 @@ impl ThreadViewModels {
                 tool_groups: Rc::new(VecModel::default()),
                 tool_group_models: RefCell::new(HashMap::new()),
                 tool_group_slots: RefCell::new(Vec::new()),
+                tool_group_slot_keys: RefCell::new(Vec::new()),
                 keys: RefCell::new(Vec::new()),
                 row_index: RefCell::new(HashMap::new()),
                 content_hash: RefCell::new(HashMap::new()),
@@ -73,6 +75,7 @@ impl ThreadViewModels {
         };
         let mut active = std::collections::HashSet::new();
         let mut slots = Vec::with_capacity(rows.len());
+        let mut slot_keys = vec![None; rows.len()];
         let mut row_slots = vec![None; rows.len()];
         let mut start = 0usize;
         while start < rows.len() {
@@ -87,18 +90,31 @@ impl ThreadViewModels {
                 continue;
             }
             let end = (start + len).min(rows.len());
-            let key = keys
+            let base_key = keys
                 .get(start)
                 .cloned()
                 .unwrap_or_else(|| start.to_string());
+            // Keep malformed duplicate message/group keys from aliasing the
+            // same retained VecModel. A deterministic position suffix makes
+            // each group independent while preserving identity across
+            // frames as long as the group remains at that position.
+            let key = if active.contains(&base_key) {
+                format!("{base_key}#dup{start}")
+            } else {
+                base_key
+            };
             active.insert(key.clone());
             let group_model = state
                 .tool_group_models
                 .borrow_mut()
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| Rc::new(VecModel::default()))
                 .clone();
-            replace_rows(&group_model, &rows[start..end]);
+            // Tool output streams are reconciled on every frame. Keep the
+            // retained group model stable and only publish rows whose view
+            // fingerprint changed; this avoids broadcasting a VecModel
+            // change for every unchanged tool call on every poll tick.
+            replace_rows_bounded(&group_model, &rows[start..end]);
             let label = if rows[start].kind == "mcp_server_call" {
                 "MCP CALL"
             } else {
@@ -114,11 +130,10 @@ impl ThreadViewModels {
                 item_count: (end - start) as i32,
                 messages: ModelRc::from(group_model),
             };
+            slot_keys[start] = Some(key.clone());
             for (offset, slot) in row_slots[start..end].iter_mut().enumerate() {
                 *slot = Some((
-                    keys.get(start)
-                        .cloned()
-                        .unwrap_or_else(|| start.to_string()),
+                    key.clone(),
                     offset,
                 ));
             }
@@ -134,11 +149,25 @@ impl ThreadViewModels {
         }
         for (index, slot) in slots.into_iter().enumerate() {
             if index < state.tool_groups.row_count() {
-                state.tool_groups.set_row_data(index, slot);
+                let expected_key = slot_keys.get(index).and_then(Clone::clone);
+                let current_key = state
+                    .tool_group_slot_keys
+                    .borrow()
+                    .get(index)
+                    .and_then(Clone::clone);
+                let unchanged = state.tool_groups.row_data(index).is_some_and(|current| {
+                    current_key == expected_key
+                        && current.label == slot.label
+                        && current.item_count == slot.item_count
+                });
+                if !unchanged {
+                    state.tool_groups.set_row_data(index, slot);
+                }
             } else {
                 state.tool_groups.push(slot);
             }
         }
+        *state.tool_group_slot_keys.borrow_mut() = slot_keys;
     }
 
     pub(crate) fn update_tool_group_row(
@@ -213,8 +242,14 @@ impl ThreadViewModels {
                 .borrow()
                 .iter()
                 .enumerate()
-                .map(|(index, key)| (key.clone(), index))
-                .collect();
+                .fold(HashMap::new(), |mut index, (row, key)| {
+                    // A malformed/partially streamed transcript can
+                    // briefly produce duplicate fallback keys. Keep the
+                    // first row authoritative; overwriting here silently
+                    // redirected keyed updates to the last duplicate.
+                    index.entry(key.clone()).or_insert(row);
+                    index
+                });
             *state.row_index.borrow_mut() = index;
         }
     }
@@ -250,13 +285,18 @@ impl ThreadViewModels {
     }
 }
 
-fn replace_rows(model: &VecModel<MessageItem>, rows: &[MessageItem]) {
+fn replace_rows_bounded(model: &VecModel<MessageItem>, rows: &[MessageItem]) {
     while model.row_count() > rows.len() {
         model.remove(model.row_count() - 1);
     }
     for (index, row) in rows.iter().cloned().enumerate() {
         if index < model.row_count() {
-            model.set_row_data(index, row);
+            let unchanged = model.row_data(index).is_some_and(|current| {
+                message_content_hash(&current) == message_content_hash(&row)
+            });
+            if !unchanged {
+                model.set_row_data(index, row);
+            }
         } else {
             model.push(row);
         }
@@ -272,6 +312,15 @@ fn message_content_hash(row: &MessageItem) -> u64 {
     row.raw_output.as_str().hash(&mut hasher);
     row.expanded.hash(&mut hasher);
     row.index.hash(&mut hasher);
+    row.queued.hash(&mut hasher);
+    row.can_edit.hash(&mut hasher);
+    row.can_send_now.hash(&mut hasher);
+    row.sending.hash(&mut hasher);
+    row.first_use.hash(&mut hasher);
+    // Tool grouping is rendered through the retained nested model. Include
+    // its span in the fingerprint or a streamed tool-call update that only
+    // changes grouping metadata will leave Slint with stale group slots.
+    row.tool_group_len.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -341,6 +390,39 @@ mod tests {
     }
 
     #[test]
+    fn tool_group_slot_key_change_replaces_same_shaped_group() {
+        let mut views = ThreadViewModels::default();
+        views.ensure("thread-a");
+        let first = vec![MessageItem {
+            kind: "tool_use".into(),
+            text: "first".into(),
+            tool_group_len: 1,
+            ..MessageItem::default()
+        }];
+        views.reconcile_tool_groups("thread-a", &["tool:one".into()], &first);
+
+        let second = vec![MessageItem {
+            kind: "tool_use".into(),
+            text: "second".into(),
+            tool_group_len: 1,
+            ..MessageItem::default()
+        }];
+        views.reconcile_tool_groups("thread-a", &["tool:two".into()], &second);
+
+        let group = views.tool_groups("thread-a").unwrap().row_data(0).unwrap();
+        assert_eq!(group.messages.row_data(0).unwrap().text, "second");
+    }
+
+    #[test]
+    fn duplicate_keys_keep_first_row_index() {
+        let mut views = ThreadViewModels::default();
+        views.ensure("thread-a");
+        views.set_keys("thread-a", vec!["same".into(), "other".into(), "same".into()]);
+        assert_eq!(views.row_index_for("thread-a", "same"), Some(0));
+        assert_eq!(views.row_index_for("thread-a", "other"), Some(1));
+    }
+
+    #[test]
     fn retaining_thread_ids_drops_closed_views_but_keeps_live_identity() {
         let mut views = ThreadViewModels::default();
         let retained = views.ensure("thread-a");
@@ -399,6 +481,35 @@ mod tests {
         assert_eq!(group.item_count, 2);
         assert_eq!(group.messages.row_count(), 2);
         assert_eq!(groups.row_data(2).unwrap().item_count, 0);
+
+        // A second projection with identical rows must preserve the compact
+        // group contents; the reconciler should not publish redundant row
+        // notifications on every frame.
+        views.reconcile_tool_groups("thread-a", &keys, &rows);
+        assert_eq!(
+            groups
+                .row_data(0)
+                .unwrap()
+                .messages
+                .row_data(1)
+                .unwrap()
+                .text,
+            "call 2"
+        );
+
+        let mut changed_rows = rows.clone();
+        changed_rows[1].text = "call 2 updated".into();
+        views.reconcile_tool_groups("thread-a", &keys, &changed_rows);
+        assert_eq!(
+            groups
+                .row_data(0)
+                .unwrap()
+                .messages
+                .row_data(1)
+                .unwrap()
+                .text,
+            "call 2 updated"
+        );
 
         views.update_tool_group_row(
             "thread-a",

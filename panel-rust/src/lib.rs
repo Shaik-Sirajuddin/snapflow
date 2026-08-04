@@ -4264,8 +4264,10 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let busy_thread_animating = {
             let model = panel.model.borrow();
             model.threads.iter().any(|thread| {
-                matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
-                    || thread.connection_status == "Connecting..."
+                !thread.archived
+                    && !thread.closed
+                    && (matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                        || thread.connection_status == "Connecting...")
             })
         };
         // mcp_servers_spinner_repaint_gap: the Settings > MCP Servers row

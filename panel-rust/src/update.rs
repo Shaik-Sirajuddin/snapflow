@@ -704,9 +704,14 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             )
         }
         ThreadMsg::ArchiveRequested(idx) => {
+            let was_loading = model
+                .threads
+                .get(idx)
+                .is_some_and(|thread| matches!(thread.state, ThreadState::Loading));
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
             };
+            let thread_id = thread.thread_id.clone();
             // Phase 19: TOGGLE -- the same action resumes an archived
             // thread (sidebar's archived rows wire it as Resume).
             let now_archived = !thread.archived;
@@ -715,7 +720,17 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 real_index: idx,
                 archived: now_archived,
             }];
-            let mut dirty = vec![thread_row_dirty(model, idx)];
+            let mut dirty = vec![Dirty::ThreadRow { thread_id }];
+            // Archiving is local presentation state, but it must not leave an
+            // in-flight generation orphaned behind an archived row. Request
+            // native ACP cancellation and move the reducer state to
+            // Cancelling immediately; the eventual TurnEnded/Error event
+            // remains the authoritative completion path. Cancelling an
+            // already-cancelling turn must not enqueue a duplicate request.
+            if now_archived && was_loading {
+                thread.state = ThreadState::Cancelling;
+                effects.push(Effect::CancelGeneration { real_index: idx });
+            }
             // Phase 19 pool cap: at most ARCHIVE_POOL_CAP archived
             // threads; beyond it the OLDEST archived thread is quietly
             // dropped -- permanent delete via the existing delete flow
@@ -3811,6 +3826,55 @@ mod tests {
         assert_eq!(model.selected_thread, 0);
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn archiving_loading_thread_requests_native_cancel_and_marks_cancelling() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::ArchiveRequested(0))),
+        );
+
+        assert!(model.threads[0].archived);
+        assert_eq!(model.threads[0].state, ThreadState::Cancelling);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::ArchiveThread {
+                    real_index: 0,
+                    archived: true,
+                },
+                Effect::CancelGeneration { real_index: 0 },
+            ]
+        );
+        assert_eq!(
+            dirty,
+            vec![Dirty::ThreadRow {
+                thread_id: "thread-0".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn archiving_cancelling_thread_does_not_duplicate_native_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Cancelling;
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::ArchiveRequested(0))),
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::ArchiveThread {
+                real_index: 0,
+                archived: true,
+            }]
+        );
     }
 
     #[test]

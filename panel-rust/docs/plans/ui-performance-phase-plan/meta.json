@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "phase-plan execution file",
+  "plan": "ui-performance-phase-plan",
+  "status": "in_progress",
+  "updated": "2026-08-04",
+  "plan_doc": "00-plan.md",
+  "source_task": "Eliminate UI freezes during streaming, typing, project switching, Save-As, resize, and file persistence.",
+  "ordering_rationale": "First isolate hot-path projection and I/O, then make resize/project transitions latest-value-wins, then run cross-cutting review and host/runtime verification.",
+  "execution_strategy": {
+    "mode": "parallel_workstreams",
+    "subagents": true,
+    "blocks": [
+      {"id": "streaming", "name": "Streaming projection", "tasks": ["coalesce visual deltas", "single Markdown path", "keyed tool-group updates", "chat model windowing"], "phases": ["stream_delta_coalescing", "markdown_projection", "tool_group_diff", "chat_view_windowing"], "depends_on": []},
+      {"id": "io", "name": "Persistence and project I/O", "tasks": ["offload JSONL/file saves", "offload Save-As SQLite/filesystem work", "preserve epochs and errors"], "phases": ["event_persistence_offload", "save_as_offload"], "depends_on": []},
+      {"id": "host", "name": "Qt host and resize", "tasks": ["debounce geometry", "coalesce buffer resize", "offload/debounce PTY resize"], "phases": ["resize_coalescing"], "depends_on": []}
+    ]
+  },
+  "completed": [
+    {
+      "phase": "rust_slint_review",
+      "status": "completed",
+      "evidence": "Cross-angle review completed with rust-audit/slint guidance and two subagents: no lock-across-await remains in touched async paths; stream-close flush and persistence ordering were fixed/verified; no Slint source was edited, and retained-model updates are keyed/no-op aware."
+    },
+    {
+      "phase": "implementation_verification",
+      "status": "completed",
+      "evidence": "Reviewed each completed phase against the plan and source diff; no false-positive completion found. Remaining Save-As, resize, Markdown worker, chat windowing, and runtime UI phases remain explicitly pending."
+    },
+    {
+      "phase": "verification_loop",
+      "status": "completed",
+      "evidence": "No implementation misalignments remained after the review patch; stream-close visual flush was added and cargo check/tests rerun."
+    },
+    {
+      "phase": "stream_delta_coalescing",
+      "status": "completed",
+      "evidence": "Event forwarder retains every ordered AgentEvent::Message and persists each one, while coalescing transcript refreshes into bursts of four; semantic events flush pending visual state before handling. cargo check --lib passed."
+    },
+    {
+      "phase": "tool_group_diff",
+      "status": "completed",
+      "evidence": "thread_view::tests (9 passed); bounded nested-row and outer-slot updates skip unchanged rows while changed rows propagate. Review fixes include outer group-key identity, deterministic duplicate-group suffixing to prevent VecModel aliasing, duplicate message-key first-row retention, and all Slint-visible queued/send/first-use/grouping fields in the row fingerprint."
+    },
+    {
+      "phase": "event_persistence_offload",
+      "status": "completed",
+      "evidence": "jsonl_append_offload_tests::offloaded_append_preserves_serial_order passed; live and replay AgentEvent::Message appends use spawn_blocking with sequential awaits. push_local/runtime snapshot writes remain synchronous by API/design."
+    }
+  ],
+  "pending": [
+    {"phase": "stream_delta_coalescing", "order": 1, "tier": 2, "status": "completed", "description": "Coalesce only visual stream deltas while preserving ACP event ordering.", "verification": "Reducer and integration tests prove latest text wins and TurnEnded/tool/error events remain lossless."},
+    {"phase": "markdown_projection", "order": 2, "tier": 2, "status": "not_started", "description": "Remove duplicate Markdown work and move render parsing off the GUI thread with epoch guards.", "verification": "Markdown worker tests plus long-stream projection tests show no stale delivery."},
+    {"phase": "tool_group_diff", "order": 3, "tier": 2, "status": "completed", "description": "Make message and tool-group models keyed/no-op aware.", "verification": "Only changed rows receive set_row_data; tool status/input/output tests pass."},
+    {"phase": "chat_view_windowing", "order": 4, "tier": 3, "status": "not_started", "description": "Bound mounted chat/tool rows or introduce a safe visible-window model.", "verification": "Long-history UI test confirms mounted/rendered row count stays bounded."},
+    {"phase": "event_persistence_offload", "order": 5, "tier": 2, "status": "completed", "description": "Batch/offload JSONL and other stream-time file saves.", "verification": "Persistence ordering, flush, failure, and shutdown tests pass."},
+    {"phase": "resize_coalescing", "order": 6, "tier": 2, "status": "not_started", "description": "Debounce Qt geometry, software-buffer resize, and PTY dimension updates.", "verification": "Resize tests prove latest geometry and terminal dimensions converge without per-tick work."},
+    {"phase": "save_as_offload", "order": 7, "tier": 2, "status": "not_started", "description": "Move Save-As SQLite/filesystem rename work off the GUI thread with completion/error events.", "verification": "Large-store Save-As test proves UI remains responsive and identity/store paths converge."},
+    {"phase": "rust_slint_review", "order": 8, "tier": "review_gate", "status": "completed", "description": "Audit touched Rust/Slint/Qt paths for thread safety, reactivity, and stale-result risks.", "max_iterations": 2},
+    {"phase": "implementation_verification", "order": 9, "tier": "verification_gate", "status": "completed", "description": "Verify implementation against this plan and evidence fields.", "misalignments": []},
+    {"phase": "verification_loop", "order": 10, "tier": "loop_gate", "status": "completed", "description": "Resolve verification misalignments and rerun the gate.", "completion_rule": "Closes only when implementation_verification.misalignments is empty."},
+    {"phase": "runtime_ui_matrix", "order": 11, "tier": "runtime_gate", "status": "not_started", "description": "Run host/VNC scenarios for stream, typing, resize, project switch, Save-As, and persistence.", "matrix_ref": "00-plan.md#verification-matrix", "harness": "panel-rust/tests/host_e2e_mcp_driver.py", "matrix_rows": []}
+  ],
+  "open_risks_ref": "00-plan.md#baseline-findings"
+}

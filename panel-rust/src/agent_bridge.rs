@@ -3435,6 +3435,56 @@ fn complete_attachment(slot: &ThreadSlot, error: Option<String>) {
     slot.attachment_ready.notify_waiters();
 }
 
+/// Append a transcript message without performing filesystem I/O on the
+/// ACP runtime worker.  The caller awaits this future, so a single event
+/// forwarder still preserves append order, while Tokio can continue polling
+/// other connections while the disk write is in progress.
+async fn append_jsonl_offloaded(
+    store: &JsonlStore,
+    thread_id: &str,
+    message: &ChatMessage,
+) -> Result<(), String> {
+    let store = store.clone();
+    let thread_id = thread_id.to_owned();
+    let message = message.clone();
+    tokio::task::spawn_blocking(move || store.append(&thread_id, &message))
+        .await
+        .map_err(|error| format!("jsonl append worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod jsonl_append_offload_tests {
+    use super::append_jsonl_offloaded;
+    use crate::jsonl_store::JsonlStore;
+    use crate::protocol_types::{ChatMessage, MessageKind};
+
+    #[test]
+    fn offloaded_append_preserves_serial_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JsonlStore::open(dir.path()).expect("open store");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for text in ["first", "second", "third"] {
+                let message = ChatMessage {
+                    kind: MessageKind::Agent,
+                    text: text.to_owned(),
+                    status: None,
+                    id: None,
+                    raw_input: None,
+                    raw_output: None,
+                };
+                append_jsonl_offloaded(&store, "thread", &message)
+                    .await
+                    .expect("append");
+            }
+        });
+        let cached = store.load("thread").expect("load");
+        let texts: Vec<_> = cached.messages.iter().map(|message| message.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+    }
+}
+
 fn spawn_event_forwarder(
     runtime: &tokio::runtime::Handle,
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
@@ -3466,7 +3516,17 @@ fn spawn_event_forwarder(
     // keeps accumulating every message it receives, exactly as it did
     // before that windowing was introduced.
     runtime.spawn(async move {
+        // ACP message events are ordered, but a fast stream can deliver many
+        // adjacent snapshots before the UI gets a useful chance to paint.
+        // Keep every message in history/persistence while coalescing only the
+        // visual refresh to bounded bursts. Any semantic event flushes the
+        // pending visual state before it is handled.
+        let mut pending_visual_messages = 0usize;
         while let Some(ev) = events_rx.recv().await {
+            if !matches!(ev, AgentEvent::Message(_)) && pending_visual_messages > 0 {
+                refresh_transcript(&slot_for_task);
+                pending_visual_messages = 0;
+            }
             match &ev {
                 AgentEvent::ConnectionRestored => {
                     if slot_for_task
@@ -3541,9 +3601,19 @@ fn spawn_event_forwarder(
                             .unwrap_or_else(|e| e.into_inner());
                         history.push(msg.clone());
                     }
-                    refresh_transcript(&slot_for_task);
+                    pending_visual_messages = pending_visual_messages.saturating_add(1);
+                    if pending_visual_messages >= 4 {
+                        refresh_transcript(&slot_for_task);
+                        pending_visual_messages = 0;
+                    }
                     if let Some(store) = &store_for_task {
-                        if let Err(e) = store.append(&slot_for_task.thread_id, msg) {
+                        if let Err(e) = append_jsonl_offloaded(
+                            store,
+                            &slot_for_task.thread_id,
+                            msg,
+                        )
+                        .await
+                        {
                             eprintln!(
                                 "panel-rust: jsonl append failed for {}: {e}",
                                 slot_for_task.thread_id
@@ -3667,6 +3737,11 @@ fn spawn_event_forwarder(
                     thread_index: idx,
                     event: ev,
                 });
+        }
+        // If the stream closes after a partial burst, publish the remaining
+        // messages so the final transcript is not left stale.
+        if pending_visual_messages > 0 {
+            refresh_transcript(&slot_for_task);
         }
     });
 }
@@ -3953,12 +4028,25 @@ fn spawn_background_attachment(
                     let mut replayed_any = false;
                     while let Ok(ev) = events_rx.try_recv() {
                         if let AgentEvent::Message(message) = &ev {
-                            let mut history = slot.history.lock().unwrap_or_else(|e| e.into_inner());
-                            if !replay_matches_cached_position(&history, &mut cached_index, message) {
-                                history.push(message.clone());
+                            let replayed = {
+                                let mut history = slot.history.lock().unwrap_or_else(|e| e.into_inner());
+                                if !replay_matches_cached_position(&history, &mut cached_index, message) {
+                                    history.push(message.clone());
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if replayed {
                                 replayed_any = true;
                                 if let Some(store) = &store {
-                                    if let Err(error) = store.append(&slot.thread_id, message) {
+                                    if let Err(error) = append_jsonl_offloaded(
+                                        store,
+                                        &slot.thread_id,
+                                        message,
+                                    )
+                                    .await
+                                    {
                                         eprintln!(
                                             "panel-rust: jsonl append failed for {}: {error}",
                                             slot.thread_id
@@ -5732,13 +5820,26 @@ impl AgentBridge {
                     while let Ok(event) = events_rx.try_recv() {
                         match &event {
                             AgentEvent::Message(message) => {
-                                slot.history
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .push(message.clone());
+                                {
+                                    slot.history
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(message.clone());
+                                }
                                 replayed_any = true;
                                 if let Some(store) = &store {
-                                    let _ = store.append(&slot.thread_id, message);
+                                    if let Err(error) = append_jsonl_offloaded(
+                                        store,
+                                        &slot.thread_id,
+                                        message,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "panel-rust: jsonl append failed for {}: {error}",
+                                            slot.thread_id
+                                        );
+                                    }
                                 }
                             }
                             AgentEvent::SessionModes(_)
