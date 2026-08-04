@@ -325,6 +325,16 @@ PY
     echo "    SNAPSHOTD_MCP_SSE_ADDR=$mcp_addr"
     echo "    SNAPSHOTD_HOME=$snapshotd_home"
 
+    # ACPX_STORAGE_DIR/RUI_MOCK_AGENT_EVENT_LOG aren't among the explicit
+    # SNAPSHOTD_ACPX_* overrides acpxmgr sets (see acpxmgr.go's
+    # `cmd.Env = append(os.Environ(), ...)`), so it inherits whatever is in
+    # THIS process's own environment when it spawns a fresh acpx-server --
+    # export them here rather than trying to pass them through
+    # SNAPSHOTD_ACPX_CONFIG. Only takes effect for a freshly-started daemon;
+    # an already-running reused daemon (see ensure_daemon's session reuse
+    # above) keeps whatever env it was first spawned with.
+    export ACPX_STORAGE_DIR="$state_dir/acpx/storage"
+    export RUI_MOCK_AGENT_EVENT_LOG="${RUI_MOCK_AGENT_EVENT_LOG:-}"
     echo "==> waiting for daemon-managed acpx-server..."
     local acpx_config="$snapshotd_home/acpx-config.json"
     local acpx_pid_file="$snapshotd_home/acpx-server.pid"
@@ -441,7 +451,7 @@ PY
         if ! DISPLAY="$vnc_display" "$SHARED_VNC" workspace-place \
             "$worktree_dir" "$shotcut_pid" "$workspace_id"; then
             # Do not leave an untracked live editor behind when placement
-            # fails.  The old path exited before connect.env was written,
+            # fails. The old path exited before connect.env was written,
             # making the next clean unable to discover this process.
             kill_process_group "$shotcut_pid"
             kill_process_group "$server_pid"

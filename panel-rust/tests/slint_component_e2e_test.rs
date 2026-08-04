@@ -45,6 +45,7 @@ fn sample_open_thread(name: &str) -> ThreadItem {
         profile_name: "".into(),
         has_session: false,
         project_instance_live: false,
+        unread: false,
     }
 }
 
@@ -95,6 +96,13 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    // ChatPanel mirrors the production root: controls are disabled until the
+    // gateway handshake completes. This fixture drives the controls directly,
+    // so put it in the ready state before querying accessibility.
+    panel.set_gateway_ready(true);
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1200.0));
     let new_thread_count = Rc::new(Cell::new(0));
     let settings_count = Rc::new(Cell::new(0));
     let settings_save_count = Rc::new(Cell::new(0));
@@ -103,7 +111,6 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     let approval_count = Rc::new(Cell::new(0));
     let rejection_count = Rc::new(Cell::new(0));
     let selected_permission_option = Rc::new(Cell::new(String::new()));
-    let load_older_count = Rc::new(Cell::new(0));
     let expanded_terminal = Rc::new(Cell::new(String::new()));
     let terminal_overlay_close_count = Rc::new(Cell::new(0));
     let closed_local_terminal_count = Rc::new(Cell::new(0));
@@ -142,17 +149,6 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         let selected_permission_option = selected_permission_option.clone();
         panel.on_permission_option_selected(move |id| {
             selected_permission_option.set(id.to_string());
-        });
-    }
-    {
-        let load_older_count = load_older_count.clone();
-        let panel_weak = panel.as_weak();
-        panel.on_load_older_requested(move || {
-            load_older_count.set(load_older_count.get() + 1);
-            panel_weak
-                .upgrade()
-                .expect("panel alive during page callback")
-                .set_loading_older_messages(false);
         });
     }
     {
@@ -242,6 +238,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     panel.set_settings_open(true);
     // Background session controls live under the Harness tab now
     // (harness_view.slint), not directly on the sheet -- select it.
+    panel.set_beta_mode_enabled(true);
     panel.set_settings_active_section("harness".into());
     assert!(!panel.get_background_default());
     let background_default =
@@ -308,6 +305,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         kind: "agent".into(),
         text: "streamed response".into(),
         markdown_lines: Default::default(),
+        markdown_blocks: Default::default(),
         status: "streaming".into(),
         expanded: false,
         index: 0,
@@ -324,20 +322,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         "streamed message updates must not steal composer focus"
     );
 
-    panel.set_has_older_messages(true);
-    let load_older = ElementHandle::find_by_accessible_label(&panel, "Load older messages")
-        .next()
-        .expect("older-page control must be accessible");
-    assert_eq!(
-        load_older.id().as_deref(),
-        Some("ChatArea::load-older-button")
-    );
-    load_older.invoke_accessible_default_action();
-    assert_eq!(load_older_count.get(), 1);
-    assert!(
-        !panel.get_loading_older_messages(),
-        "page-load guard must reset after its Rust callback completes"
-    );
+    // No older-page assertion here: the clickable "Load older messages"
+    // control was removed in favour of scroll-only pagination (the
+    // Flickable's `flicked` handler) plus a non-interactive spinner, so
+    // there is no addressable control left for this test to exercise.
 
     panel.set_pending_request(PendingRequestItem {
         active: true,
@@ -389,6 +377,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         has_exited: false,
         exit_code: 0,
     }])));
+    let terminals_chip = ElementHandle::find_by_accessible_label(&panel, "Select 1 terminal")
+        .next()
+        .expect("terminal chip must be accessible");
+    terminals_chip.invoke_accessible_default_action();
     let expand_terminal =
         ElementHandle::find_by_accessible_label(&panel, "Expand terminal build-42")
             .next()
@@ -399,7 +391,10 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     // "TerminalCard::terminal-expand" id in the current component tree
     // (this assertion predates that refactor). HoverSurface::touch is
     // the real, current id of the single accessible-label match.
-    assert_eq!(expand_terminal.id().as_deref(), Some("HoverSurface::touch"));
+    assert_eq!(
+        expand_terminal.id().as_deref(),
+        Some("MentionPickRow::touch")
+    );
     expand_terminal.invoke_accessible_default_action();
     assert_eq!(expanded_terminal.take(), "build-42");
 
@@ -534,6 +529,11 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
+    panel.set_beta_mode_enabled(true);
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1600.0));
     let mode_selection = Rc::new(RefCell::new(Vec::<String>::new()));
     let config_selection = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
     let created_mcp = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
@@ -694,6 +694,8 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         id: "claude".into(),
         name: "Claude".into(),
         version: "1.0".into(),
+        website: "".into(),
+        website_domain: "".into(),
         status: "not installed".into(),
         enabled: true,
         loading: false,
@@ -806,7 +808,7 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     assert_eq!(&*installed_agents.borrow(), &["claude"]);
 
     panel.set_settings_active_section("mcp_servers".into());
-    let mcp_name = ElementHandle::find_by_accessible_label(&panel, "New MCP server name")
+    let mcp_name = ElementHandle::find_by_accessible_label(&panel, "MCP server name")
         .next()
         .expect("MCP name input must be accessible");
     // Migrated to the shared TextField component; its own inner
@@ -822,11 +824,11 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
 
     // Label gained an " or URL" suffix since this assertion was written
     // (mcp_servers_view.slint now supports remote/URL-based servers too).
-    let mcp_command =
-        ElementHandle::find_by_accessible_label(&panel, "New MCP server command or URL")
-            .next()
-            .expect("MCP command input must be accessible");
+    let mcp_command = ElementHandle::find_by_accessible_label(&panel, "MCP command")
+        .next()
+        .expect("MCP command input must be accessible");
     mcp_command.invoke_accessible_default_action();
+    slint::platform::update_timers_and_animations();
     for key in "node server.js".chars() {
         panel.window().dispatch_event(WindowEvent::KeyPressed {
             text: key.to_string().into(),
@@ -1059,6 +1061,8 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
         id: "claude".into(),
         name: "Claude".into(),
         version: "1.0".into(),
+        website: "".into(),
+        website_domain: "".into(),
         status: "installed".into(),
         enabled: true,
         loading: false,
@@ -1098,6 +1102,8 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
         id: "claude".into(),
         name: "Claude".into(),
         version: "1.0".into(),
+        website: "".into(),
+        website_domain: "".into(),
         status: "installed".into(),
         enabled: false,
         loading: false,
@@ -1143,6 +1149,8 @@ fn agents_settings_search_filters_catalog_cards() {
             id: "claude".into(),
             name: "Claude".into(),
             version: "1.0".into(),
+            website: "".into(),
+            website_domain: "".into(),
             status: "installed".into(),
             enabled: true,
             loading: false,
@@ -1151,6 +1159,8 @@ fn agents_settings_search_filters_catalog_cards() {
             id: "codex".into(),
             name: "Codex".into(),
             version: "1.0".into(),
+            website: "".into(),
+            website_domain: "".into(),
             status: "installed".into(),
             enabled: true,
             loading: false,
@@ -1159,6 +1169,8 @@ fn agents_settings_search_filters_catalog_cards() {
             id: "gemini".into(),
             name: "Gemini".into(),
             version: "1.0".into(),
+            website: "".into(),
+            website_domain: "".into(),
             status: "available".into(),
             enabled: false,
             loading: false,
@@ -1240,6 +1252,7 @@ fn thread_search_box_accepts_real_typed_keystrokes_and_dispatches_search_changed
         profile_name: "".into(),
         has_session: false,
         project_instance_live: false,
+        unread: false,
     }])));
 
     let search_changes = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -1386,6 +1399,10 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 1200.0));
     let profile_selection = Rc::new(RefCell::new(Vec::<String>::new()));
     {
         let profile_selection = profile_selection.clone();
@@ -1457,6 +1474,11 @@ fn composer_dropdowns_are_mutually_exclusive() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
+    panel.set_beta_mode_enabled(true);
+    panel
+        .window()
+        .set_size(slint::LogicalSize::new(900.0, 900.0));
 
     panel.set_mode_trigger_label("Ask".into());
     panel.set_mode_dropdown_entries(ModelRc::new(VecModel::from(vec![DropdownEntry {
@@ -1514,6 +1536,7 @@ fn composer_reasoning_effort_dropdown_dispatches_config_option() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
     let selected = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
     {
         let selected = selected.clone();
@@ -1560,6 +1583,57 @@ fn composer_reasoning_effort_dropdown_dispatches_config_option() {
     assert_eq!(
         selected.borrow().as_slice(),
         &[("reasoning".to_owned(), "high".to_owned())]
+    );
+}
+
+/// Backend-native permissionMode uses the same runtime config-option write
+/// callback as model and reasoning selectors, while remaining its own UI
+/// dropdown.
+#[test]
+fn composer_permission_mode_dropdown_dispatches_config_option() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
+    panel.window().set_size(slint::PhysicalSize::new(1600, 900));
+    let selected = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+    {
+        let selected = selected.clone();
+        panel.on_config_option_selected(move |id, value| {
+            selected
+                .borrow_mut()
+                .push((id.to_string(), value.to_string()));
+        });
+    }
+    panel.set_permission_mode_trigger_label("Permission".into());
+    panel.set_permission_mode_dropdown_entries(ModelRc::new(VecModel::from(vec![
+        DropdownEntry {
+            id: "permissionMode".into(),
+            label: "Accept edits".into(),
+            value: "acceptEdits".into(),
+            is_header: false,
+            is_current: false,
+        },
+        DropdownEntry {
+            id: "permissionMode".into(),
+            label: "Plan".into(),
+            value: "plan".into(),
+            is_header: false,
+            is_current: false,
+        },
+    ])));
+
+    let trigger = ElementHandle::find_by_accessible_label(&panel, "Permission")
+        .next()
+        .expect("permission trigger uses host label");
+    trigger.invoke_accessible_default_action();
+    let accept_edits = ElementHandle::find_by_accessible_label(&panel, "Accept edits")
+        .next()
+        .expect("permission options open in their own popup");
+    accept_edits.invoke_accessible_default_action();
+    assert_eq!(
+        selected.borrow().as_slice(),
+        &[("permissionMode".to_owned(), "acceptEdits".to_owned())]
     );
 }
 
@@ -1742,6 +1816,7 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.set_gateway_ready(true);
     panel
         .window()
         .set_size(slint::LogicalSize::new(900.0, 700.0));
@@ -1764,6 +1839,7 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
             is_dev_only: false,
         },
     ])));
+    panel.set_show_global_skills(false);
 
     // Threads tab is default — project skill row is under Skills mode only.
     assert!(
@@ -1794,6 +1870,12 @@ fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
         .next()
         .expect("Show global skills toggle must be accessible");
     show_global.invoke_accessible_default_action();
+    slint::platform::update_timers_and_animations();
+    // In production Rust persists this preference and republishes the
+    // available-skills model; mirror that host reconciliation in the direct
+    // component fixture so the assertion observes the committed state.
+    panel.set_show_global_skills(true);
+    slint::platform::update_timers_and_animations();
 
     ElementHandle::find_by_accessible_label(&panel, "Open skill global-only")
         .next()

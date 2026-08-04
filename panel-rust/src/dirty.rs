@@ -305,6 +305,31 @@ pub enum Dirty {
     Connection {
         thread_id: String,
     },
+    /// mcp-servers-settings follow-up: `thread_id`'s provider-probe
+    /// (`Model::provider_probes_in_flight`) loading state changed --
+    /// start on `SettingsMsg::ProfileSelected`'s `Effect::ProbeProvider`
+    /// dispatch, end on the matching `AgentEvent::ProviderProbe` (either
+    /// `Ok` or `Err`; the error text itself still goes only through the
+    /// existing `provider_errors`/toast path, not duplicated here -- see
+    /// `sync::chat_view_provider_switching`'s doc comment). Same
+    /// singleton-property, displayed-thread-gated shape as `Connection`
+    /// above.
+    ProviderSwitch {
+        thread_id: String,
+    },
+    /// mcp-servers-settings follow-up: `thread_id`'s first-session-attach
+    /// (`Model::first_attach_in_flight`) loading state changed -- start
+    /// on `dispatch::dispatch_compose_send_maybe_attach`'s
+    /// `EffectResultMsg::SessionAttachStarted` dispatch, end either on
+    /// `update_frame`'s `frame.thread_list_snapshot` fold observing
+    /// `session_id` go `None` -> `Some` (success) or on `SessionAttached`'s
+    /// `Err` arm / `AgentEvent::Error` (failure). Same singleton-property,
+    /// displayed-thread-gated shape as `ProviderSwitch`/`Connection`
+    /// above -- see `sync::chat_view_first_attach_in_flight`'s doc
+    /// comment.
+    ThreadAttaching {
+        thread_id: String,
+    },
     Error {
         thread_id: String,
         detail: ErrorDetail,

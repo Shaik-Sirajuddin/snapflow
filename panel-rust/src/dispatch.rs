@@ -52,16 +52,38 @@ fn execute_thread_lifecycle_effect(
         } => {
             if let Some(bridge) = panel.bridge.as_mut() {
                 if let Err(error) = bridge.add_thread_deferred(&display_name, Some(&provider)) {
-                    return Some(crate::effect::EffectResultMsg::SessionAttached {
+                    // mcp-servers-settings plan: `add_thread_deferred`
+                    // returns Err BEFORE pushing a slot (see its doc
+                    // comment), so this real_index's `model.threads` row
+                    // has no bridge slot at all -- `ThreadCreationFailed`,
+                    // not `SessionAttached`, so the fold removes the row
+                    // instead of leaving a permanently unaligned one.
+                    return Some(crate::effect::EffectResultMsg::ThreadCreationFailed {
                         real_index,
-                        thread_id: None,
-                        provider: Some(provider),
-                        result: Err(crate::effect::EffectError::new(error.to_string())),
+                        message: error.to_string(),
                     });
                 }
             }
             None
         }
+        // recoverable-attach-fix: `add_thread_recovering_session` used to
+        // run `session/load` synchronously (via `self.runtime.block_on`)
+        // before returning, so a binding was always present by the time
+        // control came back here -- a missing one meant a real error.
+        // Now the attach happens in the background (same shape as
+        // `NewThreadDeferred`'s own eventual attach), so `thread_binding`
+        // is expected to still be `None` immediately after a *successful*
+        // call: that's the normal "attach in flight" state, not a
+        // failure. Mirror `NewThreadDeferred`'s own `None` return here --
+        // there is no `SessionAttached` result to fold yet. The row
+        // renders as a loading placeholder (external_snapshot.rs's
+        // existing "no binding yet, not deferred" check already covers
+        // this), and `hydrate_thread_ids_from_bridge` picks up the real
+        // session id every frame once the background task completes. A
+        // failed attach still surfaces promptly: `complete_attachment`'s
+        // error queues a real `AgentEvent::Error` that the next frame's
+        // `bridge.poll()` turns into the thread's error state the same
+        // way any other agent-originated failure does.
         crate::effect::Effect::RecoverSessionAttach {
             real_index,
             session_id,
@@ -77,42 +99,18 @@ fn execute_thread_lifecycle_effect(
                         .add_thread_recovering_session(&title, &provider, &session_id)
                         .map_err(|error| crate::effect::EffectError::new(error.to_string()))
                 });
-            let (thread_id, actual_provider, result) = match result {
-                Ok(real_idx) => {
-                    let binding = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_binding(real_idx));
-                    let actual_provider = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_provider(real_idx));
-                    match binding {
-                        Some(binding) => (
-                            Some(binding.thread_id),
-                            actual_provider,
-                            Ok(binding.session_id),
-                        ),
-                        None => (
-                            None,
-                            actual_provider,
-                            Err(crate::effect::EffectError::new(
-                                "bridge created a recovery slot without a session binding",
-                            )),
-                        ),
-                    }
-                }
-                Err(error) => (None, None, Err(error)),
-            };
-            let result = result.map_err(|error| {
-                crate::effect::EffectError::new(format!("recovery thread {real_index}: {error}"))
-            });
-            Some(crate::effect::EffectResultMsg::SessionAttached {
-                real_index,
-                thread_id,
-                provider: actual_provider,
-                result,
-            })
+            match result {
+                Ok(_real_idx) => None,
+                // mcp-servers-settings plan: same reasoning as
+                // `NewThreadDeferred`'s Err arm above -- `add_thread_
+                // recovering_session` also returns Err before pushing a
+                // slot, so this row has no bridge slot to fold an attach
+                // failure onto; remove it instead of leaving it unaligned.
+                Err(error) => Some(crate::effect::EffectResultMsg::ThreadCreationFailed {
+                    real_index,
+                    message: format!("recovery thread {real_index}: {error}"),
+                }),
+            }
         }
         other => panic!("unexpected lifecycle effect: {other:?}"),
     }
@@ -183,7 +181,10 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
     // rendered ahead of an actual switch to them.
     let selected_id = {
         let model = panel.model.borrow();
-        model.threads.get(model.selected_thread).map(|t| t.thread_id.clone())
+        model
+            .threads
+            .get(model.selected_thread)
+            .map(|t| t.thread_id.clone())
     };
     if let Some(selected_id) = selected_id {
         spawn_markdown_prewarm_for_other_threads(panel, &selected_id);
@@ -228,7 +229,13 @@ fn messages_needing_prewarm(
         .iter()
         .zip(rows.iter())
         .filter(|(_, row)| row.kind.as_str() == "agent")
-        .filter(|(key, _)| thread.markdown_render_index.borrow().rendered_blocks_for(key).is_none())
+        .filter(|(key, _)| {
+            thread
+                .markdown_render_index
+                .borrow()
+                .rendered_blocks_for(key)
+                .is_none()
+        })
         .map(|(key, row)| (key.clone(), row.text.to_string()))
         .collect()
 }
@@ -278,7 +285,8 @@ fn spawn_markdown_prewarm_for_thread(panel: &PanelSingleton, thread_id: &str) {
     let deliver = |job: Box<dyn FnOnce() + Send>| {
         let _ = slint::invoke_from_event_loop(move || job());
     };
-    let on_chunk = move |chunk: crate::markdown_worker::MessageBlocksChunk, ack: Box<dyn FnOnce() + Send>| {
+    let on_chunk = move |chunk: crate::markdown_worker::MessageBlocksChunk,
+                         ack: Box<dyn FnOnce() + Send>| {
         crate::PANEL.with(|cell| {
             let slot = cell.borrow();
             if let Some(panel) = slot.as_ref() {
@@ -298,7 +306,9 @@ fn spawn_markdown_prewarm_for_thread(panel: &PanelSingleton, thread_id: &str) {
         ack();
     };
     let on_done = |thread_id: String, epoch: u64| {
-        crate::trace_host_input(format_args!("markdown prewarm done thread={thread_id} epoch={epoch}"));
+        crate::trace_host_input(format_args!(
+            "markdown prewarm done thread={thread_id} epoch={epoch}"
+        ));
     };
 
     crate::markdown_worker::spawn_background_render_pooled(
@@ -618,10 +628,11 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
             .as_ref()
             .is_some_and(|bridge| bridge.is_deferred(real_idx));
         if is_deferred {
-            let (provider, profile, desired_config_options) = {
+            let (thread_id, provider, profile, desired_config_options) = {
                 let model = panel.model.borrow();
                 match model.threads.get(real_idx) {
                     Some(thread) => (
+                        thread.thread_id.clone(),
                         thread.provider.clone(),
                         thread.profile_name.clone(),
                         thread
@@ -634,9 +645,22 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
                             })
                             .collect(),
                     ),
-                    None => (String::new(), None, Vec::new()),
+                    None => (String::new(), String::new(), None, Vec::new()),
                 }
             };
+            // mcp-servers-settings follow-up: mark the first-attach pulse
+            // in flight *here*, synchronously, before the background
+            // attach below has any chance to resolve -- same "mark it in
+            // the same call that dispatches the real work" convention as
+            // `SettingsMsg::ProfileSelected`'s `provider_probes_in_flight`
+            // insert. See `Model::first_attach_in_flight`'s doc comment
+            // for the full start/end contract.
+            let _ = update_persistent(
+                panel,
+                Msg::Effect(crate::effect::EffectResultMsg::SessionAttachStarted {
+                    thread_id: thread_id.clone(),
+                }),
+            );
             if let Some(bridge) = panel.bridge.as_mut() {
                 let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
                 if let Err(error) = bridge.attach_deferred_thread_with_config_options(
@@ -675,36 +699,34 @@ pub(crate) fn dispatch_compose_draft_changed(panel: &PanelSingleton, text: Strin
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
-    let expected_thread_id = panel.real_index(filtered_idx).and_then(|real_idx| {
-        panel
-            .model
-            .borrow()
-            .threads
-            .get(real_idx)
-            .map(|thread| thread.thread_id.clone())
-    });
+    let _ = filtered_idx;
     let (effects, _dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
     );
+    // A server-owned queue resumes dispatch alongside the prompt, so a
+    // normal send may produce both MutateQueue(resume) and SendPrompt. The
+    // old assertion only allowed the latter and crashed debug VNC builds
+    // before the prompt could be sent.
+    let send_prompt_count = effects
+        .iter()
+        .filter(|effect| matches!(effect, crate::effect::Effect::SendPrompt { .. }))
+        .count();
     debug_assert!(
-        effects.is_empty()
-            || matches!(
-                effects.as_slice(),
-                [crate::effect::Effect::SendPrompt { .. }]
-            ),
-        "Compose::SendRequested must produce zero (no selected thread) or one SendPrompt effect"
+        send_prompt_count <= 1
+            && effects.iter().all(|effect| {
+                matches!(
+                    effect,
+                    crate::effect::Effect::SendPrompt { .. }
+                        | crate::effect::Effect::MutateQueue { .. }
+                )
+            }),
+        "Compose::SendRequested must produce at most one SendPrompt plus optional queue effects"
     );
-    debug_assert!(
-        effects.iter().all(|effect| {
-            matches!(
-                effect,
-                crate::effect::Effect::SendPrompt { thread_id, .. }
-                    if Some(thread_id) == expected_thread_id.as_ref()
-            )
-        }),
-        "send effect must target the selected filtered index"
-    );
+    // Do not compare against the pre-reducer thread id here. Deferred
+    // session attachment can bind/update the selected thread while the send
+    // reducer is running, making that snapshot stale and causing a false
+    // debug-build panic. The reducer is authoritative for the effect target.
     execute_effects(panel, effects);
 }
 
@@ -714,10 +736,30 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
 pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
     let (effects, _dirty) =
         update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::StopRequested)));
+    // A server-owned queue freezes (MutateQueue "pause") alongside the
+    // cancel, so a stop on a server-queue-backed thread legitimately
+    // produces both CancelGeneration and MutateQueue -- same class of gap
+    // as `dispatch_compose_send`'s assertion above (see its comment): the
+    // old assertion only ever allowed a single-element
+    // `[CancelGeneration]` slice and crashed (panic across the Slint FFI
+    // boundary -> process abort, since unwinding isn't supported there)
+    // the moment `update()`'s StopRequested/QueueStop arm started pushing
+    // the "pause" queue effect too. Not related to queue depth: it fires
+    // on any Stop click for a session-bound server-queue thread.
+    let cancel_count = effects
+        .iter()
+        .filter(|effect| matches!(effect, crate::effect::Effect::CancelGeneration { .. }))
+        .count();
     debug_assert!(
-        effects.is_empty()
-            || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
-        "Compose::StopRequested must produce zero (no selected thread) or one CancelGeneration effect"
+        cancel_count <= 1
+            && effects.iter().all(|effect| {
+                matches!(
+                    effect,
+                    crate::effect::Effect::CancelGeneration { .. }
+                        | crate::effect::Effect::MutateQueue { .. }
+                )
+            }),
+        "Compose::StopRequested must produce at most one CancelGeneration plus optional queue effects"
     );
     execute_effects(panel, effects);
 }
@@ -728,9 +770,24 @@ pub(crate) fn dispatch_queue_cancel(panel: &PanelSingleton, message_index: usize
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::QueueCancel { message_index })),
     );
+    // A server-owned queue mirrors the local dequeue with a "cancel"
+    // `Effect::MutateQueue` so the remote queue stays in sync (see
+    // `update.rs`'s `ComposeMsg::QueueCancel` arm and `queue_mutation`) --
+    // same crash class as `dispatch_compose_stop`/`dispatch_queue_stop`/
+    // `dispatch_queue_send_now`/`dispatch_queue_fast_track`: the old
+    // assertion only ever allowed an empty effect list and aborted the
+    // process (panic across the Slint FFI boundary can't unwind) the
+    // moment a server-queue-backed thread's cancel produced that effect.
+    let mutate_queue_count = effects
+        .iter()
+        .filter(|effect| matches!(effect, crate::effect::Effect::MutateQueue { .. }))
+        .count();
     debug_assert!(
-        effects.is_empty(),
-        "Compose::QueueCancel must not produce effects"
+        mutate_queue_count <= 1
+            && effects
+                .iter()
+                .all(|effect| matches!(effect, crate::effect::Effect::MutateQueue { .. })),
+        "Compose::QueueCancel must produce at most one MutateQueue effect"
     );
     execute_effects(panel, effects);
 }
@@ -755,14 +812,21 @@ pub(crate) fn dispatch_queue_send_now(panel: &PanelSingleton, message_index: usi
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::QueueSendNow { message_index })),
     );
+    // A server-owned queue steers via `Effect::MutateQueue` ("sendNow" op,
+    // server-owned cancel-then-promote -- see router.rs's
+    // `dispatch_queue_mutation_shared`) instead of a local
+    // CancelGeneration/SendPrompt pair, so this assert must tolerate that
+    // shape too. Same crash class as `dispatch_compose_stop`/
+    // `dispatch_queue_stop` above.
     debug_assert!(
         effects.len() <= 2
             && effects.iter().all(|effect| matches!(
                 effect,
                 crate::effect::Effect::CancelGeneration { .. }
                     | crate::effect::Effect::SendPrompt { .. }
+                    | crate::effect::Effect::MutateQueue { .. }
             )),
-        "Compose::QueueSendNow must only produce CancelGeneration/SendPrompt effects"
+        "Compose::QueueSendNow must only produce CancelGeneration/SendPrompt/MutateQueue effects"
     );
     execute_effects(panel, effects);
 }
@@ -773,14 +837,17 @@ pub(crate) fn dispatch_queue_send_now(panel: &PanelSingleton, message_index: usi
 pub(crate) fn dispatch_queue_fast_track(panel: &PanelSingleton) {
     let (effects, _dirty) =
         update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)));
+    // Same server-owned-queue MutateQueue shape as `dispatch_queue_send_now`
+    // above -- must be tolerated here too.
     debug_assert!(
         effects.len() <= 2
             && effects.iter().all(|effect| matches!(
                 effect,
                 crate::effect::Effect::CancelGeneration { .. }
                     | crate::effect::Effect::SendPrompt { .. }
+                    | crate::effect::Effect::MutateQueue { .. }
             )),
-        "Compose::QueueFastTrack must only produce CancelGeneration/SendPrompt effects"
+        "Compose::QueueFastTrack must only produce CancelGeneration/SendPrompt/MutateQueue effects"
     );
     execute_effects(panel, effects);
 }
@@ -789,13 +856,28 @@ pub(crate) fn dispatch_queue_fast_track(panel: &PanelSingleton) {
 pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
     let (effects, _dirty) =
         update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)));
+    // Same gap as `dispatch_compose_stop` just above (see its comment):
+    // `update()` treats `StopRequested`/`QueueStop` as the same reducer
+    // arm, so this call site needs the identical widened assert -- a
+    // server-owned queue's "pause" MutateQueue effect rides along with
+    // CancelGeneration here too. This exact call site is what a live
+    // repro (host_e2e_mcp_smoke.sh queue-stop-with-multiple-queued)
+    // caught aborting the process: `dispatch_compose_stop`'s own assert
+    // was fixed but this sibling copy of the same check was missed.
+    let cancel_count = effects
+        .iter()
+        .filter(|effect| matches!(effect, crate::effect::Effect::CancelGeneration { .. }))
+        .count();
     debug_assert!(
-        effects.is_empty()
-            || matches!(
-                effects.as_slice(),
-                [crate::effect::Effect::CancelGeneration { .. }]
-            ),
-        "Compose::QueueStop must produce zero or one CancelGeneration effect"
+        cancel_count <= 1
+            && effects.iter().all(|effect| {
+                matches!(
+                    effect,
+                    crate::effect::Effect::CancelGeneration { .. }
+                        | crate::effect::Effect::MutateQueue { .. }
+                )
+            }),
+        "Compose::QueueStop must produce at most one CancelGeneration plus optional queue effects"
     );
     execute_effects(panel, effects);
 }
@@ -1084,7 +1166,7 @@ pub(crate) fn dispatch_settings_scope_changed(
     });
 }
 
-pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPanel) {
+pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
     let model = panel.model.borrow();
     let selected_thread_id = panel.real_index(model.selected_thread).and_then(|idx| {
         panel
@@ -1093,16 +1175,27 @@ pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPa
             .and_then(|bridge| bridge.thread_binding(idx))
             .map(|binding| binding.thread_id)
     });
+    // NOTE: these fields are two-way (`<=>`) bound Slint `in-out` properties
+    // with no `*-changed` callback wired back to Rust (see agents_view.slint's
+    // `set-default` handler, which only assigns `root.default-agent-id`
+    // locally). `model.*` is therefore stale here -- it never observes edits
+    // made in the Settings UI. Read the live component getters instead, as
+    // this function did before 0c958f48 ("panel-rust: close remaining TEA
+    // ownership gaps") regressed it to read the stale model copy, which
+    // caused Save to silently persist whatever `default_agent_id` (etc.) the
+    // model happened to be initialized/hydrated with -- typically empty --
+    // regardless of what the user had just toggled, so cold start always
+    // fell back to NO_PROVIDER_REQUESTED_FALLBACK ("codex").
     let input = crate::msg::SettingsSaveInput {
         scope: model.settings_scope.clone(),
-        default_profile: model.default_profile.clone(),
-        permission_profile: model.permission_profile.clone(),
-        background_default: model.background_default,
-        default_agent_id: model.default_agent_id.clone(),
+        default_profile: component.get_default_profile().to_string(),
+        permission_profile: component.get_permission_profile().to_string(),
+        background_default: component.get_background_default(),
+        default_agent_id: component.get_default_agent_id().to_string(),
         selected_thread_id,
-        background_override_set: model.background_override_set,
-        background_override: model.background_override,
-        show_global_skills: model.show_global_skills,
+        background_override_set: component.get_background_override_set(),
+        background_override: component.get_background_override(),
+        show_global_skills: component.get_show_global_skills(),
     };
     drop(model);
     let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))));
@@ -1118,8 +1211,10 @@ pub(crate) fn dispatch_mcp_server_create(
     component: &ChatPanel,
     entry: crate::protocol_types::McpServerEntry,
 ) {
-    let (effects, _) =
-        update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate { entry })));
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate { entry })),
+    );
     let _ = component;
     execute_effects(panel, effects);
 }
@@ -1129,8 +1224,10 @@ pub(crate) fn dispatch_mcp_server_update(
     component: &ChatPanel,
     entry: crate::protocol_types::McpServerEntry,
 ) {
-    let (effects, _) =
-        update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerUpdate { entry })));
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerUpdate { entry })),
+    );
     let _ = component;
     execute_effects(panel, effects);
 }
@@ -1182,7 +1279,11 @@ pub(crate) fn dispatch_mcp_server_authenticate(
     execute_effects(panel, effects);
 }
 
-pub(crate) fn dispatch_mcp_server_logout(panel: &PanelSingleton, component: &ChatPanel, name: String) {
+pub(crate) fn dispatch_mcp_server_logout(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+) {
     let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerLogout { name })),
@@ -1461,9 +1562,7 @@ pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
     // state that once crashed Send (dispatch_compose_send's debug_assert)
     // would have hit here too now that selected_real_index no longer
     // fabricates an index in that case.
-    debug_assert!(
-        dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. }))
-    );
+    debug_assert!(dirty.is_empty() || dirty.iter().any(|item| matches!(item, Dirty::Error { .. })));
 }
 
 pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
@@ -1708,6 +1807,42 @@ pub(crate) fn dispatch_apply_host_appearance(
             .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
                 scale_factor: appearance.density,
             });
+        // `ScaleFactorChanged` alone only updates the live scale factor --
+        // it does NOT retroactively recompute the Slint window item's
+        // stored *logical* geometry (see i-slint-core's window.rs
+        // `try_dispatch_event`: `ScaleFactorChanged` calls only
+        // `set_scale_factor`, while `Resized` is the only event that calls
+        // `set_window_item_geometry`). That logical geometry was last set
+        // by `panel_rust_create`'s `window.set_size(PhysicalSize::new(w,
+        // h))`, which converts physical -> logical using whatever scale
+        // factor was live *at that moment*. If density changes afterward
+        // (independently, or in the same host tick as a resize but applied
+        // second -- see `RustPanelItem::ensureHandle()`, which always calls
+        // `panel_rust_create` before `panel_rust_apply_host_appearance`),
+        // the stored logical geometry goes stale relative to the new
+        // factor. `i_slint_renderer_software::SoftwareRenderer::render`
+        // then recomputes the required physical size as `window_item.width
+        // ()/height() (stale logical) * current scale factor (new)` and
+        // asserts it fits the buffer -- which was sized directly from the
+        // physical pixels `panel_rust_create` was actually given, not from
+        // this recomputation. A stale-low logical size times a raised
+        // factor demands more pixels than the buffer holds, aborting the
+        // process on a non-unwinding panic across the Qt paint FFI
+        // boundary (confirmed via a live crash: buffer sized for a
+        // 697px-wide window, render demanded 871px -- a ~1.25x ratio,
+        // consistent with one live DPI step landing between a resize and
+        // its paired density push).
+        //
+        // Re-issuing `set_size` with the CURRENT physical size (the same
+        // `panel.width`/`panel.height` the buffer is actually sized for)
+        // right after the factor changes forces `window_item_geometry` to
+        // be recomputed under the factor that was just applied, so
+        // `logical_size * factor == physical_size` holds again by
+        // construction -- independent of call ordering on the C++ side or
+        // of which factor value gets applied.
+        panel
+            .window
+            .set_size(slint::PhysicalSize::new(panel.width, panel.height));
     }
     panel.window.window().request_redraw();
     true
@@ -1756,7 +1891,10 @@ mod tests {
 
     fn thread_with_rows(keys_kinds_texts: &[(&str, &str, &str)]) -> ThreadModel {
         let mut thread = ThreadModel::default();
-        thread.transcript_keys = keys_kinds_texts.iter().map(|(k, _, _)| k.to_string()).collect();
+        thread.transcript_keys = keys_kinds_texts
+            .iter()
+            .map(|(k, _, _)| k.to_string())
+            .collect();
         thread.message_rows = keys_kinds_texts
             .iter()
             .enumerate()
@@ -1778,18 +1916,29 @@ mod tests {
             ("tool:1", "tool_use", "ran a command"),
         ]);
         let result = messages_needing_prewarm(&thread, &thread.message_rows);
-        assert_eq!(result, vec![("assistant:1".to_string(), "hello".to_string())]);
+        assert_eq!(
+            result,
+            vec![("assistant:1".to_string(), "hello".to_string())]
+        );
     }
 
     #[test]
     fn messages_needing_prewarm_skips_already_cached_agent_messages() {
         let thread = {
             let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello")]);
-            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello");
-            thread.markdown_render_index.borrow_mut().set_rendered_blocks(
-                "assistant:1",
-                slint::ModelRc::new(slint::VecModel::from(vec![crate::MarkdownBlock::default()])),
-            );
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .record("assistant:1", 0, "hello");
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .set_rendered_blocks(
+                    "assistant:1",
+                    slint::ModelRc::new(slint::VecModel::from(vec![
+                        crate::MarkdownBlock::default(),
+                    ])),
+                );
             thread
         };
         assert!(
@@ -1806,7 +1955,10 @@ mod tests {
         // updated, but no cached ModelRc yet for the new text.
         let thread = {
             let mut thread = thread_with_rows(&[("assistant:1", "agent", "hello again")]);
-            thread.markdown_render_index.borrow_mut().record("assistant:1", 0, "hello again");
+            thread
+                .markdown_render_index
+                .borrow_mut()
+                .record("assistant:1", 0, "hello again");
             thread
         };
         assert_eq!(

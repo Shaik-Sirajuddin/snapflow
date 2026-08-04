@@ -135,10 +135,17 @@ async fn pooled_session_config_does_not_leak_across_threads_on_background_releas
 
     // -- Thread A: acquire, pick a non-default model, release in the
     // background (idle-pool-eligible).
-    let mut thread_a = spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
+    let mut thread_a =
+        spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
     let mut events_a = thread_a.take_events();
     let attach_a = thread_a
-        .acquire_and_attach(key.clone(), "thread-a", None, project_dir.clone(), Vec::new())
+        .acquire_and_attach(
+            key.clone(),
+            "thread-a",
+            None,
+            project_dir.clone(),
+            Vec::new(),
+        )
         .await
         .expect("thread A acquire_and_attach");
     let baseline = wait_for_config_options(&mut events_a, Duration::from_secs(5)).await;
@@ -171,10 +178,17 @@ async fn pooled_session_config_does_not_leak_across_threads_on_background_releas
     // asserted below so a future pool-internals change that broke that
     // premise would fail loudly here instead of this test silently
     // proving nothing.
-    let mut thread_b = spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
+    let mut thread_b =
+        spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
     let mut events_b = thread_b.take_events();
     let attach_b = thread_b
-        .acquire_and_attach(key.clone(), "thread-b", None, project_dir.clone(), Vec::new())
+        .acquire_and_attach(
+            key.clone(),
+            "thread-b",
+            None,
+            project_dir.clone(),
+            Vec::new(),
+        )
         .await
         .expect("thread B acquire_and_attach");
     assert_eq!(
@@ -205,10 +219,17 @@ async fn pooled_session_config_does_not_leak_across_threads_on_background_releas
         .await
         .expect("thread B non-background close_session (invalidate)");
 
-    let mut thread_c = spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
+    let mut thread_c =
+        spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
     let mut events_c = thread_c.take_events();
     let attach_c = thread_c
-        .acquire_and_attach(key.clone(), "thread-c", None, project_dir.clone(), Vec::new())
+        .acquire_and_attach(
+            key.clone(),
+            "thread-c",
+            None,
+            project_dir.clone(),
+            Vec::new(),
+        )
         .await
         .expect("thread C acquire_and_attach");
     assert_ne!(
@@ -271,16 +292,28 @@ async fn capability_preview_never_reflects_a_live_config_change_made_between_pre
         .and_then(|value| value.get("configOptions"))
         .and_then(panel_rust::gateway_actor::parse_config_options)
         .unwrap_or_default();
-    assert_eq!(model_value(&preview_one_options).as_deref(), Some("mock-model-a"));
-    pool.release(&preview_one).await.expect("preview release #1");
+    assert_eq!(
+        model_value(&preview_one_options).as_deref(),
+        Some("mock-model-a")
+    );
+    pool.release(&preview_one)
+        .await
+        .expect("preview release #1");
 
     // A real thread now attaches to that exact session and changes its
     // live config -- the condition that used to leak into a *different
     // real thread* per row 1 above.
-    let mut thread_a = spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
+    let mut thread_a =
+        spawn_acpx_thread_with_gateway_and_pool(Arc::clone(&shared_gateway), pool.clone());
     let mut events_a = thread_a.take_events();
     let attach_a = thread_a
-        .acquire_and_attach(key.clone(), "thread-a", None, project_dir.clone(), Vec::new())
+        .acquire_and_attach(
+            key.clone(),
+            "thread-a",
+            None,
+            project_dir.clone(),
+            Vec::new(),
+        )
         .await
         .expect("thread A acquire_and_attach");
     assert_eq!(
@@ -321,5 +354,7 @@ async fn capability_preview_never_reflects_a_live_config_change_made_between_pre
         Some("mock-model-a"),
         "a capability preview must never surface a different thread's in-progress live config change"
     );
-    pool.release(&preview_two).await.expect("preview release #2");
+    pool.release(&preview_two)
+        .await
+        .expect("preview release #2");
 }

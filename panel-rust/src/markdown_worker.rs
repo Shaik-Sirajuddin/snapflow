@@ -203,7 +203,15 @@ pub fn spawn_background_render(
         in_flight.finish(&finish_thread_id, epoch);
         on_done(thread_id, epoch);
     };
-    let job = render_job(thread_id, epoch, epoch_counter, messages, deliver, on_chunk, on_done);
+    let job = render_job(
+        thread_id,
+        epoch,
+        epoch_counter,
+        messages,
+        deliver,
+        on_chunk,
+        on_done,
+    );
     std::thread::spawn(job)
 }
 
@@ -236,7 +244,15 @@ pub fn spawn_background_render_pooled(
         in_flight.finish(&finish_thread_id, epoch);
         on_done(thread_id, epoch);
     };
-    let job = render_job(thread_id, epoch, epoch_counter, messages, deliver, on_chunk, on_done);
+    let job = render_job(
+        thread_id,
+        epoch,
+        epoch_counter,
+        messages,
+        deliver,
+        on_chunk,
+        on_done,
+    );
     pool.submit(job);
 }
 
@@ -410,7 +426,10 @@ impl RenderWorkerPool {
                 })
             })
             .collect();
-        Self { sender, _threads: threads }
+        Self {
+            sender,
+            _threads: threads,
+        }
     }
 
     pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
@@ -560,10 +579,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        assert!(*done.lock().unwrap(), "pooled render must complete within the deadline");
+        assert!(
+            *done.lock().unwrap(),
+            "pooled render must complete within the deadline"
+        );
         let keys = delivered_keys.lock().unwrap();
         let expected: Vec<String> = (0..45).map(|i| format!("k{i}")).collect();
-        assert_eq!(*keys, expected, "pooled dispatch delivers every message key exactly once, in order");
+        assert_eq!(
+            *keys, expected,
+            "pooled dispatch delivers every message key exactly once, in order"
+        );
     }
 
     #[test]
@@ -602,7 +627,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        assert_eq!(*completed.lock().unwrap(), SWITCHES, "every rapid submission completes, none dropped or hung");
+        assert_eq!(
+            *completed.lock().unwrap(),
+            SWITCHES,
+            "every rapid submission completes, none dropped or hung"
+        );
     }
 
     #[test]
@@ -636,7 +665,8 @@ mod tests {
                 },
                 |_, _| {},
             );
-            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("raw chunk delivered");
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("raw chunk delivered");
             raw_latencies.push(start.elapsed());
             handle.join().unwrap();
         }
@@ -662,7 +692,8 @@ mod tests {
                 },
                 |_, _| {},
             );
-            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("pooled chunk delivered");
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pooled chunk delivered");
             pooled_latencies.push(start.elapsed());
         }
 
@@ -717,14 +748,19 @@ mod tests {
 
         let keys = delivered_keys.lock().unwrap();
         let expected: Vec<String> = (0..45).map(|i| format!("k{i}")).collect();
-        assert_eq!(*keys, expected, "every message key delivered exactly once, in order");
+        assert_eq!(
+            *keys, expected,
+            "every message key delivered exactly once, in order"
+        );
         assert!(*done.lock().unwrap(), "on_done fired");
     }
 
     #[test]
     fn chunks_are_sized_at_most_chunk_messages_per_step() {
         let _serial = TEST_SERIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let messages: Vec<(String, String)> = (0..45).map(|i| (format!("k{i}"), format!("message {i}"))).collect();
+        let messages: Vec<(String, String)> = (0..45)
+            .map(|i| (format!("k{i}"), format!("message {i}")))
+            .collect();
         let epoch_counter = EpochCounter::new();
         let epoch = epoch_counter.bump();
         let chunk_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
@@ -746,7 +782,11 @@ mod tests {
         handle.join().unwrap();
 
         let sizes = chunk_sizes.lock().unwrap();
-        assert_eq!(*sizes, vec![20, 20, 5], "45 messages -> 20+20+5, none over the cap");
+        assert_eq!(
+            *sizes,
+            vec![20, 20, 5],
+            "45 messages -> 20+20+5, none over the cap"
+        );
     }
 
     #[test]
@@ -756,7 +796,9 @@ mod tests {
         // arrival": bump the epoch again from inside the first chunk's
         // callback (simulating a rapid switch-away mid-render), and
         // assert no further chunks ever get delivered.
-        let messages: Vec<(String, String)> = (0..100).map(|i| (format!("k{i}"), format!("message {i}"))).collect();
+        let messages: Vec<(String, String)> = (0..100)
+            .map(|i| (format!("k{i}"), format!("message {i}")))
+            .collect();
         let epoch_counter = EpochCounter::new();
         let epoch = epoch_counter.bump();
         let chunk_count = Arc::new(Mutex::new(0usize));
@@ -783,7 +825,11 @@ mod tests {
 
         // 100 messages / 20-per-chunk = 5 possible chunks; cancellation
         // after the first one must mean far fewer than 5 were produced.
-        assert_eq!(*chunk_count.lock().unwrap(), 1, "worker stopped after the epoch it was spawned with was superseded");
+        assert_eq!(
+            *chunk_count.lock().unwrap(),
+            1,
+            "worker stopped after the epoch it was spawned with was superseded"
+        );
     }
 
     #[test]
@@ -792,7 +838,9 @@ mod tests {
         // A render spawned for an epoch that's already stale by the time
         // it starts (e.g. two rapid switches queued back to back) must
         // do zero work, not even one chunk.
-        let messages: Vec<(String, String)> = (0..40).map(|i| (format!("k{i}"), format!("message {i}"))).collect();
+        let messages: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("k{i}"), format!("message {i}")))
+            .collect();
         let epoch_counter = EpochCounter::new();
         let stale_epoch = epoch_counter.bump();
         epoch_counter.bump(); // supersede it before the worker ever starts
@@ -823,7 +871,9 @@ mod tests {
         // Deliberately delay the ack for the first chunk and assert the
         // second chunk's callback hasn't run yet at that point -- proves
         // this is a real ack gate, not just a shape/count coincidence.
-        let messages: Vec<(String, String)> = (0..40).map(|i| (format!("k{i}"), format!("message {i}"))).collect();
+        let messages: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("k{i}"), format!("message {i}")))
+            .collect();
         let epoch_counter = EpochCounter::new();
         let epoch = epoch_counter.bump();
         let chunks_seen = Arc::new(Mutex::new(0usize));
@@ -872,11 +922,19 @@ mod tests {
 
         // Give the first chunk's callback time to start and block.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(*chunks_seen.lock().unwrap(), 1, "second chunk must not start before the first is acked");
+        assert_eq!(
+            *chunks_seen.lock().unwrap(),
+            1,
+            "second chunk must not start before the first is acked"
+        );
 
         release_tx.send(()).unwrap();
         handle.join().unwrap();
-        assert_eq!(*chunks_seen.lock().unwrap(), 2, "second chunk proceeds once the first is acked");
+        assert_eq!(
+            *chunks_seen.lock().unwrap(),
+            2,
+            "second chunk proceeds once the first is acked"
+        );
     }
 
     #[test]
@@ -896,7 +954,9 @@ mod tests {
         // unblocks it. With more than one chunk, on_chunk (which blocks
         // unconditionally, every call) would deadlock waiting for a
         // second release that never comes.
-        let messages: Vec<(String, String)> = (0..5).map(|i| (format!("k{i}"), format!("message {i}"))).collect();
+        let messages: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("k{i}"), format!("message {i}")))
+            .collect();
 
         // Keep the first render's single chunk callback blocked so its
         // (thread_id, epoch) entry stays registered as in-flight for the
@@ -928,7 +988,10 @@ mod tests {
         while !*first_chunk_started.lock().unwrap() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(*first_chunk_started.lock().unwrap(), "first render's chunk callback must have started");
+        assert!(
+            *first_chunk_started.lock().unwrap(),
+            "first render's chunk callback must have started"
+        );
 
         // Second call: identical thread_id + epoch + registry.
         let second_on_chunk_fired = Arc::new(Mutex::new(false));
@@ -951,8 +1014,14 @@ mod tests {
         );
         second_handle.join().unwrap();
 
-        assert!(!*second_on_chunk_fired.lock().unwrap(), "de-duped second spawn must never fire on_chunk");
-        assert!(!*second_on_done_fired.lock().unwrap(), "de-duped second spawn must never fire on_done");
+        assert!(
+            !*second_on_chunk_fired.lock().unwrap(),
+            "de-duped second spawn must never fire on_chunk"
+        );
+        assert!(
+            !*second_on_done_fired.lock().unwrap(),
+            "de-duped second spawn must never fire on_done"
+        );
 
         // Unblock and confirm the *first*, real render still completes
         // normally -- de-dupe only skips the redundant second call, it
@@ -995,7 +1064,10 @@ mod tests {
         );
         handle.join().unwrap();
 
-        assert!(*on_chunk_fired.lock().unwrap(), "a different epoch for the same thread_id must not be de-duped");
+        assert!(
+            *on_chunk_fired.lock().unwrap(),
+            "a different epoch for the same thread_id must not be de-duped"
+        );
     }
 
     #[test]
@@ -1029,7 +1101,9 @@ mod tests {
         // sender is dropped without ever sending. The worker must stop
         // -- not hang forever on ack_rx.recv(), and not silently keep
         // parsing further chunks nobody will ever see.
-        let messages: Vec<(String, String)> = (0..40).map(|i| (format!("k{i}"), format!("message {i}"))).collect();
+        let messages: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("k{i}"), format!("message {i}")))
+            .collect();
         let epoch_counter = EpochCounter::new();
         let epoch = epoch_counter.bump();
         let on_chunk_calls = Arc::new(Mutex::new(0usize));
@@ -1054,8 +1128,16 @@ mod tests {
         // Must terminate (not hang) within a bounded time.
         handle.join().unwrap();
 
-        assert_eq!(*on_chunk_calls.lock().unwrap(), 0, "on_chunk never runs since deliver drops the closure");
-        assert_eq!(*on_done_calls.lock().unwrap(), 0, "worker stopped before reaching on_done, not after silently finishing");
+        assert_eq!(
+            *on_chunk_calls.lock().unwrap(),
+            0,
+            "on_chunk never runs since deliver drops the closure"
+        );
+        assert_eq!(
+            *on_done_calls.lock().unwrap(),
+            0,
+            "worker stopped before reaching on_done, not after silently finishing"
+        );
     }
 
     #[test]
@@ -1088,7 +1170,10 @@ mod tests {
         assert_eq!(blocks[0].kind, "text");
         assert_eq!(blocks[0].default_font_size, 18.0, "h1 heading font size");
         assert_eq!(blocks[1].kind, "text");
-        assert_eq!(blocks[1].default_font_size, 0.0, "body text inherits the view default");
+        assert_eq!(
+            blocks[1].default_font_size, 0.0,
+            "body text inherits the view default"
+        );
     }
 
     #[test]
@@ -1127,6 +1212,9 @@ mod tests {
         handle.join().unwrap();
 
         let delivered_hash = got_hash.lock().unwrap().expect("chunk delivered");
-        assert_eq!(delivered_hash, crate::thread_message_index::hash_content(&text));
+        assert_eq!(
+            delivered_hash,
+            crate::thread_message_index::hash_content(&text)
+        );
     }
 }

@@ -1,10 +1,9 @@
 //! Live relay of agent-initiated requests (`session/request_permission`,
-//! and -- as more methods opt in -- `fs/*`/`terminal/*`) to whichever
-//! transport connection currently owns the corresponding *gateway*
-//! session, mirroring `crate::notify::NotificationHub`'s subscribe model
-//! but bidirectional: a request goes *out* to the owning client, and
-//! that client's eventual `acpx/agent_response` reply must come back in
-//! and resolve the exact same relay attempt that's still waiting on it.
+//! and -- as more methods opt in -- `fs/*`/`terminal/*`) to every subscribed
+//! transport connection for the corresponding *gateway* session, mirroring
+//! `crate::notify::NotificationHub`'s fan-out model but bidirectional: a
+//! request goes *out* to all clients, and the first client's eventual
+//! `acpx/agent_response` reply resolves the exact same relay attempt.
 //!
 //! **The gap this closes.** Before this existed, `router::read_matching_
 //! response` answered every agent-initiated request itself, synchronously,
@@ -26,7 +25,7 @@
 //! left hanging just because no interactive client happened to be
 //! attached.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,8 +42,41 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 pub struct AgentRequestEnvelope {
     pub relay_id: String,
     pub gateway_session_id: String,
+    /// ACPX-server-generated id of the connection receiving this copy.
+    pub client_id: String,
     /// The original backend-native JSON-RPC request frame, verbatim.
     pub request: serde_json::Value,
+}
+
+/// Resolution sent to every subscriber except the client that won the
+/// response race.  This is deliberately a separate stream from
+/// `acpx/agent_response`: a losing client must not mistake it for a new
+/// request or attempt to answer it again.
+#[derive(Debug, Clone)]
+pub struct AgentResolutionEnvelope {
+    pub relay_id: String,
+    pub gateway_session_id: String,
+    pub winner_client_id: String,
+    pub selected: bool,
+    pub late: bool,
+}
+
+/// Receivers for one server-managed client connection.
+pub struct AgentRequestSubscription {
+    pub requests: mpsc::Receiver<AgentRequestEnvelope>,
+    pub resolutions: mpsc::Receiver<AgentResolutionEnvelope>,
+}
+
+#[derive(Clone)]
+struct Subscriber {
+    request_tx: mpsc::Sender<AgentRequestEnvelope>,
+    resolution_tx: mpsc::Sender<AgentResolutionEnvelope>,
+}
+
+struct PendingRelay {
+    gateway_session_id: String,
+    client_ids: HashSet<String>,
+    reply_tx: oneshot::Sender<serde_json::Value>,
 }
 
 /// Cheaply cloneable (an `Arc` internally), same convention as
@@ -54,8 +86,8 @@ pub struct AgentRequestEnvelope {
 /// lock for either side of a relay.
 #[derive(Clone, Default)]
 pub struct AgentRequestHub {
-    subscribers: Arc<Mutex<HashMap<String, mpsc::Sender<AgentRequestEnvelope>>>>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
+    subscribers: Arc<Mutex<HashMap<String, HashMap<String, Subscriber>>>>,
+    pending: Arc<Mutex<HashMap<String, PendingRelay>>>,
 }
 
 static RELAY_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -71,6 +103,14 @@ fn fresh_relay_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("relay-{nanos:x}-{n}")
+}
+
+static CLIENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate the ACPX-server-owned connection id placed on relay frames.
+pub fn fresh_client_id() -> String {
+    let n = CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("client-{n}")
 }
 
 /// Capacity of each session's live agent-request delivery channel.
@@ -94,26 +134,60 @@ impl AgentRequestHub {
         Self::default()
     }
 
-    /// Subscribe to `gateway_session_id`'s live agent-request stream.
-    /// Same "last subscriber wins" contract as `NotificationHub::
-    /// subscribe` -- a gateway session is only ever owned by one
-    /// connection at a time in practice.
+    /// Subscribe to `gateway_session_id`'s live agent-request stream using a
+    /// generated compatibility client id. New transports should use
+    /// [`Self::subscribe_with_client`] for a stable connection id.
     pub async fn subscribe(
         &self,
         gateway_session_id: impl Into<String>,
     ) -> mpsc::Receiver<AgentRequestEnvelope> {
+        self.subscribe_with_client(gateway_session_id, fresh_client_id())
+            .await
+            .requests
+    }
+
+    /// Subscribe a concrete ACPX-server-managed connection. Multiple clients
+    /// may subscribe to one session and all receive each request.
+    pub async fn subscribe_with_client(
+        &self,
+        gateway_session_id: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> AgentRequestSubscription {
         let (tx, rx) = mpsc::channel(AGENT_REQUEST_QUEUE_CAPACITY);
+        let (resolution_tx, resolution_rx) = mpsc::channel(AGENT_REQUEST_QUEUE_CAPACITY);
         self.subscribers
             .lock()
             .await
-            .insert(gateway_session_id.into(), tx);
-        rx
+            .entry(gateway_session_id.into())
+            .or_default()
+            .insert(
+                client_id.into(),
+                Subscriber {
+                    request_tx: tx,
+                    resolution_tx,
+                },
+            );
+        AgentRequestSubscription {
+            requests: rx,
+            resolutions: resolution_rx,
+        }
     }
 
     /// Remove `gateway_session_id`'s live subscriber, if any. Safe to
     /// call even if nothing (or a since-replaced sender) is registered.
     pub async fn unsubscribe(&self, gateway_session_id: &str) {
         self.subscribers.lock().await.remove(gateway_session_id);
+    }
+
+    /// Remove one connection without disturbing other subscribers.
+    pub async fn unsubscribe_client(&self, gateway_session_id: &str, client_id: &str) {
+        let mut subscribers = self.subscribers.lock().await;
+        if let Some(session) = subscribers.get_mut(gateway_session_id) {
+            session.remove(client_id);
+            if session.is_empty() {
+                subscribers.remove(gateway_session_id);
+            }
+        }
     }
 
     /// Attempt to relay `request` to whichever connection currently owns
@@ -126,33 +200,42 @@ impl AgentRequestHub {
         request: serde_json::Value,
         timeout: Duration,
     ) -> Option<serde_json::Value> {
-        let sender = {
+        let targets = {
             let subscribers = self.subscribers.lock().await;
-            subscribers.get(gateway_session_id)?.clone()
+            subscribers
+                .get(gateway_session_id)?
+                .iter()
+                .map(|(client_id, subscriber)| (client_id.clone(), subscriber.request_tx.clone()))
+                .collect::<Vec<_>>()
         };
         let relay_id = fresh_relay_id();
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.pending.lock().await.insert(relay_id.clone(), reply_tx);
-        let envelope = AgentRequestEnvelope {
-            relay_id: relay_id.clone(),
-            gateway_session_id: gateway_session_id.to_string(),
-            request,
-        };
-        // Bounded channel now (see `AGENT_REQUEST_QUEUE_CAPACITY`'s doc
-        // comment) -- `send` can briefly wait on backpressure instead of
-        // succeeding instantly, so it shares this call's own `timeout`
-        // budget rather than being allowed to block beyond it.
-        if tokio::time::timeout(timeout, sender.send(envelope))
-            .await
-            .map(|result| result.is_err())
-            .unwrap_or(true)
-        {
-            // Either the subscriber's receiver was already dropped
-            // (connection closing) but hadn't yet called `unsubscribe`,
-            // or its queue stayed full for this call's entire `timeout`
-            // (a connection too far behind to be a usable relay target
-            // right now either way) -- both treated identically to "no
-            // subscriber" rather than hanging further.
+        let client_ids = targets.iter().map(|(id, _)| id.clone()).collect();
+        self.pending.lock().await.insert(
+            relay_id.clone(),
+            PendingRelay {
+                gateway_session_id: gateway_session_id.to_string(),
+                client_ids,
+                reply_tx,
+            },
+        );
+        let mut delivered = false;
+        for (client_id, sender) in targets {
+            let envelope = AgentRequestEnvelope {
+                relay_id: relay_id.clone(),
+                gateway_session_id: gateway_session_id.to_string(),
+                client_id,
+                request: request.clone(),
+            };
+            if tokio::time::timeout(timeout, sender.send(envelope))
+                .await
+                .map(|result| result.is_ok())
+                .unwrap_or(false)
+            {
+                delivered = true;
+            }
+        }
+        if !delivered {
             self.pending.lock().await.remove(&relay_id);
             return None;
         }
@@ -171,10 +254,47 @@ impl AgentRequestHub {
     /// -- either way there's nothing left to deliver the value to, which
     /// is not an error, just a race the caller may want to log.
     pub async fn resolve(&self, relay_id: &str, response: serde_json::Value) -> bool {
-        match self.pending.lock().await.remove(relay_id) {
-            Some(sender) => sender.send(response).is_ok(),
-            None => false,
+        self.resolve_from_client(relay_id, None, response).await
+    }
+
+    /// Atomically claim a pending relay for the first subscribed client that
+    /// responds. `None` retains the legacy trusted-internal behavior.
+    pub async fn resolve_from_client(
+        &self,
+        relay_id: &str,
+        client_id: Option<&str>,
+        response: serde_json::Value,
+    ) -> bool {
+        let pending = {
+            let mut pending = self.pending.lock().await;
+            let Some(entry) = pending.get(relay_id) else {
+                return false;
+            };
+            if let Some(client_id) = client_id {
+                if !entry.client_ids.contains(client_id) {
+                    return false;
+                }
+            }
+            pending.remove(relay_id).expect("entry checked above")
+        };
+        let winner_client_id = client_id.unwrap_or("internal").to_string();
+        let delivered = pending.reply_tx.send(response).is_ok();
+        let subscribers = self.subscribers.lock().await;
+        if let Some(session) = subscribers.get(&pending.gateway_session_id) {
+            for (subscriber_id, subscriber) in session {
+                if subscriber_id != &winner_client_id && pending.client_ids.contains(subscriber_id)
+                {
+                    let _ = subscriber.resolution_tx.try_send(AgentResolutionEnvelope {
+                        relay_id: relay_id.to_string(),
+                        gateway_session_id: pending.gateway_session_id.clone(),
+                        winner_client_id: winner_client_id.clone(),
+                        selected: false,
+                        late: true,
+                    });
+                }
+            }
         }
+        delivered
     }
 }
 
@@ -286,5 +406,47 @@ mod tests {
             .resolve(&envelope.relay_id, serde_json::json!({"late": true}))
             .await;
         assert!(!delivered);
+    }
+
+    #[tokio::test]
+    async fn fanout_first_client_wins_and_losers_receive_resolution() {
+        let hub = AgentRequestHub::new();
+        let mut first = hub.subscribe_with_client("gw-1", "client-a").await;
+        let mut second = hub.subscribe_with_client("gw-1", "client-b").await;
+        let relay_hub = hub.clone();
+        let task = tokio::spawn(async move {
+            relay_hub
+                .relay(
+                    "gw-1",
+                    serde_json::json!({"method": "terminal/create"}),
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+        let first_request = first.requests.recv().await.expect("first request");
+        let second_request = second.requests.recv().await.expect("second request");
+        assert_eq!(first_request.relay_id, second_request.relay_id);
+        assert!(
+            hub.resolve_from_client(
+                &first_request.relay_id,
+                Some("client-b"),
+                serde_json::json!({"approved": true})
+            )
+            .await
+        );
+        assert!(
+            !hub.resolve_from_client(
+                &first_request.relay_id,
+                Some("client-a"),
+                serde_json::json!({"approved": false})
+            )
+            .await
+        );
+        let result = task.await.unwrap();
+        assert_eq!(result, Some(serde_json::json!({"approved": true})));
+        let resolution = first.resolutions.recv().await.expect("loser resolution");
+        assert_eq!(resolution.winner_client_id, "client-b");
+        assert!(resolution.late);
+        assert!(second.resolutions.try_recv().is_err());
     }
 }

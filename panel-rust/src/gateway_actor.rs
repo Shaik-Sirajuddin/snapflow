@@ -48,8 +48,8 @@ mod session_opener;
 mod thread_actor;
 
 pub use crate::protocol_types::{
-    AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
-    SessionModesEvent,
+    AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, QueueItemInfo,
+    SessionModeInfo, SessionModesEvent,
 };
 pub use session_opener::{provider_profile_key, GatewaySessionOpener, NO_PROFILE_SENTINEL};
 pub use thread_actor::{
@@ -98,7 +98,17 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
     // `tool_call_update` (`ToolCallUpdateFields`/`ToolCall` in
     // `agent-client-protocol`) that this classifier previously discarded
     // entirely -- not missing data, just unread data.
-    let raw_of = |field: &str| -> Option<serde_json::Value> { session_update.get(field).cloned() };
+    // Bounded at ingestion, not just at render time: an image-returning
+    // tool puts megabytes of base64 in one string leaf here, and every
+    // downstream stage (jsonl append, per-chunk transcript rebuild,
+    // per-poll-tick deep clone, Slint text layout) pays for it again.
+    // See `protocol_types::MAX_RAW_PAYLOAD_STRING_BYTES`.
+    let raw_of = |field: &str| -> Option<serde_json::Value> {
+        session_update.get(field).cloned().map(|mut v| {
+            crate::protocol_types::elide_large_payload_strings(&mut v);
+            v
+        })
+    };
 
     match kind {
         "agent_message_chunk" => text_of(session_update).map(|text| ChatMessage {
@@ -285,5 +295,34 @@ mod classify_raw_update_tests {
     fn unknown_session_update_kind_is_ignored_not_an_error() {
         let update = update_notification(json!({"sessionUpdate": "plan"}));
         assert!(classify_raw_update(&update).is_none());
+    }
+
+    #[test]
+    fn image_tool_output_is_bounded_before_it_enters_the_transcript() {
+        let update = update_notification(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-img",
+            "status": "completed",
+            "rawInput": {"prompt": "a cat"},
+            "rawOutput": {"content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "A".repeat(4 * 1024 * 1024),
+            }]},
+        }));
+        let msg = classify_raw_update(&update).expect("message");
+        let rendered = msg
+            .raw_output
+            .as_ref()
+            .map(crate::protocol_types::bounded_payload_display_string)
+            .expect("raw output");
+        assert!(
+            rendered.len() <= crate::protocol_types::MAX_RAW_PAYLOAD_TOTAL_BYTES + 64,
+            "raw output reaching the UI is {} bytes",
+            rendered.len()
+        );
+        // Small structured fields survive the bound, so tool-kind
+        // classification off `rawInput` is unaffected.
+        assert_eq!(msg.raw_input.expect("raw input")["prompt"], "a cat");
     }
 }

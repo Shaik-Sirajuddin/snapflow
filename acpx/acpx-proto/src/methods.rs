@@ -208,6 +208,41 @@ pub const METHODS: &[MethodSchema] = &[
         alternate_result: Some(UpstreamAcp("ListSessionsResponse")),
     },
     MethodSchema {
+        method: "acpx/sessions/subscribe",
+        side: ClientToAgent,
+        params: Some(Native("SessionsSubscribeParams")),
+        result: Some(Native("SessionsSubscribeResult")),
+        alternate_result: None,
+    },
+    MethodSchema {
+        method: "acpx/sessions/paginate",
+        side: ClientToAgent,
+        params: Some(Native("SessionPaginateParams")),
+        result: Some(Native("SessionPageResult")),
+        alternate_result: None,
+    },
+    MethodSchema {
+        method: "acpx/sessions/sync",
+        side: ClientToAgent,
+        params: Some(Native("SessionSyncParams")),
+        result: Some(Native("SessionSyncResult")),
+        alternate_result: None,
+    },
+    MethodSchema {
+        method: "acpx/sessions/queue/subscribe",
+        side: ClientToAgent,
+        params: Some(Native("QueueSubscribeParams")),
+        result: Some(Native("QueueSubscribeResult")),
+        alternate_result: None,
+    },
+    MethodSchema {
+        method: "session/queue",
+        side: ClientToAgent,
+        params: Some(Native("QueueMutationParams")),
+        result: Some(Native("QueueMutationResult")),
+        alternate_result: None,
+    },
+    MethodSchema {
         method: "agents/list",
         side: ClientToAgent,
         params: None,
@@ -373,7 +408,7 @@ mod tests {
         // method being silently added/removed here without the count
         // being revisited.
         let client_to_agent = METHODS.iter().filter(|m| m.side == ClientToAgent).count();
-        assert_eq!(client_to_agent, 25);
+        assert_eq!(client_to_agent, 30);
         let agent_to_client = METHODS.iter().filter(|m| m.side == AgentToClient).count();
         assert_eq!(agent_to_client, 8);
     }

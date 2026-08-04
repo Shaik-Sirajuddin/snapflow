@@ -98,6 +98,14 @@ export component SettingsPage inherits Rectangle {
             self.active-section = "agents";
         }
     }
+    // Same redirect precedent as the scope handler above -- if the user was
+    // sitting on the Harness tab and BETA_MODE flips off, redirect off it
+    // so the content pane isn't left mounted on a now-hidden tab.
+    changed beta-mode-enabled => {
+        if (!self.beta-mode-enabled && self.active-section == "harness") {
+            self.active-section = "agents";
+        }
+    }
     out property <bool> search-has-focus:
         top-search-bar.input-has-focus || agents-search-focus-mirror
         || mcp-servers-focus-mirror || skills-search-focus-mirror;
@@ -110,6 +118,16 @@ export component SettingsPage inherits Rectangle {
     // default-profile/permission-profile controls above -- see
     // app.slint's own doc comment for this same property.
     in property <bool> profile-wiring-enabled: false;
+    // Env-var feature-flag gate (BETA_MODE) -- see app.slint's own doc
+    // comment for this same property. Additive on top of
+    // profile-wiring-enabled for the Profile field (agents_view.slint);
+    // independently gates the whole Harness tab (left-tabs nav item +
+    // HarnessView mount below).
+    in property <bool> beta-mode-enabled: false;
+    // Installed app version -- see left_tabs.slint's own doc comment on
+    // its `app-version` property (this is a plain pass-through, set once
+    // from lib.rs at startup, same as beta-mode-enabled's shape above).
+    in property <string> app-version: "";
     in-out property <bool> background-default: false;
     in-out property <string> default-agent-id: "";
     // Genuinely dual-tier like `background-default` -- see
@@ -264,6 +282,8 @@ export component SettingsPage inherits Rectangle {
                 active-section: root.active-section;
                 expanded: root.sections-expanded;
                 scope: root.scope;
+                beta-mode-enabled: root.beta-mode-enabled;
+                app-version: root.app-version;
                 section-selected(new-section) => { root.active-section = new-section; }
                 collapse-requested => { root.sections-expanded = false; }
             }
@@ -298,6 +318,7 @@ export component SettingsPage inherits Rectangle {
                     default-profile <=> root.default-profile;
                     permission-profile <=> root.permission-profile;
                     profile-wiring-enabled: root.profile-wiring-enabled;
+                    beta-mode-enabled: root.beta-mode-enabled;
                     default-agent-id <=> root.default-agent-id;
                     available-profiles: root.available-profiles;
                     agent-catalog: root.agent-catalog;
@@ -391,6 +412,7 @@ export component SettingsPage inherits Rectangle {
                                 total-tools-count: root.mcp-tools-total-count;
                                 submit-busy: root.mcp-server-submit-busy;
                                 page-search-query: root.search-query;
+                                beta-mode-enabled: root.beta-mode-enabled;
                                 mcp-server-submit(data) => { root.mcp-server-submit(data); }
                                 mcp-server-delete(name) => { root.mcp-server-delete(name); }
                                 mcp-server-enabled-changed(name, enabled) => {
@@ -415,7 +437,7 @@ export component SettingsPage inherits Rectangle {
                                     root.mcp-servers-focus-mirror = self.search-has-focus;
                                 }
                             }
-                            if root.active-section == "harness" : HarnessView {
+                            if root.active-section == "harness" && root.beta-mode-enabled : HarnessView {
                                 width: parent.width;
                                 background-default <=> root.background-default;
                                 background-override-set <=> root.background-override-set;

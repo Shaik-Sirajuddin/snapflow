@@ -266,6 +266,88 @@ pub struct BackendProcess {
     pub authenticated: bool,
 }
 
+/// Resolve `program` to the `Command` that should actually be spawned on
+/// Windows, working around the same well-known Rust/Windows gotcha
+/// `panel-rust/src/editor_detect.rs` fixed for VS Code's `code.cmd`
+/// (`a0cbde2e`): `npm`/`npx`/`uvx`'s real Windows CLI entrypoints are
+/// `.cmd` batch-script stubs on `PATH` (npm ships no bare `.exe` at all),
+/// not directly-executable PE binaries. `std::process::Command::spawn`
+/// calls `CreateProcessW` directly, bypassing `cmd.exe`'s own
+/// `.cmd`/`.bat` script-launcher handling, so asking it to run a `.cmd`
+/// file as if it were a PE binary fails with `ERROR_BAD_EXE_FORMAT` (os
+/// error 193, "not a valid Win32 application"). Every backend agent process
+/// (`npx`-distributed, `uvx`-distributed, and custom `binary` entries) goes
+/// through this one spawn path (`BackendProcess::spawn`), so fixing it here
+/// covers all of them instead of patching each `SpawnSpec` construction
+/// site individually.
+///
+/// Unix is unaffected: `spec.program` there is either a real executable or
+/// a script with a working `#!` shebang, both of which `Command::spawn`
+/// already handles directly, so this returns `Command::new(program)`
+/// unchanged.
+///
+/// NOTE ON VERIFICATION: no Windows machine is available in this
+/// environment to empirically spawn a real `npx.cmd`/`uv.exe` and confirm
+/// this resolves the error. This mirrors the exact, already-verified
+/// reasoning and `cmd /C` workaround from `editor_detect.rs`'s
+/// `spawn_editor_command` (same os-error-193 class, same standard fix for
+/// Node-style `.cmd`-launched CLIs) rather than reasoning from scratch.
+fn base_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        if let Some((resolved, is_script_launcher)) = resolve_windows_spawn_program(program) {
+            if is_script_launcher {
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/C").arg(resolved);
+                return cmd;
+            }
+            return Command::new(resolved);
+        }
+    }
+    Command::new(program)
+}
+
+/// Probe `PATH` for `program`'s real file on Windows, the same way
+/// `editor_detect.rs::which_binary` does for editor CLIs. Returns the
+/// resolved path and whether it is a `.cmd`/`.bat` script launcher (which
+/// needs `cmd /C` routing) as opposed to a real PE binary.
+///
+/// If `program` already names a file with an extension (a caller-resolved
+/// absolute path, or an explicit `node.exe`/`foo.cmd`), it is trusted
+/// as-is -- only its own extension decides the launcher check. If it names
+/// a path with a directory component that isn't found, `None` is returned
+/// rather than silently substituting a different bare-name match found
+/// elsewhere on `PATH`.
+#[cfg(windows)]
+fn resolve_windows_spawn_program(program: &str) -> Option<(std::path::PathBuf, bool)> {
+    let path = std::path::Path::new(program);
+    let is_script_ext = |ext: &str| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat");
+    if path.extension().is_some() || path.parent().filter(|p| !p.as_os_str().is_empty()).is_some() {
+        let is_script = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(is_script_ext)
+            .unwrap_or(false);
+        return Some((path.to_path_buf(), is_script));
+    }
+    // Bare name (e.g. "npm", "npx", "uvx") -- these tools ship as `.cmd`
+    // batch-script launcher stubs on Windows (npm/npx have no plain `.exe`
+    // on PATH at all). Probe `.cmd`/`.bat` first since that is what these
+    // specific tools actually ship, `.exe` last for real PE binaries the
+    // caller passed a bare name for (e.g. `uv.exe`, which IS a real PE
+    // binary, unlike npm/npx).
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for ext in ["cmd", "bat", "exe"] {
+            let candidate = dir.join(format!("{program}.{ext}"));
+            if candidate.is_file() {
+                return Some((candidate, is_script_ext(ext)));
+            }
+        }
+    }
+    None
+}
+
 impl BackendProcess {
     /// Spawn a backend process per `spec`, wiring newline-delimited
     /// JSON-RPC framing over its stdio. stderr is inherited (not captured)
@@ -273,7 +355,7 @@ impl BackendProcess {
     /// revisit if that gets noisy.
     pub async fn spawn(spec: &SpawnSpec) -> Result<Self, ProcessError> {
         warm_npx_cache_if_needed(spec).await;
-        let mut cmd = Command::new(&spec.program);
+        let mut cmd = base_command(&spec.program);
         cmd.args(&spec.args)
             .envs(&spec.env)
             .stdin(Stdio::piped())

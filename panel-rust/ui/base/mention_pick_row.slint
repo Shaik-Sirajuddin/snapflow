@@ -36,6 +36,10 @@ export component MentionPickRow inherits Rectangle {
     // needing OAuth). Empty label renders nothing; the action click is
     // its own callback and does NOT trigger the row's clicked().
     in property <string> action-label: "";
+    // Optional native accessibility target for rows whose primary action is
+    // the row itself (for example the terminal picker). Other mention rows
+    // keep their historical non-actionable presentation when this is empty.
+    in property <string> row-accessible-label: "";
     callback action-clicked();
     callback clicked();
 
@@ -48,6 +52,16 @@ export component MentionPickRow inherits Rectangle {
 
     touch := TouchArea {
         mouse-cursor: pointer;
+        // Slint requires accessible-role to be compile-time constant.
+        // Rows without a label remain unnamed and therefore are ignored by
+        // label-based harness queries.
+        accessible-role: button;
+        accessible-label: root.row-accessible-label;
+        accessible-action-default => {
+            if (root.row-accessible-label != "") {
+                root.clicked();
+            }
+        }
         clicked => { root.clicked(); }
         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }

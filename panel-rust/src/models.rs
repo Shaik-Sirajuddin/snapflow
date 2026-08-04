@@ -772,7 +772,13 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                     .unwrap_or_default()
                     .into(),
                 text: m.text.clone().into(),
-                markdown_lines: markdown_lines_for(&mut render_index, &i.to_string(), i, kind, &m.text),
+                markdown_lines: markdown_lines_for(
+                    &mut render_index,
+                    &i.to_string(),
+                    i,
+                    kind,
+                    &m.text,
+                ),
                 markdown_blocks: markdown_blocks_for(
                     &mut render_index,
                     &i.to_string(),
@@ -1072,10 +1078,7 @@ pub fn message_rows_for_thread_with_state(
     // real "thinking" row had already landed -- rendering both "Agent is
     // working..." and "Thinking" at once instead of the pending
     // placeholder yielding to the real one, as intended.
-    let last_is_user = rows
-        .last()
-        .map(|row| row.kind == "user")
-        .unwrap_or(false);
+    let last_is_user = rows.last().map(|row| row.kind == "user").unwrap_or(false);
     if generation_in_flight && last_is_user {
         rows.push(MessageItem {
             kind: "pending".into(),
@@ -1404,7 +1407,9 @@ pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
 /// Permission-mode selector rows (dedicated compose dropdown) -- same
 /// shape as [`to_reasoning_dropdown_entries`], filtering on
 /// [`is_permission_mode_option_id`] instead.
-pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+pub fn to_permission_mode_dropdown_entries(
+    options: Vec<ConfigOptionInfo>,
+) -> ModelRc<DropdownEntry> {
     let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
         if is_permission_mode_option_id(&option.id) {
@@ -1417,7 +1422,10 @@ pub fn to_permission_mode_dropdown_entries(options: Vec<ConfigOptionInfo>) -> Mo
 /// Trigger label for the permission-mode dropdown (current value name, or
 /// ""), same shape as [`current_reasoning_trigger_label`].
 pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> String {
-    for option in options.iter().filter(|o| is_permission_mode_option_id(&o.id)) {
+    for option in options
+        .iter()
+        .filter(|o| is_permission_mode_option_id(&o.id))
+    {
         let Some(cur) = option.current_value.as_ref() else {
             continue;
         };
@@ -1437,7 +1445,16 @@ pub fn current_permission_mode_trigger_label(options: &[ConfigOptionInfo]) -> St
 /// result is truncated to `max_chars` with a trailing ellipsis so a long
 /// first line can't blow out the fixed-height thread card.
 pub fn describe_thread(msgs: &[ChatMessage], max_chars: usize) -> String {
-    let Some(last) = msgs.last() else {
+    describe_thread_from_last(msgs.last(), max_chars)
+}
+
+/// Same derivation as `describe_thread`, but taking just the candidate
+/// last message directly rather than a full slice -- lets callers that
+/// already have (or cheaply fetched) only the last message avoid cloning
+/// or holding an entire thread's scrollback just to read one line. See
+/// `AgentBridge::last_message`.
+pub fn describe_thread_from_last(last: Option<&ChatMessage>, max_chars: usize) -> String {
+    let Some(last) = last else {
         return String::new();
     };
     let flattened: String = last.text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1541,6 +1558,67 @@ pub fn is_backend_requires_authentication_error(message: &str) -> bool {
     message.contains("backend requires authentication before session/new")
 }
 
+/// windows-reliability-audit (panel-rust side): best-effort detector for
+/// "this agent's process couldn't even start because a required external
+/// runtime (Node.js/npm or Python/uv) isn't on PATH" -- the single most
+/// common fresh-Windows-machine failure mode for ACP agents that shell out
+/// to `npx`/`node` or `uv`/`python`. Same caveat as
+/// `is_backend_requires_authentication_error` just above: there is no
+/// structured "missing prerequisite" error code anywhere in the spawn
+/// path (acpx-core, the gateway, and the OS process spawn all just
+/// propagate their own `Display` text), so this is a substring heuristic
+/// over BOTH a runtime-name mention and a process-not-found phrase --
+/// covering the differently-worded Unix (`No such file or directory`),
+/// Windows (`is not recognized as an internal or external command`,
+/// `cannot find the file specified`) and Rust-std (`os error 2`, `Enoent`)
+/// spawn failures -- not a guarantee. Deliberately permissive (any
+/// runtime keyword + any not-found phrase, rather than one exact wording)
+/// because the daemon/backend side of this same audit is concurrently
+/// provisioning Node/Python and adding a `snapflowd doctor`-style
+/// diagnostic, and may still be settling on its own exact error wording;
+/// a future daemon-side structured error code should replace this
+/// heuristic outright rather than trying to keep it in lockstep.
+pub fn is_missing_runtime_prerequisite_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_runtime = ["node", "npm", "npx", "python", "uv"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    let mentions_not_found = [
+        "not found",
+        "not recognized",
+        "no such file or directory",
+        "cannot find the file specified",
+        "enoent",
+        "os error 2",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    mentions_runtime && mentions_not_found
+}
+
+/// Appends an actionable hint pointing at the daemon's diagnostic command
+/// when `is_missing_runtime_prerequisite_error` matches `message`,
+/// otherwise returns it unchanged. Kept as its own pure function (not
+/// inlined at each call site) so it stays independently testable and
+/// every failure arm that surfaces a raw spawn/attach error string
+/// (`update.rs`'s `SessionAttached` `Err` arm and `AgentEvent::Error`
+/// arm) can apply the same wording without copy-pasting it. The hint is
+/// deliberately worded around "your daemon's diagnostic/doctor command"
+/// rather than a hardcoded binary name, since the exact command the
+/// backend-side of this audit ships (`snapflowd doctor` or similar) isn't
+/// this crate's to pin down.
+pub fn annotate_missing_prerequisite_hint(message: &str) -> String {
+    if is_missing_runtime_prerequisite_error(message) {
+        format!(
+            "{message}\n\nThis looks like a missing runtime dependency (Node.js/npm or \
+             Python/uv) rather than an agent bug. Run your daemon's diagnostic/doctor \
+             command (e.g. `snapflowd doctor`) to check what's installed."
+        )
+    } else {
+        message.to_owned()
+    }
+}
+
 /// Builds the sidebar's thread-list items from `names`/`state`
 /// (parallel slices, same convention as `PanelSingleton::thread_state`),
 /// optionally narrowed by a case-insensitive substring `query` --
@@ -1557,6 +1635,7 @@ pub fn build_thread_items<N: AsRef<str>>(
     background_sessions: &[bool],
     closed: &[bool],
     archived: &[bool],
+    unread: &[bool],
     query: &str,
 ) -> Vec<VisibleThreadItem> {
     let query_lower = query.trim().to_lowercase();
@@ -1601,6 +1680,7 @@ pub fn build_thread_items<N: AsRef<str>>(
                     .into(),
                 closed: closed.get(real_index).copied().unwrap_or(false),
                 archived: archived.get(real_index).copied().unwrap_or(false),
+                unread: unread.get(real_index).copied().unwrap_or(false),
                 // Provider/model are not part of the name/state slices this
                 // filter operates on -- `lib.rs` post-populates them by
                 // `real_index` after filtering, so they default empty here.
@@ -1911,6 +1991,35 @@ pub fn current_provider_trigger_label(profiles: &[ProfileOption], current_profil
         .unwrap_or_else(|| current_profile.to_owned())
 }
 
+/// Compose-bar Provider trigger label, with a live fallback to the
+/// thread's own `provider` field.
+///
+/// `current_provider_trigger_label` resolves through `profile_name`
+/// (`current_profile`), which is legitimately empty for native/unmanaged-
+/// mode threads and for threads restored from `state_store` (a
+/// `thread_settings` row can have a real `provider` with a NULL
+/// `profile_name` -- see `StateStore::thread_records`'s doc comment), even
+/// though the thread has a real, active provider. Bug report: the compose
+/// Provider trigger showed the literal placeholder "Provider" for such a
+/// thread even though a provider was already selected/active, while
+/// `agent-badge` (app.slint), which reads `thread.provider` directly,
+/// showed the real value. Falling back to `thread_provider` here keeps the
+/// trigger label live-derived the same way `agent-badge` already is,
+/// instead of leaving it stuck on the generic placeholder whenever
+/// `profile_name` alone doesn't resolve to anything.
+pub fn resolve_provider_trigger_label(
+    profiles: &[ProfileOption],
+    current_profile: &str,
+    thread_provider: &str,
+) -> String {
+    let label = current_provider_trigger_label(profiles, current_profile);
+    if label.is_empty() {
+        thread_provider.to_owned()
+    } else {
+        label
+    }
+}
+
 /// Agent/provider id for the thread's selected profile (empty if unknown).
 pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile: &str) -> String {
     if current_profile.is_empty() {
@@ -2144,7 +2253,9 @@ fn parse_kv_lines(text: &str, sep: char) -> std::collections::HashMap<String, St
 /// shell-style quoting/escaping); `timeout` is parsed as whole seconds,
 /// `None` on empty/invalid input rather than erroring, since 0 is a
 /// meaningless timeout and the field is optional.
-pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_types::McpServerEntry {
+pub fn mcp_server_entry_from_form(
+    data: &McpServerFormData,
+) -> crate::protocol_types::McpServerEntry {
     use crate::protocol_types::{McpServerConfig, McpServerEntry, OAuthClientConfig};
 
     let timeout = data.timeout.trim().parse::<u64>().ok();
@@ -2165,11 +2276,7 @@ pub fn mcp_server_entry_from_form(data: &McpServerFormData) -> crate::protocol_t
     } else {
         McpServerConfig::Stdio {
             command: data.command.trim().to_string(),
-            args: data
-                .args
-                .split_whitespace()
-                .map(str::to_string)
-                .collect(),
+            args: data.args.split_whitespace().map(str::to_string).collect(),
             env: parse_kv_lines(&data.env, '='),
             timeout,
         }
@@ -2190,11 +2297,7 @@ pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption>
     // Live injection gate (Settings toggle) — not always-on once the
     // user has disabled snapflow; still show the row so they can re-enable.
     let enabled = crate::agent_bridge::snapflow_mcp_enabled();
-    let status = if enabled {
-        "connected"
-    } else {
-        "disconnected"
-    };
+    let status = if enabled { "connected" } else { "disconnected" };
     let status_line = if enabled {
         "built-in daemon · injected into sessions"
     } else {
@@ -2211,9 +2314,15 @@ pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption>
         needs_auth: false,
         auth_status: String::new().into(),
         tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
-        // The built-in daemon isn't a registry entry at all -- there's no
-        // `mcp_servers/tools_fetch` target for it, so it never has a
-        // fetch status to show.
+        // Placeholder defaults -- this synthetic row has no registry
+        // entry of its own to read `tool_catalog` from. The background
+        // watcher (`agent_bridge::ensure_snapshotd_watcher_started`) does
+        // sync a real "snapflow" registry entry that `mcp_servers/
+        // tools_fetch` actually targets; `sync::reconcile_settings_models`
+        // looks that entry up by `agent_bridge::is_builtin_snapflow_mcp_
+        // name` and overwrites these four fields with its live-fetched
+        // state before this row is displayed. Do not rely on these
+        // defaults being final.
         tool_fetch_status: String::new().into(),
         tool_fetch_error: String::new().into(),
         tools_search_blob: String::new().into(),
@@ -2256,9 +2365,18 @@ fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<Mc
             let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            let enabled = tool.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-            let deferred = tool.get("deferred").and_then(|v| v.as_bool()).unwrap_or(false);
-            let token_usage = tool.get("token_usage").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let enabled = tool
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let deferred = tool
+                .get("deferred")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let token_usage = tool
+                .get("token_usage")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
             preferences.insert(name.to_string(), (enabled, deferred, token_usage));
         }
     }
@@ -2268,8 +2386,10 @@ fn mcp_tools_from_entry(entry: &crate::protocol_types::McpServerEntry) -> Vec<Mc
 
     if let Some(crate::protocol_types::McpToolCatalog::Ready { tools }) = &entry.tool_catalog {
         for tool in tools {
-            let (enabled, deferred, token_usage) =
-                preferences.get(&tool.name).copied().unwrap_or((true, false, 0));
+            let (enabled, deferred, token_usage) = preferences
+                .get(&tool.name)
+                .copied()
+                .unwrap_or((true, false, 0));
             seen.insert(tool.name.clone());
             rows.push(McpToolOption {
                 name: tool.name.clone().into(),
@@ -2327,19 +2447,32 @@ pub fn to_skill_option_rows(entries: Vec<SkillEntry>) -> Vec<SkillOption> {
 pub fn to_remote_session_options(
     sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     provider: &str,
+    busy_session_ids: &[String],
 ) -> ModelRc<crate::RemoteSessionOption> {
     ModelRc::new(VecModel::from(to_remote_session_option_rows(
-        sessions, provider,
+        sessions,
+        provider,
+        busy_session_ids,
     )))
 }
 
+/// `busy_session_ids` is `AgentBridge::recover_session_operations_in_
+/// flight`'s raw output (Settings > Agents "Attach" click -> `session/
+/// load` still in flight) -- same `is_busy` shape `to_mcp_server_option_
+/// rows` already established for the MCP-servers row spinners, applied
+/// here since this row previously had no busy-state tracking at all
+/// (symptom #2).
 pub fn to_remote_session_option_rows(
     sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     provider: &str,
+    busy_session_ids: &[String],
 ) -> Vec<crate::RemoteSessionOption> {
     sessions
         .into_iter()
         .map(|session| crate::RemoteSessionOption {
+            busy: busy_session_ids
+                .iter()
+                .any(|id| id == &session.acp_session_id),
             session_id: session.acp_session_id.into(),
             provider: provider.into(),
             title: session.title.unwrap_or_default().into(),
@@ -2379,6 +2512,29 @@ fn agent_status_sort_priority(status: &crate::protocol_types::AgentStatus) -> u8
     }
 }
 
+/// Display-ready host portion of a `website` URL for `agent_card.slint`'s
+/// website row (e.g. "openai.com" for "https://openai.com/codex") --
+/// Slint has no string-split primitive, so this is computed Rust-side
+/// and threaded through as `AgentCatalogEntry.website-domain`, kept
+/// alongside the raw `website` field (still used verbatim for the
+/// actual click-to-open URL, see `lib.rs::dispatch_agent_website_
+/// clicked`'s http(s)-only guard). Strips a `http(s)://` scheme, any
+/// path/query/fragment after the host, and a leading `www.`. Never
+/// panics: an empty or schemeless/malformed input just falls through to
+/// whatever's left of the string (possibly empty).
+fn website_domain(website: &str) -> String {
+    let trimmed = website.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    host.strip_prefix("www.").unwrap_or(host).to_string()
+}
+
 pub fn to_agent_catalog_entry_rows(
     mut agents: Vec<crate::protocol_types::AgentCatalogEntry>,
     loading_ids: &[String],
@@ -2392,6 +2548,7 @@ pub fn to_agent_catalog_entry_rows(
                 id: id.clone().into(),
                 name: entry.name.into(),
                 version: entry.version.into(),
+                website_domain: website_domain(&entry.website).into(),
                 website: entry.website.into(),
                 status: entry.status.as_wire_str().into(),
                 enabled: entry.enabled,
@@ -2478,6 +2635,37 @@ pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use slint::Model;
+
+    #[test]
+    fn website_domain_strips_scheme_and_path() {
+        assert_eq!(website_domain("https://openai.com/codex"), "openai.com");
+        assert_eq!(website_domain("http://openai.com/codex"), "openai.com");
+    }
+
+    #[test]
+    fn website_domain_handles_bare_host() {
+        assert_eq!(website_domain("openai.com"), "openai.com");
+    }
+
+    #[test]
+    fn website_domain_strips_leading_www() {
+        assert_eq!(website_domain("https://www.openai.com/codex"), "openai.com");
+        assert_eq!(website_domain("www.openai.com"), "openai.com");
+    }
+
+    #[test]
+    fn website_domain_strips_query_and_fragment() {
+        assert_eq!(
+            website_domain("https://openai.com?ref=x#section"),
+            "openai.com"
+        );
+    }
+
+    #[test]
+    fn website_domain_empty_input_is_empty() {
+        assert_eq!(website_domain(""), "");
+        assert_eq!(website_domain("   "), "");
+    }
 
     // PROF-7: agent_detected_for_profile is the pure decision function the
     // real per-thread Stale state is built on -- exercised directly here so
@@ -2741,8 +2929,14 @@ mod tests {
         let rows = to_mcp_server_option_rows(vec![entry], &[]);
         let tools: Vec<_> = rows[0].tools.iter().collect();
         assert_eq!(tools.len(), 2);
-        let read_file = tools.iter().find(|t| t.name == "read_file").expect("read_file row");
-        assert!(!read_file.enabled, "persisted preference must override the live default");
+        let read_file = tools
+            .iter()
+            .find(|t| t.name == "read_file")
+            .expect("read_file row");
+        assert!(
+            !read_file.enabled,
+            "persisted preference must override the live default"
+        );
         assert!(read_file.deferred);
         assert_eq!(read_file.token_usage, 42);
         let vanished = tools
@@ -2771,7 +2965,10 @@ mod tests {
         });
         let rows = to_mcp_server_option_rows(vec![entry], &[]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "error");
-        assert_eq!(rows[0].tool_fetch_error.as_str(), "process exited before responding");
+        assert_eq!(
+            rows[0].tool_fetch_error.as_str(),
+            "process exited before responding"
+        );
     }
 
     /// Never-fetched entries (no `tool_catalog` at all) must not be
@@ -2806,8 +3003,7 @@ mod tests {
                 timeout: None,
             },
         );
-        let rows =
-            to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
+        let rows = to_mcp_server_option_rows(vec![entry], &["tools_fetch:fs".to_owned()]);
         assert_eq!(rows[0].tool_fetch_status.as_str(), "fetching");
     }
 
@@ -2980,10 +3176,7 @@ mod tests {
                     Some("Bearer xyz")
                 );
                 assert_eq!(timeout, None, "blank timeout must parse to None, not 0");
-                assert_eq!(
-                    oauth.map(|o| o.client_id),
-                    Some("client-abc".to_string())
-                );
+                assert_eq!(oauth.map(|o| o.client_id), Some("client-abc".to_string()));
             }
             other => panic!("expected Http config, got {other:?}"),
         }
@@ -3028,6 +3221,7 @@ mod tests {
     const BACKGROUND: &[bool] = &[false, true, false, false];
     const NO_CLOSED: &[bool] = &[false, false, false, false];
     const NO_ARCHIVED: &[bool] = &[false, false, false, false];
+    const NO_UNREAD: &[bool] = &[false, false, false, false];
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
@@ -3038,6 +3232,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items.len(), 4);
@@ -3056,6 +3251,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "FADE",
         );
         assert_eq!(items.len(), 1);
@@ -3072,6 +3268,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "fade",
         );
         assert_eq!(items.len(), 1);
@@ -3090,6 +3287,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "x",
         );
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
@@ -3110,6 +3308,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "zzz-no-such-thread",
         );
         assert!(items.is_empty());
@@ -3124,6 +3323,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "   ",
         );
         assert_eq!(items.len(), 4);
@@ -3138,6 +3338,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items[1].item.status, "loading");
@@ -3158,6 +3359,7 @@ mod tests {
             BACKGROUND,
             closed,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items[1].item.status, "closed");
@@ -3182,6 +3384,7 @@ mod tests {
             BACKGROUND,
             closed,
             archived,
+            NO_UNREAD,
             "",
         );
         assert_eq!(items[1].item.status, "archived");
@@ -3189,6 +3392,29 @@ mod tests {
         assert!(items[1].item.closed);
         assert_eq!(items[0].item.status, "idle");
         assert!(!items[0].item.archived);
+    }
+
+    #[test]
+    fn unread_is_carried_through_by_real_index_when_filtered() {
+        // thread-unread-state: filtering changes a thread's displayed
+        // position, so unread must be read by real_index like every other
+        // per-thread flag -- and it must not disturb `status`, which the
+        // sidebar keys the spinner/error branches off.
+        let unread: &[bool] = &[false, false, false, true];
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            unread,
+            "bug",
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].real_index, 3);
+        assert!(items[0].item.unread);
+        assert_eq!(items[0].item.status, STATE[3].as_str());
     }
 
     #[test]
@@ -3206,6 +3432,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "fade",
         );
         assert_eq!(items.len(), 1);
@@ -3221,6 +3448,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "",
         );
         assert!(items.iter().all(|i| i.item.description.is_empty()));
@@ -3235,6 +3463,7 @@ mod tests {
             BACKGROUND,
             NO_CLOSED,
             NO_ARCHIVED,
+            NO_UNREAD,
             "fade",
         );
         assert!(items[0].item.background);
@@ -3681,7 +3910,10 @@ mod transcript_model_tests {
         let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
         let a = markdown_lines_for(&mut render_index, "k1", 0, "agent", "# First");
         let b = markdown_lines_for(&mut render_index, "k2", 1, "agent", "# Second");
-        assert_ne!(a.row_data(0).unwrap().plain_text, b.row_data(0).unwrap().plain_text);
+        assert_ne!(
+            a.row_data(0).unwrap().plain_text,
+            b.row_data(0).unwrap().plain_text
+        );
     }
 
     #[test]
@@ -3786,6 +4018,133 @@ mod transcript_model_tests {
     }
 
     #[test]
+    fn markdown_blocks_for_single_line_message_last_and_only_block_fully_present() {
+        // Coverage gap closed: the existing incremental-cache tests
+        // (added alongside this one by the streaming-freeze fix) assert
+        // block *counts* and prove *reuse*, but none of them assert that
+        // the tail line's actual rendered text reaches the true end of
+        // the source string -- the specific property a "last line looks
+        // cut off" bug report is about. A single short one-block message
+        // is the simplest case where "last block" and "only block" are
+        // the same thing; the multi-paragraph tests below cover the
+        // "several blocks, last one is short" shape too.
+        let text = "Just one short line, nothing else.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        // Streamed in growing partial calls, then settled (repeat call
+        // with unchanged text) -- matches a real short agent reply.
+        markdown_blocks_for(&mut render_index, "k", 0, "agent", "Just one short", false);
+        markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "Just one short line, nothing",
+            false,
+        );
+        let settled = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        let settled_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+
+        let direct = markdown_block_data_to_model(build_markdown_block_data(text, false));
+        assert_eq!(settled.row_count(), 1);
+        assert_eq!(settled_again.row_count(), 1);
+        assert_eq!(
+            settled.row_data(0).unwrap().text,
+            direct.row_data(0).unwrap().text,
+            "settled single-line message's only block does not match ground truth"
+        );
+        assert_eq!(
+            settled_again.row_data(0).unwrap().text,
+            direct.row_data(0).unwrap().text,
+            "re-settled single-line message's only block does not match ground truth"
+        );
+    }
+
+    #[test]
+    fn markdown_blocks_for_streaming_char_by_char_last_line_matches_ground_truth_every_tick() {
+        // Simulates a message streaming in one character at a time -- the
+        // most granular real-world shape -- ending on a short final
+        // sentence after a longer paragraph, and at EVERY tick (not just
+        // the last one) compares `markdown_blocks_for`'s (the real
+        // production call path) last block's text against a from-scratch,
+        // non-incremental `build_markdown_block_data` build of the exact
+        // same text. Any tick where they diverge would mean the
+        // incremental cache is returning stale/incomplete content for the
+        // tail block -- the exact failure mode a "last line clipped"
+        // live bug report during active streaming would come from.
+        let full_text = "This is a longer first paragraph with quite a bit of content in it so it wraps across more than one visual line in the chat bubble.\n\nShort final line.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        for end in 1..=full_text.len() {
+            if !full_text.is_char_boundary(end) {
+                continue;
+            }
+            let partial = &full_text[..end];
+            let got = markdown_blocks_for(&mut render_index, "k", 0, "agent", partial, false);
+            let direct = markdown_block_data_to_model(build_markdown_block_data(partial, false));
+            assert_eq!(
+                got.row_count(),
+                direct.row_count(),
+                "block count diverged at len={end} partial={partial:?}"
+            );
+            for i in 0..got.row_count() {
+                assert_eq!(
+                    got.row_data(i).unwrap().text,
+                    direct.row_data(i).unwrap().text,
+                    "block {i} text diverged at len={end} partial={partial:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_blocks_for_settled_multi_paragraph_last_line_fully_present() {
+        // A message that has fully settled (streamed once, then stopped
+        // changing -- matches real "message turn ended" behavior) must
+        // render its LAST paragraph's full text, not a truncated prefix
+        // of it. Live-verified against the real `markdown_blocks_for`
+        // production entry point (not just the lower-level incremental
+        // builder) so this covers the actual whole-message settled
+        // cache-hit path too, not only the per-block diff.
+        let text = "First paragraph of the message.\n\nSecond paragraph, a bit longer than the first one to be realistic.\n\nFinal short line.";
+        let mut render_index = crate::thread_message_index::ThreadMessageIndex::default();
+        // Tick 1: streaming arrives (simulated as a few growing calls).
+        markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "First paragraph of the message.",
+            false,
+        );
+        markdown_blocks_for(
+            &mut render_index,
+            "k",
+            0,
+            "agent",
+            "First paragraph of the message.\n\nSecond paragraph, a bit longer than the first one to be realistic.",
+            false,
+        );
+        let settled = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+        // Tick 2+: message settled, text stops changing (real repeat-poll
+        // behavior after the turn ends).
+        let settled_again = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
+
+        let direct = markdown_block_data_to_model(build_markdown_block_data(text, false));
+        assert_eq!(settled.row_count(), direct.row_count());
+        assert_eq!(settled_again.row_count(), direct.row_count());
+        let last = settled.row_count() - 1;
+        assert_eq!(
+            settled.row_data(last).unwrap().text,
+            direct.row_data(last).unwrap().text,
+            "settled message's LAST block text does not match ground truth"
+        );
+        assert_eq!(
+            settled_again.row_data(last).unwrap().text,
+            direct.row_data(last).unwrap().text,
+            "re-settled (repeat idle tick) message's LAST block text does not match ground truth"
+        );
+    }
+
+    #[test]
     fn build_markdown_block_data_incremental_reuses_matching_blocks_and_rebuilds_only_new_ones() {
         // The core claim of the streaming-freeze fix: growing `text` by
         // appending a new block must reuse the *unchanged* earlier
@@ -3798,8 +4157,14 @@ mod transcript_model_tests {
         let grown_text = format!("{first_text}\n\nThird paragraph.");
         let grown = build_markdown_block_data_incremental(&grown_text, false, &first);
         assert_eq!(grown.len(), 3);
-        assert_eq!(grown[0].0, first[0].0, "unchanged block keeps the same source hash");
-        assert_eq!(grown[1].0, first[1].0, "unchanged block keeps the same source hash");
+        assert_eq!(
+            grown[0].0, first[0].0,
+            "unchanged block keeps the same source hash"
+        );
+        assert_eq!(
+            grown[1].0, first[1].0,
+            "unchanged block keeps the same source hash"
+        );
 
         // Prove the *data itself* -- not just the hash -- was reused
         // rather than recomputed: tamper with the cached entry's content
@@ -3828,7 +4193,10 @@ mod transcript_model_tests {
         // property of the diff: hash mismatch always means rebuild.
         let step1 = build_markdown_block_data_incremental("Hel", false, &[]);
         let step2 = build_markdown_block_data_incremental("Hello world", false, &step1);
-        assert_ne!(step1[0].0, step2[0].0, "growing text changes the block's source hash");
+        assert_ne!(
+            step1[0].0, step2[0].0,
+            "growing text changes the block's source hash"
+        );
         // Rebuilt data reflects the new, longer text, not the stale
         // cached entry -- `StyledText` derives `PartialEq`, so comparing
         // against a fresh direct build (bypassing the incremental path
@@ -3890,7 +4258,11 @@ mod transcript_model_tests {
         // matches a real turn-ended/settled message being re-projected on
         // every subsequent idle poll tick).
         let cached = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
-        assert_eq!(cached.row_count(), 2, "still returns the correct rendered rows");
+        assert_eq!(
+            cached.row_count(),
+            2,
+            "still returns the correct rendered rows"
+        );
         assert!(
             render_index.block_cache_is_empty("k"),
             "settling (a whole-message cache hit) must free the now-redundant per-block cache"
@@ -3924,12 +4296,19 @@ mod transcript_model_tests {
         let first = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
         let second = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
         let third = markdown_blocks_for(&mut render_index, "k", 0, "agent", text, false);
-        assert_eq!(first, second, "settled repeat calls return the identical cached ModelRc");
-        assert_eq!(second, third, "settled repeat calls return the identical cached ModelRc");
+        assert_eq!(
+            first, second,
+            "settled repeat calls return the identical cached ModelRc"
+        );
+        assert_eq!(
+            second, third,
+            "settled repeat calls return the identical cached ModelRc"
+        );
     }
 
     #[test]
-    fn build_markdown_block_data_incremental_pays_no_more_hashing_than_segment_blocks_already_needs() {
+    fn build_markdown_block_data_incremental_pays_no_more_hashing_than_segment_blocks_already_needs(
+    ) {
         // Cold-start / never-before-seen-message sanity check: with an
         // empty `prev` cache (exactly the state for a message the thread
         // is rendering for the very first time, e.g. cold hydration of a
@@ -3940,8 +4319,14 @@ mod transcript_model_tests {
         let text = "# Heading\n\nA paragraph with `code` and **bold**.\n\n```\nfn main() {}\n```";
         let direct = build_markdown_block_data(text, false);
         let incremental: Vec<MarkdownBlockData> =
-            build_markdown_block_data_incremental(text, false, &[]).into_iter().map(|(_, d)| d).collect();
-        assert_eq!(direct, incremental, "cold start (empty prev cache) must match the non-incremental builder exactly");
+            build_markdown_block_data_incremental(text, false, &[])
+                .into_iter()
+                .map(|(_, d)| d)
+                .collect();
+        assert_eq!(
+            direct, incremental,
+            "cold start (empty prev cache) must match the non-incremental builder exactly"
+        );
     }
 
     #[test]
@@ -4108,6 +4493,55 @@ mod transcript_model_tests {
             filtered.row_data(2).unwrap().value.as_str(),
             "claude-acp/sonnet"
         );
+    }
+
+    /// Regression test for a live-reported bug: the compose-bar Provider
+    /// trigger showed the literal placeholder "Provider" instead of the
+    /// real provider name for a thread that already had one
+    /// selected/active (cold-start restore or a prior explicit pick),
+    /// unless the user re-touched the dropdown. Root cause:
+    /// `current_provider_trigger_label` resolves the label through the
+    /// thread's `profile_name`, which is legitimately empty for
+    /// native/unmanaged-mode threads and for threads restored from
+    /// `state_store` (a `thread_settings` row can persist a real
+    /// `provider` with a NULL `profile_name` -- see
+    /// `StateStore::thread_records`'s doc comment), even though the
+    /// thread's own `provider` field is a real, active value. Unlike
+    /// `agent-badge` (app.slint), which already reads `thread.provider`
+    /// directly and stayed correct, the compose trigger had no such
+    /// fallback and fell straight to `""`, which
+    /// `chat_input_layout.slint`'s `profile-label-shown` renders as the
+    /// generic "Provider ›" placeholder. `resolve_provider_trigger_label`
+    /// (the fix, wired into `sync.rs`'s `sync_profile_picker`) falls back
+    /// to the thread's live `provider` field whenever the profile-name
+    /// resolution comes back empty.
+    #[test]
+    fn provider_trigger_label_falls_back_to_thread_provider_when_profile_name_is_empty() {
+        // No profiles loaded/matched at all (e.g. native/unmanaged mode, or
+        // a cold-start-restored thread with no persisted `profile_name`).
+        assert_eq!(
+            resolve_provider_trigger_label(&[], "", "codex-acp"),
+            "codex-acp",
+            "an empty profile_name must not blank out an already-active provider"
+        );
+
+        // A non-empty profile_name that still resolves normally must keep
+        // taking priority over the raw `thread.provider` fallback.
+        let profiles = vec![ProfileOption {
+            name: "work".into(),
+            agent_id: "codex-acp".into(),
+            terminal_enabled: true,
+            fs_enabled: true,
+        }];
+        assert_eq!(
+            resolve_provider_trigger_label(&profiles, "work", "claude-acp"),
+            "codex-acp",
+            "a resolved profile_name label must win over the thread_provider fallback"
+        );
+
+        // Both profile_name and thread.provider empty (genuinely nothing
+        // selected yet) must still render as the "Provider ›" placeholder.
+        assert_eq!(resolve_provider_trigger_label(&[], "", ""), "");
     }
 
     /// PROF-10: a provider whose agent the catalog genuinely reports as
@@ -4433,5 +4867,61 @@ mod transcript_model_tests {
         assert!(reasoning.row_data(2).unwrap().is_current); // medium
         assert_eq!(current_reasoning_trigger_label(&options), "Medium");
         assert_eq!(current_config_trigger_label(&options), "GPT-5");
+    }
+
+    // windows-reliability-audit: is_missing_runtime_prerequisite_error is a
+    // heuristic (see its doc comment), so these pin the specific cross-
+    // platform wordings it's meant to catch, plus a few "must NOT match"
+    // cases so an unrelated failure never gets mislabeled as a missing
+    // runtime.
+    #[test]
+    fn missing_runtime_prerequisite_error_matches_unix_spawn_failure() {
+        assert!(is_missing_runtime_prerequisite_error(
+            "Failed to spawn \"npx\": No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_prerequisite_error_matches_windows_spawn_failure() {
+        assert!(is_missing_runtime_prerequisite_error(
+            "'node' is not recognized as an internal or external command"
+        ));
+        assert!(is_missing_runtime_prerequisite_error(
+            "program not found: npm: The system cannot find the file specified. (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_prerequisite_error_matches_python_uv() {
+        assert!(is_missing_runtime_prerequisite_error(
+            "uv: command not found"
+        ));
+        assert!(is_missing_runtime_prerequisite_error(
+            "spawn python ENOENT"
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_prerequisite_error_does_not_match_unrelated_failures() {
+        assert!(!is_missing_runtime_prerequisite_error(
+            "backend requires authentication before session/new"
+        ));
+        assert!(!is_missing_runtime_prerequisite_error(
+            "unexpected status 502 Bad Gateway"
+        ));
+        // Mentions a runtime but isn't a not-found failure at all.
+        assert!(!is_missing_runtime_prerequisite_error(
+            "node process exited with code 1"
+        ));
+    }
+
+    #[test]
+    fn annotate_missing_prerequisite_hint_appends_only_when_detected() {
+        let matched = annotate_missing_prerequisite_hint("spawn node ENOENT");
+        assert!(matched.starts_with("spawn node ENOENT"));
+        assert!(matched.contains("snapflowd doctor"));
+
+        let unrelated = "backend requires authentication before session/new";
+        assert_eq!(annotate_missing_prerequisite_hint(unrelated), unrelated);
     }
 }

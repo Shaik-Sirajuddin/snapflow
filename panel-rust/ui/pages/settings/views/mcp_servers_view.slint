@@ -105,6 +105,16 @@ export component McpServersView inherits Rectangle {
     // comment) since only one add/edit form can be open at a time, so
     // this doesn't need to be tracked per-row like the other four actions.
     in property <bool> submit-busy: false;
+    // Env-var feature-flag gate (BETA_MODE, read in lib.rs's
+    // beta_mode_enabled() and threaded down through settings_page.slint /
+    // app.slint, same pattern as agents_view.slint's own beta-mode-
+    // enabled property). Additive: gates ONLY the per-server "Fetch
+    // tools"/"Refresh tools" button below (the real `mcp_servers/
+    // tools_fetch` probe) -- everything else in a server's row (Connect/
+    // Disconnect, the Tools expand/collapse button once a catalog
+    // already exists, enable toggle, Remove) stays visible and
+    // functional regardless of this flag.
+    in property <bool> beta-mode-enabled: false;
     callback mcp-server-submit(McpServerFormData);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
@@ -331,7 +341,10 @@ export component McpServersView inherits Rectangle {
                     // (or a failed attempt) exists. `busy` (real Spinner)
                     // reads `tool-fetch-status` -- optimistically stamped
                     // Fetching in AgentBridge, then polled from catalog.
-                    Button {
+                    // Additive BETA_MODE gate (see beta-mode-enabled's doc
+                    // comment above): hidden entirely by default, same as
+                    // agents_view.slint's own beta-gated fields.
+                    if root.beta-mode-enabled : Button {
                         label: server.tool-fetch-status == "fetching"
                             ? "Fetching..."
                             : (server.tool-fetch-status == "" ? "Fetch tools" : "Refresh tools");
@@ -422,9 +435,17 @@ export component McpServersView inherits Rectangle {
                             }
 
                             if server.tool-fetch-status != "fetching" && server.tools.length == 0 : Text {
+                                // "click Fetch tools" only makes sense while
+                                // that button is actually visible -- it's
+                                // gated behind BETA_MODE (see beta-mode-
+                                // enabled's doc comment above), so this
+                                // branch would otherwise point at a hidden
+                                // control.
                                 text: server.tool-fetch-status == "error"
                                     ? "No tools (fetch failed)."
-                                    : "No tools discovered yet — click Fetch tools.";
+                                    : (root.beta-mode-enabled
+                                        ? "No tools discovered yet — click Fetch tools."
+                                        : "No tools discovered yet.");
                                 color: Theme.text-muted;
                                 font-size: 9px * Theme.font-scale;
                             }
@@ -608,7 +629,7 @@ export component McpServersView inherits Rectangle {
                     label: "Command";
                     command-field := TextField {
                         text <=> root.form-command;
-                        field-accessible-label: "Command";
+                        field-accessible-label: "MCP command";
                         placeholder: "e.g. npx @modelcontextprotocol/server-filesystem";
                         changed has-focus => {
                             root.stdio-fields-focused = self.has-focus

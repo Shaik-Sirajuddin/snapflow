@@ -28,6 +28,27 @@
 pub use acpx_proto::jsonrpc::{Request, RequestId, Response};
 
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+/// Hard ceiling on one `POST {base_url}/rpc` round trip, `send()` through
+/// reading the full response body. `reqwest::Client::new()` (this
+/// module's previous construction) sets **no** timeout at all -- a
+/// `session/prompt` call is a single blocking HTTP request the gateway
+/// only answers once the whole turn (or an explicit error) resolves, so a
+/// wedged gateway/backend (crashed or hung without closing the TCP
+/// connection) left the caller's future pending forever: no
+/// `AgentEvent::TurnEnded`, no `AgentEvent::Error`, nothing for
+/// `panel-rust`'s reducer to react to, so the thread's busy/loading state
+/// (set the moment the request went out) never clears. Mirrors
+/// `acpx_client::ws::WS_RESPONSE_TIMEOUT`'s exact reasoning and value --
+/// that module already documents this raw HTTP transport as its
+/// fallback for "constrained deployments", so it needs the same
+/// protection, not a shorter one: long enough to comfortably outlast any
+/// legitimate long-running turn or permission-approval wait
+/// (`acpx_core::router`'s own `BACKEND_IDLE_READ_TIMEOUT` backstop is 20
+/// minutes), only there to catch a connection that looks alive at the
+/// TCP level but will never actually answer.
+pub const HTTP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -141,8 +162,20 @@ impl GatewayClient {
     /// `base_url` is the gateway's HTTP origin, e.g. `http://127.0.0.1:8790`
     /// (no trailing slash, no `/rpc` suffix -- that's appended per call).
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_timeout(base_url, HTTP_RESPONSE_TIMEOUT)
+    }
+
+    /// Same as [`Self::new`], but with an explicit per-request timeout
+    /// instead of [`HTTP_RESPONSE_TIMEOUT`] -- exists so tests can prove
+    /// the timeout behavior (a wedged/never-responding peer) without
+    /// actually waiting 30 minutes. Every real caller should use
+    /// [`Self::new`].
+    pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.into(),
             next_id: AtomicI64::new(1),
             auth_token: None,
@@ -258,5 +291,99 @@ impl GatewayClient {
             .cloned()
             .unwrap_or_default();
         Ok((result, updates))
+    }
+}
+
+#[cfg(test)]
+mod http_timeout_tests {
+    //! Regression coverage for the "left loading forever" gap this file's
+    //! `HTTP_RESPONSE_TIMEOUT` closes (see `GatewayClient::new`'s doc
+    //! comment): before this fix, `GatewayClient` was built from
+    //! `reqwest::Client::new()`, which sets no timeout at all, so a peer
+    //! that accepts the TCP connection but never writes a response byte
+    //! (a wedged gateway/backend -- crashed or hung without closing the
+    //! socket) left `call`/`call_with_updates` pending indefinitely: no
+    //! `Ok`, no `Err`, forever. A caller awaiting that future (panel-
+    //! rust's `Command::SendPrompt` handler) never gets *anything* to
+    //! react to, so the thread's busy/loading UI state, set the moment
+    //! the request went out, never clears -- exactly the bug this proves
+    //! is now closed.
+    use super::{ClientError, GatewayClient};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    /// Binds a listener that accepts one connection, reads whatever the
+    /// client sends (so the write side doesn't itself block/reset), and
+    /// then holds the socket open forever without ever writing a
+    /// response -- the "wedged peer" this test proves `GatewayClient` no
+    /// longer hangs against.
+    async fn spawn_wedged_peer() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                // Drain the request so the client's write completes, then
+                // simply never respond -- and never let the task/socket
+                // drop, which would otherwise send a RST/FIN the client
+                // could (correctly) treat as an ordinary connection-reset
+                // error rather than exercising the timeout path.
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn call_with_updates_times_out_instead_of_hanging_forever() {
+        let base_url = spawn_wedged_peer().await;
+        let client = GatewayClient::with_timeout(base_url, Duration::from_millis(300));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_with_updates("session/prompt", serde_json::json!({}), None),
+        )
+        .await
+        .expect(
+            "GatewayClient::call_with_updates hung past its own configured timeout -- \
+             the wedged-peer protection regressed",
+        );
+
+        match outcome {
+            Err(ClientError::Http(error)) => {
+                assert!(
+                    error.is_timeout(),
+                    "expected the configured request timeout to fire, got a different \
+                     reqwest error: {error:?}"
+                );
+            }
+            other => panic!("expected a timeout ClientError::Http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_times_out_instead_of_hanging_forever() {
+        let base_url = spawn_wedged_peer().await;
+        let client = GatewayClient::with_timeout(base_url, Duration::from_millis(300));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call("session/prompt", serde_json::json!({}), None),
+        )
+        .await
+        .expect("GatewayClient::call hung past its own configured timeout");
+
+        let is_http_timeout =
+            matches!(&outcome, Err(ClientError::Http(error)) if error.is_timeout());
+        assert!(
+            is_http_timeout,
+            "expected a timeout ClientError::Http, got {outcome:?}"
+        );
     }
 }

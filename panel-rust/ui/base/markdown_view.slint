@@ -55,6 +55,10 @@ export component MarkdownView inherits VerticalLayout {
     // caller that hasn't bothered to markdown-parse its body.
     in property <string> fallback-text: "";
     in property <length> row-width: 0px;
+    // Edge-triggered commands from AgentBubble. These let the parent drive
+    // TextInputs created inside repeaters without referencing their ids.
+    in property <int> focus-selection-command: 0;
+    in property <int> select-all-command: 0;
 
     spacing: 0px;
     // Cross-axis for VerticalLayout = horizontal. Stretch children to
@@ -100,6 +104,13 @@ export component MarkdownView inherits VerticalLayout {
         min-width: 0px;
         selection-foreground-color: Theme.text-primary;
         selection-background-color: Theme.selection-bg;
+        property <int> focus-selection-command: root.focus-selection-command;
+        property <int> select-all-command: root.select-all-command;
+        changed focus-selection-command => { self.focus(); }
+        changed select-all-command => {
+            self.focus();
+            self.set-selection-offsets(0, 2147483647);
+        }
     }
 
     // Architecture v2 block path -- takes over entirely when `blocks` is
@@ -258,6 +269,13 @@ export component MarkdownView inherits VerticalLayout {
                 color: transparent;
                 selection-foreground-color: transparent;
                 selection-background-color: Theme.selection-bg;
+                property <int> focus-selection-command: root.focus-selection-command;
+                property <int> select-all-command: root.select-all-command;
+                changed focus-selection-command => { self.focus(); }
+                changed select-all-command => {
+                    self.focus();
+                    self.set-selection-offsets(0, 2147483647);
+                }
             }
 
             HorizontalLayout {

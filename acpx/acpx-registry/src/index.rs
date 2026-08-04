@@ -123,16 +123,15 @@ pub enum RegistryError {
 /// should use [`fetch_registry_or_fallback`] or [`fallback_registry`]
 /// instead.
 pub async fn fetch_registry(client: &reqwest::Client) -> Result<Registry, RegistryError> {
-    let response =
-        client
-            .get(REGISTRY_URL)
-            .timeout(REGISTRY_FETCH_TIMEOUT)
-            .send()
-            .await
-            .map_err(|source| RegistryError::Request {
-                url: REGISTRY_URL.to_string(),
-                source,
-            })?;
+    let response = client
+        .get(REGISTRY_URL)
+        .timeout(REGISTRY_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|source| RegistryError::Request {
+            url: REGISTRY_URL.to_string(),
+            source,
+        })?;
 
     let status = response.status();
     if !status.is_success() {

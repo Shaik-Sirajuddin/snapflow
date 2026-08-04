@@ -316,11 +316,42 @@ impl SettingsPaths {
     }
 }
 
+/// Platform config-root fallback used when neither `RUI_PANEL_SETTINGS_DIR`
+/// nor `RUI_ACP_CACHE_DIR` is set. `.config` is an XDG (Linux) convention;
+/// on Windows `HOME` is typically unset (the platform variable is
+/// `USERPROFILE`) so, before this fixed an actual reported failure, this
+/// fell all the way through to the final `PathBuf::from(".config")` branch --
+/// a path relative to whatever the process's current directory happened to
+/// be, not inside the user's profile at all. Writing/reading there produced
+/// exactly the reported `.config/panel-rust ... access is denied, os error 5`
+/// (`ERROR_ACCESS_DENIED`): a relative `.config` can land under a
+/// working directory the process has no write access to (e.g. `C:\Program
+/// Files\...` when launched from an installed shortcut, or a
+/// redirected/OneDrive-synced folder). This now checks `APPDATA` (Windows'
+/// roaming per-user config root, i.e. `%APPDATA%`, the config-tier
+/// counterpart to the `LOCALAPPDATA` branch `agent_bridge::resolve_cache_dir`
+/// already uses for its cache-tier directory) before falling back to
+/// `HOME`/`.config`.
 fn dirs_fallback_config() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+    dirs_fallback_config_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("APPDATA"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn dirs_fallback_config_from(
+    xdg_config_home: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
         return PathBuf::from(xdg);
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(appdata) = appdata.filter(|v| !v.is_empty()) {
+        return PathBuf::from(appdata);
+    }
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
         return PathBuf::from(home).join(".config");
     }
     PathBuf::from(".config")
@@ -431,6 +462,38 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn dirs_fallback_config_prefers_xdg_then_appdata_then_home() {
+        assert_eq!(
+            dirs_fallback_config_from(
+                Some("/xdg".into()),
+                Some("C:\\Users\\u\\AppData\\Roaming".into()),
+                Some("/home/u".into()),
+            ),
+            PathBuf::from("/xdg"),
+        );
+        // No HOME on Windows (USERPROFILE is the real var there), but
+        // APPDATA is set -- this is the case that used to fall all the way
+        // through to a CWD-relative ".config" and produced the reported
+        // Windows "access is denied, os error 5".
+        assert_eq!(
+            dirs_fallback_config_from(
+                None,
+                Some("C:\\Users\\u\\AppData\\Roaming".into()),
+                None,
+            ),
+            PathBuf::from("C:\\Users\\u\\AppData\\Roaming"),
+        );
+        assert_eq!(
+            dirs_fallback_config_from(None, None, Some("/home/u".into())),
+            PathBuf::from("/home/u/.config"),
+        );
+        assert_eq!(
+            dirs_fallback_config_from(None, None, None),
+            PathBuf::from(".config"),
+        );
+    }
 
     #[test]
     fn merge_project_overrides_global() {

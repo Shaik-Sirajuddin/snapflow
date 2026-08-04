@@ -16,6 +16,7 @@ pub mod openapi;
 pub mod openrpc;
 pub mod schema;
 pub mod session;
+pub mod session_stream;
 pub mod validate;
 
 /// Single source of truth for the default acpx-server HTTP/WS bind address.

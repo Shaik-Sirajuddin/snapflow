@@ -236,7 +236,31 @@ fn which_uncached(bin: &str) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|dir| is_executable_file(&dir.join(bin)))
+    std::env::split_paths(&path_var).any(|dir| {
+        if is_executable_file(&dir.join(bin)) {
+            return true;
+        }
+        // On Windows, `npm`/`npx`/`uvx`'s real PATH entries are `.cmd`
+        // batch-script launcher stubs (npm/npx ship no bare `.exe` at
+        // all) -- a plain `dir.join(bin)` with no extension never matches
+        // that file, so this reported `RuntimeMissing` even when the
+        // runtime is fully installed and spawns fine (see
+        // `acpx-conductor::process::base_command`/`acpx-registry::
+        // install::runtime_command`, which resolve the same `.cmd`/`.bat`
+        // stub for the actual spawn -- this keeps `agents/status`'s
+        // detection consistent with what a spawn attempt would actually
+        // find). Same well-known Rust/Windows gotcha as `editor_detect.rs`
+        // documents for VS Code's `code.cmd` (`a0cbde2e`).
+        #[cfg(windows)]
+        {
+            for ext in ["cmd", "bat", "exe"] {
+                if is_executable_file(&dir.join(format!("{bin}.{ext}"))) {
+                    return true;
+                }
+            }
+        }
+        false
+    })
 }
 
 #[cfg(unix)]
