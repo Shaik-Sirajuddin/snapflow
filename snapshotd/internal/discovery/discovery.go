@@ -80,6 +80,11 @@ func ScanAndPing(runtimeDir string) ([]Candidate, error) {
 			continue
 		}
 		if !health.ProcessIdentityMatches(descriptor.PID, descriptor.ProcessStart) {
+			// A killed GUI can leave its descriptor and Unix socket behind
+			// because process teardown is not signal-safe.  Only prune after
+			// the PID/start identity check proves that the original process is
+			// gone; this prevents deleting a live endpoint during PID reuse.
+			removeDeadDescriptor(runtimeDir, filepath.Join(runtimeDir, entry.Name()), descriptor)
 			continue
 		}
 		challenge, err := randomChallenge()
@@ -93,6 +98,21 @@ func ScanAndPing(runtimeDir string) ([]Candidate, error) {
 		candidates = append(candidates, Candidate{Descriptor: descriptor, ProjectPath: response.ProjectPath, SAPSocketPath: response.SAPSocketPath, SAPToken: response.SAPToken, Verified: true})
 	}
 	return candidates, nil
+}
+
+func removeDeadDescriptor(runtimeDir, descriptorPath string, descriptor Descriptor) {
+	_ = os.Remove(descriptorPath)
+
+	// On Unix the discovery endpoint is a socket file beside the descriptor.
+	// Keep the cleanup strictly inside the daemon's apps directory and only
+	// accept the conventional .sock basename. Windows named pipes have no
+	// filesystem entry, so transport.RemoveStale is intentionally a no-op.
+	endpoint := filepath.Clean(descriptor.Endpoint)
+	root := filepath.Clean(runtimeDir)
+	if filepath.Dir(endpoint) != root || !strings.HasSuffix(filepath.Base(endpoint), ".sock") {
+		return
+	}
+	_ = transport.RemoveStale(endpoint)
 }
 
 func validDescriptor(descriptor Descriptor) bool {

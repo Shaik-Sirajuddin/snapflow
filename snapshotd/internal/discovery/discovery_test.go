@@ -106,5 +106,8 @@ func TestScanAndPingRejectsStaleAndWrongChallengeCandidates(t *testing.T) {
 	if err != nil || len(candidates) != 0 {
 		t.Fatalf("expected no candidates: candidates=%+v err=%v", candidates, err)
 	}
+	if _, err := os.Stat(filepath.Join(temp, "stale.json")); !os.IsNotExist(err) {
+		t.Fatalf("dead descriptor should be pruned, stat err=%v", err)
+	}
 	_ = time.Second // keep the test's deadline vocabulary explicit for future fake peers
 }
