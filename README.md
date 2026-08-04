@@ -100,6 +100,18 @@ archive manually from the Releases page. Windows service auto-start isn't wired 
 (`install.ps1` installs the binaries and PATH but not a Scheduled Task) -- run
 `snapflowd.exe serve` manually for now.
 
+For a local Linux build, assemble the production-shaped archive first, then use the
+same installer without any asset environment variable:
+
+```sh
+scripts/package-local-linux.sh --output /tmp/snapflow-dist
+curl -fsSL file://$PWD/scripts/install.sh \
+  | bash -s -- --asset /tmp/snapflow-dist/snapflow-linux-x86_64-local-<version>.tar.gz
+```
+
+The local bundle contains the GUI, `snapflowd`, and the colocated `acpx-server`; the
+installer provisions the daemon service and ACP Node runtime using its normal defaults.
+
 To build from source instead, see "How to build" below.
 
 ## Dependencies
