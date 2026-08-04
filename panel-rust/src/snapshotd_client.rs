@@ -687,6 +687,30 @@ fn process_start_identity() -> String {
             return start.to_owned();
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let handle = unsafe { GetCurrentProcess() };
+        let mut creation = std::mem::MaybeUninit::uninit();
+        let mut exit = std::mem::MaybeUninit::uninit();
+        let mut kernel = std::mem::MaybeUninit::uninit();
+        let mut user = std::mem::MaybeUninit::uninit();
+        let ok = unsafe {
+            GetProcessTimes(
+                handle,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
+        if ok != 0 {
+            let creation = unsafe { creation.assume_init() };
+            let value =
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+            return value.to_string();
+        }
+    }
     format!("{}", std::process::id())
 }
 

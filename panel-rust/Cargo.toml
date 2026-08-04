@@ -70,6 +70,9 @@ uuid = { version = "1", features = ["v4"] }
 # system-sqlite behavior in effect without needing a vcpkg/choco install
 # step. Linux and macOS are unaffected by this override.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Use the native process creation FILETIME for snapshotd external-instance
+# identity, preventing Windows PID reuse from impersonating a prior GUI.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"
