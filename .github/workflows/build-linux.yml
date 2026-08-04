@@ -260,25 +260,28 @@ jobs:
             echo "SOURCE_DIR=/tmp/shotcut/src"
           } > build-snapflow.conf
           mkdir -p "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/.cargo/registry" "$GITHUB_WORKSPACE/.cargo/git"
-          # Confirmed root cause (run 30919304236): on this hosted runner,
-          # read-only (`:ro`) docker bind mounts are silently dropped --
-          # the mount target never gets created inside the container at
-          # all, while the exact same paths mount fine read-write. `::error`
-          # diagnostics dumped the container's own /tmp and every rw mount
-          # (.ccache, .cargo/*, the main $PWD mount) was present and correct;
-          # every :ro mount (these four plus ccache-host-bin) was missing.
-          # Mount everything read-write -- we only ever read from these.
-          docker run \
+          # This hosted runner has been observed, across three separate
+          # release tags (v0.1.18/19/20) and every combination of :ro/rw and
+          # checkout-vs-freshly-copied host paths, to silently drop bind
+          # mounts beyond the first four `-v` flags on this specific docker
+          # image -- the mount target is simply never created inside the
+          # container, even though `docker inspect`/local repro with the
+          # identical image, flags, and paths never reproduces it. Since
+          # `-v`/`--mount` can't be made reliable here, sidestep bind
+          # mounting for the remaining sources entirely: create the
+          # container without starting it, `docker cp` the extra sources
+          # directly into its filesystem (unrelated machinery to bind
+          # mounts, in every container state), then start it.
+          # docker cp below needs its destination's parent to already exist
+          # in the (not-yet-started) container -- pre-create it on the host
+          # side of the already-working $PWD:/tmp/shotcut mount.
+          mkdir -p "$PWD/src"
+          CID=$(docker create \
             --workdir /tmp/shotcut \
             -v "$PWD:/tmp/shotcut" \
             -v "$GITHUB_WORKSPACE/.ccache:/tmp/ccache" \
             -v "$GITHUB_WORKSPACE/.cargo/registry:/tmp/cargo/registry" \
             -v "$GITHUB_WORKSPACE/.cargo/git:/tmp/cargo/git" \
-            -v "$(command -v ccache):/tmp/ccache-host-bin" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/tmp/sap-rust-src" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/tmp/panel-rust-src" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/tmp/acpx-src" \
-            -v "$GITHUB_WORKSPACE/multi-media-main/lib:/tmp/lib-src" \
             -e "DEPS_CACHE_HIT=$DEPS_CACHE_HIT" \
             "$IMAGE_NAME" \
             -c '
@@ -299,39 +302,6 @@ jobs:
               export RUSTUP_HOME=/tmp/rustup
               ccache --set-config=compiler_check=content
               ccache --zero-stats || true
-              # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
-              # ../panel-rust (sibling crates, see corrosion_import_crate)
-              # via Corrosion, which needs a real Rust toolchain -- not
-              # present in this image by default. panel-rust itself
-              # depends on ../acpx/acpx-client, so that whole workspace
-              # needs to land at the same relative sibling position too.
-              # Unconditional (cheap local copies) regardless of dep-cache
-              # state, since snapflow itself always needs these siblings.
-              # lib/ is included too since panel-rust/Cargo.toml declares
-              # `skills-manager = { path = "../lib/skills-manager" }`.
-              #
-              # Kept defensive (was how the :ro-mount-drop bug above got
-              # diagnosed): wait briefly for each mount to actually appear
-              # before copying, and dump /tmp if it genuinely never does,
-              # instead of failing on the very first stat.
-              mkdir -p /tmp/shotcut/src
-              for pair in sap-rust-src:sap-rust panel-rust-src:panel-rust acpx-src:acpx lib-src:lib; do
-                src="/tmp/${pair%%:*}"
-                dst="/tmp/shotcut/src/${pair##*:}"
-                if [ ! -d "$dst" ]; then
-                  tries=0
-                  while [ ! -d "$src" ] && [ "$tries" -lt 10 ]; do
-                    tries=$((tries + 1))
-                    sleep 1
-                  done
-                  if [ ! -d "$src" ]; then
-                    echo "::error::$src never appeared after ${tries}s; /tmp contents:"
-                    ls -la /tmp
-                    exit 1
-                  fi
-                  cp -r "$src" "$dst"
-                fi
-              done
               export PATH="/tmp/cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -347,14 +317,39 @@ jobs:
               # the 45-90 min part and rarely change -- skip rebuilding them
               # entirely on a cache hit (see the actions/cache step above).
               # snapflow itself is our own source (this checkout + the
-              # sap-rust/panel-rust siblings just copied in) and always
-              # changes, so it always builds fresh, every run, cached or not.
+              # sap-rust/panel-rust siblings, docker cp'd in below) and
+              # always changes, so it always builds fresh, every run,
+              # cached or not.
               if [ "$DEPS_CACHE_HIT" != "true" ]; then
                 SNAPFLOW_DEPS_ONLY=1 /root/shotcut/build-shotcut.sh
               fi
               SNAPFLOW_ONLY=1 /root/shotcut/build-shotcut.sh
               ccache --show-stats || true
-            '
+            ')
+          # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
+          # ../panel-rust (sibling crates, see corrosion_import_crate) via
+          # Corrosion. panel-rust itself depends on ../acpx/acpx-client, so
+          # that whole workspace comes along too, and lib/ since panel-rust
+          # /Cargo.toml declares `skills-manager = { path =
+          # "../lib/skills-manager" }`. docker cp writes directly into the
+          # (not-yet-started) container's filesystem -- unrelated machinery
+          # to bind mounts, so it isn't affected by whatever silently drops
+          # `-v` mounts past the first four on this runner (confirmed across
+          # three separate release tags: v0.1.18 checkout paths, v0.1.19
+          # freshly-copied paths, v0.1.20/21 with and without :ro -- always
+          # the same four mounts fail, `docker cp` sidesteps the mechanism
+          # entirely rather than chasing the exact cause further).
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/sap-rust" "$CID:/tmp/shotcut/src/sap-rust"
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/panel-rust" "$CID:/tmp/shotcut/src/panel-rust"
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/acpx" "$CID:/tmp/shotcut/src/acpx"
+          docker cp "$GITHUB_WORKSPACE/multi-media-main/lib" "$CID:/tmp/shotcut/src/lib"
+          docker cp "$(command -v ccache)" "$CID:/tmp/ccache-host-bin"
+          docker start --attach "$CID" || true
+          STATUS=$(docker wait "$CID")
+          docker rm -f "$CID" >/dev/null 2>&1 || true
+          if [ "$STATUS" != "0" ]; then
+            exit 1
+          fi
           mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
 
       - uses: actions/upload-artifact@v4
