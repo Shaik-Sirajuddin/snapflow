@@ -2,7 +2,6 @@ package procmgr
 
 import (
 	"context"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"snapshotd/internal/registry"
+	"snapshotd/internal/transport"
 )
 
 // buildFixture compiles the throwaway testdata/fixture program (a stand-in
@@ -393,7 +393,7 @@ func TestLaunch_ConcurrentDoubleLaunchYieldsOneProcess(t *testing.T) {
 // above doesn't need to import internal/health directly just for one poll
 // loop.
 func socketStillResponds(path string) bool {
-	c, err := net.DialTimeout("unix", path, 50*time.Millisecond)
+	c, err := transport.DialTimeout(path, 50*time.Millisecond)
 	if err != nil {
 		return false
 	}

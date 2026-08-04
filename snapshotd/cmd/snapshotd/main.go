@@ -30,6 +30,10 @@ import (
 	"snapshotd/internal/sdp"
 )
 
+// progName is the invoked binary name used in CLI diagnostics and usage
+// strings (for example, snapflowd in packaged builds).
+var progName = filepath.Base(os.Args[0])
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -127,7 +131,9 @@ func cmdServe(cfg config.Config, args []string) error {
 	// last resort) -- `snapshotd stop` itself no longer reads this; it goes
 	// through the SDP control socket (daemon.stop) instead, which works
 	// the same on every platform.
-	pidPath := cfg.ControlSocketPath + ".pid"
+	// The control endpoint is a filesystem path on Unix but a named-pipe
+	// namespace on Windows; never derive a pidfile by appending to it.
+	pidPath := filepath.Join(cfg.HomeDir, "daemon.pid")
 	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
 		logger.Warn("could not write pidfile", "path", pidPath, "err", err)
 	}
@@ -160,7 +166,7 @@ func cmdServe(cfg config.Config, args []string) error {
 	// "connection refused". Binding here, on the main goroutine, before the
 	// log line and before any client could plausibly be told to dial,
 	// closes that race.
-	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
+	sdpServer := &sdp.Server{Endpoint: cfg.ControlSocketPath, Handler: d, Log: logger}
 	if err := sdpServer.Listen(); err != nil {
 		return fmt.Errorf("binding SDP control socket: %w", err)
 	}
@@ -251,7 +257,7 @@ func cmdServe(cfg config.Config, args []string) error {
 }
 
 func cmdStatus(cfg config.Config, args []string) error {
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -293,7 +299,7 @@ func cmdStop(cfg config.Config, args []string) error {
 	// control socket also means "no daemon reachable" is reported the same
 	// way status/launch/etc already report it, rather than as a separate
 	// PID-file-missing error path.
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return fmt.Errorf("no running daemon found at %s: %w", cfg.ControlSocketPath, err)
 	}
@@ -315,7 +321,7 @@ func cmdLaunch(cfg config.Config, args []string) error {
 	}
 	projectPath := fs.Arg(0)
 
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -339,7 +345,7 @@ func cmdLaunch(cfg config.Config, args []string) error {
 }
 
 func cmdList(cfg config.Config, args []string) error {
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -365,7 +371,7 @@ func cmdList(cfg config.Config, args []string) error {
 // registry.Project's RootDir) to show which real project a live instance
 // is actually for.
 func cmdListProjects(cfg config.Config, args []string) error {
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -390,7 +396,7 @@ func cmdClose(cfg config.Config, args []string) error {
 	}
 	instanceID := fs.Arg(0)
 
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -423,7 +429,7 @@ func cmdMCP(cfg config.Config, args []string) error {
 }
 
 func cmdMCPStatus(cfg config.Config, args []string) error {
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -443,7 +449,7 @@ func cmdMCPRestart(cfg config.Config, args []string) error {
 	bind := fs.String("bind", "", "address to rebind the MCP listener to (default: keep current address); a non-loopback address (e.g. 0.0.0.0:7777) requires `mcp auth set` to have been run first")
 	_ = fs.Parse(args)
 
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -480,7 +486,7 @@ func cmdMCPAuth(cfg config.Config, args []string) error {
 		return fmt.Errorf("usage: snapshotd mcp auth set --user U [--password P | $SNAPSHOTD_MCP_PASSWORD] (both required)")
 	}
 
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -501,7 +507,7 @@ func cmdMCPInstallConfig(cfg config.Config, args []string) error {
 		return fmt.Errorf("usage: snapshotd mcp install-config get")
 	}
 
-	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	c, err := sdp.DialConfig(cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}

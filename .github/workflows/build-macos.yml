@@ -57,6 +57,12 @@ jobs:
           sed -i '' "0,/^version = \"[^\"]*\"/s//version = \"$TAG_VERSION\"/" Cargo.toml
           grep -m1 '^version = ' Cargo.toml
       - run: cargo build --release
+      - name: Verify native daemon transport and SAP protocol tests
+        run: |
+          cargo test --lib snapshotd_client --no-default-features
+          cargo test --manifest-path ../sap-rust/Cargo.toml --quiet
+      - name: Build SAP macOS static library (compile-time transport variant)
+        run: cargo build --manifest-path ../sap-rust/Cargo.toml --release
       # See build-linux.yml's identical step: RUST_TEST_THREADS=4 didn't
       # reliably fix agent_bridge's flakiness on a real GitHub runner
       # despite being verified locally -- back to advisory.
@@ -69,6 +75,10 @@ jobs:
         with:
           name: panel-rust-staticlib-macos
           path: panel-rust/target/release/libpanel_rust.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap-rust-staticlib-macos
+          path: sap-rust/target/release/libsap_rust.a
 
   snapshotd:
     runs-on: macos-latest
@@ -85,6 +95,8 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd ./cmd/snapshotd
+      - name: Verify native AF_UNIX transport and endpoint consumers
+        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       # macOS's default TMPDIR (/var/folders/<xx>/<hash>/T/) is long enough
       # that once the tests' own random subdirectories are appended, real
       # AF_UNIX sockets bound under a temp RunDir (daemon/procmgr/sapproxy

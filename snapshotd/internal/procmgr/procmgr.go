@@ -36,6 +36,7 @@ import (
 
 	"snapshotd/internal/health"
 	"snapshotd/internal/registry"
+	"snapshotd/internal/transport"
 )
 
 // liveInstanceHealthTimeout bounds the socket-health probe Launch performs
@@ -306,9 +307,11 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// using all 16 hex characters can exceed the conservative AF_UNIX limit
 	// before the child has even started.
 	socketID := shortID[:12]
-	sockPath := filepath.Join(m.RunDir, socketID+".sock")
+	sockPath := transport.DefaultSAPEndpoint(m.RunDir, socketID)
 	const maxSockPathLen = 100 // conservative margin under the ~108-byte sun_path limit
-	if len(sockPath) > maxSockPathLen {
+	// Named pipes are not subject to Unix sun_path limits; their endpoint
+	// names are validated by the Windows transport implementation instead.
+	if !strings.HasPrefix(sockPath, `\\.\pipe\`) && len(sockPath) > maxSockPathLen {
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
 	}
 

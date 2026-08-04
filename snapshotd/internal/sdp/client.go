@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"snapshotd/internal/config"
+	"snapshotd/internal/transport"
 )
 
 // Client is a minimal synchronous SDP client used by the CLI subcommands
@@ -21,13 +24,28 @@ type Client struct {
 // 09-project-folder-layout.md's CLI design note: "if no daemon is running,
 // these commands simply fail to connect, by design."
 func Dial(socketPath string, timeout time.Duration) (*Client, error) {
-	conn, err := net.DialTimeout("unix", socketPath, timeout)
+	conn, err := transport.DialTimeout(socketPath, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("sdp: could not connect to daemon control socket %s: %w", socketPath, err)
+		return nil, fmt.Errorf("sdp: could not connect to daemon control endpoint %s: %w", socketPath, err)
 	}
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	return &Client{conn: conn, reader: scanner}, nil
+}
+
+// DialConfig connects to the daemon endpoint selected by cfg. Callers should
+// prefer this helper (or DialDefault) instead of constructing a Unix socket or
+// Windows named-pipe path themselves; transport selection remains an internal
+// implementation detail.
+func DialConfig(cfg config.Config, timeout time.Duration) (*Client, error) {
+	return Dial(cfg.ControlSocketPath, timeout)
+}
+
+// DialDefault resolves the platform-appropriate runtime configuration and
+// connects to its control endpoint. It is intended for integrations that do
+// not otherwise need to load daemon configuration.
+func DialDefault(timeout time.Duration) (*Client, error) {
+	return DialConfig(config.Default(), timeout)
 }
 
 func (c *Client) Close() error { return c.conn.Close() }

@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"snapshotd/internal/health"
+	"snapshotd/internal/transport"
 )
 
 const protocolVersion = 1
@@ -108,7 +108,7 @@ func randomChallenge() (string, error) {
 }
 
 func ping(descriptor Descriptor, challenge string) (pingResponseResult, error) {
-	conn, err := net.DialTimeout("unix", descriptor.Endpoint, time.Second)
+	conn, err := transport.DialTimeout(descriptor.Endpoint, time.Second)
 	if err != nil {
 		return pingResponseResult{}, err
 	}

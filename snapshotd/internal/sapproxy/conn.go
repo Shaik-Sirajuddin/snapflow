@@ -8,6 +8,8 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+
+	"snapshotd/internal/transport"
 )
 
 // Sink receives notifications fanned out from a project's SAP connection --
@@ -45,8 +47,7 @@ type Conn struct {
 }
 
 func dial(ctx context.Context, socketPath string) (*Conn, error) {
-	d := net.Dialer{}
-	nc, err := d.DialContext(ctx, "unix", socketPath)
+	nc, err := transport.DialContext(ctx, socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("sapproxy: dial %s: %w", socketPath, err)
 	}

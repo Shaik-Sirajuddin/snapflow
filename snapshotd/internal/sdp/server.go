@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"snapshotd/internal/sapproxy"
+	"snapshotd/internal/transport"
 )
 
 // Handler is implemented by the daemon core (internal/daemon.Daemon).
@@ -42,12 +42,18 @@ type Handler interface {
 	UnbindSession(sessionID string)
 }
 
-// Server is the SDP control-socket JSON-RPC 2.0 server: one Unix socket
+// Server is the SDP control-endpoint JSON-RPC 2.0 server: one native local
+// listener (AF_UNIX on Unix-like systems, named pipe on Windows)
 // listener, newline-delimited JSON framing (see protocol.go's doc comment),
 // one goroutine per connection, sequential request handling per connection
 // (no pipelining assumed -- simple and sufficient for the CLI/MCP-adapter
 // clients this serves).
 type Server struct {
+	// Endpoint is the transport-neutral local endpoint selected by config.
+	// Callers should set this field and leave transport selection to the
+	// adapter; SocketPath remains as a compatibility alias for older callers.
+	Endpoint string
+	// SocketPath is deprecated; use Endpoint.
 	SocketPath string
 	Handler    Handler
 	Log        *slog.Logger
@@ -75,11 +81,13 @@ func (s *Server) Listen() error {
 	if s.Log == nil {
 		s.Log = slog.Default()
 	}
-	// Remove a stale socket file from a previous, uncleanly-terminated run --
-	// otherwise net.Listen("unix", ...) fails with "address already in use".
-	_ = os.Remove(s.SocketPath)
+	// Unix endpoints may leave a stale filesystem entry after a crash. Named
+	// pipes have no filesystem entry, so the platform adapter makes cleanup a
+	// no-op there.
+	endpoint := s.endpoint()
+	_ = transport.RemoveStale(endpoint)
 
-	ln, err := net.Listen("unix", s.SocketPath)
+	ln, err := transport.Listen(endpoint)
 	if err != nil {
 		return err
 	}
@@ -87,6 +95,13 @@ func (s *Server) Listen() error {
 	s.listener = ln
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Server) endpoint() string {
+	if s.Endpoint != "" {
+		return s.Endpoint
+	}
+	return s.SocketPath
 }
 
 // Serve accepts and handles connections until Shutdown is called or an
@@ -140,7 +155,7 @@ func (s *Server) Shutdown() error {
 		err = ln.Close()
 	}
 	s.wg.Wait()
-	_ = os.Remove(s.SocketPath)
+	_ = transport.RemoveStale(s.SocketPath)
 	return err
 }
 

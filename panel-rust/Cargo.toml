@@ -49,7 +49,7 @@ acpx-proto = { path = "../acpx/acpx-proto" }
 # at lib/skills-manager/, wired in the same path-dependency style as
 # acpx-client above. See memory/acpx/gen/plans/acpx-skills/README.md.
 skills-manager = { path = "../lib/skills-manager" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std", "net"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

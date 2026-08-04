@@ -1721,20 +1721,16 @@ pub fn is_builtin_snapflow_mcp_name(name: &str) -> bool {
     name == "snapflow" || name == "snapshotd"
 }
 
-const SNAPSHOTD_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
 fn snapshotd_control_socket_path() -> PathBuf {
-    admin_token_dir().join("control.sock")
+    crate::snapshotd_client::SnapshotdControlClient::from_default_runtime()
+        .map(|client| client.socket_path().to_owned())
+        .unwrap_or_else(|| admin_token_dir().join("control.sock"))
 }
 
 /// Query the daemon's ground-truth MCP listener address over its control
 /// socket. This function is only called by the process-lifetime watcher, not
 /// from session creation or the UI thread.
-#[cfg(unix)]
 fn query_snapshotd_mcp_addr_at(path: &Path) -> Option<String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
     // std::os::unix::net::UnixStream has no connect timeout. Use a tiny
     // current-thread runtime on the already-background watcher thread so a
     // dead/stuck control socket cannot stop all future five-second probes.
@@ -1744,40 +1740,11 @@ fn query_snapshotd_mcp_addr_at(path: &Path) -> Option<String> {
         .build()
         .ok()?;
     runtime.block_on(async {
-        let stream = tokio::time::timeout(SNAPSHOTD_CONTROL_TIMEOUT, UnixStream::connect(path))
+        let client = crate::snapshotd_client::SnapshotdControlClient::new(path.to_owned());
+        let result = client
+            .call("daemon.mcpStatus", serde_json::json!({}))
             .await
-            .ok()?
             .ok()?;
-        let (read_half, mut write_half) = stream.into_split();
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "daemon.mcpStatus",
-            "params": {}
-        });
-        let mut line = serde_json::to_vec(&request).ok()?;
-        line.push(b'\n');
-        tokio::time::timeout(SNAPSHOTD_CONTROL_TIMEOUT, write_half.write_all(&line))
-            .await
-            .ok()?
-            .ok()?;
-        let mut response_line = String::new();
-        let mut reader = BufReader::new(read_half);
-        let count = tokio::time::timeout(
-            SNAPSHOTD_CONTROL_TIMEOUT,
-            reader.read_line(&mut response_line),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        if count == 0 {
-            return None;
-        }
-        let response: serde_json::Value = serde_json::from_str(&response_line).ok()?;
-        if response.get("error").is_some() {
-            return None;
-        }
-        let result = response.get("result")?;
         if result.get("listening").and_then(|value| value.as_bool()) != Some(true) {
             return None;
         }
@@ -1789,18 +1756,8 @@ fn query_snapshotd_mcp_addr_at(path: &Path) -> Option<String> {
     })
 }
 
-#[cfg(unix)]
 fn query_snapshotd_mcp_addr() -> Option<String> {
     query_snapshotd_mcp_addr_at(&snapshotd_control_socket_path())
-}
-
-#[cfg(not(unix))]
-// snapshotd currently exposes only a Unix-domain control socket on the Go
-// side. Windows therefore fails closed until the daemon and panel gain a
-// named-pipe transport; it must not silently fall back to the guessed MCP
-// TCP address.
-fn query_snapshotd_mcp_addr() -> Option<String> {
-    None
 }
 
 fn ensure_snapshotd_watcher_started() {
@@ -4442,8 +4399,15 @@ impl AgentBridge {
     /// pulse stayed stuck forever for exactly the thread state this
     /// no-op case exists to support (a thread with no project bound and
     /// no session cwd override).
-    pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) -> bool {
-        let Some(slot) = self.slots.get(idx) else { return false };
+    pub fn probe_provider_selection(
+        &self,
+        idx: usize,
+        provider: String,
+        profile_name: Option<String>,
+    ) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
         // A thread with no resolvable project directory (no project bound
         // and no session cwd override) is a normal, fully-supported state
         // -- not a provider problem. `PoolKey`/session acquisition require a
@@ -4454,16 +4418,40 @@ impl AgentBridge {
         // provider state. Push nothing at all (not even an `Ok`) so a
         // stale error from a previous project stays until a probe that can
         // actually run replaces it.
-        let Some(project_dir) = thread_project_dir(slot.project_path_snapshot().as_deref(), &self.session_cwd_override) else {
+        let Some(project_dir) = thread_project_dir(
+            slot.project_path_snapshot().as_deref(),
+            &self.session_cwd_override,
+        ) else {
             return false;
         };
         let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("no gateway is configured for {provider}")) } });
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ProviderProbe {
+                        provider: provider.clone(),
+                        result: Err(format!("no gateway is configured for {provider}")),
+                    },
+                });
             return true;
         };
         let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
-        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers) else {
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("could not initialize the gateway pool for {provider}")) } });
+        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers)
+        else {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::ProviderProbe {
+                        provider: provider.clone(),
+                        result: Err(format!(
+                            "could not initialize the gateway pool for {provider}"
+                        )),
+                    },
+                });
             return true;
         };
         let events = self.events.clone();
