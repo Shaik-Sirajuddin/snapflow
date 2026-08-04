@@ -223,7 +223,6 @@ pub(crate) fn visible_thread_row(
             open: true,
             closed: thread.closed,
             archived: thread.archived,
-            unread: thread.unread,
             profile_name: thread.profile_name.clone().unwrap_or_default().into(),
             has_session: thread.session_id.is_some(),
             description: cached
@@ -231,35 +230,10 @@ pub(crate) fn visible_thread_row(
                 .map(|c| c.description.clone())
                 .unwrap_or_default(),
             background: cached.as_ref().map(|c| c.background).unwrap_or(false),
-            // Bug (default-thread-provider-not-shown): unlike model/
-            // project_path/project_name/project_instance_live (which only
-            // ever live on the AgentBridge-collected frame snapshot, with
-            // no equivalent field on `ThreadModel` to fall back to),
-            // `provider` IS also tracked directly on `ThreadModel` (set at
-            // thread-creation time from the seeded/configured default, see
-            // `cold_start_thread_specs`/`ThreadMsg::New`) and is reliably
-            // correct from the very first call, before any frame snapshot
-            // has ever run. `cached` is `None` on a thread's very first
-            // row build (cold-start seed, or a freshly `ThreadMsg::New`-
-            // created thread) -- with no fallback, this produced an empty
-            // `ThreadItem.provider` that stayed empty until some *unrelated*
-            // event (e.g. session attach on first send) happened to also
-            // trigger a `Dirty::ThreadRow` full resync, since
-            // `dirty.rs::diff_by_id` only emits ops for identity
-            // (insert/remove/move) changes, never for content changes on a
-            // row whose key/position didn't move -- so a corrected
-            // provider from a later frame snapshot folded into
-            // `model.thread_rows` never actually reached the Slint-facing
-            // `thread_model` for that already-inserted row. Falling back to
-            // `thread.provider` (not `String::default()`) on the first,
-            // cache-less build fixes exactly that gap: the sidebar/compose
-            // provider badge reflects the real provider immediately, and a
-            // later frame snapshot's own value (once collected) still wins
-            // once cached, same as before.
             provider: cached
                 .as_ref()
                 .map(|c| c.provider.clone())
-                .unwrap_or_else(|| thread.provider.clone().into()),
+                .unwrap_or_default(),
             model: cached.as_ref().map(|c| c.model.clone()).unwrap_or_default(),
             project_path: cached
                 .as_ref()
@@ -344,21 +318,6 @@ fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>)
         // observable message model already contains B's rows, so switching
         // does not install/copy a list into a shared model.
         model.displayed_thread = real_idx;
-
-        // thread-unread-state: becoming the displayed thread IS being read.
-        // This app has no separate render-completion signal -- the retained
-        // ChatView's message model already holds this thread's rows, so the
-        // switch above is the moment its content is on screen. Clearing here
-        // (rather than in ThreadMsg::Selected) covers every selection path:
-        // sidebar click, keyboard NavigateDelta, and programmatic selection.
-        if let Some(idx) = real_idx {
-            if model.threads.get(idx).is_some_and(|thread| thread.unread) {
-                if let Some(thread) = model.threads.get_mut(idx) {
-                    thread.unread = false;
-                }
-                dirty.push(thread_row_dirty(model, idx));
-            }
-        }
 
         let target_id = real_idx
             .and_then(|idx| model.threads.get(idx))
@@ -1433,41 +1392,13 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
                 thread.provider = resolved_agent;
             }
             let thread_id = thread.thread_id.clone();
-            let provider = thread.provider.clone();
-            let profile_name = thread.profile_name.clone();
-            if provider.is_empty() {
-                return (
-                    vec![],
-                    vec![
-                        Dirty::ThreadRow {
-                            thread_id: thread_id.clone(),
-                        },
-                        Dirty::Capabilities { thread_id },
-                    ],
-                );
-            }
-            // mcp-servers-settings follow-up: mark the probe in flight
-            // *here*, in the same reducer call that dispatches
-            // `Effect::ProbeProvider`, not from inside the effect executor
-            // -- same "model mutation happens in `update`, never in the
-            // async effect body" convention every other in-flight tracker
-            // in this file already follows (`mcp_operations_in_flight`,
-            // `recover_session_operations_in_flight`, etc).
-            model.provider_probes_in_flight.insert(provider.clone());
             (
-                vec![Effect::ProbeProvider {
-                    real_index: idx,
-                    provider,
-                    profile_name,
-                }],
+                vec![],
                 vec![
                     Dirty::ThreadRow {
                         thread_id: thread_id.clone(),
                     },
-                    Dirty::Capabilities {
-                        thread_id: thread_id.clone(),
-                    },
-                    Dirty::ProviderSwitch { thread_id },
+                    Dirty::Capabilities { thread_id },
                 ],
             )
         }
@@ -1839,13 +1770,6 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 ],
             )
         }
-        ChromeMsg::CompleteOnboarding => {
-            model.onboarding_completed = true;
-            if let Err(err) = crate::settings_file::SettingsPaths::from_env().set_onboarding_completed(true) {
-                eprintln!("panel-rust: failed to save onboarding_completed: {err}");
-            }
-            (vec![], vec![Dirty::Settings])
-        }
     }
 }
 
@@ -2092,56 +2016,15 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                         vec![thread_row_dirty(model, real_index)],
                     )
                 }
-                Err(err) => {
-                    // top-bar-stuck-loading fix (2026-08-02): this used to
-                    // push only Dirty::Error (the banner) and leave
-                    // `thread.state` untouched -- so a thread whose attach
-                    // failed here (gateway provisioning/EACCES/etc., both
-                    // the async `spawn_background_attachment` path and the
-                    // synchronous `dispatch_compose_send_maybe_attach`
-                    // path route their failure through this exact arm)
-                    // never actually reached `ThreadState::Error`. `087dd6
-                    // 41` guarded `collect_thread_list_snapshot`'s per-row
-                    // loop against re-clobbering an already-"error" status
-                    // back to "loading" -- but that guard only helps once
-                    // `status` genuinely reads "error", and
-                    // `models::build_thread_items` derives `status` from
-                    // `thread.state`, which this arm never set. Without a
-                    // binding (a failed attach never gets one) and not
-                    // deferred, `shows_starting_thread_loading` kept
-                    // re-forcing "loading" on this row every frame forever
-                    // -- the sidebar row AND the chat-area top-bar dot
-                    // (bound to the same `connection_status` / thread-row
-                    // plumbing) both looked permanently stuck loading
-                    // instead of ever surfacing the real failure. Setting
-                    // `thread.state`/`thread.error` here, the same as every
-                    // other terminal-failure arm in this file (see
-                    // `AgentEvent::Error` and `PromptSent`'s `Err` arm just
-                    // below), and pushing `ThreadRow`/`Connection` dirty
-                    // alongside the banner (mirroring `PromptSent`'s `Err`
-                    // arm) gets both surfaces to reflect it on the very
-                    // next frame instead of relying on some later,
-                    // unrelated dirty event to eventually pick it up.
-                    thread.state = ThreadState::Error;
-                    thread.error = Some(err.message.clone());
-                    (
-                        vec![],
-                        vec![
-                            Dirty::Error {
-                                thread_id: thread.thread_id.clone(),
-                                detail: ErrorDetail {
-                                    message: err.message,
-                                },
-                            },
-                            Dirty::ThreadRow {
-                                thread_id: thread.thread_id.clone(),
-                            },
-                            Dirty::Connection {
-                                thread_id: thread.thread_id.clone(),
-                            },
-                        ],
-                    )
-                }
+                Err(err) => (
+                    vec![],
+                    vec![Dirty::Error {
+                        thread_id: thread.thread_id.clone(),
+                        detail: ErrorDetail {
+                            message: err.message,
+                        },
+                    }],
+                ),
             }
         }
         // Skills list is refreshed by effect_executor before this
@@ -2491,11 +2374,6 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
 fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect>, Vec<Dirty>) {
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
-    // Captured before the fold: no arm below changes which thread is
-    // displayed, and the mutable borrow of `model.threads` inside the loop
-    // rules out reading it there.
-    let displayed_thread = model.displayed_thread;
-    let mut unread_marked: Vec<usize> = Vec::new();
     for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
         let Some(target_index) = frame
             .bridge_event_thread_ids
@@ -2510,27 +2388,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // hydration makes the identity available.
             continue;
         };
-        if let crate::protocol_types::AgentEvent::ProviderProbe { provider, result } = &bridge_event.event {
-            match result {
-                Ok(()) => { model.provider_errors.remove(provider); }
-                Err(error) => {
-                    model.provider_errors.insert(provider.clone(), error.clone());
-                    dirty.push(show_toast(model, "error", format!("Provider {provider} unavailable: {error}")));
-                }
-            }
-            // mcp-servers-settings follow-up: the probe's acquire+release
-            // round-trip (`ProbeProvider` dispatch above) has now
-            // completed either way -- clear the in-flight marker so the
-            // chat-view loading pulse clears, regardless of Ok/Err (an
-            // error still ends the *loading* state even though it also
-            // populates provider_errors/toast separately above).
-            if model.provider_probes_in_flight.remove(provider) {
-                dirty.push(Dirty::ProviderSwitch {
-                    thread_id: model.threads[target_index].thread_id.clone(),
-                });
-            }
-            continue;
-        }
         let target_thread_id = model.threads[target_index].thread_id.clone();
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
@@ -2561,18 +2418,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 ) && !is_status_only
                 {
                     thread.agent_content_this_turn = true;
-                    // thread-unread-state: same "real visible agent output"
-                    // gate as above (thinking chunks and reconnect/status
-                    // spam are not content the user missed). A thread the
-                    // user is looking at is being read as it streams, so it
-                    // must never flip -- hence the displayed_thread guard.
-                    // This arm only ever sees live bridge deltas; restored
-                    // history is hydrated through thread snapshots, so
-                    // replay cannot manufacture an unread thread.
-                    if displayed_thread != Some(target_index) && !thread.unread {
-                        thread.unread = true;
-                        unread_marked.push(target_index);
-                    }
                 }
                 thread.last_activity_time = Some(std::time::Instant::now());
                 // Hard transport failures often arrive as ordinary agent
@@ -2698,7 +2543,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 // per-event beyond letting the frame refresh.
             }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
-            | crate::protocol_types::AgentEvent::ProviderProbe { .. }
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
@@ -2719,13 +2563,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 });
             }
         }
-    }
-    // Repainting the sidebar dot needs a ThreadRow, which the Message arm
-    // does not emit (it only pushes MessageAppended, for the transcript).
-    // Deferred out of the loop because `thread_row_dirty` borrows the model
-    // immutably while the fold holds it mutably.
-    for real_index in unread_marked {
-        dirty.push(thread_row_dirty(model, real_index));
     }
     if frame.bridge_events_pending {
         dirty.push(Dirty::MessagesDiff {
@@ -2896,14 +2733,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let changed = model.available_profiles != snapshot.profiles
             || model.available_mcp_servers != snapshot.mcp_servers
             || model.agent_catalog != snapshot.agents
-            || model.agent_catalog_fetched != snapshot.agents_fetched
             || model.recoverable_sessions != snapshot.recoverable_sessions
             || model.recovery_provider != snapshot.recovery_provider;
         if changed {
             model.available_profiles = snapshot.profiles;
             model.available_mcp_servers = snapshot.mcp_servers;
             model.agent_catalog = snapshot.agents;
-            model.agent_catalog_fetched = snapshot.agents_fetched;
             model.recoverable_sessions = snapshot.recoverable_sessions;
             model.recovery_provider = snapshot.recovery_provider;
             dirty.push(Dirty::Settings);
@@ -2915,10 +2750,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
     }
     if model.mcp_operations_in_flight != frame.mcp_operations_in_flight {
         model.mcp_operations_in_flight = frame.mcp_operations_in_flight;
-        dirty.push(Dirty::Settings);
-    }
-    if model.recover_session_operations_in_flight != frame.recover_session_operations_in_flight {
-        model.recover_session_operations_in_flight = frame.recover_session_operations_in_flight;
         dirty.push(Dirty::Settings);
     }
     if let Some(snapshot) = frame.settings_preferences_snapshot {
@@ -3030,59 +2861,21 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
+            let old_rows = model
+                .thread_view_models
+                .rows(&thread_id)
+                .unwrap_or_default();
             // Include send-queue rows (QueuedMessageBar) in the projection.
             let in_flight = matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling);
-            let queue_state = (thread.send_queue.clone(), in_flight);
-            // The frame poll runs at 60-90fps and collects `snapshot.
-            // transcript` every tick regardless of whether it changed (see
-            // `ExternalSnapshotSource::collect_thread_snapshot_for`'s doc
-            // comment). Rebuilding rows from scratch on every such tick re-
-            // clones the whole transcript and re-parses every tool row's
-            // `raw_input` JSON (`to_message_rows_from_transcript`'s
-            // `serde_json::from_str` call) even when nothing about this
-            // thread changed since the last tick. When the transcript AND
-            // the queue/in-flight state that also feed the projection are
-            // both unchanged since the rows currently installed in
-            // `thread_view_models` were built, reuse those rows (cheap
-            // `Rc`-backed clones) instead of re-projecting from scratch.
-            let rows_unchanged = !switched_thread
-                && thread.transcript == snapshot.transcript
-                && thread.rows_synced_with.as_ref() == Some(&queue_state);
-            let (rows, new_keys) = if rows_unchanged {
-                match model.thread_view_models.rows(&thread_id) {
-                    Some(cached_rows) if cached_rows.len() == old_keys.len() => {
-                        (cached_rows, old_keys.clone())
-                    }
-                    // Retained model and this thread's own key cache have
-                    // desynced (should not happen; defensive only, mirrors
-                    // `list_model::reconcile`'s own self-heal). Fall back to
-                    // a full rebuild rather than serving a mismatched row
-                    // list.
-                    _ => crate::models::message_rows_for_thread_with_state(
-                        snapshot.transcript.clone(),
-                        &expanded,
-                        &thread.send_queue,
-                        in_flight,
-                        &mut *thread.markdown_render_index.borrow_mut(),
-                    ),
-                }
-            } else {
-                let old_rows = model
-                    .thread_view_models
-                    .rows(&thread_id)
-                    .unwrap_or_default();
-                let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
-                    snapshot.transcript.clone(),
-                    &expanded,
-                    &thread.send_queue,
-                    in_flight,
-                    &mut *thread.markdown_render_index.borrow_mut(),
-                );
-                // Preserve expand-by-key across re-project (live poll + switch).
-                merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
-                (rows, new_keys)
-            };
-            thread.rows_synced_with = Some(queue_state);
+            let (mut rows, new_keys) = crate::models::message_rows_for_thread_with_state(
+                snapshot.transcript.clone(),
+                &expanded,
+                &thread.send_queue,
+                in_flight,
+                &mut *thread.markdown_render_index.borrow_mut(),
+            );
+            // Preserve expand-by-key across re-project (live poll + switch).
+            merge_expanded_by_key(&old_keys, &old_rows, &new_keys, &mut rows);
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
             // A brand new thread's own cache is empty both before and
@@ -3820,11 +3613,10 @@ mod tests {
             model.threads[0].provider, "codex-acp",
             "Provider picker must update thread.provider (agent id) for deferred attach"
         );
-        assert_eq!(effects, vec![Effect::ProbeProvider {
-            real_index: 0,
-            provider: "codex-acp".to_owned(),
-            profile_name: Some("codex-tools".to_owned()),
-        }]);
+        assert!(
+            effects.is_empty(),
+            "no backend to notify yet -- nothing to send"
+        );
         assert_eq!(
             dirty,
             vec![
@@ -3833,17 +3625,8 @@ mod tests {
                 },
                 Dirty::Capabilities {
                     thread_id: "thread-0".to_owned()
-                },
-                Dirty::ProviderSwitch {
-                    thread_id: "thread-0".to_owned()
                 }
             ]
-        );
-        assert!(
-            model
-                .provider_probes_in_flight
-                .contains("codex-acp"),
-            "dispatching the probe effect must mark it in flight for the chat-view pulse"
         );
 
         // Once a real session has attached, the same message must be a
@@ -3868,109 +3651,6 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
-    }
-
-    // mcp-servers-settings follow-up: the chat-view pulsing "Switching
-    // provider..." indicator's loading-state transition. Covers the pool
-    // probe's start (this test) and both ways it can end (the two tests
-    // below), keyed off `Model::provider_probes_in_flight` /
-    // `sync::chat_view_provider_switching`.
-    #[test]
-    fn provider_probe_completion_clears_in_flight_on_success() {
-        let mut model = model_with_threads(&["a"]);
-        model.threads[0].provider = "codex-acp".to_owned();
-        model
-            .provider_probes_in_flight
-            .insert("codex-acp".to_owned());
-        let (_effects, dirty) = update(
-            &mut model,
-            Msg::Frame(FrameInput {
-                bridge_events: vec![crate::agent_bridge::BridgeEvent {
-                    thread_index: 0,
-                    event: crate::protocol_types::AgentEvent::ProviderProbe {
-                        provider: "codex-acp".to_owned(),
-                        result: Ok(()),
-                    },
-                }],
-                bridge_event_thread_ids: vec!["thread-0".to_owned()],
-                ..FrameInput::default()
-            }),
-        );
-        assert!(
-            !model.provider_probes_in_flight.contains("codex-acp"),
-            "a successful probe must clear the in-flight marker so the pulse stops"
-        );
-        assert!(
-            !model.provider_errors.contains_key("codex-acp"),
-            "a successful probe must not leave a stale failure behind"
-        );
-        assert!(dirty.contains(&Dirty::ProviderSwitch {
-            thread_id: "thread-0".to_owned()
-        }));
-    }
-
-    #[test]
-    fn provider_probe_completion_clears_in_flight_on_failure_too() {
-        // The *loading* half of this must end on an error just as much as
-        // on success -- only the error *text* additionally goes through
-        // provider_errors/the toast (existing behavior, unchanged here).
-        let mut model = model_with_threads(&["a"]);
-        model.threads[0].provider = "codex-acp".to_owned();
-        model
-            .provider_probes_in_flight
-            .insert("codex-acp".to_owned());
-        let (_effects, dirty) = update(
-            &mut model,
-            Msg::Frame(FrameInput {
-                bridge_events: vec![crate::agent_bridge::BridgeEvent {
-                    thread_index: 0,
-                    event: crate::protocol_types::AgentEvent::ProviderProbe {
-                        provider: "codex-acp".to_owned(),
-                        result: Err("auth required".to_owned()),
-                    },
-                }],
-                bridge_event_thread_ids: vec!["thread-0".to_owned()],
-                ..FrameInput::default()
-            }),
-        );
-        assert!(
-            !model.provider_probes_in_flight.contains("codex-acp"),
-            "a failed probe must still clear the in-flight marker so the pulse stops"
-        );
-        assert_eq!(
-            model.provider_errors.get("codex-acp").map(String::as_str),
-            Some("auth required"),
-            "the failure itself must still land in provider_errors as before"
-        );
-        assert!(dirty.contains(&Dirty::ProviderSwitch {
-            thread_id: "thread-0".to_owned()
-        }));
-    }
-
-    #[test]
-    fn provider_probe_completion_with_no_prior_in_flight_marker_is_a_quiet_no_op() {
-        // A probe result arriving for a provider this model never marked
-        // in flight (e.g. a stale/duplicate event, or provider_errors
-        // populated some other way in a future refactor) must not emit a
-        // spurious ProviderSwitch dirty -- there is nothing for the chat
-        // view to un-pulse.
-        let mut model = model_with_threads(&["a"]);
-        model.threads[0].provider = "codex-acp".to_owned();
-        let (_effects, dirty) = update(
-            &mut model,
-            Msg::Frame(FrameInput {
-                bridge_events: vec![crate::agent_bridge::BridgeEvent {
-                    thread_index: 0,
-                    event: crate::protocol_types::AgentEvent::ProviderProbe {
-                        provider: "codex-acp".to_owned(),
-                        result: Ok(()),
-                    },
-                }],
-                bridge_event_thread_ids: vec!["thread-0".to_owned()],
-                ..FrameInput::default()
-            }),
-        );
-        assert!(!dirty.iter().any(|d| matches!(d, Dirty::ProviderSwitch { .. })));
     }
 
     #[test]
@@ -4122,60 +3802,6 @@ mod tests {
             vec![Dirty::ThreadRow {
                 thread_id: "durable-new".to_owned()
             }]
-        );
-    }
-
-    /// top-bar-stuck-loading fix (2026-08-02): a failed attach (the
-    /// `SessionAttached { result: Err(..) }` fold both `spawn_background_
-    /// attachment` and `dispatch_compose_send_maybe_attach` route their
-    /// failure through) must land the thread on `ThreadState::Error` --
-    /// not just emit the error banner -- and dirty `ThreadRow`/
-    /// `Connection` so both the sidebar row and the chat-area top-bar
-    /// status dot pick up the real failure on the very next frame instead
-    /// of staying on whatever pre-failure state (`Loading`, or seeded
-    /// `Idle` for a never-before-attached thread) they had. Before this
-    /// fix, `thread.state` was left untouched here, so `models::
-    /// build_thread_items` never derived "error" for this row and `087dd6
-    /// 41`'s `shows_starting_thread_loading` guard (which only stops
-    /// re-forcing "loading" once `status == "error"`) never got a chance
-    /// to engage -- the row looked stuck loading forever.
-    #[test]
-    fn session_attached_failure_sets_error_state_and_dirties_row_and_connection() {
-        let mut model = model_with_threads(&["existing"]);
-        model.threads[0].state = ThreadState::Loading;
-
-        let (effects, dirty) = update(
-            &mut model,
-            Msg::Effect(EffectResultMsg::SessionAttached {
-                real_index: 0,
-                thread_id: None,
-                provider: None,
-                result: Err(crate::effect::EffectError::new("Permission denied (os error 13)")),
-            }),
-        );
-
-        assert!(effects.is_empty());
-        assert_eq!(model.threads[0].state, ThreadState::Error);
-        assert_eq!(
-            model.threads[0].error.as_deref(),
-            Some("Permission denied (os error 13)")
-        );
-        assert_eq!(
-            dirty,
-            vec![
-                Dirty::Error {
-                    thread_id: "thread-0".to_owned(),
-                    detail: ErrorDetail {
-                        message: "Permission denied (os error 13)".to_owned(),
-                    },
-                },
-                Dirty::ThreadRow {
-                    thread_id: "thread-0".to_owned(),
-                },
-                Dirty::Connection {
-                    thread_id: "thread-0".to_owned(),
-                },
-            ]
         );
     }
 
@@ -5005,74 +4631,6 @@ mod tests {
         assert_eq!(model.threads[0].send_queue.len(), 1);
     }
 
-    /// thread-unread-state: one agent message delivered to `thread_index`,
-    /// carrying the durable id `update_frame` actually resolves against.
-    fn agent_message_frame(thread_index: usize, text: &str) -> FrameInput {
-        FrameInput {
-            bridge_events: vec![crate::agent_bridge::BridgeEvent {
-                thread_index,
-                event: crate::protocol_types::AgentEvent::Message(
-                    crate::protocol_types::ChatMessage {
-                        kind: crate::protocol_types::MessageKind::Agent,
-                        text: text.to_owned(),
-                        status: None,
-                        id: Some(format!("msg-{thread_index}")),
-                        raw_input: None,
-                        raw_output: None,
-                    },
-                ),
-            }],
-            bridge_event_thread_ids: vec![format!("thread-{thread_index}")],
-            ..FrameInput::default()
-        }
-    }
-
-    #[test]
-    fn agent_content_marks_a_non_displayed_thread_unread() {
-        let mut model = model_with_threads(&["a", "b"]);
-        model.displayed_thread = Some(0);
-        let (_effects, dirty) = update(&mut model, Msg::Frame(agent_message_frame(1, "reply")));
-        assert!(
-            model.threads[1].unread,
-            "content for a thread the user is not looking at must mark it unread"
-        );
-        assert!(!model.threads[0].unread);
-        assert!(
-            dirty.contains(&Dirty::ThreadRow {
-                thread_id: "thread-1".to_owned()
-            }),
-            "the sidebar row must be repainted so the dot turns blue, got {dirty:?}"
-        );
-    }
-
-    #[test]
-    fn agent_content_never_marks_the_displayed_thread_unread() {
-        let mut model = model_with_threads(&["a", "b"]);
-        model.displayed_thread = Some(0);
-        let _ = update(&mut model, Msg::Frame(agent_message_frame(0, "streaming")));
-        assert!(
-            !model.threads[0].unread,
-            "a thread streaming its reply in front of the user is being read, not missed"
-        );
-    }
-
-    #[test]
-    fn selecting_an_unread_thread_marks_it_read() {
-        let mut model = model_with_threads(&["a", "b"]);
-        model.displayed_thread = Some(0);
-        let _ = update(&mut model, Msg::Frame(agent_message_frame(1, "reply")));
-        assert!(model.threads[1].unread);
-
-        let (_effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
-        assert!(
-            !model.threads[1].unread,
-            "displaying a thread is reading it -- the dot must go back to muted"
-        );
-        assert!(dirty.contains(&Dirty::ThreadRow {
-            thread_id: "thread-1".to_owned()
-        }));
-    }
-
     #[test]
     fn cancelled_empty_turn_never_fires_the_empty_turn_notice() {
         // Interaction between setup-followups' queue-stop semantics and
@@ -5445,7 +5003,6 @@ mod tests {
                     thread_states: vec![],
                     startup_warnings: vec![],
                     send_queues: vec![],
-                    onboarding_completed: false,
                 },
             ))),
         );
@@ -5476,67 +5033,6 @@ mod tests {
         assert!(!dirty.is_empty());
     }
 
-    /// Regression test (default-thread-provider-not-shown, real user
-    /// report): a cold-start seeded default thread's `ThreadSpec.provider`
-    /// is already correctly populated from the Settings-configured default
-    /// (`lib.rs::cold_start_thread_specs`, per commit a8058a45) -- that part
-    /// was never broken. The actual gap was downstream, in what reaches the
-    /// Slint-facing `ThreadItem` row: `thread_list_dirty_with_keys`'s
-    /// `Dirty::ThreadListDiff(RowOp::Insert { row, .. })` is exactly the
-    /// payload `sync.rs::apply_thread_ops` pushes into `model.thread_model`
-    /// (the real `thread_model` VecModel a live `ChatPanel` binds to) for a
-    /// brand-new row -- so asserting on it here pins the same value that
-    /// would actually reach Slint, not just `Model.threads[0].provider`.
-    /// Before the fix, `visible_thread_row`'s `cached` lookup (populated
-    /// only by a *later* frame snapshot) was `None` on this first build and
-    /// `provider` silently defaulted to `""` -- and because
-    /// `dirty::diff_by_id` only emits ops for identity (insert/remove/move)
-    /// changes, never content changes on an unchanged key/position, a later
-    /// frame snapshot's corrected provider never actually reached this
-    /// already-inserted row until an unrelated event (session attach on
-    /// first send) happened to also force a full `Dirty::ThreadRow` resync.
-    #[test]
-    fn cold_start_default_thread_row_insert_carries_the_configured_provider() {
-        let mut model = Model::default();
-        let (_, dirty) = update(
-            &mut model,
-            Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
-                crate::model::InitialState {
-                    threads: vec![crate::agent_bridge::ThreadSpec {
-                        display_name: "Chat".to_owned(),
-                        provider: "claude".to_owned(),
-                        session_id: None,
-                        profile_name: Some("claude".to_owned()),
-                        project_path: None,
-                    }],
-                    thread_ids: vec!["thread:0".to_owned()],
-                    selected_thread_id: None,
-                    permission_profiles: vec![],
-                    thread_states: vec![],
-                    startup_warnings: vec![],
-                    send_queues: vec![],
-                    onboarding_completed: false,
-                },
-            ))),
-        );
-        assert_eq!(model.threads[0].provider, "claude");
-        let insert_row_provider = dirty.iter().find_map(|d| match d {
-            Dirty::ThreadListDiff(ops) => ops.iter().find_map(|op| match op {
-                RowOp::Insert { row, .. } => Some(row.item.provider.to_string()),
-                _ => None,
-            }),
-            _ => None,
-        });
-        assert_eq!(
-            insert_row_provider.as_deref(),
-            Some("claude"),
-            "the seeded default thread's very first ThreadListDiff Insert row -- the \
-             exact payload sync.rs pushes into the Slint-facing thread_model -- must \
-             already carry the configured provider, not an empty string that only a \
-             later, unrelated event happens to correct"
-        );
-    }
-
     #[test]
     fn initial_state_loaded_surfaces_startup_warnings_as_dirty_errors() {
         let mut model = Model::default();
@@ -5554,7 +5050,6 @@ mod tests {
                         "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
                     ],
                     send_queues: vec![],
-                    onboarding_completed: false,
                 },
             ))),
         );
@@ -5786,7 +5281,6 @@ mod tests {
                 settings_preferences_snapshot: None,
                 agent_operations_in_flight: Vec::new(),
                 mcp_operations_in_flight: Vec::new(),
-                recover_session_operations_in_flight: Vec::new(),
                 skills_snapshot: None,
                 daemon_projects_refresh_due: false,
             }),
@@ -5854,86 +5348,6 @@ mod tests {
             item,
             Dirty::Connection { thread_id } if thread_id == "thread-0"
         )));
-    }
-
-    /// render-loop-idle-pause: `panel_rust_poll` (lib.rs) treats
-    /// `dispatch_frame_poll`'s "did anything change" result (this
-    /// reducer's own `!dirty.is_empty()`) as one of the signals that
-    /// force a repaint tick -- so `RustPanelItem::applyPollCadence`
-    /// (rustpanelitem.cpp)'s new idle backoff is only safe if a *settled*
-    /// thread (one whose connection has resolved and isn't
-    /// Loading/Cancelling/streaming -- the ordinary "user has a project
-    /// open, nothing is happening right now" case, unlike the zero-thread
-    /// fixture `panel_rust_poll_tick_counts_on_a_freshly_created_panel`
-    /// documents as a separate pre-existing gap) actually stops producing
-    /// non-empty `dirty` once repeatedly fed the exact same snapshot.
-    /// Confirms that repeated `Msg::Frame` on unchanging input is
-    /// idempotent (`dirty` empty from the second identical frame
-    /// onward), which is the reducer-level guarantee the C++ poll-cadence
-    /// backoff actually depends on for the mainstream idle case.
-    #[test]
-    fn a_settled_threads_repeated_identical_frame_snapshot_produces_no_further_dirty() {
-        let mut model = model_with_threads(&["thread"]);
-        model.threads[0].session_id = Some("thread-1".to_owned());
-        model.displayed_thread = Some(0);
-        let snapshot = crate::msg::ThreadFrameSnapshot {
-            thread_id: "thread-1".to_owned(),
-            real_index: 0,
-            transcript: vec![crate::conversation::TranscriptItem::Assistant {
-                message_id: "message-1".to_owned(),
-                text: "hello".to_owned(),
-                streaming: false,
-            }],
-            has_older_messages: false,
-            pending_request: crate::PendingRequestItem::default(),
-            terminals: vec![],
-            expanded_terminal: None,
-            open_terminals: vec![],
-            local_terminal: crate::LocalTerminalItem::default(),
-            connection_status: "Live connection".to_owned(),
-            session_modes: None,
-            config_options: vec![],
-            available_commands: vec![],
-            plan: vec![],
-            session_title: None,
-            usage: (0, 0),
-        };
-
-        let (_, first_dirty) = update(
-            &mut model,
-            Msg::Frame(FrameInput {
-                selected_thread_snapshot: Some(snapshot.clone()),
-                ..FrameInput::default()
-            }),
-        );
-        assert!(
-            !first_dirty.is_empty(),
-            "first frame establishing the settled thread should dirty something"
-        );
-        assert_eq!(model.threads[0].state, ThreadState::Idle);
-        assert_eq!(model.threads[0].connection_status, "Live connection");
-
-        // Poll again several times with the exact same snapshot -- this is
-        // what an idle `panel_rust_poll` tick looks like once nothing is
-        // actually happening: no new tokens, no state change, identical
-        // input every tick.
-        for tick in 0..5 {
-            let (_, dirty) = update(
-                &mut model,
-                Msg::Frame(FrameInput {
-                    selected_thread_snapshot: Some(snapshot.clone()),
-                    ..FrameInput::default()
-                }),
-            );
-            assert!(
-                dirty.is_empty(),
-                "tick {tick}: a settled thread fed an unchanged snapshot must not keep \
-                 producing dirty -- if this fails, panel_rust_poll's `frame_changed` signal \
-                 would stay true forever even with nothing actually happening, defeating \
-                 RustPanelItem::applyPollCadence's idle backoff for the mainstream \
-                 (non-zero-thread) idle case"
-            );
-        }
     }
 
     #[test]
@@ -6165,7 +5579,6 @@ mod tests {
                     }],
                     mcp_servers: vec![],
                     agents: vec![],
-                    agents_fetched: false,
                     recoverable_sessions: vec![],
                     recovery_provider: "codex".to_owned(),
                 }),
@@ -6183,7 +5596,6 @@ mod tests {
             profiles: model.available_profiles.clone(),
             mcp_servers: model.available_mcp_servers.clone(),
             agents: model.agent_catalog.clone(),
-            agents_fetched: model.agent_catalog_fetched,
             recoverable_sessions: model.recoverable_sessions.clone(),
             recovery_provider: model.recovery_provider.clone(),
         };
@@ -6901,7 +6313,7 @@ mod tests {
 
     #[test]
     fn mcp_server_tool_deferred_changed_produces_a_matching_effect() {
-        let mut model = model_with_threads(&["Thread"]);
+        let mut model = Model::default();
         let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolDeferredChanged {
@@ -6914,10 +6326,10 @@ mod tests {
         assert!(matches!(
             &effects[0],
             Effect::McpServerToolDeferredChanged {
-                real_index: 0,
                 server_name,
                 tool_name,
                 deferred: true,
+                ..
             } if server_name == "fs" && tool_name == "read_file"
         ));
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
@@ -6925,7 +6337,7 @@ mod tests {
 
     #[test]
     fn mcp_server_tools_fetch_requested_produces_a_matching_effect() {
-        let mut model = model_with_threads(&["Thread"]);
+        let mut model = Model::default();
         let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolsFetchRequested {
@@ -6935,10 +6347,7 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             &effects[0],
-            Effect::McpServerToolsFetchRequested {
-                real_index: 0,
-                server_name,
-            } if server_name == "fs"
+            Effect::McpServerToolsFetchRequested { server_name, .. } if server_name == "fs"
         ));
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Settings)));
     }

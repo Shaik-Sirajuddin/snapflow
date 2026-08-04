@@ -703,7 +703,6 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         provider: "codex".into(),
         title: "Fix export pipeline".into(),
         updated_at: "2026-07-16T10:00:00Z".into(),
-        busy: false,
     }])));
     panel.set_settings_open(true);
     // The settings sheet's own `Flickable` clips its content to the

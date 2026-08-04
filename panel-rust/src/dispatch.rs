@@ -62,24 +62,6 @@ fn execute_thread_lifecycle_effect(
             }
             None
         }
-        // recoverable-attach-fix: `add_thread_recovering_session` used to
-        // run `session/load` synchronously (via `self.runtime.block_on`)
-        // before returning, so a binding was always present by the time
-        // control came back here -- a missing one meant a real error.
-        // Now the attach happens in the background (same shape as
-        // `NewThreadDeferred`'s own eventual attach), so `thread_binding`
-        // is expected to still be `None` immediately after a *successful*
-        // call: that's the normal "attach in flight" state, not a
-        // failure. Mirror `NewThreadDeferred`'s own `None` return here --
-        // there is no `SessionAttached` result to fold yet. The row
-        // renders as a loading placeholder (external_snapshot.rs's
-        // existing "no binding yet, not deferred" check already covers
-        // this), and `hydrate_thread_ids_from_bridge` picks up the real
-        // session id every frame once the background task completes. A
-        // failed attach still surfaces promptly: `complete_attachment`'s
-        // error queues a real `AgentEvent::Error` that the next frame's
-        // `bridge.poll()` turns into the thread's error state the same
-        // way any other agent-originated failure does.
         crate::effect::Effect::RecoverSessionAttach {
             real_index,
             session_id,
@@ -95,17 +77,42 @@ fn execute_thread_lifecycle_effect(
                         .add_thread_recovering_session(&title, &provider, &session_id)
                         .map_err(|error| crate::effect::EffectError::new(error.to_string()))
                 });
-            match result {
-                Ok(_real_idx) => None,
-                Err(error) => Some(crate::effect::EffectResultMsg::SessionAttached {
-                    real_index,
-                    thread_id: None,
-                    provider: None,
-                    result: Err(crate::effect::EffectError::new(format!(
-                        "recovery thread {real_index}: {error}"
-                    ))),
-                }),
-            }
+            let (thread_id, actual_provider, result) = match result {
+                Ok(real_idx) => {
+                    let binding = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(real_idx));
+                    let actual_provider = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_provider(real_idx));
+                    match binding {
+                        Some(binding) => (
+                            Some(binding.thread_id),
+                            actual_provider,
+                            Ok(binding.session_id),
+                        ),
+                        None => (
+                            None,
+                            actual_provider,
+                            Err(crate::effect::EffectError::new(
+                                "bridge created a recovery slot without a session binding",
+                            )),
+                        ),
+                    }
+                }
+                Err(error) => (None, None, Err(error)),
+            };
+            let result = result.map_err(|error| {
+                crate::effect::EffectError::new(format!("recovery thread {real_index}: {error}"))
+            });
+            Some(crate::effect::EffectResultMsg::SessionAttached {
+                real_index,
+                thread_id,
+                provider: actual_provider,
+                result,
+            })
         }
         other => panic!("unexpected lifecycle effect: {other:?}"),
     }
@@ -668,7 +675,14 @@ pub(crate) fn dispatch_compose_draft_changed(panel: &PanelSingleton, text: Strin
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
-    let _ = filtered_idx;
+    let expected_thread_id = panel.real_index(filtered_idx).and_then(|real_idx| {
+        panel
+            .model
+            .borrow()
+            .threads
+            .get(real_idx)
+            .map(|thread| thread.thread_id.clone())
+    });
     let (effects, _dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
@@ -681,10 +695,16 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
             ),
         "Compose::SendRequested must produce zero (no selected thread) or one SendPrompt effect"
     );
-    // Do not compare against the pre-reducer thread id here. Deferred
-    // session attachment can bind/update the selected thread while the send
-    // reducer is running, making that snapshot stale and causing a false
-    // debug-build panic. The reducer is authoritative for the effect target.
+    debug_assert!(
+        effects.iter().all(|effect| {
+            matches!(
+                effect,
+                crate::effect::Effect::SendPrompt { thread_id, .. }
+                    if Some(thread_id) == expected_thread_id.as_ref()
+            )
+        }),
+        "send effect must target the selected filtered index"
+    );
     execute_effects(panel, effects);
 }
 
@@ -1688,42 +1708,6 @@ pub(crate) fn dispatch_apply_host_appearance(
             .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
                 scale_factor: appearance.density,
             });
-        // `ScaleFactorChanged` alone only updates the live scale factor --
-        // it does NOT retroactively recompute the Slint window item's
-        // stored *logical* geometry (see i-slint-core's window.rs
-        // `try_dispatch_event`: `ScaleFactorChanged` calls only
-        // `set_scale_factor`, while `Resized` is the only event that calls
-        // `set_window_item_geometry`). That logical geometry was last set
-        // by `panel_rust_create`'s `window.set_size(PhysicalSize::new(w,
-        // h))`, which converts physical -> logical using whatever scale
-        // factor was live *at that moment*. If density changes afterward
-        // (independently, or in the same host tick as a resize but applied
-        // second -- see `RustPanelItem::ensureHandle()`, which always calls
-        // `panel_rust_create` before `panel_rust_apply_host_appearance`),
-        // the stored logical geometry goes stale relative to the new
-        // factor. `i_slint_renderer_software::SoftwareRenderer::render`
-        // then recomputes the required physical size as `window_item.width
-        // ()/height() (stale logical) * current scale factor (new)` and
-        // asserts it fits the buffer -- which was sized directly from the
-        // physical pixels `panel_rust_create` was actually given, not from
-        // this recomputation. A stale-low logical size times a raised
-        // factor demands more pixels than the buffer holds, aborting the
-        // process on a non-unwinding panic across the Qt paint FFI
-        // boundary (confirmed via a live crash: buffer sized for a
-        // 697px-wide window, render demanded 871px -- a ~1.25x ratio,
-        // consistent with one live DPI step landing between a resize and
-        // its paired density push).
-        //
-        // Re-issuing `set_size` with the CURRENT physical size (the same
-        // `panel.width`/`panel.height` the buffer is actually sized for)
-        // right after the factor changes forces `window_item_geometry` to
-        // be recomputed under the factor that was just applied, so
-        // `logical_size * factor == physical_size` holds again by
-        // construction -- independent of call ordering on the C++ side or
-        // of which factor value gets applied.
-        panel
-            .window
-            .set_size(slint::PhysicalSize::new(panel.width, panel.height));
     }
     panel.window.window().request_redraw();
     true

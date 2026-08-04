@@ -307,7 +307,6 @@ pub enum ChromeMsg {
         text: String,
     },
     ErrorBannerDismissed,
-    CompleteOnboarding,
 }
 
 /// Direct C++ -> Rust FFI entry points that mutate panel state and are *not*
@@ -378,10 +377,6 @@ pub struct FrameInput {
     /// in flight -- see `AgentBridge::mcp_operations_in_flight`'s doc
     /// comment.
     pub mcp_operations_in_flight: Vec<String>,
-    /// Remote session ids with a Settings > Agents "Attach" `session/
-    /// load` still in flight -- see `AgentBridge::recover_session_
-    /// operations_in_flight`'s doc comment.
-    pub recover_session_operations_in_flight: Vec<String>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
     /// PISO-8 (project-isolation-mlt-binding plan): true at most once
     /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors
@@ -428,7 +423,6 @@ pub struct SettingsGatewaySnapshot {
     pub profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agents: Vec<crate::protocol_types::AgentCatalogEntry>,
-    pub agents_fetched: bool,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
 }

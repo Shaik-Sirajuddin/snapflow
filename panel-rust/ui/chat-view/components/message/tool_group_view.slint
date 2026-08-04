@@ -75,16 +75,6 @@ export component ToolGroupView inherits Rectangle {
 
     VerticalLayout {
         padding: Metrics.space-2;
-        // Extra leading inset beyond the uniform `padding` above -- the
-        // left-edge pulse rail (x:0..3px, just above) sits just outside
-        // this layout, so `padding-left: Metrics.space-2` alone (4px)
-        // left the header icon only ~1px clear of the rail, reading as
-        // flush/touching. `space-4` (8px) gives the icon a small but
-        // visible gap from the rail while leaving top/right/bottom at
-        // the original space-2. Unconditional (not gated on
-        // `root.loading`) so content never shifts when the pulse rail
-        // appears/disappears.
-        padding-left: Metrics.space-4;
         spacing: Metrics.space-2;
 
         // Top Header Bar: label + tool count badge + Fullscreen button + Top-Right Expand/Collapse toggle button

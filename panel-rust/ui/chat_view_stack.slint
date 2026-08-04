@@ -1,5 +1,5 @@
 import { ChatArea } from "chat_area.slint";
-import { ThreadViewItem, MessageItem, PendingRequestItem, TerminalItem, PlanEntryItem, LocalTerminalItem, DropdownEntry, SkillOption, McpServerOption, AgentCatalogEntry } from "types.slint";
+import { ThreadViewItem, MessageItem, PendingRequestItem, TerminalItem, PlanEntryItem, LocalTerminalItem, DropdownEntry, SkillOption, McpServerOption } from "types.slint";
 
 // Retained ChatArea instances, one per durable thread. The stack deliberately
 // owns no transcript data: each delegate receives the Rc-backed model carried
@@ -22,11 +22,6 @@ export component ChatViewStack inherits Rectangle {
     in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
-    // mcp-servers-settings follow-up: forwarded straight through to every
-    // ChatArea delegate below, same "singleton, applies identically to
-    // whichever delegate is actually visible" convention as
-    // connection-status/last-error/sending above.
-    in property <bool> provider-switching: false;
     in property <bool> agent-unauthenticated: false;
     in property <[PlanEntryItem]> plan-entries: [];
     in property <string> live-session-title: "";
@@ -36,8 +31,6 @@ export component ChatViewStack inherits Rectangle {
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
     in property <bool> inputs-enabled: true;
-    in property <[AgentCatalogEntry]> agent-catalog: [];
-    in property <bool> agent-catalog-fetched: false;
     in property <[DropdownEntry]> mode-dropdown-entries: [];
     in property <[DropdownEntry]> config-dropdown-entries: [];
     in property <string> mode-trigger-label: "";
@@ -65,8 +58,6 @@ export component ChatViewStack inherits Rectangle {
     in property <bool> rename-editing: false;
     in property <string> rename-focus-target: "";
     in-out property <string> rename-draft: "";
-    in-out property <bool> onboarding-completed: false;
-    callback complete-onboarding();
 
     // Commands are broadcast as generations; only the selected delegate
     // consumes them, so a hidden ChatArea cannot steal focus or approval.
@@ -83,7 +74,6 @@ export component ChatViewStack inherits Rectangle {
     callback load-older-requested();
     callback mcp-connect-requested(string);
     callback mcp-enabled-changed(string, bool);
-    callback mention-filter-changed(string, string);
     callback md-link-activated(string);
     callback error-banner-dismissed();
     callback send-requested(string);
@@ -158,7 +148,6 @@ export component ChatViewStack inherits Rectangle {
         no-project: root.no-project;
         connection-status: root.connection-status;
         last-error: root.last-error;
-        provider-switching: root.provider-switching;
         agent-unauthenticated: root.agent-unauthenticated;
         plan-entries: root.plan-entries;
         live-session-title: root.live-session-title;
@@ -166,13 +155,9 @@ export component ChatViewStack inherits Rectangle {
         pending-request: root.pending-request;
         terminals: root.terminals;
         local-terminal: root.local-terminal;
-        onboarding-completed <=> root.onboarding-completed;
-        complete-onboarding => { root.complete-onboarding(); }
         compose-text <=> root.compose-text;
         compose-text-changed(text) => { root.compose-draft-changed(text); }
         inputs-enabled: root.inputs-enabled;
-        agent-catalog: root.agent-catalog;
-        agent-catalog-fetched: root.agent-catalog-fetched;
         mode-dropdown-entries: root.mode-dropdown-entries;
         config-dropdown-entries: root.config-dropdown-entries;
         mode-trigger-label: root.mode-trigger-label;
@@ -208,7 +193,6 @@ export component ChatViewStack inherits Rectangle {
         load-older-requested => { root.load-older-requested(); }
         mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
         mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
-        mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
         md-link-activated(target) => { root.md-link-activated(target); }
         error-banner-dismissed => { root.error-banner-dismissed(); }
         send-requested(text) => { root.send-requested(text); }
@@ -269,7 +253,6 @@ export component ChatViewStack inherits Rectangle {
         no-project: root.no-project;
         connection-status: root.connection-status;
         last-error: root.last-error;
-        provider-switching: root.provider-switching;
         agent-unauthenticated: root.agent-unauthenticated;
         plan-entries: root.plan-entries;
         live-session-title: root.live-session-title;
@@ -277,8 +260,6 @@ export component ChatViewStack inherits Rectangle {
         pending-request: root.pending-request;
         terminals: root.terminals;
         local-terminal: root.local-terminal;
-        onboarding-completed <=> root.onboarding-completed;
-        complete-onboarding => { if (index == root.selected-index) { root.complete-onboarding(); } }
         // Each retained ChatArea owns its composer buffer. Do not bind this
         // to the stack-level fallback property: doing so makes hidden views
         // observe and overwrite the selected thread's draft.
@@ -287,8 +268,6 @@ export component ChatViewStack inherits Rectangle {
             if (index == root.selected-index) { root.compose-draft-changed(text); }
         }
         inputs-enabled: root.inputs-enabled;
-        agent-catalog: root.agent-catalog;
-        agent-catalog-fetched: root.agent-catalog-fetched;
         mode-dropdown-entries: root.mode-dropdown-entries;
         config-dropdown-entries: root.config-dropdown-entries;
         mode-trigger-label: root.mode-trigger-label;
@@ -340,7 +319,6 @@ export component ChatViewStack inherits Rectangle {
         load-older-requested => { if (index == root.selected-index) { root.load-older-requested(); } }
         mcp-connect-requested(name) => { if (index == root.selected-index) { root.mcp-connect-requested(name); } }
         mcp-enabled-changed(name, enabled) => { if (index == root.selected-index) { root.mcp-enabled-changed(name, enabled); } }
-        mention-filter-changed(prefix, query) => { if (index == root.selected-index) { root.mention-filter-changed(prefix, query); } }
         md-link-activated(target) => { if (index == root.selected-index) { root.md-link-activated(target); } }
         error-banner-dismissed => { if (index == root.selected-index) { root.error-banner-dismissed(); } }
         send-requested(text) => { if (index == root.selected-index) { root.send-requested(text); } }

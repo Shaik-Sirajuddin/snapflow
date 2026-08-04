@@ -188,18 +188,4 @@ const (
 	// (project.select response with opened=true). Distinct from AuditLaunch
 	// (process spawn) so empty-project investigations can query init rows.
 	AuditInit = "init"
-	// AuditExternalNoSAP is recorded once (per project, via AuditOnce) the
-	// first time project.select discovers an external GUI that owns the
-	// project but has never reported a SAP socket. This is a *permanent*
-	// condition for that GUI process, not a transient startup race: SAP
-	// exposure is opt-in via the SNAPSHOT_SAP_SOCKET/_TOKEN env vars set
-	// only by daemon-orchestrated launches (procmgr.go), and a process's
-	// environment cannot gain that pair after it has already started. A
-	// GUI missing it was opened outside snapshotd's control (e.g. the
-	// binary run directly, or a launcher that didn't set the env vars) and
-	// will never expose SAP for the rest of its lifetime. The audit trail
-	// exists so this permanently-blocked state is diagnosable without
-	// re-deriving it from scratch each time, per the class of incident
-	// this constant was added for (see awaitLiveExternalProject).
-	AuditExternalNoSAP = "external_no_sap"
 )

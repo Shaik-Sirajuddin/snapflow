@@ -28,13 +28,6 @@ export struct ThreadItem {
     // flag -- archiving does not send any ACP request, it just hides the
     // Archive control and swaps the row's status label to "archived".
     archived: bool,
-    // thread-unread-state: true when visible agent output has arrived for
-    // this thread while it was NOT the displayed thread, and the user has
-    // not opened it since. Deliberately NOT durable (unlike `archived`):
-    // nothing can arrive while the panel process is down, so every restart
-    // legitimately starts with nothing unread -- see ThreadModel::unread.
-    // Only recolors the plain status dot; it never changes `status`.
-    unread: bool,
     // layout-redesign.md Phase 8: the thread's real provider (persisted
     // `AgentBridge::thread_provider`) and active model (the `"model"`
     // config option's current value, the same `configOptions[]` feed the
@@ -584,12 +577,6 @@ export struct RemoteSessionOption {
     provider: string,
     title: string,
     updated_at: string,
-    // recoverable-attach-fix: true while this session's `session/load`
-    // attach is in flight (Settings > Agents "Attach" click), sourced
-    // from `AgentBridge::recover_session_operations_in_flight`. Drives
-    // the Attach Button's own `busy` spinner -- this row previously had
-    // no busy-state tracking at all.
-    busy: bool,
 }
 
 // Settings-sheet addition: one agent-catalog entry, as returned by
@@ -605,13 +592,6 @@ export struct AgentCatalogEntry {
     name: string,
     version: string,
     website: string,
-    // Display-ready host portion of `website` (e.g. "openai.com" for
-    // "https://openai.com/codex"), computed Rust-side in
-    // `models::website_domain` -- Slint has no string-split primitive,
-    // so this rides alongside the raw `website` field (still used
-    // verbatim for the actual click-to-open URL) rather than being
-    // sliced in `agent_card.slint`.
-    website-domain: string,
     status: string,
     // setup-followups plan, agent_settings_ordering_and_install_enable_
     // flow: current admin-plane enablement, merged in client-side (see

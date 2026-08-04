@@ -2,6 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Strings } from "../tokens/strings.slint";
 import { Icon } from "../base/icon.slint";
+import { Spinner } from "../base/spinner.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
@@ -100,7 +101,6 @@ export component ChatInputLayout inherits Rectangle {
     callback mcp-connect-requested(string);
     // Phase 15: inline enable/disable from the @ MCP popup row.
     callback mcp-enabled-changed(string, bool);
-    callback mention-filter-changed(string, string);
     // Panel chords (Ctrl+B/N/K/,, Escape, Ctrl+Enter approve) re-dispatched
     // while the composer owns focus — wired by ChatArea → ChatPanel.
     callback panel-shortcut(KeyEvent) -> EventResult;
@@ -233,21 +233,6 @@ export component ChatInputLayout inherits Rectangle {
         compose.has-focus
         && (token-prefix == "/" || token-prefix == "@" || token-prefix == "#");
     property <length> mention-popup-h: 220px;
-    // The popup list is a real Flickable, so keyboard selection must move
-    // its viewport as the highlighted row leaves the currently visible
-    // range. The selected row reports its content-space y/height below.
-    property <length> mention-scroll-y: 0px;
-
-    function scroll-to-mention(item-y: length, item-height: length) {
-        let viewport-top = mention-list.viewport-y;
-        let viewport-bottom = viewport-top + mention-list.height;
-        if (item-y < viewport-top) {
-            root.mention-scroll-y = item-y;
-        } else if (item-y + item-height > viewport-bottom) {
-            root.mention-scroll-y = Math.max(0px,
-                item-y + item-height - mention-list.height);
-        }
-    }
 
     // Keep mini-search + list filter in lockstep with the active token.
     changed token-query => {
@@ -264,16 +249,6 @@ export component ChatInputLayout inherits Rectangle {
     }
     changed mention-filter => {
         root.reselect-closest();
-        root.mention-filter-changed(root.token-prefix, root.mention-filter);
-    }
-    // Ctrl+A followed by Backspace/Delete can clear the whole compose text
-    // in one edit event. Close the local fallback state too; otherwise its
-    // remembered "/" prefix keeps the skill filter bar open on an empty
-    // composer.
-    changed compose-text => {
-        if (root.compose-text == "") {
-            root.close-local-mention();
-        }
     }
 
     function open-local-mention(prefix: string) {
@@ -305,14 +280,20 @@ export component ChatInputLayout inherits Rectangle {
         root.close-local-mention();
         compose.focus();
     }
-    // @ MCP suggestions intentionally do not filter. Slash-command rows are
-    // already supplied as a filtered copy by the host; the source catalog
-    // remains untouched in the per-thread model.
+    // Hide rows that don't match the live filter (name or secondary text).
+    // Single contains-ci call — passing mention-filter twice into helpers
+    // trips a SharedString move bug in generated Rust.
     function row-hidden(label: string, extra: string) -> bool {
-        return (root.token-prefix == "/" || root.token-prefix == "#")
-            && root.mention-filter != ""
-            && root.mention-filter != "'"
-            && !TextUtil.matches-filter(label + "\n" + extra, root.mention-filter);
+        if (root.mention-filter == "") {
+            return false;
+        }
+        if (TextUtil.contains-ci(label + "\n" + extra, root.mention-filter)) {
+            return false;
+        }
+        // Host/viewer with TextUtil: no match → hide.
+        // Pure slint-viewer (callback uninstalled): contains-ci always
+        // false — keep rows visible so the list is not blanked.
+        return TextUtil.filter-ready();
     }
 
     function catalog-len() -> int {
@@ -435,7 +416,6 @@ export component ChatInputLayout inherits Rectangle {
     }
     function reselect-closest() {
         // First visible under the current filter (default selection).
-        root.mention-scroll-y = 0px;
         root.mention-sel = root.next-visible(-1, 1);
     }
     function mention-move(dir: int) {
@@ -747,17 +727,40 @@ export component ChatInputLayout inherits Rectangle {
                     animate background { duration: 100ms; }
                     border-radius: Theme.radius-md;
                     opacity: (root.sending || compose.text != "") ? 1.0 : 0.7;
-                    // chat_input_send_box_double_busy_indicator: this used to
-                    // also render a spinning ring behind the stop icon while
-                    // `root.sending` was true (setup-followups plan,
-                    // in_flight_turn_loading_indicator), but that meant the
-                    // busy compose box showed a spinner AND the stop button
-                    // at once. Per explicit direction, the stop button alone
-                    // is the in-progress/queued signal here now; the ring is
-                    // removed. Repaint-gate note: `panel_rust_poll`'s
-                    // `busy_thread_animating` check (lib.rs) still applies --
-                    // it also drives chat_area.slint's header Spinner and
-                    // sidebar row spinners, so it stays as-is.
+                    // setup-followups plan, in_flight_turn_loading_indicator:
+                    // the composer previously gave zero animated feedback
+                    // during an in-flight turn -- the button just went
+                    // static-stop-icon and sat there. Same spinning-ring
+                    // motif as sidebar.slint's own load-spin (thread.status
+                    // == "loading"), so a user watching only the composer
+                    // (not the sidebar) can still see the turn is actively
+                    // in progress.
+                    //
+                    // audit-fixes animation_tick_loaders: continuous spin
+                    // via animation-tick (no dynamic iteration-count).
+                    property <angle> load-spin: root.sending
+                        ? 360deg * mod(animation-tick(), Metrics.pulse-period) / Metrics.pulse-period
+                        : 0deg;
+                    if root.sending : VerticalLayout {
+                        // Without this wrapper the ring rendered pinned to
+                        // this Rectangle's top-left corner (a plain child
+                        // Item with no layout defaults to (0,0)), not
+                        // centered behind the stop icon -- unlike the stop/
+                        // send Icon just below, which already has this same
+                        // centering wrapper.
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: center;
+                            Spinner {
+                                // Larger than the stop icon (icon-sm, 12px)
+                                // so it reads as a ring around it, not an
+                                // overlapping duplicate at the same size.
+                                size: 26px;
+                                stroke: Theme.text-secondary.with-alpha(0.55);
+                                stroke-width: 2px;
+                            }
+                        }
+                    }
                     send-stop-button := TouchArea {
                         mouse-cursor: pointer;
                         accessible-role: button;
@@ -777,9 +780,9 @@ export component ChatInputLayout inherits Rectangle {
                         alignment: center;
                         HorizontalLayout {
                             alignment: center;
-                            // Stop icon is the sole in-progress/busy signal
-                            // in this button now (no spinner behind it --
-                            // see chat_input_send_box_double_busy_indicator).
+                            // Stop icon still renders on top so click-to-
+                            // stop stays visually obvious; the spinning
+                            // ring behind it is the new in-progress signal.
                             Icon {
                                 source: root.sending
                                     ? @image-url("../assets/icons/square.svg")
@@ -1234,17 +1237,11 @@ export component ChatInputLayout inherits Rectangle {
                     return root.mention-key(event);
                 }
             }
-            mention-list := Flickable {
+            Flickable {
                 vertical-stretch: 1;
                 preferred-height: 0px;
                 min-height: 40px;
-                // A filtered result with one (or otherwise short) visible
-                // row should not behave like a scrollable list. Hidden rows
-                // already collapse to zero height, so preferred-height is
-                // the actual rendered content height here.
-                interactive: mention-col.preferred-height > self.height;
                 viewport-height: mention-col.preferred-height;
-                viewport-y <=> root.mention-scroll-y;
                 mention-col := VerticalLayout {
                     spacing: Metrics.space-1;
 
@@ -1254,11 +1251,6 @@ export component ChatInputLayout inherits Rectangle {
                             property <bool> hidden: root.row-hidden(skill.name, skill.description);
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
-                            changed highlighted => {
-                                if (self.highlighted) {
-                                    root.scroll-to-mention(self.y, self.height);
-                                }
-                            }
                             show-icon: true;
                             icon-source: @image-url("../assets/icons/sparkles.svg");
                             title: skill.name;
@@ -1282,11 +1274,6 @@ export component ChatInputLayout inherits Rectangle {
                             property <bool> hidden: root.row-hidden(srv.name, srv.command);
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
-                            changed highlighted => {
-                                if (self.highlighted) {
-                                    root.scroll-to-mention(self.y, self.height);
-                                }
-                            }
                             show-icon: true;
                             icon-source: @image-url("../assets/icons/server.svg");
                             title: srv.name;
@@ -1324,11 +1311,6 @@ export component ChatInputLayout inherits Rectangle {
                             property <bool> hidden: root.row-hidden(f, "");
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
-                            changed highlighted => {
-                                if (self.highlighted) {
-                                    root.scroll-to-mention(self.y, self.height);
-                                }
-                            }
                             title: f;
                             title-font-family: Theme.font-mono;
                             clicked => {
@@ -1345,19 +1327,6 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
         }
-            // Make overflow discoverable: the list is keyboard-scrollable,
-            // but the scrollbar also gives a clear indication when more
-            // matching skills exist than fit in the popup. ThinScrollbar's
-            // own overflow check keeps it hidden for one short match.
-            mention-scrollbar := ThinScrollbar {
-                x: parent.width - self.width - 2px;
-                y: mention-search-bar.height + Metrics.gap-sm + 2px;
-                visible-height: mention-list.height - 4px;
-                viewport-height: mention-col.preferred-height;
-                viewport-y <=> root.mention-scroll-y;
-                thumb-width: 4px;
-                active: root.mention-open;
-            }
     }
 
     focus-compose => { compose.focus(); }

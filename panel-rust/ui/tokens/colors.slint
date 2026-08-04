@@ -70,16 +70,7 @@ export global ColorScale {
     out property <color> light-primary-container: #e5e5ea;
 
     // sys-user-bubble dark vs light
-    // Dark value lightened from #151518 (only ~2/255 off dark-surface-2's
-    // #131313 -- a ~1.00:1 contrast ratio, effectively invisible) to
-    // #17171a, doubling the lift off chat surface while staying below
-    // dark-agent-bubble's #18181b (24 vs this token's 23), so the user
-    // bubble is now clearly distinguishable from bg-chat while remaining
-    // the less prominent of the two bubble surfaces, per the reported
-    // low-contrast issue. Light value already clears bg-chat with room to
-    // spare (~1.17:1) and is left unchanged -- the report was dark-theme
-    // specific.
-    out property <color> dark-user-bubble: #17171a;
+    out property <color> dark-user-bubble: #151518;
     out property <color> light-user-bubble: #eaeaea;
 
     // Agent message fill — subtle step off chat surface (dark-surface-2

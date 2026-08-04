@@ -66,33 +66,19 @@ export component SidebarThreadRow inherits HoverSurface {
             // the icon group (alignment:center was the gap).
             alignment: stretch;
             spacing: 0px;
-            // Only reserve in-layout width for the stick when expanded,
-            // where its 3px indent is needed so row text/controls don't
-            // start flush at x=0. Collapsed: the stick must NOT consume
-            // HorizontalLayout width -- 5b3cd157 fixed the (much larger)
-            // ~78px residual from the trailing action-button cluster,
-            // but left this 3px stick still subtracted from the region
-            // the status icon centers within. That leaves the icon
-            // centered in the *post-stick* 45px remainder (center
-            // x=25.5 on a 48px rail) instead of the rail's true center
-            // (x=24) -- a real, reproducible +1.5px (half the stick's
-            // own width) rightward bias, confirmed live via a headless
-            // `i_slint_backend_testing::ElementHandle` geometry
-            // measurement even with 5b3cd157's fix fully intact. Gating
-            // this stick on `if expanded` (dropping it from layout
-            // entirely when collapsed) and repainting it as a plain
-            // root-level overlay below removes that bias: the status
-            // icon then centers over the full 48px rail.
-            if expanded : Rectangle {
+            Rectangle {
                 width: 3px;
                 horizontal-stretch: 0;
                 // Full row height, flush to the rail's left end.
                 height: 100%;
-                // White selection bar (bg-primary) on the selected row
-                // only; transparent otherwise. (Collapsed's per-thread
-                // accent color is now painted by the overlay Rectangle
-                // below instead of this in-layout copy.)
-                background: index == selected-thread ? Theme.bg-primary : transparent;
+                // Collapsed: per-thread accent (rose/orange/…).
+                // Expanded: white selection bar (bg-primary) on
+                // the selected row only; transparent otherwise.
+                // Phase 29: archived rows carry NO accent glow in the
+                // collapsed rail -- only live threads get their color.
+                background: expanded
+                    ? (index == selected-thread ? Theme.bg-primary : transparent)
+                    : (thread.archived ? transparent : accent-color);
             }
             VerticalLayout {
                 horizontal-stretch: 1;
@@ -183,7 +169,7 @@ export component SidebarThreadRow inherits HoverSurface {
                             width: 6px;
                             height: 6px;
                             border-radius: 3px;
-                            background: thread.unread ? Theme.status-info : Theme.text-muted;
+                            background: Theme.text-muted;
                         }
                     }
                     if expanded && rename-thread-index != index : Text {
@@ -338,45 +324,16 @@ export component SidebarThreadRow inherits HoverSurface {
                     // the selected row (and on hover for others)
                     // so keyboard / headless e2e can reach them
                     // without a pointer hover.
-                    // Collapsed-rail status-icon centering fix: this
-                    // container previously existed unconditionally, only
-                    // gating its *children* on `expanded` via `visible:`.
-                    // `visible: false` hides painting/hit-testing but does
-                    // NOT remove an element from layout -- each IconButton
-                    // child sets a hard `width: btn-width` (see
-                    // base/icon_button.slint) regardless of its own
-                    // visibility, so this cluster kept contributing up to
-                    // ~4 * 18px + spacing of residual min-width to the
-                    // enclosing icon-row HorizontalLayout even while
-                    // collapsed. That unbalanced the row's
-                    // `alignment: center` (which centers the status icon
-                    // together with this now-invisible-but-still-sized
-                    // sibling), pushing the status icon left of true
-                    // center. Same class of bug as the rename-editor
-                    // `visible` vs `if` height incident documented above
-                    // (Phase 25). Gating the whole container on `if
-                    // expanded` (matching every other row-content element
-                    // in this file) removes it from layout entirely when
-                    // collapsed, so the status icon is the sole child
-                    // being centered.
-                    if expanded : HorizontalLayout {
+                    property <bool> row-hovered: root.has-hover
+                        || rename-btn.has-hover
+                        || delete-btn.has-hover
+                        || resume-btn.has-hover
+                        || archive-btn.has-hover;
+
+                    HorizontalLayout {
                         horizontal-stretch: 0;
                         spacing: 2px;
                         cross-axis-alignment: center;
-
-                        // Moved inside this `if expanded` block (was a
-                        // sibling property referencing these same ids) --
-                        // ids declared inside a conditional element are
-                        // only reachable from within that same block, and
-                        // this property is only ever consumed by the
-                        // buttons declared right below, all of which are
-                        // already `expanded`-gated, so hoisting it here
-                        // changes no runtime behavior.
-                        property <bool> row-hovered: root.has-hover
-                            || rename-btn.has-hover
-                            || delete-btn.has-hover
-                            || resume-btn.has-hover
-                            || archive-btn.has-hover;
 
                         rename-btn := IconButton {
                             visible: expanded && rename-thread-index != index && (row-hovered || index == selected-thread);
@@ -511,19 +468,5 @@ export component SidebarThreadRow inherits HoverSurface {
                     min-width: 0px;
                 }
             }
-        }
-        // Collapsed-rail accent stick, painted as a root-level overlay
-        // (a sibling of the HorizontalLayout above, not a child inside
-        // it) so it never contributes to that layout's width math -- see
-        // the `if expanded` gate on the in-layout copy above for why.
-        // Same flush-left placement/color logic as before: per-thread
-        // accent (rose/orange/…), except archived rows carry no glow
-        // (Phase 29).
-        if !expanded : Rectangle {
-            x: 0px;
-            y: 0px;
-            width: 3px;
-            height: 100%;
-            background: thread.archived ? transparent : accent-color;
         }
 }

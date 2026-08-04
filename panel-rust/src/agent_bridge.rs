@@ -60,7 +60,8 @@
 use crate::conversation::ConversationState;
 use crate::gateway_actor::{
     spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_delayed_gateway_and_pool,
-    AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
+    spawn_acpx_thread_with_gateway, AcpxThreadGatewaySetter, AcpxThreadHandle,
+    GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
     JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
@@ -500,17 +501,6 @@ pub struct AgentBridge {
     /// an agent id and an MCP server name can never collide on the same
     /// key by coincidence.
     mcp_operations: Arc<Mutex<HashSet<String>>>,
-    /// recoverable-attach-fix: remote session ids with a `recover-
-    /// session-attach` `session/load` currently in flight (Settings >
-    /// Agents "Attach" button, symptom #2 -- the row previously had no
-    /// busy-state tracking at all, unlike `agent_operations`/`mcp_
-    /// operations` above). Same shape/lifecycle: `begin_recover_session_
-    /// operation`/`recover_session_operations_in_flight` mirror `begin_
-    /// mcp_operation`/`mcp_operations_in_flight` exactly. Keyed by the
-    /// remote `acp_session_id`, not the local thread id -- a session
-    /// stays a candidate row (and therefore needs its own busy key) right
-    /// up until it disappears from `recoverable_sessions` once bound.
-    recover_session_operations: Arc<Mutex<HashSet<String>>>,
     // PROF-1: the same per-provider URL resolver the constructor used to
     // seed `gateway_urls` up front, kept around so a provider nobody
     // asked for at construction time (any real agent id, not just a
@@ -1015,29 +1005,17 @@ fn resolve_acpx_server_bin_from(
     if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
         return PathBuf::from(bin);
     }
-    // A real Windows install's `acpx-server` binary is named
-    // `acpx-server.exe` -- shotcut-rebrand's CMakeLists.txt installs it
-    // via `install(PROGRAMS $<TARGET_FILE:acpx-server> ...)` with no
-    // RENAME, and CMake's `TARGET_FILE` generator expression already
-    // includes the platform executable suffix. Every candidate below
-    // previously joined a bare `"acpx-server"` with no suffix, so
-    // `candidate.is_file()` could never match the installed
-    // `acpx-server.exe` on Windows -- it always fell through to the
-    // dev-checkout fallback (which doesn't exist on a packaged install),
-    // silently leaving `gateway-ready` false forever and the sidebar's
-    // "+ New Thread" button (`sidebar.slint`'s `enabled: root.gateway-
-    // ready`) permanently, silently disabled. `EXE_SUFFIX` is `""` on
-    // Unix, so this is a no-op there.
-    let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
-    let libexec_name = format!("../libexec/acpx-server{}", std::env::consts::EXE_SUFFIX);
     if let Some(parent) = current_exe.and_then(Path::parent) {
-        for candidate in [parent.join(&exe_name), parent.join(&libexec_name)] {
+        for candidate in [
+            parent.join("acpx-server"),
+            parent.join("../libexec/acpx-server"),
+        ] {
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
-    manifest_dir.join(format!("../acpx/target/debug/{exe_name}"))
+    manifest_dir.join("../acpx/target/debug/acpx-server")
 }
 
 fn resolve_acpx_server_bin() -> PathBuf {
@@ -1047,54 +1025,6 @@ fn resolve_acpx_server_bin() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
 }
-
-/// Best-effort self-heal for a real, recurring production failure: real
-/// installs (2026-08-01 `system_launch.yaml` log, "failed to spawn
-/// acpx-server for codex on port ...: Permission denied (os error 13)",
-/// twice in one session) hit `Command::spawn`'s own `EACCES` -- confirmed
-/// by tracing `spawn_gateway_process` below, where `cmd.spawn()` is the
-/// *only* syscall in this whole function whose error is wrapped into the
-/// "failed to spawn" message (the other candidate EACCES source, the
-/// per-provider stderr log `File::create` a few lines down, has its own
-/// separate error handling that falls back to `Stdio::null()` instead of
-/// failing the spawn at all -- so it can never produce this message).
-///
-/// `EACCES` from `execve` on a path that *does* resolve to a real file
-/// (as opposed to `ENOENT`, which `resolve_acpx_server_bin_from`'s own
-/// fallback chain can also produce, but that surfaces as a distinctly
-/// different os error 2) means the file exists but lacks the execute
-/// bit for this process's effective uid/gid -- exactly what a plain
-/// `cp`/archive-extract/artifact-download step that does not preserve
-/// POSIX permission bits produces (this project's own Linux packaging
-/// pipeline, `shotcut/scripts/build-snapflow.sh`'s `install_snapflow_linux`,
-/// assembles the bundle with a long sequence of manual `cp`/`install`
-/// calls rather than exclusively CMake's `install(PROGRAMS ...)`, which
-/// is the one step that would otherwise always normalize this). Rather
-/// than hard-failing the whole gateway (and every thread on this
-/// provider) over a one-bit permission defect this process is fully
-/// entitled to fix on a file it already resolved by path, attempt to add
-/// the owner/group/world execute bits before spawning. Best-effort and
-/// silent on failure (e.g. a read-only install root) -- `cmd.spawn()`'s
-/// own error still surfaces normally if this doesn't help.
-#[cfg(unix)]
-fn ensure_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-    let mut perms = metadata.permissions();
-    let mode = perms.mode();
-    // 0o111 = owner+group+world execute. Only touched when at least one
-    // of those bits is missing, so an already-correct file's mtime/ctime
-    // is left alone.
-    if mode & 0o111 != 0o111 {
-        perms.set_mode(mode | 0o111);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-#[cfg(not(unix))]
-fn ensure_executable(_path: &Path) {}
 
 /// Resolves the `snapflowd-mcp` binary path (`skill_injection_
 /// verification` phase): `RUI_SNAPFLOWD_MCP_BIN` env override, else a
@@ -2425,70 +2355,24 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
     // spawn there directly (keeps the common case's URL predictable);
     // otherwise it's occupied by some unrelated service, so probe for a
     // real free ephemeral port instead of fighting over the default one.
-    //
-    // That check only catches a port that's already *listening* --
-    // `reserve_port`'s own lock file only guards against two calls in
-    // *this* process racing each other, not an unrelated process binding
-    // the same port between this check and `spawn_gateway_process`'s own
-    // `cmd.spawn()` a moment later. When that race loses, `acpx-server`
-    // itself fails to bind and exits immediately with the real "Address
-    // already in use" -- `spawn_gateway_process` tags that specific
-    // failure with `PORT_COLLISION_ERROR_MARKER` (see its doc comment), so
-    // retry a small, bounded number of times on a fresh ephemeral port
-    // instead of surfacing a bare crash with no fallback. Any other
-    // failure shape (missing binary, bad config, permission error, ...) is
-    // returned immediately -- a retry would never fix those.
-    const MAX_PORT_COLLISION_RETRIES: u32 = 3;
-    let mut attempt = 0;
-    loop {
-        let (port, lock) = if attempt == 0 {
-            if std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
-                std::time::Duration::from_millis(100),
-            )
-            .is_err()
-            {
-                match reserve_port(default_port) {
-                    Ok(lock) => (default_port, lock),
-                    Err(_) => reserve_ephemeral_port()
-                        .ok_or_else(|| "could not reserve a loopback port".to_string())?,
-                }
-            } else {
-                reserve_ephemeral_port()
-                    .ok_or_else(|| "could not reserve a loopback port".to_string())?
-            }
-        } else {
-            reserve_ephemeral_port()
-                .ok_or_else(|| "could not reserve a loopback port".to_string())?
-        };
-
-        match spawn_gateway_process(provider, port, lock, cache_dir) {
-            Ok(()) => return Ok(format!("http://127.0.0.1:{port}")),
-            Err(e)
-                if e.starts_with(PORT_COLLISION_ERROR_MARKER)
-                    && attempt < MAX_PORT_COLLISION_RETRIES =>
-            {
-                attempt += 1;
-                continue;
-            }
-            Err(e) => {
-                return Err(e
-                    .strip_prefix(PORT_COLLISION_ERROR_MARKER)
-                    .unwrap_or(&e)
-                    .to_string());
-            }
+    let (port, lock) = if std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
+        std::time::Duration::from_millis(100),
+    )
+    .is_err()
+    {
+        match reserve_port(default_port) {
+            Ok(lock) => (default_port, lock),
+            Err(_) => reserve_ephemeral_port()
+                .ok_or_else(|| "could not reserve a loopback port".to_string())?,
         }
-    }
-}
+    } else {
+        reserve_ephemeral_port().ok_or_else(|| "could not reserve a loopback port".to_string())?
+    };
 
-/// Prefix `spawn_gateway_process` puts on its error string when the spawned
-/// `acpx-server` exited during startup for what its own stderr log confirms
-/// was a port collision -- lets [`provision_gateway`] distinguish "retry on
-/// a different port" from every other startup failure (missing binary, bad
-/// config, permission error, ...) that a retry would never fix. Not a real
-/// error type since every other error in this module is already a bare
-/// `String`; a marker prefix keeps this one consistent with that.
-const PORT_COLLISION_ERROR_MARKER: &str = "\u{0}PORT_COLLISION\u{0}";
+    spawn_gateway_process(provider, port, lock, cache_dir)?;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
 
 /// The actual `Command::spawn` -- split from [`provision_gateway`] so the
 /// port-selection policy above stays readable. See that function's doc
@@ -2744,67 +2628,20 @@ fn spawn_gateway_process(
         // TOCTOU-safe convention `reserve_ephemeral_port`'s own caller
         // (the main HTTP port, `lock` above) already uses.
     }
-    // See `ensure_executable`'s doc comment: a real, recurring production
-    // failure (`system_launch.yaml`, "Permission denied (os error 13)")
-    // traced to this exact `cmd.spawn()` call losing the resolved
-    // binary's execute bit somewhere in packaging/transfer. Self-heal
-    // before attempting the exec so a stripped permission bit does not
-    // fail every thread on this provider.
-    let acpx_server_bin = resolve_acpx_server_bin();
-    ensure_executable(&acpx_server_bin);
     let mut child = cmd.spawn().map_err(|e| {
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
-        // Distinguish "never resolved a real binary" (EACCES self-heal
-        // above cannot help, and a bare `ENOENT`/os error 2 from Command
-        // is easy to misread as a permissions problem) from "resolved a
-        // real file that still failed to exec" -- surfaces the exact
-        // path this process tried, which the bare `io::Error` alone does
-        // not include, so an operator does not have to reconstruct
-        // `resolve_acpx_server_bin_from`'s own fallback chain by hand.
-        let exists = acpx_server_bin.is_file();
-        format!(
-            "failed to spawn acpx-server for {provider} on port {port} \
-             (resolved path {acpx_server_bin:?}, exists={exists}): {e}"
-        )
+        format!("failed to spawn acpx-server for {provider} on port {port}: {e}")
     })?;
     for _ in 0..50 {
         if probe_acpx_gateway_for_agent(port, Some(provider)) {
-            // Health-visibility gap: this watcher used to silently `break`
-            // and clean up the port lock on the gateway's own unexpected
-            // exit, with no log line and nothing surfaced to the panel at
-            // all -- an already-running gateway dying (crash, OOM-kill,
-            // operator `kill`) left every thread on it stuck with no
-            // explanation anywhere on disk, the same "zero diagnostics"
-            // failure mode the stderr-log-instead-of-/dev/null fix above
-            // addresses for startup failures. Full model/UI wiring for a
-            // post-start death is a larger TEA-plumbing change (no
-            // existing global channel from this background std::thread
-            // into the reducer); this is the tractable first step so the
-            // event is at least discoverable instead of invisible.
-            let provider_owned = provider.to_string();
             std::thread::spawn(move || {
                 let mut child = child;
-                let exit_status = loop {
+                loop {
                     match child.try_wait() {
-                        Ok(Some(status)) => break Some(status),
-                        Err(error) => {
-                            eprintln!(
-                                "panel-rust: lost track of acpx-server for {provider_owned} \
-                                 on port {port} (pid wait error: {error})"
-                            );
-                            break None;
-                        }
+                        Ok(Some(_)) | Err(_) => break,
                         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
                     }
-                };
-                if let Some(status) = exit_status {
-                    eprintln!(
-                        "panel-rust: acpx-server for {provider_owned} on port {port} exited \
-                         unexpectedly ({status}); every thread still bound to this gateway \
-                         will fail its next request -- see gateway-{provider_owned}.stderr.log \
-                         for the process's own diagnostics"
-                    );
                 }
                 drop(lock);
                 let _ = std::fs::remove_file(
@@ -2820,30 +2657,8 @@ fn spawn_gateway_process(
             let _ = std::fs::remove_file(
                 std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
             );
-            // `reserve_port`/the pre-spawn `TcpStream::connect_timeout` probe
-            // in `provision_gateway` only catch a port that's already
-            // *listening*; a port bound-but-not-accepting (TIME_WAIT, or an
-            // unrelated process racing this one between the probe and this
-            // exact `cmd.spawn()`) sails through both checks and only shows
-            // up here, as `acpx-server` itself failing to bind and exiting
-            // immediately. Scan its stderr log (the only place that real
-            // "Address already in use" / EADDRINUSE text lands, see the
-            // stderr redirection above) so `provision_gateway` can tell this
-            // apart from every other startup failure and retry on a fresh
-            // port instead of surfacing a bare crash with no fallback.
-            let looks_like_port_collision = std::fs::read_to_string(&stderr_log)
-                .map(|log| {
-                    let lower = log.to_ascii_lowercase();
-                    lower.contains("address already in use") || lower.contains("eaddrinuse")
-                })
-                .unwrap_or(false);
             return Err(format!(
-                "{}acpx-server exited during startup for {provider} on port {port}: {status}",
-                if looks_like_port_collision {
-                    PORT_COLLISION_ERROR_MARKER
-                } else {
-                    ""
-                }
+                "acpx-server exited during startup for {provider} on port {port}: {status}"
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -3246,7 +3061,6 @@ fn spawn_event_forwarder(
                     *slot_for_task.usage.lock().expect("usage mutex poisoned") = (*used, *size);
                 }
                 AgentEvent::Error(_) => {}
-                AgentEvent::ProviderProbe { .. } => {}
                 AgentEvent::PermissionRequest(req) => {
                     slot_for_task
                         .pending_requests
@@ -3992,7 +3806,6 @@ impl AgentBridge {
             gateway_catalog_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
             mcp_operations: Arc::new(Mutex::new(HashSet::new())),
-            recover_session_operations: Arc::new(Mutex::new(HashSet::new())),
             resolve_gateway,
             default_provider,
             store,
@@ -4092,42 +3905,6 @@ impl AgentBridge {
             base_url,
             mcp_servers,
         )
-    }
-
-    pub fn probe_provider_selection(&self, idx: usize, provider: String, profile_name: Option<String>) {
-        let Some(slot) = self.slots.get(idx) else { return };
-        // A thread with no resolvable project directory (no project bound
-        // and no session cwd override) is a normal, fully-supported state
-        // -- not a provider problem. `PoolKey`/session acquisition require a
-        // real project dir structurally, so the probe mechanism itself
-        // cannot run here; that's a precondition failure of the probe, not
-        // evidence this provider's auth is broken. Skip silently: no
-        // `provider_errors` entry, no toast, Send stays unaffected by
-        // provider state. Push nothing at all (not even an `Ok`) so a
-        // stale error from a previous project stays until a probe that can
-        // actually run replaces it.
-        let Some(project_dir) = thread_project_dir(slot.project_path_snapshot().as_deref(), &self.session_cwd_override) else {
-            return;
-        };
-        let Some(base_url) = self.gateway_urls.get(&provider).cloned() else {
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("no gateway is configured for {provider}")) } });
-            return;
-        };
-        let mcp_servers = snapflowd_mcp_servers_entry(Some(&project_dir), &provider);
-        let Some(pool) = self.pool_for(&project_dir.to_string_lossy(), &base_url, &mcp_servers) else {
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider: provider.clone(), result: Err(format!("could not initialize the gateway pool for {provider}")) } });
-            return;
-        };
-        let events = self.events.clone();
-        let key = acpx_client::pool::PoolKey::new(project_dir.to_string_lossy().into_owned(), provider.clone(), crate::gateway_actor::provider_profile_key(profile_name.as_deref()));
-        let preview_thread_id = format!("provider-probe:{idx}:{provider}");
-        self.runtime.spawn(async move {
-            let result = match pool.acquire(key, preview_thread_id, acpx_client::pool::OpenSpec { saved_session_id: None }).await {
-                Ok(lease) => pool.release(&lease).await.map_err(|error| format!("provider probe cleanup failed: {error}")),
-                Err(error) => Err(error.to_string()),
-            };
-            events.lock().unwrap_or_else(|e| e.into_inner()).push_back(BridgeEvent { thread_index: idx, event: AgentEvent::ProviderProbe { provider, result } });
-        });
     }
 
     /// Notify every pool for the settings gateway that its admin-plane MCP
@@ -4315,23 +4092,6 @@ impl AgentBridge {
     /// identity`] overwrites `session_project_path_override`, since that
     /// is exactly the "currently active project" this method reads.
     ///
-    /// Unscoped threads (`project_path: None`) are ALSO released here, on
-    /// every switch, regardless of what (if anything) was previously
-    /// active. Unlike scoped threads, an unscoped thread's `project_path`
-    /// is never bound to whatever project happens to be active -- it stays
-    /// `None` for the thread's whole life (barring an explicit rebind, see
-    /// `rebind_unscoped_project_path`) -- so there is no "switching away
-    /// from it" moment to key off of the way there is for a scoped thread.
-    /// Without this, an unscoped thread's live session/pool lease would
-    /// never be released by ANY project switch, accumulating indefinitely
-    /// no matter how many times the user changes projects. This does not
-    /// affect sidebar visibility: `retain_items_for_project` unconditionally
-    /// keeps unscoped threads listed (they were never tied to a project),
-    /// and releasing here never sets the permanent `closed` flag, so a
-    /// released unscoped thread reappears exactly like a released
-    /// scoped-foreign-project thread does today -- listed, session-less,
-    /// reopenable on next send.
-    ///
     /// Root cause this closes: before this method existed, a project
     /// switch or close only ever updated `session_cwd_override`/
     /// `session_project_path_override` (so *future* `session/new` calls
@@ -4366,37 +4126,25 @@ impl AgentBridge {
     /// AgentBridge`) -- a failed release here should not block the
     /// project switch itself.
     pub fn release_sessions_for_current_project(&self) {
-        let leaving_project_path = self
+        let Some(project_path) = self
             .session_project_path_override
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .clone()
+        else {
+            return;
+        };
         for slot in &self.slots {
-            let slot_project_path = slot.project_path_snapshot();
-            // Unscoped threads (`project_path: None`) are never tied to any
-            // one project, so they never match `leaving_project_path` by
-            // equality -- release them on EVERY switch, regardless of what
-            // (if anything) was previously active, otherwise their live
-            // session accumulates forever across arbitrarily many project
-            // switches. Scoped threads keep the original behavior: release
-            // only when they match the project actually being left.
-            let should_release = match (&slot_project_path, &leaving_project_path) {
-                (None, _) => true,
-                (Some(slot_path), Some(leaving_path)) => slot_path == leaving_path,
-                (Some(_), None) => false,
-            };
-            if !should_release {
+            if slot.project_path_snapshot().as_deref() != Some(project_path.as_path()) {
                 continue;
             }
             let handle = slot.handle.clone();
-            let thread_id = slot.thread_id.clone();
-            self.runtime.spawn(async move {
-                if let Err(error) = handle.close_session(true).await {
-                    eprintln!(
-                        "panel-rust: release_sessions_for_current_project close_session failed for thread {thread_id} (async): {error}"
-                    );
-                }
-            });
+            if let Err(error) = self.runtime.block_on(handle.close_session(true)) {
+                eprintln!(
+                    "panel-rust: release_sessions_for_current_project close_session failed for thread {}: {error}",
+                    slot.thread_id
+                );
+            }
         }
     }
 
@@ -4910,38 +4658,6 @@ impl AgentBridge {
     /// [`Self::add_thread_with_profile`]'s own cached-session-resume
     /// branch already establishes for a different trigger (local jsonl
     /// cache instead of a picked remote session).
-    ///
-    /// recoverable-attach-fix: this used to resolve the gateway and run
-    /// `session/load` via two `self.runtime.block_on(..)` calls right
-    /// here, on whatever thread called this method -- the Slint "Attach"
-    /// button's click handler, i.e. the UI thread. That froze the whole
-    /// app for the full round trip (and up to a 10s gateway-wait on top).
-    /// Every other attach path in this file (`add_thread_deferred`'s
-    /// eventual `attach_deferred_thread`, `add_thread_with_profile_and_
-    /// provider`) claims its slot's index synchronously (cheap: name
-    /// dedup + a `HashMap` lookup) and then does the real network work on
-    /// `self.runtime` via `spawn_background_attachment`, in the
-    /// background. This method now follows the identical shape, using
-    /// the same delayed-gateway handle (`spawn_acpx_thread_with_delayed_
-    /// gateway`) `build_slot` uses for its own non-pool branch, so the
-    /// slot is pushed -- and this call returns -- before any RPC ever
-    /// starts. The slot starts with `AttachmentState::default()`
-    /// (`complete: false`), exactly like every other in-flight attach;
-    /// `external_snapshot.rs`'s existing "no binding yet, not deferred"
-    /// check already renders such a slot as a loading/"Starting new
-    /// thread..." row with zero additional wiring (see its own "eager/
-    /// recovered" comment, which already anticipated this path), and
-    /// `wait_for_attachment` already makes a `send_prompt` issued before
-    /// attachment completes wait for it in the background rather than
-    /// erroring or blocking the caller.
-    ///
-    /// Deliberately does NOT reuse `spawn_background_attachment` itself:
-    /// that function's `requested_session_id` branch falls back to a
-    /// brand-new `session/new` if `session/load` fails for a non-auth
-    /// reason, which would silently violate this method's own contract
-    /// ("never `session/new`") the moment a picked-from-`session/list`
-    /// session id turned out to be stale/gone -- exactly the case a
-    /// recovery flow most needs to fail loudly on, not paper over.
     pub fn add_thread_recovering_session(
         &mut self,
         name: &str,
@@ -4960,67 +4676,40 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let base_url = match self.gateway_urls.get(provider).cloned() {
-            Some(base_url) => base_url,
-            None => {
-                return Err(BridgeError::Gateway(format!(
-                    "gateway URL missing for {provider}"
-                )))
+        let base_url =
+            self.gateway_urls.get(provider).cloned().ok_or_else(|| {
+                BridgeError::Gateway(format!("gateway URL missing for {provider}"))
+            })?;
+        let gateways = self.gateways.clone();
+        let gateway = self.runtime.block_on(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(gateway) = gateways
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&base_url)
+                    .cloned()
+                {
+                    return Ok(gateway);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(BridgeError::Gateway(format!(
+                        "gateway connection missing for {base_url}"
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        };
-        // Marked busy from this point on (a real attach is about to
-        // start) through the background task's completion below --
-        // covers both the success and error exits, symmetric with `end_
-        // recover_session_operation` at the bottom of the spawned task.
-        self.begin_recover_session_operation(session_id);
+        })?;
 
         // Deliberately does not consult the local jsonl cache for
         // `thread_id` -- this is a *new* local thread identity being
         // bound to a pre-existing *remote* session, not a reopen of a
         // thread this panel already knew about (that path is `add_
         // thread_with_profile`'s own `cached_session_id` branch).
-        //
-        // Same delayed-gateway construction `build_slot`'s non-pool
-        // branch uses: the handle is usable immediately (queues its
-        // first command until a gateway is set), so nothing here needs
-        // to wait -- synchronously if already connected, or via a
-        // background poll loop (identical to `build_slot`'s own) if the
-        // gateway's `Gateway::connect` task from the constructor hasn't
-        // resolved yet.
-        let (mut handle, gateway_setter) = {
+        let mut handle = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread_with_delayed_gateway()
+            spawn_acpx_thread_with_gateway(gateway)
         };
-        match self
-            .gateways
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&base_url)
-            .cloned()
-        {
-            Some(gateway) => gateway_setter.set_gateway(gateway),
-            None => {
-                let gateways = self.gateways.clone();
-                self.runtime.spawn(async move {
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                    loop {
-                        if let Some(gateway) = gateways
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&base_url)
-                            .cloned()
-                        {
-                            gateway_setter.set_gateway(gateway);
-                            return;
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                });
-            }
-        }
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
         let project_path_for_slot = self
@@ -5050,14 +4739,10 @@ impl AgentBridge {
             available_commands: Mutex::new(Vec::new()),
             plan: Mutex::new(Vec::new()),
             session_title: Mutex::new(None),
-            // Not yet attached: `session/load` hasn't even been sent
-            // yet, let alone completed. `wait_for_attachment` (used by
-            // `send_prompt`/`cancel_prompt`) blocks on this in the
-            // background until the task below calls `complete_
-            // attachment`, and `external_snapshot.rs`'s thread-list
-            // hydration already renders a slot in this state as a
-            // loading row.
-            attachment: Mutex::new(AttachmentState::default()),
+            attachment: Mutex::new(AttachmentState {
+                complete: true,
+                error: None,
+            }),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(false),
@@ -5065,116 +4750,62 @@ impl AgentBridge {
             deferred: false,
             background: Mutex::new(false),
         });
-        self.slots.push(slot.clone());
 
-        let session_id = session_id.to_string();
-        let store = self.store.clone();
-        let session_cwd_override = self.session_cwd_override.clone();
-        let events_out = self.events.clone();
-        let recover_session_operations = self.recover_session_operations.clone();
-        self.runtime.spawn(async move {
-            // `slot.project_path` (not `session_cwd_override` directly) so
-            // this cwd -- and the MCP `--project-dir` below -- can never
-            // disagree with what was just recorded on the slot above
-            // (PISO-4): both trace back to the same snapshot, not an
-            // independent re-read of the global that could have moved
-            // since.
-            let slot_project_path = slot.project_path_snapshot();
-            let cwd = cwd_for_session(slot_project_path.as_deref(), &session_cwd_override);
-            let project_dir =
-                thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
-            let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), &slot.provider);
-            match handle
-                .resume_session(session_id.clone(), cwd, mcp_servers)
-                .await
-            {
-                Ok(()) => {
-                    *slot
-                        .acp_session_id
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
-                    persist_thread_snapshot(store.as_ref(), &slot, now_token());
+        // `slot.project_path` (not `self.session_cwd_override` directly) so
+        // this cwd -- and the MCP `--project-dir` below -- can never
+        // disagree with what was just recorded on the slot a few lines
+        // above (PISO-4): both trace back to the same `project_path_for_
+        // slot` snapshot taken before construction, not an independent
+        // re-read of the global that could have moved since.
+        let slot_project_path = slot.project_path_snapshot();
+        let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
+        let project_dir =
+            thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
+        let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), provider);
+        self.runtime
+            .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
+            .map_err(|error| BridgeError::Gateway(error.to_string()))?;
+        *slot
+            .acp_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
+        persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
 
-                    // `resume_session`'s own replayed `session/update`
-                    // history -- AND the capability events (`session/
-                    // load`'s own `configOptions`/`modes`, emitted via
-                    // `emit_capability_events` before the RPC resolves --
-                    // see `Command::ResumeSession`'s handler) -- have
-                    // already fully arrived on `events_rx` by the time
-                    // the call above returns. Drain both into this
-                    // brand-new slot's state now, before handing the
-                    // receiver off to the continuous forwarder for
-                    // anything that arrives afterward. Previously this
-                    // drain only matched `AgentEvent::Message`, silently
-                    // dropping every `ConfigOptions`/`SessionModes`/etc.
-                    // event already queued here -- the recovered
-                    // thread's compose bar never got a provider/model
-                    // dropdown because the one and only capability event
-                    // `session/load` ever emits for it was thrown away
-                    // right here, before the forwarder task (which DOES
-                    // handle those variants via `store_capability_event`)
-                    // ever got a chance to see it.
-                    let mut replayed_any = false;
-                    while let Ok(event) = events_rx.try_recv() {
-                        match &event {
-                            AgentEvent::Message(message) => {
-                                slot.history
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .push(message.clone());
-                                replayed_any = true;
-                                if let Some(store) = &store {
-                                    let _ = store.append(&slot.thread_id, message);
-                                }
-                            }
-                            AgentEvent::SessionModes(_)
-                            | AgentEvent::CurrentModeChanged(_)
-                            | AgentEvent::ConfigOptions(_)
-                            | AgentEvent::AvailableCommands(_)
-                            | AgentEvent::PlanUpdate(_)
-                            | AgentEvent::SessionInfoUpdate { .. } => {
-                                store_capability_event(&slot, &event);
-                            }
-                            _ => {}
-                        }
-                    }
-                    if replayed_any {
-                        refresh_transcript(&slot);
-                    }
-                    complete_attachment(&slot, None);
-                }
-                Err(error) => {
-                    let message = format!(
-                        "session/load failed for recovered session {session_id:?}: {error}"
-                    );
-                    complete_attachment(&slot, Some(message.clone()));
-                    events_out
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back(BridgeEvent {
-                            thread_index: idx,
-                            event: AgentEvent::Error(message),
-                        });
+        // `resume_session`'s own replayed `session/update` history has
+        // already fully arrived on `events_rx` by the time the call
+        // above returns (it drains to a real ACP response before
+        // `AcpxThreadHandle::resume_session` resolves -- see that
+        // method's own actor-loop implementation) -- drain it now into
+        // this brand-new slot's `history`, same `try_recv` sweep
+        // `add_thread_with_profile`'s own cached-resume branch uses,
+        // before handing the receiver off to the continuous forwarder
+        // for anything that arrives afterward.
+        let mut replayed_any = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::Message(message) = event {
+                slot.history
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(message.clone());
+                replayed_any = true;
+                if let Some(store) = &self.store {
+                    let _ = store.append(&slot.thread_id, &message);
                 }
             }
-            // Symmetric with `begin_recover_session_operation` above --
-            // covers both the `Ok` and `Err` arms, so the Settings >
-            // Agents row's spinner (`RemoteSessionOption.busy`, sourced
-            // from `recover_session_operations_in_flight`) clears the
-            // instant this attach settles, success or failure alike.
-            recover_session_operations
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&session_id);
-            spawn_event_forwarder(
-                &tokio::runtime::Handle::current(),
-                events_rx,
-                events_out,
-                store,
-                slot,
-                idx,
-            );
-        });
+        }
+        if replayed_any {
+            refresh_transcript(&slot);
+        }
+
+        spawn_event_forwarder(
+            &self.runtime.handle().clone(),
+            events_rx,
+            self.events.clone(),
+            self.store.clone(),
+            slot.clone(),
+            idx,
+        );
+        self.slots.push(slot);
         Ok(idx)
     }
 
@@ -5231,23 +4862,6 @@ impl AgentBridge {
             .get(idx)
             .map(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .unwrap_or_default()
-    }
-
-    /// Just the last message of a thread's scrollback, if any -- O(1)
-    /// relative to that thread's history length, unlike `history()` which
-    /// clones the entire `Vec<ChatMessage>`. Used by per-frame snapshot
-    /// paths (e.g. the sidebar's one-line description) that only ever
-    /// look at the final message and must not scale with a thread's total
-    /// message count, since those paths run on every poll tick for every
-    /// thread regardless of which thread (if any) is actively sending.
-    pub fn last_message(&self, idx: usize) -> Option<ChatMessage> {
-        self.slots.get(idx).and_then(|s| {
-            s.history
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .last()
-                .cloned()
-        })
     }
 
     /// The durable identity of an already-open thread, used by the panel's
@@ -6177,31 +5791,6 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
-    /// recoverable-attach-fix: marks `session_id` busy for the duration
-    /// of its `recover-session-attach` `session/load`. Mirrors `begin_
-    /// mcp_operation`'s own contract; the key is removed again once the
-    /// background attach task completes (success or error) -- inlined
-    /// there directly (via a cloned `Arc`) rather than through a `&self`
-    /// method, since that task runs detached from any `AgentBridge`
-    /// borrow.
-    fn begin_recover_session_operation(&self, session_id: &str) {
-        self.recover_session_operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.to_owned());
-    }
-
-    /// Non-blocking read, safe to call every frame poll -- same contract
-    /// as [`Self::mcp_operations_in_flight`]. Keys are bare remote
-    /// `acp_session_id`s (never composite like the MCP/agent sets above,
-    /// since a session id alone is already unique).
-    pub fn recover_session_operations_in_flight(&self) -> Vec<String> {
-        self.recover_session_operations
-            .try_lock()
-            .map(|operations| operations.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
     /// `agents/list` against thread `idx`'s bound gateway -- the
     /// registry catalogue (installed/not-installed/runtime-missing
     /// status per entry) an agent-catalog UI section populates from.
@@ -6361,7 +5950,6 @@ impl AgentBridge {
                 profiles: cache.profiles.clone(),
                 mcp_servers: cache.mcp_servers.clone(),
                 agents: cache.agents.clone(),
-                agents_fetched: cache.gen > 0,
                 recoverable_sessions: cache.recoverable_sessions.clone(),
                 recovery_provider: cache.recovery_provider.clone(),
             })
@@ -7745,12 +7333,10 @@ mod tests {
 
     /// project-close-session-teardown: releasing sessions for the
     /// currently active project must not touch threads recorded against a
-    /// DIFFERENT project -- mirrors `rebind_project_path_moves_only_the_
-    /// renamed_projects_threads`'s "only the matching project's threads
-    /// move" shape, but for teardown instead of rename. Unscoped threads
-    /// are deliberately NOT exempt here (see the sibling test below for
-    /// that behavior) -- this test only pins down the scoped-vs-scoped
-    /// isolation. None of these threads ever opened a real session (an
+    /// DIFFERENT project (or an unscoped thread) -- mirrors `rebind_
+    /// project_path_moves_only_the_renamed_projects_threads`'s "only the
+    /// matching project's threads move" shape, but for teardown instead of
+    /// rename. None of these threads ever opened a real session (an
     /// unreachable gateway URL, same as every other bridge-construction
     /// test in this module), so `close_session` resolves to an immediate
     /// no-op success on each -- this test's real assertion is that the
@@ -7789,10 +7375,7 @@ mod tests {
         )
         .expect("bridge construction does not require a reachable gateway");
 
-        // No active project recorded yet -- releasing is still safe (and,
-        // per the new unscoped behavior, actively releases the unscoped
-        // thread's session) but must never touch the permanent `closed`
-        // flag on any thread.
+        // No active project recorded yet -- must be a safe no-op.
         bridge.release_sessions_for_current_project();
         for idx in 0..3 {
             assert!(!bridge.thread_closed(idx));
@@ -7808,65 +7391,6 @@ mod tests {
             assert!(
                 !bridge.thread_closed(idx),
                 "release must never flip the permanent closed flag"
-            );
-        }
-    }
-
-    /// New behavior: unscoped threads' live sessions must be released on
-    /// EVERY project switch, not just when a scoped thread's own project is
-    /// being left -- otherwise an unscoped thread's session/pool lease
-    /// would never be released by any switch and accumulate indefinitely.
-    /// Verifies this holds both for a "no-project -> project A" switch and
-    /// a "project A -> project B" switch, and that the unscoped thread
-    /// stays visible/reopenable (never permanently `closed`) afterward,
-    /// matching how a released scoped-foreign-project thread already
-    /// behaves.
-    #[test]
-    fn release_sessions_for_current_project_releases_unscoped_threads_on_every_switch() {
-        let specs = vec![
-            ThreadSpec {
-                display_name: "on-a".to_owned(),
-                provider: "codex".to_owned(),
-                session_id: None,
-                profile_name: None,
-                project_path: Some("/projects/a/timeline.mlt".to_owned()),
-            },
-            ThreadSpec {
-                display_name: "unscoped".to_owned(),
-                provider: "codex".to_owned(),
-                session_id: None,
-                profile_name: None,
-                project_path: None,
-            },
-        ];
-        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
-            &specs,
-            |_provider| Ok("http://127.0.0.1:1".to_owned()),
-            None,
-        )
-        .expect("bridge construction does not require a reachable gateway");
-
-        // "no project -> project A": previously no project was active at
-        // all, yet the unscoped thread's session must still be released.
-        bridge.release_sessions_for_current_project();
-        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
-            "/projects/a/timeline.mlt".to_owned(),
-        ));
-
-        // "project A -> project B": the unscoped thread is released again,
-        // same as A's own thread is released for leaving A.
-        bridge.release_sessions_for_current_project();
-        bridge.set_active_project_identity(&crate::model::ProjectIdentity::Saved(
-            "/projects/b/timeline.mlt".to_owned(),
-        ));
-
-        // Neither release call may ever flip the permanent `closed` flag --
-        // both threads must remain visible/reopenable, just session-less.
-        for idx in 0..2 {
-            assert!(
-                !bridge.thread_closed(idx),
-                "releasing a session must never permanently close the thread \
-                 (slot {idx} must remain visible and reopenable)"
             );
         }
     }
@@ -9173,20 +8697,8 @@ mod tests {
         let recovered_idx = bridge
             .add_thread_recovering_session("Recovered Thread", "codex", &orphan_session_id)
             .expect("add_thread_recovering_session");
-        // recoverable-attach-fix: the attach itself (gateway resolution +
-        // `session/load`) now runs on the background runtime instead of
-        // blocking this call, so the binding is not necessarily present
-        // the instant `add_thread_recovering_session` returns -- poll for
-        // it with a deadline, same convention every other event-driven
-        // assertion in this module already follows.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut binding = bridge.thread_binding(recovered_idx);
-        while std::time::Instant::now() < deadline && binding.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            binding = bridge.thread_binding(recovered_idx);
-        }
         assert_eq!(
-            binding.map(|b| b.session_id),
+            bridge.thread_binding(recovered_idx).map(|b| b.session_id),
             Some(orphan_session_id.clone()),
             "the recovered thread must bind to the orphan's own session id, not a new one"
         );
@@ -10018,33 +9530,6 @@ done
         );
     }
 
-    /// A thread with no project bound and no session cwd override is a
-    /// normal, fully-supported state (default cold-start thread, unscoped
-    /// thread kept open across a project switch -- see
-    /// `retain_items_for_project` and the `2e20021c`/`a8058a45` seeded
-    /// default thread). `probe_provider_selection` must not treat "no
-    /// project" as a provider auth failure: no `ProviderProbe` event at all
-    /// should be emitted, since a stored `Err` here becomes a
-    /// "Provider unavailable" toast and disables Send
-    /// (`selected-provider-unavailable`) for a reason that has nothing to
-    /// do with the provider itself.
-    #[test]
-    fn probe_provider_selection_is_a_silent_noop_when_thread_has_no_project() {
-        let mut bridge = AgentBridge::new_with_gateway_url(&["Untitled"], "http://127.0.0.1:1".to_owned())
-            .expect("bridge");
-
-        bridge.probe_provider_selection(0, "codex".to_owned(), None);
-
-        // Give any (unexpected) spawned task a chance to land before
-        // asserting the queue is empty.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let events = bridge.poll();
-        assert!(
-            events.is_empty(),
-            "no-project probe must not emit any ProviderProbe event, got: {events:?}"
-        );
-    }
-
     /// Supersedes the old `normalize_provider_maps_registry_ids_onto_
     /// gateway_keys` test now that `normalize_provider` is gone entirely
     /// (see `resolve_provider_for`'s doc comment): every distinct
@@ -10104,16 +9589,10 @@ done
 
     #[test]
     fn packaged_gateway_binary_resolution_prefers_override_then_relative_install() {
-        // Windows installs the real binary as `acpx-server.exe`
-        // (`EXE_SUFFIX`) -- exercise the exact platform-appropriate name
-        // so this test still proves the resolver finds a real packaged
-        // install on every CI OS (build-windows.yml runs `cargo test
-        // --release` on windows-latest too), not just Unix's bare name.
-        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        let packaged = bin_dir.join(&exe_name);
+        let packaged = bin_dir.join("acpx-server");
         std::fs::write(&packaged, b"binary").expect("packaged binary");
         let exe = bin_dir.join("panel");
 
@@ -10132,21 +9611,20 @@ done
 
         let libexec_dir = temp.path().join("libexec");
         std::fs::create_dir_all(&libexec_dir).expect("libexec dir");
-        let libexec_bin = libexec_dir.join(&exe_name);
+        let libexec_bin = libexec_dir.join("acpx-server");
         std::fs::write(&libexec_bin, b"binary").expect("libexec binary");
         std::fs::remove_file(&packaged).expect("remove sibling binary");
         assert_eq!(
             resolve_acpx_server_bin_from(None, Some(&exe), Path::new("/manifest")),
-            bin_dir.join(format!("../libexec/{exe_name}"))
+            bin_dir.join("../libexec/acpx-server")
         );
     }
 
     #[test]
     fn packaged_gateway_binary_resolution_falls_back_to_dev_checkout() {
-        let exe_name = format!("acpx-server{}", std::env::consts::EXE_SUFFIX);
         assert_eq!(
             resolve_acpx_server_bin_from(None, None, Path::new("/manifest")),
-            PathBuf::from(format!("/manifest/../acpx/target/debug/{exe_name}"))
+            PathBuf::from("/manifest/../acpx/target/debug/acpx-server")
         );
     }
 
@@ -12436,7 +11914,6 @@ done
             profiles: Vec::new(),
             mcp_servers: Vec::new(),
             agents: Vec::new(),
-            agents_fetched: false,
             recoverable_sessions: Vec::new(),
             recovery_provider: String::new(),
         };

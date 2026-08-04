@@ -305,18 +305,6 @@ pub enum Dirty {
     Connection {
         thread_id: String,
     },
-    /// mcp-servers-settings follow-up: `thread_id`'s provider-probe
-    /// (`Model::provider_probes_in_flight`) loading state changed --
-    /// start on `SettingsMsg::ProfileSelected`'s `Effect::ProbeProvider`
-    /// dispatch, end on the matching `AgentEvent::ProviderProbe` (either
-    /// `Ok` or `Err`; the error text itself still goes only through the
-    /// existing `provider_errors`/toast path, not duplicated here -- see
-    /// `sync::chat_view_provider_switching`'s doc comment). Same
-    /// singleton-property, displayed-thread-gated shape as `Connection`
-    /// above.
-    ProviderSwitch {
-        thread_id: String,
-    },
     Error {
         thread_id: String,
         detail: ErrorDetail,

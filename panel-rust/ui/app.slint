@@ -82,8 +82,6 @@ export component ChatPanel inherits Window {
     callback load-older-requested();
     in-out property <string> compose-text: "";
     in-out property <bool> settings-open: false;
-    in-out property <bool> onboarding-completed: false;
-    callback complete-onboarding();
     // Keep in sync with SettingsPage.scope's own default -- see its doc
     // comment for why a `<=>` alias makes a mismatch silently misleading.
     in-out property <string> settings-scope: "global";
@@ -164,19 +162,6 @@ export component ChatPanel inherits Window {
     // `available-profiles`.
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
-    in property <bool> agent-catalog-fetched: false;
-    // provider-toggle-auth-probe: true when the currently selected
-    // thread's provider has a stored pool-acquire probe failure
-    // (Model.provider_errors, populated from AgentEvent::ProviderProbe).
-    // Gates Send the same way agent-catalog-fetched does below.
-    in property <bool> selected-provider-unavailable: false;
-    // mcp-servers-settings follow-up: true while the currently selected
-    // thread's provider has a `probe_provider_selection` acquire+release
-    // round-trip in flight (Model.provider_probes_in_flight) -- drives
-    // ChatArea's chat-view-local pulsing "Switching provider..."
-    // indicator, distinct from selected-provider-unavailable above
-    // (which is the probe's stored *failure*, not its in-progress state).
-    in property <bool> selected-provider-switching: false;
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     // Skill-manager backend addition (skill_discovery_backend phase) --
     // populated by `lib.rs` from `models::to_skill_options`. Plumbed
@@ -194,13 +179,6 @@ export component ChatPanel inherits Window {
     // default -- those two settings are hidden entirely, in both Project
     // and Global scope, until this is explicitly turned on.
     in property <bool> profile-wiring-enabled: false;
-    // Env-var feature-flag gate (BETA_MODE, see lib.rs's
-    // beta_mode_enabled()) for in-development UI surfaces: the Chat
-    // Defaults "Profile" field in agents_view.slint (additive on top of
-    // profile-wiring-enabled above -- both must be true for that field to
-    // show) and the whole Harness settings tab (left_tabs.slint /
-    // settings_page.slint). Off by default.
-    in property <bool> beta-mode-enabled: false;
     // `active_pane_and_editor_view` phase: which surface the main content
     // area shows -- "chat" (ChatArea, the default) or "skill" (a live
     // SkillEditorView for the sidebar's currently-selected skill).
@@ -293,7 +271,6 @@ export component ChatPanel inherits Window {
     callback thread-archive-requested(int);
     callback thread-rename-requested(int, string);
     callback search-submitted(string, bool, bool);
-    callback mention-filter-changed(string, string);
     callback send-requested(string);
     callback compose-draft-changed(string);
     callback queue-fast-track-requested();
@@ -358,16 +335,6 @@ export component ChatPanel inherits Window {
     property <string> rename-thread-draft: "";
     property <string> rename-focus-target: "";
     property <bool> pending-compose-focus: false;
-    // Set immediately by a genuine user-initiated thread switch (sidebar
-    // click or Ctrl+Alt+Up/Down nav), *not* by begin-thread-rename's own
-    // `selected-thread` write (that's a side effect of starting a rename,
-    // not the user asking to read/type in a different thread -- stealing
-    // focus to compose there would fight the rename TextInput for it).
-    // Consumed by `changed selected-thread` below once Rust's dirty-sync
-    // round-trip (sync.rs ScalarField::SelectedThread) lands the switch,
-    // so it fires for both the sidebar's optimistic local update and the
-    // keyboard-nav path (which has no local update, only the round-trip).
-    property <bool> pending-thread-switch-focus: false;
 
     function start-new-thread() {
         root.active-pane = "chat";
@@ -439,21 +406,6 @@ export component ChatPanel inherits Window {
             chat-views.restore-compose-focus();
         } else {
             legacy-chat-area.restore-compose-focus();
-        }
-    }
-    // Auto-focus compose after a genuine user-initiated thread switch
-    // lands (see `pending-thread-switch-focus`'s doc comment), so the user
-    // can start typing immediately without clicking into the box first.
-    // Guarded the same way key dispatch already guards itself (lib.rs
-    // `panel_rust_has_text_focus`) -- don't yank focus away from an
-    // actively-focused rename field, sidebar/settings search box, mention
-    // filter, or terminal.
-    changed selected-thread => {
-        if (root.pending-thread-switch-focus) {
-            root.pending-thread-switch-focus = false;
-            if (!root.secondary-text-input-has-focus && !root.local-terminal-has-focus) {
-                root.restore-active-compose-focus();
-            }
         }
     }
     public function approve-active-pending() {
@@ -534,12 +486,10 @@ export component ChatPanel inherits Window {
             // collide with in-field text navigation and Shotcut's own
             // transport/navigation shortcuts (see the execution plan).
             if (event.modifiers.alt && event.text == Key.UpArrow) {
-                root.pending-thread-switch-focus = true;
                 root.thread-navigation-requested(-1);
                 return EventResult.accept;
             }
             if (event.modifiers.alt && event.text == Key.DownArrow) {
-                root.pending-thread-switch-focus = true;
                 root.thread-navigation-requested(1);
                 return EventResult.accept;
             }
@@ -587,7 +537,6 @@ export component ChatPanel inherits Window {
                 rename-thread-draft <=> root.rename-thread-draft;
                 rename-focus-target: root.rename-focus-target;
                 thread-selected(i) => {
-                    root.pending-thread-switch-focus = true;
                     selected-thread = i;
                     // Leave live skill editor when a thread is chosen —
                     // main surface returns to chat (active-pane switch).
@@ -642,8 +591,6 @@ export component ChatPanel inherits Window {
                 active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
                 active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
                 active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
-                agent-catalog: root.agent-catalog;
-                agent-catalog-fetched: root.agent-catalog-fetched;
                 toggle-background => { thread-toggle-background(selected-thread); }
                 has-older-messages: has-older-messages;
                 loading-older-messages <=> loading-older-messages;
@@ -662,13 +609,9 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 inputs-enabled: root.gateway-ready
-                    && !(threads.length > 0 && threads[selected-thread].archived)
-                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
-                    && !root.selected-provider-unavailable;
-                provider-switching: root.selected-provider-switching;
+                    && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
-                mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
                 // Phase 16: project indicator from the selected thread's
                 // live fields (project_* post-populated from the bridge;
                 // connection-status is the live MCP/agent link state).
@@ -677,8 +620,6 @@ export component ChatPanel inherits Window {
                 // Live values from the bridge: "Live connection" (WS interactive)
                 // counts as live; "HTTP fallback"/"Connecting..." do not.
                 project-mcp-live: connection-status == "Live connection";
-                onboarding-completed <=> root.onboarding-completed;
-                complete-onboarding => { root.complete-onboarding(); }
                 md-link-activated(target) => { root.md-link-activated(target); }
                 connection-status: connection-status;
                 last-error: last-error;
@@ -774,8 +715,6 @@ export component ChatPanel inherits Window {
                 active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
                 active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
                 active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
-                agent-catalog: root.agent-catalog;
-                agent-catalog-fetched: root.agent-catalog-fetched;
                 toggle-background => { thread-toggle-background(selected-thread); }
                 messages: messages;
                 has-older-messages: has-older-messages;
@@ -795,13 +734,9 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 inputs-enabled: root.gateway-ready
-                    && !(threads.length > 0 && threads[selected-thread].archived)
-                    && !(root.agent-catalog-fetched && root.agent-catalog.length == 0)
-                    && !root.selected-provider-unavailable;
-                provider-switching: root.selected-provider-switching;
+                    && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
-                mention-filter-changed(prefix, query) => { root.mention-filter-changed(prefix, query); }
                 // Phase 16: project indicator from the selected thread's
                 // live fields (project_* post-populated from the bridge;
                 // connection-status is the live MCP/agent link state).
@@ -810,8 +745,6 @@ export component ChatPanel inherits Window {
                 // Live values from the bridge: "Live connection" (WS interactive)
                 // counts as live; "HTTP fallback"/"Connecting..." do not.
                 project-mcp-live: connection-status == "Live connection";
-                onboarding-completed <=> root.onboarding-completed;
-                complete-onboarding => { root.complete-onboarding(); }
                 md-link-activated(target) => { root.md-link-activated(target); }
                 connection-status: connection-status;
                 last-error: last-error;
@@ -925,25 +858,14 @@ export component ChatPanel inherits Window {
         }
         // Phase 28: the shared toast surface. Bottom-center of the main
         // content area, above the compose box, color-coded by kind.
-        //
-        // The "main content area" is not always the same region: normally
-        // it's everything right of the sidebar, but SettingsPage (below)
-        // paints full-window (x:8px, width: parent.width-16px) and covers
-        // the sidebar entirely while open. Centering against
-        // `sidebar.width..root.width` while Settings is open left the
-        // toast (e.g. the MCP "Fetching tools for ..." status) visibly
-        // shifted right of true-center in the Settings pane. Mirror
-        // SettingsPage's own left-edge so this stays centered in whatever
-        // region is actually visible underneath.
-        property <length> toast-region-left: root.settings-open ? 0px : sidebar.width;
         if root.toast-visible && root.toast-message != "" : Rectangle {
             // SettingsPage is a later sibling and otherwise paints over this
             // shared feedback surface. Keep action errors above every page
             // overlay, including Settings.
             z: 10000;
-            x: toast-region-left + ((root.width - toast-region-left) - self.width) / 2;
+            x: sidebar.width + ((root.width - sidebar.width) - self.width) / 2;
             y: root.height - self.height - 84px;
-            width: min(root.width - toast-region-left - 24px, max(220px, toast-text.preferred-width + 28px));
+            width: min(root.width - sidebar.width - 24px, max(220px, toast-text.preferred-width + 28px));
             height: toast-text.preferred-height + 16px;
             background: Theme.bg-primary-container;
             border-radius: Theme.radius-sm;
@@ -1033,7 +955,6 @@ export component ChatPanel inherits Window {
             default-profile <=> default-profile;
             permission-profile <=> permission-profile;
             profile-wiring-enabled: root.profile-wiring-enabled;
-            beta-mode-enabled: root.beta-mode-enabled;
             background-default <=> background-default;
             default-agent-id <=> root.default-agent-id;
             show-global-skills <=> show-global-skills;
