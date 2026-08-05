@@ -12,7 +12,7 @@
 //! continue without resurrecting the deleted backend.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -113,11 +113,39 @@ pub(crate) fn prune_finished_jobs(jobs: &mut HashMap<String, JobStatus>) -> Vec<
 
 pub(crate) fn resolve_melt_binary() -> String {
     if let Ok(p) = std::env::var("MELT_BIN") {
-        return p;
+        if !p.is_empty() && Path::new(&p).exists() {
+            return p;
+        }
     }
+
+    // Release bundles put the MLT CLI beside the running Snapflow binary.
+    // This must be checked before HOME/PATH: snapshotd intentionally gives
+    // each launched project a sandbox HOME, so `$HOME/.local/bin/melt` is not
+    // the user's real install and a systemd-launched child may have a stale
+    // PATH. `current_exe` is the post-wrapper `Snapflow.app/bin/snapflow`
+    // path in packaged launches, and the sibling lookup also works for a
+    // source-built sap-rust + melt pair.
+    let mut candidates = Vec::<PathBuf>::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("melt"));
+            candidates.push(parent.join("melt.exe"));
+        }
+    }
+    if let Ok(install_dir) = std::env::var("SNAPFLOW_INSTALL_DIR") {
+        let install_dir = PathBuf::from(install_dir);
+        candidates.push(install_dir.join("bin/melt"));
+        candidates.push(install_dir.join("bin/melt.exe"));
+        candidates.push(install_dir.join("Snapflow.app/bin/melt"));
+        candidates.push(install_dir.join("Snapflow.app/bin/melt.exe"));
+    }
+    if let Some(candidate) = candidates.into_iter().find(|path| path.is_file()) {
+        return candidate.to_string_lossy().into_owned();
+    }
+
     if let Ok(home) = std::env::var("HOME") {
         let candidate = format!("{home}/.local/bin/melt");
-        if Path::new(&candidate).exists() {
+        if Path::new(&candidate).is_file() {
             return candidate;
         }
     }
