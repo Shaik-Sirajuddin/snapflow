@@ -71,6 +71,22 @@ type Track struct {
 	Hidden    bool   `json:"hidden"`
 	Locked    bool   `json:"locked"`
 	BlendMode string `json:"blendMode"`
+	Composite bool   `json:"composite"`
+}
+
+// ProfileInfo mirrors sap-rust's backend::ProfileInfo (project.get/setProfile).
+type ProfileInfo struct {
+	Width        int `json:"width"`
+	Height       int `json:"height"`
+	FrameRateNum int `json:"frameRateNum"`
+	FrameRateDen int `json:"frameRateDen"`
+}
+
+// PlaybackState mirrors sap-rust's backend::PlaybackState.
+type PlaybackState struct {
+	Playing  bool  `json:"playing"`
+	Position int64 `json:"position"`
+	Duration int64 `json:"duration"`
 }
 
 // TrackList is the {"items": [...]} wrapper for Vec<Track> responses

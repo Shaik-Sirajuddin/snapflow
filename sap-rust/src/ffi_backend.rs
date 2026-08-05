@@ -39,8 +39,8 @@ use tokio::sync::mpsc;
 
 use crate::backend::{
     Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, FilterListEntry, JobStatus,
-    KeyframeInfo, Marker, PlaylistEntry, PlaylistEntryDetail, ProjectState, SplitClipResult,
-    SubtitleTrackInfo, Track, TransitionInfo,
+    KeyframeInfo, Marker, PlaybackState, PlaylistEntry, PlaylistEntryDetail, ProfileInfo,
+    ProjectState, SplitClipResult, SubtitleTrackInfo, Track, TransitionInfo,
 };
 use crate::ffi;
 use crate::protocol::RpcNotification;
@@ -628,6 +628,7 @@ impl Backend for FfiBackend {
             hidden: false,
             locked: false,
             blend_mode: crate::backend::default_blend_mode(),
+            composite: false,
         })
     }
 
@@ -665,13 +666,10 @@ impl Backend for FfiBackend {
         hidden: Option<bool>,
         locked: Option<bool>,
         blend_mode: Option<String>,
+        composite: Option<bool>,
     ) -> BackendResult<Track> {
-        // Real wiring for mute/hidden/locked via `MultitrackModel::
-        // setTrackMute/setTrackHidden/setTrackLock` (sap_ffi.cpp). blendMode
-        // is not wired yet -- real Shotcut's per-track blend mode lives on
-        // the qtblend/cairoblend *transition* between adjacent video
-        // tracks (trackpropertieswidget.cpp), which needs its own
-        // transition-lookup C-ABI function not yet added here.
+        // Real wiring for mute/hidden/locked/composite via MultitrackModel
+        // and blendMode via ChangeBlendModeCommand (sap_ffi.cpp).
         if let Some(v) = muted {
             let rc = unsafe {
                 ffi::sap_set_track_muted(self.main_window, track_index as c_int, v as c_int)
@@ -691,6 +689,14 @@ impl Backend for FfiBackend {
         if let Some(v) = locked {
             let rc = unsafe {
                 ffi::sap_set_track_locked(self.main_window, track_index as c_int, v as c_int)
+            };
+            if rc != 0 {
+                return Err(BackendError::NotFound(format!("track {track_index}")));
+            }
+        }
+        if let Some(v) = composite {
+            let rc = unsafe {
+                ffi::sap_set_track_composite(self.main_window, track_index as c_int, v as c_int)
             };
             if rc != 0 {
                 return Err(BackendError::NotFound(format!("track {track_index}")));
@@ -716,11 +722,8 @@ impl Backend for FfiBackend {
                 )));
             }
         }
-        // `sap_list_tracks` now reads muted/hidden/locked back from the
-        // real MultitrackModel::IsMute/Hidden/LockedRole (genuine current
-        // Qt/MLT state, not an echo), so re-querying after the writes
-        // above is both simpler and more honest than reconstructing the
-        // response from the input we just sent.
+        // `sap_list_tracks` now reads muted/hidden/locked/composite back from
+        // the real MultitrackModel roles (genuine current Qt/MLT state).
         let tracks = self.edit_list_tracks(project_id)?;
         tracks
             .into_iter()
@@ -1037,6 +1040,103 @@ impl Backend for FfiBackend {
         }
     }
 
+    fn playback_play(&mut self, _project_id: &str, speed: f64) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playback_play(self.main_window, speed) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidParams("playback.play failed".into()))
+        }
+    }
+
+    fn playback_pause(&mut self, _project_id: &str, position: Option<i64>) -> BackendResult<()> {
+        let pos = position.unwrap_or(-1);
+        let rc = unsafe { ffi::sap_playback_pause(self.main_window, pos as _) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidParams("playback.pause failed".into()))
+        }
+    }
+
+    fn playback_stop(&mut self, _project_id: &str) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playback_stop(self.main_window) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidParams("playback.stop failed".into()))
+        }
+    }
+
+    fn playback_get_state(&mut self, _project_id: &str) -> BackendResult<PlaybackState> {
+        let raw = unsafe { ffi::sap_playback_get_state(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(
+                "playback.getState failed".into(),
+            ));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad playback state JSON: {e}")))
+    }
+
+    fn project_set_profile(
+        &mut self,
+        _project_id: &str,
+        profile_name: Option<String>,
+        width: Option<i32>,
+        height: Option<i32>,
+        frame_rate_num: Option<i32>,
+        frame_rate_den: Option<i32>,
+    ) -> BackendResult<ProfileInfo> {
+        let name_c = profile_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| BackendError::InvalidParams(format!("bad profileName: {e}")))?;
+        let name_ptr = name_c
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let w = width.unwrap_or(0);
+        let h = height.unwrap_or(0);
+        let fps_n = frame_rate_num.unwrap_or(0);
+        let fps_d = frame_rate_den.unwrap_or(0);
+        if name_c.is_none() && (w <= 0 || h <= 0) {
+            return Err(BackendError::InvalidParams(
+                "project.setProfile requires profileName or width+height".into(),
+            ));
+        }
+        let rc = unsafe {
+            ffi::sap_set_profile(self.main_window, name_ptr, w, h, fps_n, fps_d)
+        };
+        if rc != 0 {
+            return Err(BackendError::InvalidParams(
+                "project.setProfile failed".into(),
+            ));
+        }
+        self.project_get_profile(_project_id)
+    }
+
+    fn project_get_profile(&mut self, _project_id: &str) -> BackendResult<ProfileInfo> {
+        let raw = unsafe { ffi::sap_get_profile(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(
+                "project.getProfile failed".into(),
+            ));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad profile JSON: {e}")))
+    }
+
     fn notes_get_text(&mut self, _project_id: &str) -> BackendResult<String> {
         let raw = unsafe { ffi::sap_notes_get_text(self.main_window) };
         if raw.is_null() {
@@ -1097,6 +1197,54 @@ impl Backend for FfiBackend {
             .into_owned();
         unsafe { ffi::sap_free_string(raw) };
         Self::parse_playlist_entry(&json_str, source)
+    }
+
+    fn playlist_append_image_sequence(
+        &mut self,
+        _project_id: &str,
+        path: &str,
+        ttl: Option<i32>,
+        begin: Option<String>,
+    ) -> BackendResult<PlaylistEntry> {
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid path: {e}")))?;
+        let c_begin = begin
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| BackendError::InvalidParams(format!("bad begin: {e}")))?;
+        let begin_ptr = c_begin
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let ttl_i = ttl.unwrap_or(1);
+        let raw = unsafe {
+            ffi::sap_playlist_append_image_sequence(
+                self.main_window,
+                c_path.as_ptr(),
+                ttl_i as c_int,
+                begin_ptr,
+            )
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to append image sequence from {path}"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        Self::parse_playlist_entry(
+            &json_str,
+            json!({
+                "path": path,
+                "imageSequence": true,
+                "ttl": ttl_i,
+                "begin": begin,
+            }),
+        )
     }
 
     fn playlist_list(&mut self, _project_id: &str) -> BackendResult<Vec<PlaylistEntry>> {

@@ -67,6 +67,19 @@ func projectTools(s *server.MCPServer, h Handler) []server.ServerTool {
 			"Redo the bound project's latest undone edit.",
 			dynamicOutputSchema[EmptyResult](),
 		),
+		sapTool(s, h, "project.setProfile", "project.setProfile",
+			"Set project canvas/video mode. Pass profileName (e.g. atsc_1080p_25) or width+height (optional frameRateNum/frameRateDen, default 25/1).",
+			mcp.WithString("profileName", mcp.Description("MLT/Shotcut profile name")),
+			mcp.WithInteger("width", mcp.Description("Canvas width in pixels")),
+			mcp.WithInteger("height", mcp.Description("Canvas height in pixels")),
+			mcp.WithInteger("frameRateNum", mcp.Description("Frame rate numerator")),
+			mcp.WithInteger("frameRateDen", mcp.Description("Frame rate denominator")),
+			dynamicOutputSchema[ProfileInfo](),
+		),
+		sapTool(s, h, "project.getProfile", "project.getProfile",
+			"Read the live project canvas width/height/frame rate.",
+			dynamicOutputSchema[ProfileInfo](),
+		),
 	}
 }
 
