@@ -647,6 +647,7 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         loading: false,
     }])));
     panel.set_recoverable_sessions(ModelRc::new(VecModel::from(vec![RemoteSessionOption {
+        busy: false,
         session_id: "orphan-session-1".into(),
         provider: "codex".into(),
         title: "Fix export pipeline".into(),
