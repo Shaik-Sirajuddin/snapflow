@@ -820,6 +820,7 @@ impl Backend for FfiBackend {
             source: Value::Null,
             in_frame: parsed.in_frame,
             out_frame: parsed.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -883,6 +884,7 @@ impl Backend for FfiBackend {
             source,
             in_frame: appended.in_frame,
             out_frame: appended.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -945,6 +947,7 @@ impl Backend for FfiBackend {
             source,
             in_frame: inserted.in_frame,
             out_frame: inserted.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -1007,6 +1010,7 @@ impl Backend for FfiBackend {
             source,
             in_frame: overwritten.in_frame,
             out_frame: overwritten.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -1041,7 +1045,8 @@ impl Backend for FfiBackend {
                 index: c.index,
                 source: json!({"path": c.path}),
                 in_frame: c.in_frame,
-                out_frame: c.out_frame,
+            out_frame: c.out_frame,
+            speed: 1.0,
             })
             .collect())
     }
@@ -1053,6 +1058,117 @@ impl Backend for FfiBackend {
         } else {
             Err(BackendError::InvalidParams("playback seek failed".into()))
         }
+    }
+
+    fn playback_fast_forward(&mut self, _project_id: &str) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playback_fast_forward(self.main_window) };
+        if rc == 0 { Ok(()) } else { Err(BackendError::InvalidParams("playback fast-forward failed".into())) }
+    }
+
+    fn edit_set_clip_speed(&mut self, _project_id: &str, track_index: usize, clip_index: usize, speed: f64) -> BackendResult<Clip> {
+        if !speed.is_finite() || speed <= 0.0 { return Err(BackendError::InvalidParams("speed must be finite and greater than zero".into())); }
+        let raw = unsafe { ffi::sap_set_clip_speed(self.main_window, track_index as c_int, clip_index as c_int, speed) };
+        if raw.is_null() { return Err(BackendError::InvalidParams("set clip speed failed".into())); }
+        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<Clip>(&text).map_err(|e| BackendError::InvalidParams(format!("bad set speed JSON: {e}")))
+    }
+
+    fn playback_play(&mut self, _project_id: &str, speed: f64) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playback_play(self.main_window, speed) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidParams("playback.play failed".into()))
+        }
+    }
+
+    fn playback_pause(&mut self, _project_id: &str, position: Option<i64>) -> BackendResult<()> {
+        let pos = position.unwrap_or(-1);
+        let rc = unsafe { ffi::sap_playback_pause(self.main_window, pos as _) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidParams("playback.pause failed".into()))
+        }
+    }
+
+    fn playback_stop(&mut self, _project_id: &str) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playback_stop(self.main_window) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidParams("playback.stop failed".into()))
+        }
+    }
+
+    fn playback_get_state(&mut self, _project_id: &str) -> BackendResult<PlaybackState> {
+        let raw = unsafe { ffi::sap_playback_get_state(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(
+                "playback.getState failed".into(),
+            ));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad playback state JSON: {e}")))
+    }
+
+    fn project_set_profile(
+        &mut self,
+        _project_id: &str,
+        profile_name: Option<String>,
+        width: Option<i32>,
+        height: Option<i32>,
+        frame_rate_num: Option<i32>,
+        frame_rate_den: Option<i32>,
+    ) -> BackendResult<ProfileInfo> {
+        let name_c = profile_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| BackendError::InvalidParams(format!("bad profileName: {e}")))?;
+        let name_ptr = name_c
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let w = width.unwrap_or(0);
+        let h = height.unwrap_or(0);
+        let fps_n = frame_rate_num.unwrap_or(0);
+        let fps_d = frame_rate_den.unwrap_or(0);
+        if name_c.is_none() && (w <= 0 || h <= 0) {
+            return Err(BackendError::InvalidParams(
+                "project.setProfile requires profileName or width+height".into(),
+            ));
+        }
+        let rc = unsafe {
+            ffi::sap_set_profile(self.main_window, name_ptr, w, h, fps_n, fps_d)
+        };
+        if rc != 0 {
+            return Err(BackendError::InvalidParams(
+                "project.setProfile failed".into(),
+            ));
+        }
+        self.project_get_profile(_project_id)
+    }
+
+    fn project_get_profile(&mut self, _project_id: &str) -> BackendResult<ProfileInfo> {
+        let raw = unsafe { ffi::sap_get_profile(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(
+                "project.getProfile failed".into(),
+            ));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad profile JSON: {e}")))
     }
 
     fn notes_get_text(&mut self, _project_id: &str) -> BackendResult<String> {
