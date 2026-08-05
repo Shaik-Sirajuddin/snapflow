@@ -7,9 +7,12 @@
 //! `Command::ReattachSession` handlers already use. Deliberately thin: no
 //! retry loop, no replay registration, no live-notification draining --
 //! those stay the actor's own responsibility (see this module's doc
-//! comment on `GatewaySessionOpener` for why), so a pool-driven open here
-//! is exactly one `Gateway::call` attempt, bounded by
-//! `acpx_client::pool::ACQUIRE_OPEN_TIMEOUT` at the pool layer.
+//! comment on `GatewaySessionOpener` for why). A pool-driven `session/new`
+//! gets one explicit reconnect/retry when the transport reports a WebSocket
+//! failure. The retry reuses one client creation identity, so the server can
+//! return the original session if the first request reached it but its
+//! response was lost. The whole reconnect is bounded before the pool's
+//! `acpx_client::pool::ACQUIRE_OPEN_TIMEOUT` limit is reached.
 //!
 //! `PoolKey::provider_profile` is `"{profile}"` with an empty string
 //! standing for "no profile" (a `PoolKey` field can't itself be
@@ -23,7 +26,12 @@ use std::sync::{Arc, RwLock};
 
 use acpx_client::pool::{OpenError, PoolKey, SessionOpener};
 use acpx_client::raw::ClientError;
-use acpx_client::Gateway;
+use acpx_client::{with_session_creation_metadata, Gateway, SessionCreationMetadata};
+
+// Keep this below `ProjectSessionPool`'s 15-second open-attempt bound: the
+// first failed call has already consumed part of that budget, so the
+// reconnect must not be allowed to make the pool cancel the retry blindly.
+const SESSION_NEW_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Classifies a `Gateway::call` failure into the pool's terminal/retryable
 /// distinction, reusing `ClientError::is_authentication_or_capacity` --
@@ -223,11 +231,40 @@ impl SessionOpener for GatewaySessionOpener {
                 "mcpServers": mcp_servers,
             });
             let (params, profile) = apply_explicit_agent_selection(key, params);
-            let value = self
+            // `Gateway::call` deliberately refuses to replay a bare
+            // non-idempotent `session/new` after a WebSocket failure. This
+            // opener is one of the higher-level callers that can make the
+            // operation safe: retain one creation identity across both
+            // attempts, reconnect explicitly, then submit the identical
+            // request. ACPX deduplicates it if the first request already
+            // created the server session before its response was lost.
+            let creation = SessionCreationMetadata::generated();
+            let params = with_session_creation_metadata(params, &creation).map_err(classify)?;
+            let value = match self
                 .gateway
-                .call("session/new", params, profile)
+                .call("session/new", params.clone(), profile)
                 .await
-                .map_err(classify)?;
+            {
+                Ok(value) => value,
+                Err(ClientError::WebSocket(first_error)) => {
+                    let reconnected = tokio::time::timeout(
+                        SESSION_NEW_RECONNECT_TIMEOUT,
+                        self.gateway.reconnect(),
+                    )
+                    .await
+                    .unwrap_or(false);
+                    if !reconnected {
+                        return Err(OpenError::retryable(format!(
+                            "session/new WebSocket failure ({first_error}); reconnect timed out"
+                        )));
+                    }
+                    self.gateway
+                        .call("session/new", params, profile)
+                        .await
+                        .map_err(classify)?
+                }
+                Err(error) => return Err(classify(error)),
+            };
             let session_id = value
                 .get("sessionId")
                 .and_then(|s| s.as_str())

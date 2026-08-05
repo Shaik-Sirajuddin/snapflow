@@ -7387,13 +7387,46 @@ impl AgentBridge {
         let base_url = self.gateway_urls.get(&provider).cloned();
         let project_pools = self.project_pools.clone();
         self.runtime.spawn(async move {
+            // `agents/list` gets its own bounded retry-with-backoff on top of
+            // the transport's own reconnect-then-HTTP-fallback (see
+            // `Gateway::call`/`call_after_reconnect` in acpx-client): by the
+            // time this returns `Err`, the transport has *already* tried a
+            // fresh WS reconnect and a full HTTP-transport fallback, so a
+            // failure here means both of those failed too -- retrying the
+            // whole thing a few more times, spaced out, gives a genuinely
+            // slow-to-come-up acpx-server (not just a dead one) more real
+            // wall-clock time to recover before this surfaces as
+            // `agent_catalog_error` in Settings. Bounded (not literally
+            // "forever") so a truly dead gateway still degrades to a visible
+            // error instead of silently retrying indefinitely with no
+            // feedback.
+            const AGENTS_LIST_MAX_ATTEMPTS: u32 = 5;
+            let list_agents_with_retry = async {
+                let mut attempt = 0u32;
+                loop {
+                    match handle.list_agents().await {
+                        Ok(agents) => return Ok(agents),
+                        Err(error) if attempt + 1 < AGENTS_LIST_MAX_ATTEMPTS => {
+                            attempt += 1;
+                            let backoff = std::time::Duration::from_millis(
+                                500u64 * (1u64 << (attempt - 1)),
+                            );
+                            eprintln!(
+                                "panel-rust: agents/list attempt {attempt} failed ({error}), retrying in {backoff:?}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
             // These four RPCs are independent of each other (only the admin-enablement
             // merge below depends on `agents` having resolved), so run them concurrently
             // via `tokio::join!` instead of paying for N sequential round-trips.
             let (profiles, mcp_servers, agents_result, sessions_result) = tokio::join!(
                 handle.list_profiles(),
                 handle.list_mcp_servers(),
-                handle.list_agents(),
+                list_agents_with_retry,
                 handle.list_sessions_for_agent(provider.clone())
             );
             let profiles = profiles.unwrap_or_default();
