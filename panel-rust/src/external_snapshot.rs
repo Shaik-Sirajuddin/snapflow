@@ -207,6 +207,21 @@ fn shows_starting_thread_loading(
     !closed && status != "error" && !has_binding && !is_deferred
 }
 
+/// True if this frame's freshly-polled `BridgeEvent`s include a transport
+/// reconnect (`AgentEvent::ConnectionRestored`, pushed once per real
+/// `client.reconnect().await` success -- see `gateway_actor/thread_actor.rs`'s
+/// `spawn_session_live_forwarder`, forwarded verbatim onto the poll queue by
+/// `agent_bridge.rs`'s `spawn_event_forwarder`). `collect_frame_input` uses
+/// this to force the next gateway-catalog pull (profiles/MCP/agents/
+/// recoverable-sessions) to actually hit the gateway instead of being
+/// absorbed by `request_gateway_catalog_refresh`'s debounce -- mirroring
+/// the catalog refresh already triggered on project switch.
+fn bridge_events_signal_connection_restored(bridge_events: &[crate::agent_bridge::BridgeEvent]) -> bool {
+    bridge_events
+        .iter()
+        .any(|event| matches!(event.event, crate::protocol_types::AgentEvent::ConnectionRestored))
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -237,6 +252,21 @@ impl<'a> ExternalSnapshotSource<'a> {
             .map(AgentBridge::poll)
             .unwrap_or_default();
         self.hydrate_model_thread_bindings();
+        // A `ConnectionRestored` edge means the gateway just re-established
+        // this session after a transport reconnect -- mirror what already
+        // happens on project switch and force the next gateway-catalog
+        // pull (profiles/MCP/agents/recoverable-sessions) to actually hit
+        // the gateway instead of being absorbed by its debounce. This is
+        // the earliest point in the per-frame pipeline that still has real
+        // `&AgentBridge` access: `update_frame`, which the raw
+        // `bridge_events` below eventually reach, only sees `&mut Model` /
+        // `FrameInput` and cannot call bridge methods itself.
+        if let Some(bridge) = self.panel.bridge.as_ref() {
+            if bridge_events_signal_connection_restored(&bridge_events) {
+                bridge.invalidate_gateway_catalog();
+                bridge.request_gateway_catalog_refresh(self.panel.settings_gateway_index());
+            }
+        }
         let bridge_event_thread_ids = bridge_events
             .iter()
             .map(|event| {
@@ -1072,6 +1102,32 @@ mod tests {
             "an already-failed attach's row must stay on its real \"error\" \
              status, not be forced back to \"loading\" forever"
         );
+    }
+
+    #[test]
+    fn bridge_events_signal_connection_restored_true_on_reconnect() {
+        // The one event `spawn_session_live_forwarder` pushes on a real
+        // `client.reconnect().await` success -- `collect_frame_input` uses
+        // this predicate to invalidate+re-request the gateway catalog the
+        // same frame it sees this, mirroring the project-switch refresh.
+        let events = vec![crate::agent_bridge::BridgeEvent {
+            thread_index: 3,
+            event: AgentEvent::ConnectionRestored,
+        }];
+        assert!(bridge_events_signal_connection_restored(&events));
+    }
+
+    #[test]
+    fn bridge_events_signal_connection_restored_false_without_it() {
+        // Any other event mix on the poll queue -- including a totally
+        // ordinary message -- must not spuriously force a catalog refresh
+        // every frame.
+        let events = vec![crate::agent_bridge::BridgeEvent {
+            thread_index: 0,
+            event: AgentEvent::Error("boom".to_owned()),
+        }];
+        assert!(!bridge_events_signal_connection_restored(&events));
+        assert!(!bridge_events_signal_connection_restored(&[]));
     }
 
     #[test]

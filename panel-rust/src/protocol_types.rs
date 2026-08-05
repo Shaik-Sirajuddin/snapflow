@@ -183,7 +183,11 @@ fn has_oversized_string(value: &serde_json::Value) -> bool {
 pub enum AgentEvent {
     /// The gateway re-established this session after a transport reconnect.
     /// Panel-Rust uses this edge to request a fresh first history page from
-    /// ACPX before accepting further UI interactions.
+    /// ACPX before accepting further UI interactions. It also mirrors what
+    /// already happens on project switch: `ExternalSnapshotter::collect_frame_input`
+    /// (`external_snapshot.rs`) sees this event pass through the polled
+    /// `bridge_events` and invalidates+re-requests the gateway catalog
+    /// (agents/MCP-servers/profiles) so Settings' data refreshes too.
     ConnectionRestored,
     Message(ChatMessage),
     HistoryPage {

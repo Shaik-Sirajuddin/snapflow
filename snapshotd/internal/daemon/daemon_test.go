@@ -582,6 +582,20 @@ func TestDaemon_ResolvePrefersReadyProcessInstanceOverExternal(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	daemonSocket := filepath.Join(t.TempDir(), "daemon.sap.sock")
+	listener, err := net.Listen("unix", daemonSocket)
+	if err != nil {
+		t.Fatalf("listen daemon socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
 	if err := d.Reg.CreateProcessInstance(&registry.ProcessInstance{
 		ID:         "pi-ready",
 		ProjectID:  project.ID,

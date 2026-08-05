@@ -71,6 +71,13 @@ func (r *Router) getOrDial(ctx context.Context, projectID string) (*pooledConn, 
 		r.mu.Unlock()
 		return pc, nil
 	}
+	rebind := false
+	for _, boundProject := range r.sessionProject {
+		if boundProject == projectID {
+			rebind = true
+			break
+		}
+	}
 	r.mu.Unlock()
 
 	socketPath, token, err := r.resolve(projectID)
@@ -83,6 +90,13 @@ func (r *Router) getOrDial(ctx context.Context, projectID string) (*pooledConn, 
 	}
 	pc := &pooledConn{conn: conn, sinks: make(map[string]Sink)}
 	conn.onNotification = pc.notify
+	if rebind {
+		params, _ := json.Marshal(map[string]string{"projectId": projectID})
+		if _, err := conn.Call(ctx, "project.select", params); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("sapproxy: rebind project %s after reconnect: %w", projectID, err)
+		}
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -178,6 +192,24 @@ func (r *Router) Unbind(sessionID string) {
 		pc.mu.Lock()
 		delete(pc.sinks, sessionID)
 		pc.mu.Unlock()
+	}
+}
+
+// InvalidateProject drops the pooled SAP connection for projectID and closes
+// it immediately. Registry lifecycle transitions are authoritative even when
+// the child socket has not reported EOF yet; retaining the old connection
+// would let an already-bound MCP session keep mutating a closed/in-memory
+// project instance. Future calls will resolve the current instance and dial
+// it afresh.
+func (r *Router) InvalidateProject(projectID string) {
+	r.mu.Lock()
+	pc, ok := r.conns[projectID]
+	if ok {
+		delete(r.conns, projectID)
+	}
+	r.mu.Unlock()
+	if ok {
+		_ = pc.conn.Close()
 	}
 }
 

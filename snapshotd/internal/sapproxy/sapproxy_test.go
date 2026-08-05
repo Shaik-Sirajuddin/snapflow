@@ -362,6 +362,35 @@ func TestRouter_Bind_RejectsSwitchingProjectWithoutUnbind(t *testing.T) {
 	}
 }
 
+func TestRouter_InvalidateProject_DropsStalePooledConnection(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fake.sock")
+	srv := newFakeSapServer("tok-123")
+	srv.serve(t, sock)
+
+	resolved := 0
+	router := NewRouter(func(projectID string) (string, string, error) {
+		resolved++
+		return sock, "tok-123", nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := router.Bind(ctx, "session-a", "proj-1", &recordingSink{}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if resolved != 1 {
+		t.Fatalf("expected one initial resolve, got %d", resolved)
+	}
+
+	router.InvalidateProject("proj-1")
+	if _, err := router.Call(ctx, "session-a", "edit.listTracks", nil); err != nil {
+		t.Fatalf("call after invalidation should redial: %v", err)
+	}
+	if resolved != 2 {
+		t.Fatalf("expected resolver to run again after invalidation, got %d", resolved)
+	}
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)
