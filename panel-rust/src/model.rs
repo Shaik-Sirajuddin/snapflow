@@ -522,6 +522,25 @@ pub(crate) struct PersistentModels {
 }
 
 impl Model {
+    /// Resolve the thread to show on startup. A persisted selection is only
+    /// valid while the row remains active; archived and closed rows are
+    /// history and must not become the default chat view.
+    pub fn startup_selection(&self, preferred_real_index: Option<usize>) -> Option<usize> {
+        let selectable = |idx: usize| {
+            self.threads
+                .get(idx)
+                .is_some_and(|thread| !thread.archived && !thread.closed)
+        };
+        preferred_real_index
+            .filter(|idx| selectable(*idx))
+            .or_else(|| {
+                self.visible_indices
+                    .iter()
+                    .copied()
+                    .find(|idx| selectable(*idx))
+            })
+    }
+
     pub(crate) fn persistent_models(&self) -> PersistentModels {
         PersistentModels {
             thread_model: self.thread_model.clone(),
@@ -734,9 +753,9 @@ impl Model {
         let selected_thread = selected_thread_id
             .as_deref()
             .and_then(|thread_id| {
-                threads
-                    .iter()
-                    .position(|thread| thread.session_id.as_deref() == Some(thread_id))
+                threads.iter().position(|thread| {
+                    thread.thread_id == thread_id || thread.session_id.as_deref() == Some(thread_id)
+                })
             })
             .unwrap_or(0);
         let thread_count = threads.len();
@@ -815,6 +834,76 @@ mod tests {
         // in-flight loading/error state across a restart.
         assert!(model.threads.iter().all(|t| t.state == ThreadState::Idle));
         assert!(model.threads.iter().all(|t| t.error.is_none()));
+    }
+
+    #[test]
+    fn startup_selection_skips_archived_or_closed_preference() {
+        let mut model = Model::from_initial_state(InitialState {
+            threads: vec![
+                ThreadSpec {
+                    thread_id: Some("archived".to_owned()),
+                    display_name: "Archived".to_owned(),
+                    provider: "codex".to_owned(),
+                    session_id: Some("sess-archived".to_owned()),
+                    profile_name: None,
+                    project_path: None,
+                },
+                ThreadSpec {
+                    thread_id: Some("active".to_owned()),
+                    display_name: "Active".to_owned(),
+                    provider: "codex".to_owned(),
+                    session_id: Some("sess-active".to_owned()),
+                    profile_name: None,
+                    project_path: None,
+                },
+            ],
+            thread_ids: vec!["archived".to_owned(), "active".to_owned()],
+            selected_thread_id: None,
+            permission_profiles: vec![None, None],
+            thread_states: vec![ThreadState::Idle, ThreadState::Idle],
+            startup_warnings: vec![],
+            send_queues: vec![],
+            server_queue: true,
+            onboarding_completed: false,
+        });
+        model.threads[0].archived = true;
+        model.visible_indices = vec![0, 1];
+        assert_eq!(model.startup_selection(Some(0)), Some(1));
+        model.threads[1].closed = true;
+        assert_eq!(model.startup_selection(Some(0)), None);
+    }
+
+    #[test]
+    fn from_initial_state_restores_durable_thread_id_selection() {
+        let model = Model::from_initial_state(InitialState {
+            threads: vec![
+                ThreadSpec {
+                    thread_id: Some("thread-a".into()),
+                    display_name: "A".into(),
+                    provider: "codex".into(),
+                    session_id: Some("sess-a".into()),
+                    profile_name: None,
+                    project_path: None,
+                },
+                ThreadSpec {
+                    thread_id: Some("thread-b".into()),
+                    display_name: "B".into(),
+                    provider: "codex".into(),
+                    session_id: Some("sess-b".into()),
+                    profile_name: None,
+                    project_path: None,
+                },
+            ],
+            thread_ids: vec!["thread-a".into(), "thread-b".into()],
+            selected_thread_id: Some("thread-b".into()),
+            permission_profiles: vec![None, None],
+            thread_states: vec![ThreadState::Idle, ThreadState::Idle],
+            startup_warnings: vec![],
+            send_queues: vec![],
+            server_queue: true,
+            onboarding_completed: false,
+        });
+        assert_eq!(model.selected_thread, 1);
     }
 
     #[test]

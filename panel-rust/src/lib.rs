@@ -2587,25 +2587,35 @@ fn panel_rust_create_with_initial_identity(
                 }),
             );
         }
-        if let Some(selected_thread_id) = defaults.selected_thread_id {
-            if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
+        // Restore the last *usable* thread, never an archived/closed one.
+        // The durable preference can legitimately point at an archived
+        // thread (the user may archive the selected row immediately before
+        // quitting).  Selecting it on the next launch made the chat open on
+        // an archived transcript even though an active thread was available.
+        // Fall back to the first active visible row; this also keeps a
+        // project switch from inheriting a stale selection from another
+        // project's store.  No bridge close/delete is issued here: project
+        // scoping only changes visibility and must not close unrelated
+        // sessions.
+        let preferred_real_idx = defaults.selected_thread_id.as_deref().and_then(|id| {
+            panel.bridge.as_ref().and_then(|bridge| {
                 (0..panel.model.borrow().threads.len()).find(|idx| {
                     bridge
                         .thread_binding(*idx)
-                        .is_some_and(|binding| binding.thread_id == selected_thread_id)
+                        .is_some_and(|binding| binding.thread_id == id)
                 })
-            }) {
-                let filtered_idx = {
-                    panel
-                        .model
-                        .borrow()
-                        .visible_indices
-                        .iter()
-                        .position(|idx| *idx == real_idx)
-                };
-                if let Some(filtered_idx) = filtered_idx {
-                    dispatch::dispatch_thread_selected(&panel, filtered_idx);
-                }
+            })
+        });
+        let real_idx = panel.model.borrow().startup_selection(preferred_real_idx);
+        if let Some(real_idx) = real_idx {
+            let filtered_idx = panel
+                .model
+                .borrow()
+                .visible_indices
+                .iter()
+                .position(|idx| *idx == real_idx);
+            if let Some(filtered_idx) = filtered_idx {
+                dispatch::dispatch_thread_selected(&panel, filtered_idx);
             }
         }
         panel.dispatch_frame_input(crate::msg::FrameInput {
@@ -2643,7 +2653,17 @@ fn panel_rust_create_with_initial_identity(
             });
         }
         let selected_thread = { panel.model.borrow().selected_thread };
-        if let Some(real_idx) = panel.real_index(selected_thread) {
+        let selected_is_active = panel.real_index(selected_thread).is_some_and(|real_idx| {
+            let model = panel.model.borrow();
+            model
+                .threads
+                .get(real_idx)
+                .is_some_and(|thread| !thread.archived && !thread.closed)
+        });
+        if selected_is_active {
+            let real_idx = panel
+                .real_index(selected_thread)
+                .expect("active selected thread must resolve to a real index");
             panel.dispatch_frame_input(crate::msg::FrameInput {
                 selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
                     &panel,

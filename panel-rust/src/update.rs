@@ -3934,6 +3934,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_switch_does_not_close_or_drop_unrelated_threads() {
+        // Project selection changes the active scope, not the lifetime of
+        // chat threads.  In particular, threads belonging to project A must
+        // remain durable (and resumable) after switching to project B; the
+        // next scoped snapshot is responsible for hiding them from the
+        // visible list.  This guards against a regression where the host
+        // project switch path reused close-thread cleanup.
+        let mut model = model_with_threads(&["a", "b", "c"]);
+        model.active_project_path = Some("/work/a/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/a/project.mlt".to_owned());
+        model.threads[0].archived = true;
+        model.threads[1].closed = false;
+
+        let original_ids: Vec<String> = model
+            .threads
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/work/b/project.mlt".to_owned(),
+            ))),
+        );
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SetActiveProjectPath { path: Some(path) }
+                if path == "/work/b/project.mlt"
+        )));
+        assert_eq!(
+            model.active_project_path.as_deref(),
+            Some("/work/b/project.mlt")
+        );
+        assert_eq!(
+            model
+                .threads
+                .iter()
+                .map(|thread| thread.thread_id.clone())
+                .collect::<Vec<_>>(),
+            original_ids,
+            "switch must not drop unrelated thread records"
+        );
+        assert!(model.threads.iter().all(|thread| !thread.closed));
+        assert!(model.threads[0].archived, "archive state is thread-scoped");
+    }
+
     /// GUI matrix: Open → Save As → switch → close (panel lifecycle identity).
     #[test]
     fn gui_matrix_open_save_as_switch_close_bumps_generation_and_reasons() {
