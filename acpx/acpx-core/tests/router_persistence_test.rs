@@ -6,7 +6,7 @@
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::persistence::PersistenceStore;
-use acpx_core::router::Router;
+use acpx_core::router::{dispatch_shared, Router};
 use serde_json::json;
 use std::time::Duration;
 
@@ -154,4 +154,77 @@ async fn session_new_creation_request_is_deduplicated_until_first_prompt() {
         .await
         .expect_err("used conflict");
     assert!(conflict.to_string().contains("already received a turn"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_clients_with_one_creation_request_create_one_backend_session() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    let counter_path = std::env::temp_dir().join(format!(
+        "acpx-session-new-idempotency-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    count=0
+    if [ -f "$COUNTER_FILE" ]; then count=$(sed -n '1p' "$COUNTER_FILE"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$COUNTER_FILE"
+    sleep 0.15
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-%s"}}\n' "$id" "$count"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  fi
+done
+"#;
+    let mut spec = SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()]);
+    spec.env.insert(
+        "COUNTER_FILE".to_string(),
+        counter_path.to_string_lossy().into_owned(),
+    );
+    let mut router = Router::new("stand-in-agent").with_persistence(store.clone());
+    router.register_agent("stand-in-agent", spec);
+    let router = std::sync::Arc::new(tokio::sync::Mutex::new(router));
+    let request = |id| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "_meta": {"com.example.client": {
+                    "creationRequestId": "ef5b9010-0cb6-4a43-8437-cd81b9114aa5",
+                    "workspaceId": "project-42"
+                }}
+            }
+        })
+    };
+
+    let client_a = dispatch_shared(&router, request(101));
+    let client_b = dispatch_shared(&router, request(102));
+    let (response_a, response_b) = tokio::join!(client_a, client_b);
+    let response_a = response_a.expect("first concurrent session/new");
+    let response_b = response_b.expect("second concurrent session/new");
+    assert_eq!(
+        response_a["result"]["sessionId"], response_b["result"]["sessionId"],
+        "both clients must receive the one durable gateway session id"
+    );
+    assert_eq!(response_a["id"], 101, "first JSON-RPC id stays correlated");
+    assert_eq!(response_b["id"], 102, "second JSON-RPC id stays correlated");
+    let sessions = store.list_sessions().await.expect("durable sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        response_a["result"]["sessionId"], sessions[0].gateway_session_id,
+        "the shared response id must be the only durable gateway row"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter_path)
+            .expect("backend creation counter")
+            .trim(),
+        "1",
+        "the second request must dedupe before reaching the backend"
+    );
+    let _ = std::fs::remove_file(counter_path);
 }
