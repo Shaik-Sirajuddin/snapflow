@@ -509,90 +509,13 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
-      "description": "List daemon-owned and externally launched Snapflow instances. Use active=true to find live SAP-editable instances or active=false for inactive/stale rows.",
+      "description": "List known process instances (running and previously running).",
       "inputSchema": {
-        "properties": {
-          "active": {
-            "description": "Optional live-state filter; omitted returns both active and inactive instances.",
-            "type": "boolean"
-          }
-        },
+        "properties": {},
         "required": [],
         "type": "object"
       },
-      "name": "daemon.list",
-      "outputSchema": {
-        "type": "object",
-        "properties": {
-          "active": {
-            "type": [
-              "null",
-              "boolean"
-            ]
-          },
-          "items": {
-            "type": [
-              "null",
-              "array"
-            ],
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "kind": {
-                  "type": "string"
-                },
-                "projectId": {
-                  "type": "string"
-                },
-                "projectPath": {
-                  "type": "string"
-                },
-                "pid": {
-                  "type": "integer"
-                },
-                "socketPath": {
-                  "type": "string"
-                },
-                "status": {
-                  "type": "string"
-                },
-                "active": {
-                  "type": "boolean"
-                },
-                "managed": {
-                  "type": "boolean"
-                },
-                "headless": {
-                  "type": "boolean"
-                },
-                "startedAt": {
-                  "type": "string"
-                },
-                "lastSeenAt": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "kind",
-                "pid",
-                "status",
-                "active",
-                "managed"
-              ],
-              "additionalProperties": false
-            }
-          }
-        },
-        "required": [
-          "active",
-          "items"
-        ],
-        "additionalProperties": false
-      }
+      "name": "daemon.list"
     },
     {
       "annotations": {
@@ -641,9 +564,6 @@
             "type": "integer"
           },
           "kind": {
-            "type": "string"
-          },
-          "name": {
             "type": "string"
           },
           "muted": {
@@ -937,9 +857,6 @@
                 "kind": {
                   "type": "string"
                 },
-                "name": {
-                  "type": "string"
-                },
                 "muted": {
                   "type": "boolean"
                 },
@@ -1231,9 +1148,6 @@
                 "kind": {
                   "type": "string"
                 },
-                "name": {
-                  "type": "string"
-                },
                 "muted": {
                   "type": "boolean"
                 },
@@ -1411,9 +1325,6 @@
             "type": "integer"
           },
           "kind": {
-            "type": "string"
-          },
-          "name": {
             "type": "string"
           },
           "muted": {
@@ -4394,19 +4305,17 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
-      "description": "Select a timeline track by native track name or numeric index as the current selection scope. trackName is optional; omit it and use trackIndex when the backend does not provide a name. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
+      "description": "Select a timeline track as the current selection scope. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
       "inputSchema": {
         "properties": {
           "trackIndex": {
-            "description": "Zero-based track index to select",
+            "description": "Track index to select",
             "type": "integer"
-          },
-          "trackName": {
-            "description": "Native track name; use edit.listTracks to discover names",
-            "type": "string"
           }
         },
-        "required": [],
+        "required": [
+          "trackIndex"
+        ],
         "type": "object"
       },
       "name": "track.enter",
