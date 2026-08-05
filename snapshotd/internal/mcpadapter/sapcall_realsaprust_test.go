@@ -162,6 +162,27 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 		t.Fatalf("expected real track result with kind=video, got %+v", track)
 	}
 
+	// New transport/retime surface: fast-forward is a successful native
+	// transport call; setClipSpeed reaches the real backend and rejects the
+	// intentionally empty clip slot rather than being an unknown MCP method.
+	ffReq := mcp.CallToolRequest{}
+	ffReq.Params.Name = "playback.fastForward"
+	ffReq.Params.Arguments = map[string]any{}
+	ffRes, err := c.CallTool(ctx, ffReq)
+	if err != nil || ffRes.IsError {
+		t.Fatalf("playback.fastForward failed: err=%v result=%+v", err, toolResultText(ffRes))
+	}
+	speedReq := mcp.CallToolRequest{}
+	speedReq.Params.Name = "edit.setClipSpeed"
+	speedReq.Params.Arguments = map[string]any{"trackIndex": 0, "clipIndex": 0, "speed": 2.0}
+	speedRes, err := c.CallTool(ctx, speedReq)
+	if err != nil {
+		t.Fatalf("edit.setClipSpeed transport failed: %v", err)
+	}
+	if !speedRes.IsError {
+		t.Fatalf("expected setClipSpeed to reject missing clip, got %+v", toolResultText(speedRes))
+	}
+
 	// edit.listTracks -- read back the real, persisted mutation.
 	listReq := mcp.CallToolRequest{}
 	listReq.Params.Name = "edit.listTracks"
