@@ -582,7 +582,9 @@ pub trait Backend: Send {
     }
 
     /// `file.export` -- returns a `jobId` immediately per 01's async-job
-    /// convention; progress/completion is polled via `jobs_get`.
+    /// convention. Callers may poll with `jobs_get`; the FFI server also
+    /// emits terminal `jobs.completed`, `jobs.failed`, or `jobs.stopped`
+    /// notifications when the export lifecycle reaches a terminal state.
     fn file_export(
         &mut self,
         project_id: &str,
