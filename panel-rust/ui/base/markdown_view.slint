@@ -134,8 +134,15 @@ export component MarkdownView inherits VerticalLayout {
             // any indent has to go through `padding-left` on a
             // wrapping layout instead, same as the `lines` path above
             // already does for its own indent handling).
-            if block.kind == "text" : HorizontalLayout {
+            // Use a vertical wrapper for the native StyledText. A horizontal
+            // wrapper only forwards its cross-axis constraint while laying
+            // out its own children; StyledText's height-for-width calculation
+            // can therefore see an unconstrained width and remain one line
+            // after a resize. The vertical wrapper owns the live row width,
+            // so StyledText recomputes both its width and wrapped height.
+            if block.kind == "text" : VerticalLayout {
                 padding-left: block.indent * 14px;
+                alignment: stretch;
                 StyledText {
                     text: block.text;
                     default-font-size: block.default-font-size > 0px
