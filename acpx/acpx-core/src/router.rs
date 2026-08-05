@@ -4641,14 +4641,6 @@ impl Router {
         if method != "session/close" {
             self.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
         }
-        if method == "session/prompt" {
-            if let Some(store) = self.persistence.as_ref() {
-                store
-                    .mark_session_creation_used(gateway_session_id.clone())
-                    .await?;
-            }
-        }
-
         // Rewrite gateway id -> backend id in place; everything else in
         // `params` is forwarded untouched (except the mcpServers merge
         // above for resume/load), per the proxied-method contract
@@ -4673,6 +4665,13 @@ impl Router {
                 .await?;
             attach_updates(response, notifications, agent_requests)
         };
+        if method == "session/prompt" && response.get("error").is_none() {
+            if let Some(store) = self.persistence.as_ref() {
+                store
+                    .mark_session_creation_used(gateway_session_id.clone())
+                    .await?;
+            }
+        }
         if matches!(method.as_str(), "session/load" | "session/resume") {
             enrich_native_session_result(
                 &mut response,
@@ -9374,11 +9373,6 @@ async fn dispatch_proxied_shared(
     // backend replays user turns in on `session/load`, so pagination and
     // `acpx/sessions/sync` reconciliation both see one shape.
     if method == "session/prompt" {
-        if let Some(store) = persistence.as_ref() {
-            store
-                .mark_session_creation_used(gateway_session_id.clone())
-                .await?;
-        }
         persist_prompt_turn(router, &gateway_session_id, &request).await;
     }
 
@@ -9496,6 +9490,13 @@ async fn dispatch_proxied_shared(
             .await?;
     }
     let mut response = response_result?;
+    if method == "session/prompt" && response.get("error").is_none() {
+        if let Some(store) = persistence.as_ref() {
+            store
+                .mark_session_creation_used(gateway_session_id.clone())
+                .await?;
+        }
+    }
     if matches!(method.as_str(), "session/load" | "session/resume") {
         enrich_native_session_result(
             &mut response,

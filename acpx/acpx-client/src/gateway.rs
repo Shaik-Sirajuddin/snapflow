@@ -672,6 +672,15 @@ impl Gateway {
             Some(websocket) => {
                 let full_params = with_profile(params.clone(), profile);
                 match websocket.call_with_updates(method, full_params).await {
+                    Err(ClientError::WebSocket(_))
+                        if !is_safe_to_retry_after_reconnect(method, &params) =>
+                    {
+                        Err(ClientError::WebSocket(
+                            "not retrying a non-idempotent method after a WebSocket failure \
+                             (the request may have already reached the server)"
+                                .to_owned(),
+                        ))
+                    }
                     Err(ClientError::WebSocket(_)) => {
                         self.call_with_updates_after_reconnect(method, params, profile)
                             .await
@@ -883,11 +892,20 @@ mod tests {
 
     #[test]
     fn preparation_is_stable_and_preserves_other_meta_namespaces() {
+        let unprepared = serde_json::json!({
+            "cwd": "/tmp/project",
+            "mcpServers": []
+        });
+        assert!(
+            !is_safe_to_retry_after_reconnect("session/new", &unprepared),
+            "both call() and call_with_updates() must fail closed before creation metadata exists"
+        );
+
         let first = prepare_call_params(
             "session/new",
             serde_json::json!({
-                "cwd": "/tmp/project",
-                "mcpServers": [],
+                "cwd": unprepared["cwd"],
+                "mcpServers": unprepared["mcpServers"],
                 "_meta": {"org.example.trace": {"traceId": "trace-1"}}
             }),
         )
