@@ -2883,7 +2883,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         match &bridge_event.event {
             crate::protocol_types::AgentEvent::ConnectionRestored => {
                 // The bridge forwarder requests the fresh ACPX history page;
-                // this transport edge itself has no direct UI payload.
+                // this transport edge itself has no direct UI payload at
+                // the model level. The gateway-catalog refresh this event
+                // also triggers is handled earlier in the pipeline, in
+                // `ExternalSnapshotter::collect_frame_input`
+                // (`external_snapshot.rs`), which still has real
+                // `&AgentBridge` access -- by the time events reach here
+                // only `&mut Model`/`FrameInput` are available.
             }
             crate::protocol_types::AgentEvent::Message(message) => {
                 if matches!(message.kind, crate::protocol_types::MessageKind::User)
