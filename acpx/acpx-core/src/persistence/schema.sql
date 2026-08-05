@@ -34,7 +34,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- the deployment default". Added after the table already shipped,
     -- so `store.rs`'s `migrate_sessions_columns` also idempotently
     -- `ALTER TABLE`s this in for a pre-existing database.
-    custom_idle_ttl_seconds INTEGER
+    custom_idle_ttl_seconds INTEGER,
+    -- Client-owned idempotency metadata for session/new. The partial unique
+    -- index below allows legacy rows (NULL) while preventing two durable
+    -- sessions from claiming the same request inside one tenant.
+    creation_request_id TEXT,
+    creation_workspace_id TEXT,
+    creation_params_json TEXT,
+    creation_used INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS agent_enablement (

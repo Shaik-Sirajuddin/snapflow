@@ -201,4 +201,21 @@ pub struct SessionRecord {
     /// Monotonic session-state revision used to detect durable drift for
     /// stream resumption without storing raw transcript payloads.
     pub state_revision: i64,
+    /// Client-owned idempotency key and optional workspace correlation
+    /// metadata supplied under `_meta.com.example.client` at session/new.
+    pub creation_request_id: Option<String>,
+    pub creation_workspace_id: Option<String>,
+    /// Canonical session/new params used to reject reuse of one key for a
+    /// different logical operation.
+    pub creation_params_json: Option<String>,
+    /// Set before the first conversational operation is forwarded.
+    pub creation_used: bool,
+}
+
+/// Optional client-owned metadata attached to a newly-created session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCreationMetadata {
+    pub request_id: String,
+    pub workspace_id: Option<String>,
+    pub params_json: String,
 }

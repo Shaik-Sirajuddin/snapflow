@@ -10,7 +10,9 @@ use crate::lifecycle::LifecycleConfig;
 use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
 use crate::persistence::{
-    sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
+    sessions::{
+        RecoveryMetadata, RecoveryMethod, RecoveryStatus, SessionCreationMetadata, SessionRecord,
+    },
     PersistenceStore, QueueHub, QueueStore, TranscriptStore,
 };
 use crate::profile::{
@@ -344,6 +346,9 @@ pub struct Router {
     queue_store: Option<QueueStore>,
     queue_hub: QueueHub,
     queue_active: Arc<Mutex<HashSet<String>>>,
+    /// Per-idempotency-key async serialization. Weak entries avoid retaining
+    /// arbitrary client keys after the last concurrent session/new finishes.
+    creation_request_locks: HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
     /// Durable admin-plane read stores. They remain absent for
     /// in-memory-only routers, preserving the legacy default behavior.
     agent_enablement: Option<AgentEnablement>,
@@ -763,6 +768,10 @@ pub enum RouterError {
     MissingParams,
     #[error("request has no \"id\" field")]
     MissingId,
+    #[error("session/new: invalid _meta.com.example.client metadata: {0}")]
+    InvalidCreationMetadata(String),
+    #[error("session/new idempotency conflict for creationRequestId {0}: {1}")]
+    SessionCreationConflict(String, &'static str),
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("params.sessionId missing or not a string")]
@@ -1064,7 +1073,178 @@ const BACKEND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// gateway on its behalf.
 const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+const CLIENT_CREATION_META_NAMESPACE: &str = "com.example.client";
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        value => value.clone(),
+    }
+}
+
+fn session_creation_metadata(
+    request: &serde_json::Value,
+) -> Result<Option<SessionCreationMetadata>, RouterError> {
+    let Some(client) = request
+        .pointer("/params/_meta/com.example.client")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(None);
+    };
+    let Some(request_id) = client
+        .get("creationRequestId")
+        .and_then(|value| value.as_str())
+    else {
+        return Err(RouterError::InvalidCreationMetadata(
+            "creationRequestId must be a UUID string".to_string(),
+        ));
+    };
+    uuid::Uuid::parse_str(request_id).map_err(|_| {
+        RouterError::InvalidCreationMetadata("creationRequestId must be a valid UUID".to_string())
+    })?;
+    let workspace_id = match client.get("workspaceId") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if !value.is_empty() && value.len() <= 256 => {
+            Some(value.clone())
+        }
+        _ => {
+            return Err(RouterError::InvalidCreationMetadata(
+                "workspaceId must be a non-empty string of at most 256 bytes".to_string(),
+            ));
+        }
+    };
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    Ok(Some(SessionCreationMetadata {
+        request_id: request_id.to_string(),
+        workspace_id,
+        params_json: serde_json::to_string(&canonical_json(&params))?,
+    }))
+}
+
+/// Remove ACPX's client-correlation namespace before proxying session/new to
+/// a strict ACP backend. Other `_meta` namespaces remain byte-for-byte
+/// available to the backend; an emptied `_meta` container is removed.
+fn strip_client_creation_metadata(request: &mut serde_json::Value) {
+    let Some(params) = request
+        .get_mut("params")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let remove_meta = if let Some(meta) = params
+        .get_mut("_meta")
+        .and_then(|value| value.as_object_mut())
+    {
+        meta.remove(CLIENT_CREATION_META_NAMESPACE);
+        meta.is_empty()
+    } else {
+        false
+    };
+    if remove_meta {
+        params.remove("_meta");
+    }
+}
+
+fn creation_meta_json(record: &SessionRecord) -> Option<serde_json::Value> {
+    let request_id = record.creation_request_id.as_ref()?;
+    let mut client = serde_json::json!({ "creationRequestId": request_id });
+    if let Some(workspace_id) = record.creation_workspace_id.as_ref() {
+        client["workspaceId"] = serde_json::Value::String(workspace_id.clone());
+    }
+    Some(serde_json::json!({ CLIENT_CREATION_META_NAMESPACE: client }))
+}
+
+fn merge_creation_meta(target: &mut serde_json::Value, meta: serde_json::Value) {
+    if !target
+        .get("_meta")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        target["_meta"] = serde_json::json!({});
+    }
+    if let (Some(target_meta), Some(additions)) =
+        (target["_meta"].as_object_mut(), meta.as_object())
+    {
+        target_meta.extend(additions.clone());
+    }
+}
+
+async fn deduplicated_session_new_response(
+    store: Option<&PersistenceStore>,
+    tenant_id: &TenantId,
+    metadata: Option<&SessionCreationMetadata>,
+    id: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, RouterError> {
+    let (Some(store), Some(metadata)) = (store, metadata) else {
+        return Ok(None);
+    };
+    let Some(record) = store
+        .find_session_by_creation_request(tenant_id.0.clone(), metadata.request_id.clone())
+        .await?
+    else {
+        return Ok(None);
+    };
+    if record.creation_params_json.as_deref() != Some(metadata.params_json.as_str())
+        || record.creation_workspace_id != metadata.workspace_id
+    {
+        return Err(RouterError::SessionCreationConflict(
+            metadata.request_id.clone(),
+            "the key was already used with different parameters",
+        ));
+    }
+    if record.creation_used {
+        return Err(RouterError::SessionCreationConflict(
+            metadata.request_id.clone(),
+            "the original session has already received a turn",
+        ));
+    }
+    if record.closed_at.is_some() || record.status == RecoveryStatus::Closed {
+        return Err(RouterError::SessionCreationConflict(
+            metadata.request_id.clone(),
+            "the original session is closed",
+        ));
+    }
+    let mut result = serde_json::json!({ "sessionId": record.gateway_session_id });
+    if let Some(meta) = creation_meta_json(&record) {
+        merge_creation_meta(&mut result, meta);
+    }
+    Ok(Some(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })))
+}
+
 impl Router {
+    fn creation_request_lock(
+        &mut self,
+        tenant_id: &TenantId,
+        request_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{}\0{}", tenant_id.0, request_id);
+        if let Some(lock) = self
+            .creation_request_locks
+            .get(&key)
+            .and_then(|lock| lock.upgrade())
+        {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        self.creation_request_locks
+            .insert(key, Arc::downgrade(&lock));
+        lock
+    }
     pub fn default_agent_id(&self) -> &str {
         &self.default_agent_id
     }
@@ -1090,6 +1270,7 @@ impl Router {
             queue_store: None,
             queue_hub: QueueHub::default(),
             queue_active: Arc::new(Mutex::new(HashSet::new())),
+            creation_request_locks: HashMap::new(),
             agent_enablement: None,
             custom_agents: None,
             materialized_custom_agents: HashSet::new(),
@@ -2875,12 +3056,13 @@ impl Router {
         gateway_session_id: &str,
         entry: &crate::session_registry::SessionEntry,
         effective_params: serde_json::Value,
+        creation: Option<SessionCreationMetadata>,
     ) -> Result<(), RouterError> {
         let Some(store) = self.persistence.as_ref() else {
             return Ok(());
         };
         store
-            .record_session_with_recovery(
+            .record_session_with_recovery_and_creation(
                 gateway_session_id,
                 entry.agent_id.clone(),
                 entry.backend_session_id.0.clone(),
@@ -2900,6 +3082,7 @@ impl Router {
                     bridge_model_alias: None,
                     bridge_config_options: None,
                 },
+                creation,
             )
             .await?;
         Ok(())
@@ -3495,6 +3678,18 @@ impl Router {
         mut request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+        let creation = session_creation_metadata(&request)?;
+        if let Some(response) = deduplicated_session_new_response(
+            self.persistence.as_ref(),
+            tenant_id,
+            creation.as_ref(),
+            &id,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+        strip_client_creation_metadata(&mut request);
         let params = request
             .get_mut("params")
             .ok_or(RouterError::MissingParams)?;
@@ -3716,6 +3911,18 @@ impl Router {
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
+            if let Some(metadata) = creation.as_ref() {
+                let mut client = serde_json::json!({
+                    "creationRequestId": metadata.request_id,
+                });
+                if let Some(workspace_id) = metadata.workspace_id.as_ref() {
+                    client["workspaceId"] = serde_json::Value::String(workspace_id.clone());
+                }
+                merge_creation_meta(
+                    result,
+                    serde_json::json!({ CLIENT_CREATION_META_NAMESPACE: client }),
+                );
+            }
             if let Some(profile) = self
                 .sessions
                 .permission_profile(tenant_id, result["sessionId"].as_str().unwrap_or_default())
@@ -3736,7 +3943,13 @@ impl Router {
             .cloned()
             .ok_or(RouterError::MissingParams)?;
         if let Err(error) = self
-            .persist_session_recovery(tenant_id, &gateway_session_id_str, &entry, effective_params)
+            .persist_session_recovery(
+                tenant_id,
+                &gateway_session_id_str,
+                &entry,
+                effective_params,
+                creation,
+            )
             .await
         {
             if let Some(removed) = self.sessions.remove(
@@ -3861,6 +4074,15 @@ impl Router {
                     continue;
                 };
                 session["sessionId"] = serde_json::Value::String(gateway_id.clone());
+                if let Some(store) = self.persistence.as_ref() {
+                    if let Some(record) = store.get_session(gateway_id.clone()).await? {
+                        if record.tenant_id == tenant_id.0 {
+                            if let Some(meta) = creation_meta_json(&record) {
+                                merge_creation_meta(&mut session, meta);
+                            }
+                        }
+                    }
+                }
                 self.spawn_session_persistence(
                     tenant_id,
                     gateway_id,
@@ -4418,6 +4640,13 @@ impl Router {
         // live sessions on first real use (not on close/cancel).
         if method != "session/close" {
             self.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
+        }
+        if method == "session/prompt" {
+            if let Some(store) = self.persistence.as_ref() {
+                store
+                    .mark_session_creation_used(gateway_session_id.clone())
+                    .await?;
+            }
         }
 
         // Rewrite gateway id -> backend id in place; everything else in
@@ -5026,15 +5255,34 @@ impl Router {
                             .await?
                     }
                     None => {
+                        let creation_by_gateway: HashMap<String, serde_json::Value> =
+                            if let Some(store) = self.persistence.as_ref() {
+                                store
+                                    .list_sessions()
+                                    .await?
+                                    .into_iter()
+                                    .filter(|record| record.tenant_id == tenant_id.0)
+                                    .filter_map(|record| {
+                                        creation_meta_json(&record)
+                                            .map(|meta| (record.gateway_session_id, meta))
+                                    })
+                                    .collect()
+                            } else {
+                                HashMap::new()
+                            };
                         let sessions: Vec<serde_json::Value> = self
                             .sessions
                             .list(tenant_id)
                             .map(|(gateway_id, entry)| {
-                                serde_json::json!({
+                                let mut session = serde_json::json!({
                                     "sessionId": gateway_id,
                                     "agentId": entry.agent_id,
                                     "cwd": entry.cwd,
-                                })
+                                });
+                                if let Some(meta) = creation_by_gateway.get(gateway_id) {
+                                    merge_creation_meta(&mut session, meta.clone());
+                                }
+                                session
                             })
                             .collect();
                         serde_json::json!({ "sessions": sessions })
@@ -8895,6 +9143,22 @@ async fn dispatch_session_list_real_shared(
         .get("result")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({ "sessions": [] }));
+    let creation_by_gateway: HashMap<String, serde_json::Value> = {
+        let persistence = { router.lock().await.persistence.clone() };
+        if let Some(store) = persistence {
+            store
+                .list_sessions()
+                .await?
+                .into_iter()
+                .filter(|record| record.tenant_id == tenant_id.0)
+                .filter_map(|record| {
+                    creation_meta_json(&record).map(|meta| (record.gateway_session_id, meta))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    };
     if let Some(raw_sessions) = result.get("sessions").and_then(|s| s.as_array()) {
         let mut r = router.lock().await;
         let mut filtered = Vec::with_capacity(raw_sessions.len());
@@ -8926,6 +9190,9 @@ async fn dispatch_session_list_real_shared(
                 continue;
             };
             session["sessionId"] = serde_json::Value::String(gateway_id.clone());
+            if let Some(meta) = creation_by_gateway.get(&gateway_id) {
+                merge_creation_meta(&mut session, meta.clone());
+            }
             spawn_session_persistence_fn(
                 r.persistence.clone(),
                 tenant_id.0.clone(),
@@ -9107,6 +9374,11 @@ async fn dispatch_proxied_shared(
     // backend replays user turns in on `session/load`, so pagination and
     // `acpx/sessions/sync` reconciliation both see one shape.
     if method == "session/prompt" {
+        if let Some(store) = persistence.as_ref() {
+            store
+                .mark_session_creation_used(gateway_session_id.clone())
+                .await?;
+        }
         persist_prompt_turn(router, &gateway_session_id, &request).await;
     }
 
@@ -9492,6 +9764,32 @@ async fn dispatch_session_new_shared(
     mut request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let creation = session_creation_metadata(&request)?;
+    // Serialize only identical tenant/request keys. The guard spans lookup,
+    // backend creation, and durable insert, so a concurrent retry waits and
+    // then observes the first call's row instead of creating a second backend
+    // session. Unrelated requests remain fully concurrent.
+    let _creation_guard = if let Some(metadata) = creation.as_ref() {
+        let lock = {
+            let mut r = router.lock().await;
+            r.creation_request_lock(tenant_id, &metadata.request_id)
+        };
+        Some(lock.lock_owned().await)
+    } else {
+        None
+    };
+    let creation_store = { router.lock().await.persistence.clone() };
+    if let Some(response) = deduplicated_session_new_response(
+        creation_store.as_ref(),
+        tenant_id,
+        creation.as_ref(),
+        &id,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    strip_client_creation_metadata(&mut request);
 
     let (
         agent_id,
@@ -9781,6 +10079,18 @@ async fn dispatch_session_new_shared(
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
+            if let Some(metadata) = creation.as_ref() {
+                let mut client = serde_json::json!({
+                    "creationRequestId": metadata.request_id,
+                });
+                if let Some(workspace_id) = metadata.workspace_id.as_ref() {
+                    client["workspaceId"] = serde_json::Value::String(workspace_id.clone());
+                }
+                merge_creation_meta(
+                    result,
+                    serde_json::json!({ CLIENT_CREATION_META_NAMESPACE: client }),
+                );
+            }
             if let Some(profile) = r
                 .sessions
                 .permission_profile(tenant_id, &gateway_session_id_str)
@@ -9805,7 +10115,7 @@ async fn dispatch_session_new_shared(
         .ok_or(RouterError::MissingParams)?;
     if let Some(store) = persistence.clone() {
         if let Err(error) = store
-            .record_session_with_recovery(
+            .record_session_with_recovery_and_creation(
                 gateway_session_id_str.clone(),
                 entry.agent_id.clone(),
                 entry.backend_session_id.0.clone(),
@@ -9825,6 +10135,7 @@ async fn dispatch_session_new_shared(
                     bridge_model_alias: None,
                     bridge_config_options: None,
                 },
+                creation,
             )
             .await
         {
@@ -9970,6 +10281,33 @@ mod tests {
         assert_eq!(classify("session/prompt"), MethodClass::Proxied);
         assert_eq!(classify("agents/list"), MethodClass::GatewayNative);
         assert_eq!(classify("bogus/method"), MethodClass::Unknown);
+    }
+
+    #[test]
+    fn strips_only_gateway_owned_creation_metadata_before_backend_forwarding() {
+        let mut request = serde_json::json!({
+            "params": {
+                "cwd": "/tmp",
+                "_meta": {
+                    "com.example.client": {"creationRequestId": "id"},
+                    "org.other": {"traceId": "keep"}
+                }
+            }
+        });
+        strip_client_creation_metadata(&mut request);
+        assert!(request
+            .pointer("/params/_meta/com.example.client")
+            .is_none());
+        assert_eq!(
+            request.pointer("/params/_meta/org.other/traceId"),
+            Some(&serde_json::json!("keep"))
+        );
+
+        let mut only_client = serde_json::json!({
+            "params": {"_meta": {"com.example.client": {"creationRequestId": "id"}}}
+        });
+        strip_client_creation_metadata(&mut only_client);
+        assert!(only_client.pointer("/params/_meta").is_none());
     }
 
     #[test]

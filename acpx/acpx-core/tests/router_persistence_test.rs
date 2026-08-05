@@ -86,3 +86,72 @@ async fn session_new_persists_session_metadata_and_state_revision() {
     }
     assert!(state_revision >= 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_new_creation_request_is_deduplicated_until_first_prompt() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    let mut router = Router::new("stand-in-agent").with_persistence(store.clone());
+    router.register_agent(
+        "stand-in-agent",
+        SpawnSpec::new(
+            "sh",
+            vec!["-c".to_string(), STAND_IN_BACKEND_SCRIPT.to_string()],
+        ),
+    );
+    let creation_request_id = "7ee35d23-17d5-4a62-92cb-d36d857fc272";
+    let new_request = |id| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "_meta": {
+                    "com.example.client": {
+                        "creationRequestId": creation_request_id,
+                        "workspaceId": "project-42"
+                    }
+                }
+            }
+        })
+    };
+
+    let first = router.dispatch(new_request(1)).await.expect("first new");
+    let gateway_id = first["result"]["sessionId"]
+        .as_str()
+        .expect("gateway id")
+        .to_string();
+    assert_eq!(
+        first["result"]["_meta"]["com.example.client"]["creationRequestId"],
+        creation_request_id
+    );
+
+    let retry = router
+        .dispatch(new_request(2))
+        .await
+        .expect("deduplicated new");
+    assert_eq!(retry["result"]["sessionId"], gateway_id);
+    assert_eq!(store.list_sessions().await.expect("sessions").len(), 1);
+
+    let listed = router
+        .dispatch(json!({"jsonrpc":"2.0", "id":3, "method":"session/list", "params":{}}))
+        .await
+        .expect("session/list");
+    assert_eq!(
+        listed["result"]["sessions"][0]["_meta"]["com.example.client"]["workspaceId"],
+        "project-42"
+    );
+
+    router
+        .dispatch(json!({
+            "jsonrpc":"2.0", "id":4, "method":"session/prompt",
+            "params":{"sessionId":gateway_id, "prompt":[{"type":"text","text":"hi"}]}
+        }))
+        .await
+        .expect("prompt");
+    let conflict = router
+        .dispatch(new_request(5))
+        .await
+        .expect_err("used conflict");
+    assert!(conflict.to_string().contains("already received a turn"));
+}

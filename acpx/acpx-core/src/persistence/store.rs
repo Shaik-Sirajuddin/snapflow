@@ -27,7 +27,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::error::PersistenceError;
-use super::sessions::{RecoveryMetadata, RecoveryStatus, RecoveryStatusCounts, SessionRecord};
+use super::sessions::{
+    RecoveryMetadata, RecoveryStatus, RecoveryStatusCounts, SessionCreationMetadata, SessionRecord,
+};
 use crate::custom_agents::CustomAgent;
 
 #[derive(Clone)]
@@ -115,6 +117,34 @@ impl PersistenceStore {
         tenant_id: impl Into<String>,
         recovery: RecoveryMetadata,
     ) -> Result<(), PersistenceError> {
+        self.record_session_with_recovery_and_creation(
+            gateway_session_id,
+            agent_id,
+            backend_session_id,
+            profile_name,
+            created_at,
+            tenant_id,
+            recovery,
+            None,
+        )
+        .await
+    }
+
+    /// Record a newly-created session together with an optional client-owned
+    /// idempotency key. The database's tenant-scoped unique index is the
+    /// final authority against duplicate durable claims.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_session_with_recovery_and_creation(
+        &self,
+        gateway_session_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        backend_session_id: impl Into<String>,
+        profile_name: Option<String>,
+        created_at: impl Into<String>,
+        tenant_id: impl Into<String>,
+        recovery: RecoveryMetadata,
+        creation: Option<SessionCreationMetadata>,
+    ) -> Result<(), PersistenceError> {
         let gateway_session_id = gateway_session_id.into();
         let agent_id = agent_id.into();
         let backend_session_id = backend_session_id.into();
@@ -136,6 +166,15 @@ impl PersistenceStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let (creation_request_id, creation_workspace_id, creation_params_json) = creation
+            .map(|metadata| {
+                (
+                    Some(metadata.request_id),
+                    metadata.workspace_id,
+                    Some(metadata.params_json),
+                )
+            })
+            .unwrap_or((None, None, None));
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
@@ -144,8 +183,9 @@ impl PersistenceStore {
                  (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id, \
                   cwd, recovery_params_json, status, recovery_method, last_recovery_error, pinned, \
                   created_at_unix_nanos, last_activity_at_unix_nanos, bridge_session_id, \
-                  bridge_model_alias, bridge_config_options_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                  bridge_model_alias, bridge_config_options_json, creation_request_id, \
+                  creation_workspace_id, creation_params_json, creation_used) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 0)",
                 params![
                     gateway_session_id,
                     agent_id,
@@ -163,7 +203,10 @@ impl PersistenceStore {
                     last_activity_at_unix_nanos,
                     recovery.bridge_session_id,
                     recovery.bridge_model_alias,
-                    bridge_config_options_json
+                    bridge_config_options_json,
+                    creation_request_id,
+                    creation_workspace_id,
+                    creation_params_json
                 ],
             )?;
             Ok(())
@@ -209,7 +252,8 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision, \
+                        creation_request_id, creation_workspace_id, creation_params_json, creation_used \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -217,6 +261,59 @@ impl PersistenceStore {
                 Some(row) => Ok(Some(row?)),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    /// Resolve a client-owned session/new idempotency key inside one tenant.
+    pub async fn find_session_by_creation_request(
+        &self,
+        tenant_id: impl Into<String>,
+        creation_request_id: impl Into<String>,
+    ) -> Result<Option<SessionRecord>, PersistenceError> {
+        let tenant_id = tenant_id.into();
+        let creation_request_id = creation_request_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn.prepare(
+                "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
+                        created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
+                        recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
+                        last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision, \
+                        creation_request_id, creation_workspace_id, creation_params_json, creation_used \
+                 FROM sessions WHERE tenant_id = ?1 AND creation_request_id = ?2 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(
+                params![tenant_id, creation_request_id],
+                row_to_session_record,
+            )?;
+            match rows.next() {
+                Some(row) => Ok(Some(row?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Permanently mark a client-keyed session as used. This update happens
+    /// before a conversational operation is forwarded, so a lost response
+    /// can never make an already-started session appear safe to recreate.
+    pub async fn mark_session_creation_used(
+        &self,
+        gateway_session_id: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "UPDATE sessions SET creation_used = 1 \
+                 WHERE gateway_session_id = ?1 AND creation_request_id IS NOT NULL",
+                params![gateway_session_id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -234,7 +331,8 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision, \
+                        creation_request_id, creation_workspace_id, creation_params_json, creation_used \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
@@ -296,7 +394,8 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision, \
+                        creation_request_id, creation_workspace_id, creation_params_json, creation_used \
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
@@ -357,7 +456,8 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision \
+                        bridge_config_options_json, custom_idle_ttl_seconds, state_revision, \
+                        creation_request_id, creation_workspace_id, creation_params_json, creation_used \
                  FROM sessions \
                  WHERE bridge_session_id = ?1 AND tenant_id = ?2 \
                  ORDER BY created_at DESC LIMIT 1",
@@ -1116,6 +1216,10 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         bridge_config_options,
         custom_idle_ttl_seconds: row.get(18)?,
         state_revision: row.get(19)?,
+        creation_request_id: row.get(20)?,
+        creation_workspace_id: row.get(21)?,
+        creation_params_json: row.get(22)?,
+        creation_used: row.get::<_, i64>(23)? != 0,
     })
 }
 
@@ -1175,6 +1279,10 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
         ("bridge_config_options_json", "TEXT"),
         ("custom_idle_ttl_seconds", "INTEGER"),
         ("state_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("creation_request_id", "TEXT"),
+        ("creation_workspace_id", "TEXT"),
+        ("creation_params_json", "TEXT"),
+        ("creation_used", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !column_names.iter().any(|column| column == name) {
             conn.execute(
@@ -1183,6 +1291,12 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
             )?;
         }
     }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_tenant_creation_request_id \
+         ON sessions (tenant_id, creation_request_id) \
+         WHERE creation_request_id IS NOT NULL",
+        [],
+    )?;
     Ok(())
 }
 
