@@ -761,16 +761,6 @@ pub struct AgentBridge {
     session_project_path_override: Arc<Mutex<Option<PathBuf>>>,
 }
 
-/// Provider gateways are process-scoped, not project-view-scoped. Keeping a
-/// strong reference here lets the C++ project switch recreate the panel's
-/// project-local bridge without tearing down the multiplexed ACPX connection
-/// that can still serve background sessions from another project.
-fn shared_gateway_cache() -> &'static Mutex<HashMap<String, Arc<acpx_client::Gateway>>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Arc<acpx_client::Gateway>>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// A point-in-time read of a client-local terminal's VT100 screen state
 /// (`AgentBridge::local_terminal_snapshot`) -- what `models::to_local_
 /// terminal_item` turns into the Slint-facing `LocalTerminalItem`.
@@ -4688,12 +4678,8 @@ impl AgentBridge {
 
         for (url, setters) in gateway_setters {
             let gateways = gateways.clone();
-            let cached = shared_gateway_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&url)
-                .cloned();
-            if let Some(gateway) = cached {
+            runtime.spawn(async move {
+                let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
                 gateways
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -4702,23 +4688,7 @@ impl AgentBridge {
                 for setter in setters {
                     setter.set_gateway(gateway.clone());
                 }
-            } else {
-                runtime.spawn(async move {
-                    let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
-                    shared_gateway_cache()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(url.clone(), gateway.clone());
-                    gateways
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(url, gateway.clone());
-                    invalidate_snapshotd_registry_sync();
-                    for setter in setters {
-                        setter.set_gateway(gateway.clone());
-                    }
-                });
-            }
+            });
         }
 
         // mcp-servers-settings: this bridge's gateway map is a target the
@@ -4785,26 +4755,9 @@ impl AgentBridge {
         self.gateway_urls.insert(provider.to_string(), url.clone());
         if !url_already_known {
             let gateways = self.gateways.clone();
-            if let Some(gateway) = shared_gateway_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&url)
-                .cloned()
-            {
-                gateways
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(url, gateway);
-                invalidate_snapshotd_registry_sync();
-                return Ok(());
-            }
             let _guard = self.runtime.enter();
             self.runtime.spawn(async move {
                 let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
-                shared_gateway_cache()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(url.clone(), gateway.clone());
                 gateways
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
