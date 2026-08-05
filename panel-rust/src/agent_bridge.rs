@@ -75,7 +75,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -563,6 +564,7 @@ struct GatewayCatalogCache {
     profiles: Vec<crate::gateway_actor::ProfileSummary>,
     mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    agent_catalog_error: String,
     recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     recovery_provider: String,
     /// Monotonic generation; UI can detect "never filled" as gen == 0.
@@ -641,7 +643,15 @@ fn merge_mcp_list_with_optimistic(
 /// Owns the background runtime, the per-thread agent connections, the
 /// jsonl cache, and the event queue the UI thread drains via `poll`.
 pub struct AgentBridge {
-    runtime: tokio::runtime::Runtime,
+    // `ManuallyDrop` instead of a plain `Runtime` (or `Option<Runtime>`)
+    // so every existing `self.runtime.spawn(...)`/`.block_on(...)`/
+    // `&self.runtime` call site keeps compiling unchanged (`ManuallyDrop<T>`
+    // derefs to `&T`/`&mut T` at every method-call and coercion site) --
+    // only `Drop for AgentBridge` needs to know this field is special,
+    // via `ManuallyDrop::take` to move the runtime off the UI thread
+    // instead of letting it drop (and hard-cancel every in-flight task,
+    // notably the WS client's background read-loop) synchronously here.
+    runtime: ManuallyDrop<tokio::runtime::Runtime>,
     slots: Vec<Arc<ThreadSlot>>,
     events: Arc<Mutex<VecDeque<BridgeEvent>>>,
     gateway_urls: std::collections::HashMap<String, String>,
@@ -4722,7 +4732,7 @@ impl AgentBridge {
         register_snapshotd_registry_sync_target(gateways.clone(), runtime.handle().clone());
 
         Ok(AgentBridge {
-            runtime,
+            runtime: ManuallyDrop::new(runtime),
             slots,
             events,
             gateway_urls: resolved_urls,
@@ -7278,6 +7288,7 @@ impl AgentBridge {
                 mcp_servers: cache.mcp_servers.clone(),
                 agents: cache.agents.clone(),
                 agents_fetched: cache.gen > 0,
+                agent_catalog_error: cache.agent_catalog_error.clone(),
                 recoverable_sessions: cache.recoverable_sessions.clone(),
                 recovery_provider: cache.recovery_provider.clone(),
             })
@@ -7387,7 +7398,14 @@ impl AgentBridge {
             );
             let profiles = profiles.unwrap_or_default();
             let mcp_servers = mcp_servers.unwrap_or_default();
-            let mut agents = agents_result.unwrap_or_default();
+            let (mut agents, agent_catalog_error) = match agents_result {
+                Ok(agents) => (agents, String::new()),
+                Err(error) => {
+                    let message = error.to_string();
+                    eprintln!("panel-rust: agents/list failed: {message}");
+                    (Vec::new(), message)
+                }
+            };
             if let Some((admin_url, admin_token)) = admin_creds {
                 let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
                 if let Ok(entries) = client.list_agents().await {
@@ -7417,6 +7435,7 @@ impl AgentBridge {
                     c.profiles = profiles;
                     c.mcp_servers = merged;
                     c.agents = agents;
+                    c.agent_catalog_error = agent_catalog_error;
                     c.recoverable_sessions = recoverable_sessions;
                     c.recovery_provider = provider;
                     c.gen = c.gen.saturating_add(1).max(1);
@@ -8451,28 +8470,109 @@ impl AgentBridge {
     }
 }
 
+/// Number of `AgentBridge::drop` background cleanup threads currently
+/// in flight (spawned but not yet finished). Incremented right before
+/// `std::thread::spawn` in `Drop::drop`, decremented when that thread's
+/// closure returns. `Drop::drop` itself never blocks on this -- it only
+/// exists so tests (which can no longer observe cleanup completion by
+/// the drop call simply returning, now that cleanup moved off the UI
+/// thread) have something deterministic to poll instead of sleeping a
+/// guessed duration.
+static AGENT_BRIDGE_DROP_CLEANUPS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn wait_for_agent_bridge_drop_cleanup(deadline: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while AGENT_BRIDGE_DROP_CLEANUPS_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        assert!(
+            start.elapsed() < deadline,
+            "timed out waiting for AgentBridge::drop's background cleanup thread to finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 impl Drop for AgentBridge {
     fn drop(&mut self) {
-        // Ask every actor to stop so its forwarder task's `events_rx.recv()`
-        // returns `None` and unwinds cleanly, instead of relying purely on
-        // the runtime's own shutdown-cancels-outstanding-tasks behavior.
-        for slot in &self.slots {
-            // Project recreation detaches foreground thread actors. Stopping
-            // only the local actor leaves the ACPX session live until server
-            // expiry, so repeated A -> B -> restart cycles exhaust the
-            // tenant session capacity. Explicitly close this panel-owned
-            // session before shutting down its actor; an explicitly
-            // backgrounded session is reattached through its durable record
-            // when the project becomes active again.
-            let background = *slot.background.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = self.runtime.block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    slot.handle.close_session(background),
-                )
-                .await
+        // `Drop::drop` fires on the Qt UI thread (via `panel_rust_destroy`
+        // -> `~RustPanelItem`), synchronously, during app close. It must
+        // return essentially immediately -- N open thread slots each
+        // taking up to a 2s `block_on` here, sequentially, used to freeze
+        // the window for up to 2N seconds.
+        //
+        // At the same time, the WS client's background read-loop task
+        // (spawned onto `self.runtime` inside `GatewayWsClient::connect`)
+        // deserves a real chance to observe a graceful close frame rather
+        // than being hard-cancelled the instant `self.runtime` drops --
+        // which is exactly what happens if this function just returns
+        // after a fire-and-forget `self.runtime.spawn(...)` per slot,
+        // because `self.runtime` (a struct field of the `AgentBridge`
+        // being dropped) is torn down the moment this function returns,
+        // and `Runtime::drop` hard-cancels every task still running on it.
+        //
+        // So instead: take ownership of the runtime out of this
+        // soon-to-be-gone struct and move it, along with the slot handles
+        // needed to close them, onto a detached OS thread. That thread
+        // closes every slot concurrently (`JoinSet`, not a sequential
+        // loop) inside a bounded `block_on`, then lets the runtime drop
+        // naturally at the end of its own scope -- fully off the UI
+        // thread, and only after the close attempts have actually had
+        // their timeout window to run.
+        let slots = self.slots.clone();
+        // SAFETY: `self.runtime` is only ever read through `Deref`/
+        // `DerefMut` (every other method on `AgentBridge`) for the
+        // entire live lifetime of this value; `Drop::drop` is the single
+        // place that runs after that lifetime ends and is guaranteed to
+        // run at most once, so taking the inner `Runtime` out here can
+        // never leave a live `&self.runtime` dangling or be observed
+        // twice.
+        let runtime = unsafe { ManuallyDrop::take(&mut self.runtime) };
+
+        AGENT_BRIDGE_DROP_CLEANUPS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        let spawned = std::thread::Builder::new()
+            .name("agent-bridge-drop-cleanup".into())
+            .spawn(move || {
+                // Ask every actor to stop so its forwarder task's
+                // `events_rx.recv()` returns `None` and unwinds cleanly,
+                // instead of relying purely on the runtime's own
+                // shutdown-cancels-outstanding-tasks behavior.
+                runtime.block_on(async {
+                    let mut closes = tokio::task::JoinSet::new();
+                    for slot in slots.iter().cloned() {
+                        closes.spawn(async move {
+                            // Project recreation detaches foreground thread
+                            // actors. Stopping only the local actor leaves
+                            // the ACPX session live until server expiry, so
+                            // repeated A -> B -> restart cycles exhaust the
+                            // tenant session capacity. Explicitly close this
+                            // panel-owned session before shutting down its
+                            // actor; an explicitly backgrounded session is
+                            // reattached through its durable record when the
+                            // project becomes active again.
+                            let background =
+                                *slot.background.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                slot.handle.close_session(background),
+                            )
+                            .await;
+                            slot.handle.shutdown();
+                        });
+                    }
+                    while closes.join_next().await.is_some() {}
+                });
+                // `runtime` drops here, at the end of this background
+                // thread's own scope -- after every slot's bounded close
+                // attempt above has already run, instead of the instant
+                // `Drop::drop` returns on the caller's (UI) thread.
+                drop(runtime);
+                AGENT_BRIDGE_DROP_CLEANUPS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             });
-            slot.handle.shutdown();
+        if spawned.is_err() {
+            // Thread creation failing is exceedingly unlikely (would mean
+            // the process is nearly out of resources), but if it happens
+            // don't leave the in-flight counter stuck incremented forever.
+            AGENT_BRIDGE_DROP_CLEANUPS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -11149,6 +11249,14 @@ done
                 .clone()
                 .expect("active session");
         }
+        // `Drop for AgentBridge` now closes sessions on a detached
+        // background thread (bounded UI-thread-lag fix) instead of
+        // synchronously inside `drop`, so the scope closing above no
+        // longer guarantees the close has happened yet -- wait for that
+        // background cleanup thread to finish before asserting on its
+        // effect. Bound generously above the per-slot 2s close timeout
+        // (single slot here, but leave headroom for slow CI hosts).
+        wait_for_agent_bridge_drop_cleanup(std::time::Duration::from_secs(10));
 
         let runtime = tokio::runtime::Runtime::new().expect("checker runtime");
         let sessions = runtime.block_on(async {
@@ -13842,6 +13950,7 @@ done
             mcp_servers: Vec::new(),
             agents: Vec::new(),
             agents_fetched: false,
+            agent_catalog_error: String::new(),
             recoverable_sessions: Vec::new(),
             recovery_provider: String::new(),
         };

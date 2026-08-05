@@ -165,6 +165,7 @@ export component ChatPanel inherits Window {
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <bool> agent-catalog-fetched: false;
+    in property <string> agent-catalog-error: "";
     // provider-toggle-auth-probe: true when the currently selected
     // thread's provider has a stored pool-acquire probe failure
     // (Model.provider_errors, populated from AgentEvent::ProviderProbe).
@@ -1066,6 +1067,7 @@ export component ChatPanel inherits Window {
             mcp-tools-total-count: root.mcp-tools-total-count;
             mcp-server-submit-busy: root.mcp-server-submit-busy;
             agent-catalog: agent-catalog;
+            agent-catalog-error: agent-catalog-error;
             recoverable-sessions: recoverable-sessions;
             available-skills: available-skills;
             dev-mode: dev-mode;

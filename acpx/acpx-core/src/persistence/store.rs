@@ -77,10 +77,13 @@ impl PersistenceStore {
         })
     }
 
-    /// Record a newly-created session. Fails if `gateway_session_id` is
-    /// already present (the `sessions` table primary key) -- callers should
-    /// only invoke this once per session, right after
-    /// [`crate::SessionRegistry::register`].
+    /// Record a newly-created session. If `gateway_session_id` (the
+    /// `sessions` table primary key) is already present -- e.g. a
+    /// `session/list` re-persist of a session recorded on an earlier call --
+    /// this no-ops other than refreshing `last_activity_at_unix_nanos`; it
+    /// does not error and does not touch any other column of the existing
+    /// row. New callers should still only invoke this once per session,
+    /// right after [`crate::SessionRegistry::register`].
     pub async fn record_session(
         &self,
         gateway_session_id: impl Into<String>,
@@ -178,6 +181,26 @@ impl PersistenceStore {
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
+            // `gateway_session_id` is UNIQUE (primary key). Callers that
+            // already hold a live/registered session (e.g. re-persisting
+            // every row returned by an agent's `session/list` response,
+            // not just newly-discovered ones -- see
+            // `Router::dispatch_session_list_real`'s "Phase B leak fix")
+            // legitimately call this again for a session that's already
+            // durable. Re-inserting used to be a plain `INSERT`, which
+            // failed that re-persist with a UNIQUE constraint error on
+            // every single call post-startup (swallowed as a WARN at the
+            // `spawn_session_persistence_fn` call site) -- pure log noise
+            // and wasted work, not a real conflict. Upsert instead: a
+            // fresh row is inserted as before, and an already-known row
+            // just gets its `last_activity_at_unix_nanos` refreshed
+            // (consistent with `update_session_pinned`'s same-column
+            // bump) rather than erroring. Every other column intentionally
+            // stays untouched on conflict -- recovery/status/pinned state
+            // for an existing session belongs to whichever call site owns
+            // that transition (e.g. `update_session_pinned`,
+            // `bump_state_revision`), not to a re-persist of already-known
+            // metadata.
             conn.execute(
                 "INSERT INTO sessions \
                  (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id, \
@@ -185,7 +208,9 @@ impl PersistenceStore {
                   created_at_unix_nanos, last_activity_at_unix_nanos, bridge_session_id, \
                   bridge_model_alias, bridge_config_options_json, creation_request_id, \
                   creation_workspace_id, creation_params_json, creation_used) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 0) \
+                 ON CONFLICT(gateway_session_id) DO UPDATE SET \
+                   last_activity_at_unix_nanos = excluded.last_activity_at_unix_nanos",
                 params![
                     gateway_session_id,
                     agent_id,

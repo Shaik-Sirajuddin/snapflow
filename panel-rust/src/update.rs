@@ -580,6 +580,9 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 provider: provider.clone(),
                 profile_name: profile_name.clone(),
                 permission_profile: permission_profile.clone(),
+                // `+` always creates an active conversation. Archive is a
+                // separate user action and must never leak into creation.
+                archived: false,
                 // ACPX owns durable queue state in production; this is only
                 // the in-memory Slint projection until queue callbacks arrive.
                 send_queue: crate::send_queue::SendQueue::new(),
@@ -587,22 +590,45 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             });
             model.rebuild_thread_indices();
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
+            // `+` is a user-requested navigation action, not merely an
+            // append.  Select the newly-created row immediately, while the
+            // reducer still has the authoritative real index.  Waiting for
+            // the next bridge snapshot left selection anchored to an
+            // archived row (especially when archived rows were interleaved
+            // with active rows), making the new thread appear to be created
+            // under Archived and keeping its compose view read-only.
+            let mut dirty = vec![
+                list_dirty,
+                Dirty::Scalar(ScalarField::ComposeText),
+                Dirty::Scalar(ScalarField::SearchQuery),
+            ];
+            let mut selection_effects = Vec::new();
+            if let Some(filtered_idx) = model
+                .visible_indices
+                .iter()
+                .position(|idx| *idx == real_index)
+            {
+                model.selected_thread = filtered_idx;
+                let (effects, selection_dirty) = apply_thread_selection_switch(model);
+                selection_effects = effects;
+                dirty.extend(selection_dirty);
+            }
             // PUI-014: create the thread DEFERRED -- no ACP session opens until
             // the first message is sent, so the provider/profile picker stays
             // editable. profile_name/permission_profile are already stored on
             // the model thread above and are read at attach time. The imperative
             // attach in the &mut send dispatch reads the then-current provider.
             (
-                vec![Effect::NewThreadDeferred {
-                    real_index,
-                    display_name,
-                    provider,
-                }],
-                vec![
-                    list_dirty,
-                    Dirty::Scalar(ScalarField::ComposeText),
-                    Dirty::Scalar(ScalarField::SearchQuery),
-                ],
+                {
+                    let mut effects = vec![Effect::NewThreadDeferred {
+                        real_index,
+                        display_name,
+                        provider,
+                    }];
+                    effects.extend(selection_effects);
+                    effects
+                },
+                dirty,
             )
         }
         ThreadMsg::NewResolved {
@@ -3384,6 +3410,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             || model.available_mcp_servers != snapshot.mcp_servers
             || model.agent_catalog != snapshot.agents
             || model.agent_catalog_fetched != snapshot.agents_fetched
+            || model.agent_catalog_error != snapshot.agent_catalog_error
             || model.recoverable_sessions != snapshot.recoverable_sessions
             || model.recovery_provider != snapshot.recovery_provider;
         if changed {
@@ -3391,6 +3418,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.available_mcp_servers = snapshot.mcp_servers;
             model.agent_catalog = snapshot.agents;
             model.agent_catalog_fetched = snapshot.agents_fetched;
+            model.agent_catalog_error = snapshot.agent_catalog_error;
             model.recoverable_sessions = snapshot.recoverable_sessions;
             model.recovery_provider = snapshot.recovery_provider;
             dirty.push(Dirty::Settings);
@@ -4071,6 +4099,25 @@ mod tests {
             ))),
         );
         assert!(!e2.is_empty() || !d2.is_empty());
+    }
+
+    #[test]
+    fn new_thread_selects_active_row_when_archived_rows_exist() {
+        let mut model = model_with_threads(&["archived", "active"]);
+        model.threads[0].archived = true;
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 0;
+
+        let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::NewThreadDeferred { real_index: 2, .. })
+        ));
+        assert_eq!(model.threads.len(), 3);
+        assert!(!model.threads[2].archived);
+        assert_eq!(model.selected_thread, 2);
+        assert!(dirty.contains(&Dirty::Scalar(ScalarField::SelectedThread)));
     }
 
     /// GUI matrix: A→B switch drops late A thread-list snapshots (view isolation).
@@ -7476,6 +7523,7 @@ mod tests {
                     mcp_servers: vec![],
                     agents: vec![],
                     agents_fetched: false,
+                    agent_catalog_error: String::new(),
                     recoverable_sessions: vec![],
                     recovery_provider: "codex".to_owned(),
                 }),
@@ -7494,6 +7542,7 @@ mod tests {
             mcp_servers: model.available_mcp_servers.clone(),
             agents: model.agent_catalog.clone(),
             agents_fetched: model.agent_catalog_fetched,
+            agent_catalog_error: model.agent_catalog_error.clone(),
             recoverable_sessions: model.recoverable_sessions.clone(),
             recovery_provider: model.recovery_provider.clone(),
         };

@@ -141,6 +141,7 @@ export component SettingsPage inherits Rectangle {
     in property <int> mcp-tools-total-count: 0;
     in property <bool> mcp-server-submit-busy: false;
     in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <string> agent-catalog-error: "";
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     in property <[SkillOption]> available-skills: [];
     in property <bool> dev-mode: false;
@@ -322,6 +323,7 @@ export component SettingsPage inherits Rectangle {
                     default-agent-id <=> root.default-agent-id;
                     available-profiles: root.available-profiles;
                     agent-catalog: root.agent-catalog;
+                    agent-catalog-error: root.agent-catalog-error;
                     page-search-query: root.search-query;
                     recoverable-sessions: root.recoverable-sessions;
                     profile-create(name, agent-id, terminal-enabled, fs-enabled) => {

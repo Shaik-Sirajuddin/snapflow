@@ -91,3 +91,100 @@ matrix rows themselves since it doesn't depend on live provider auth;
 the live instance is worth one confirming pass given the `claude-acp`
 routing anomaly found above needs a real multi-provider setup to
 reproduce.
+
+## Capability-preview WS hiccup: current failure and proposed handling
+
+Today, a transient WebSocket failure while `ensure_models_for_provider`
+opens its capability-preview session is treated the same as a permanent
+failure. `ProjectSessionPool::open_session` already knows whether an
+`OpenError` is terminal, but `PoolError::OpenFailed` currently retains only
+the message. The caller therefore cannot safely distinguish a retryable
+launch-time transport hiccup from authentication/capacity rejection.
+
+```mermaid
+flowchart TD
+    A[Provider changes on a session-less thread] --> B[ensure_models_for_provider]
+    B --> C[pool.acquire preview session]
+    C --> D{session/new or resume}
+    D -->|WebSocket hiccup| E[OpenError terminal=false]
+    D -->|Auth/capacity rejection| F[OpenError terminal=true]
+    D -->|Success| G[Lease contains configOptions]
+    E --> H[PoolError::OpenFailed message only]
+    F --> H
+    H --> I[Caller cannot classify the failure]
+    I --> J[No retry]
+    J --> K[list_models fallback]
+    K --> L{RPC succeeds?}
+    L -->|Yes| M[Model options cached]
+    L -->|No or empty result| N[Empty or stale config dropdown before first send]
+    G --> O[release lease and cache configOptions]
+    O --> P[Provider-correct dropdown]
+    style N fill:#ffd6d6,stroke:#b42318
+    style P fill:#d1fadf,stroke:#027a48
+```
+
+The recommended fix keeps retry policy narrow to this background probe:
+preserve the terminal flag (or expose `PoolError::is_retryable()`), retry only
+non-terminal failures with a short overall deadline and bounded backoff, then
+use the existing `list_models` fallback. Do not blindly retry every
+`session/new` globally: if the WS drops after the server creates a session but
+before the response arrives, another `session/new` can create an orphaned
+session. A dedicated idempotency key or capability-probe RPC would be needed
+before making session creation globally retryable.
+
+```mermaid
+flowchart TD
+    A[Preview acquire fails] --> B{Classified transient?}
+    B -->|No: terminal auth/capacity| C[Skip retry]
+    B -->|Yes: transport hiccup| D{Within preview deadline?}
+    D -->|Yes| E[Backoff 100-250 ms plus jitter]
+    E --> F[Retry acquire, at most 2 attempts]
+    F --> B
+    D -->|No| C
+    C --> G[list_models fallback]
+    G --> H[Cache options and emit ConfigOptions]
+```
+
+## Why `agents/list` can disappear from Settings
+
+This is a separate failure layer from preview-session idempotency. Settings
+does not call the preview pool. Its catalog refresh calls `profiles/list`,
+`mcp_servers/list`, `agents/list`, and `session/list` through the selected
+thread's gateway handle. The refresh currently converts every failed result to
+an empty value with `unwrap_or_default()`, so a connection/RPC failure is
+rendered as “no agents” rather than as an error.
+
+```mermaid
+sequenceDiagram
+    participant UI as Settings UI
+    participant B as AgentBridge catalog refresh
+    participant H as Thread handle
+    participant G as ACPX Gateway
+
+    UI->>B: request gateway catalog
+    B->>H: agents/list (parallel with other catalog RPCs)
+    H->>G: JSON-RPC over gateway WS/HTTP
+
+    alt Gateway URL/process unavailable
+        G--xH: connect / transport error
+        H-->>B: Err(...)
+    else Gateway rejects request
+        G--xH: RPC error (auth, route, startup failure)
+        H-->>B: Err(...)
+    else Success
+        G-->>H: result.agents
+        H-->>B: Vec<AgentCatalogEntry>
+    end
+
+    B->>B: agents_result.unwrap_or_default()
+    B-->>UI: empty catalog on both error and success-with-zero-agents
+```
+
+Therefore the first diagnostic fix is not an idempotency retry: preserve and
+log the `agents/list` error (including gateway URL and provider), expose a
+distinct `agents_fetch_error`/loading state in the Settings snapshot, and run
+a direct gateway health probe. Only after that identifies a transient startup
+or WS disconnect should we add a reconnect/retry policy. A preview `acquire`
+retry cannot make Settings show agents when the selected gateway itself is
+unreachable, mis-provisioned, or its error is being silently converted to an
+empty list.

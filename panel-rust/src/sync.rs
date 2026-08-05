@@ -1542,6 +1542,7 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     component.set_mcp_server_submit_busy(mcp_server_submit_busy);
     component.set_agent_catalog(slint::ModelRc::from(model.agent_catalog_model.clone()));
     component.set_agent_catalog_fetched(model.agent_catalog_fetched);
+    component.set_agent_catalog_error(model.agent_catalog_error.clone().into());
     component.set_selected_provider_unavailable(selected_provider_unavailable(model));
     component.set_recoverable_sessions(slint::ModelRc::from(
         model.recoverable_sessions_model.clone(),

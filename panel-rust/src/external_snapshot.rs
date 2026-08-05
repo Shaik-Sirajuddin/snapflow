@@ -74,6 +74,7 @@ fn model_gateway_catalog_snapshot(model: &crate::model::Model) -> msg::SettingsG
         mcp_servers: model.available_mcp_servers.clone(),
         agents: model.agent_catalog.clone(),
         agents_fetched: model.agent_catalog_fetched,
+        agent_catalog_error: model.agent_catalog_error.clone(),
         recoverable_sessions: model.recoverable_sessions.clone(),
         recovery_provider: model.recovery_provider.clone(),
     }
@@ -366,6 +367,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                 mcp_servers: Vec::new(),
                 agents: Vec::new(),
                 agents_fetched: false,
+                agent_catalog_error: String::new(),
                 recoverable_sessions: Vec::new(),
                 recovery_provider: String::new(),
             })

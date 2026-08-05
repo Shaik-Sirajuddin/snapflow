@@ -429,6 +429,7 @@ pub struct SettingsGatewaySnapshot {
     pub mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agents: Vec<crate::protocol_types::AgentCatalogEntry>,
     pub agents_fetched: bool,
+    pub agent_catalog_error: String,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
 }

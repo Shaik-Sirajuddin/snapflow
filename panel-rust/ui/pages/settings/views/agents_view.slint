@@ -58,6 +58,7 @@ export component AgentsView inherits Rectangle {
     in property <bool> beta-mode-enabled: false;
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <string> agent-catalog-error: "";
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     // Mirror pattern (see settings_page.slint's agents-search-focus-mirror
     // doc comment): now that the default-profile/permission-profile
@@ -203,6 +204,13 @@ export component AgentsView inherits Rectangle {
         height: parent.height;
         spacing: Metrics.space-6;
         alignment: start;
+
+        if root.agent-catalog-error != "" : Text {
+            text: "Unable to reach gateway: " + root.agent-catalog-error;
+            color: Theme.status-error;
+            horizontal-stretch: 1;
+            wrap: word-wrap;
+        }
 
         SettingsSection {
         width: parent.width;
