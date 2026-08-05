@@ -358,7 +358,32 @@ func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID stri
 	instance.Status = registry.ExternalStatusClosed
 	instance.LeaseExpiresAt = time.Now().UTC()
 	instance.UpdatedAt = time.Now().UTC()
-	return d.Reg.SaveExternalInstance(instance)
+	if err := d.Reg.SaveExternalInstance(instance); err != nil {
+		return err
+	}
+	// Closing the registry lease is also a routing transition. Drop any
+	// already-pooled SAP connection before a later MCP call can continue
+	// mutating the now-unregistered GUI/in-memory instance.
+	d.invalidateProjectForPath(instance.ProjectPath)
+	return nil
+}
+
+func (d *Daemon) invalidateProjectForPath(path string) {
+	root := externalProjectRoot(path)
+	if root == "" {
+		return
+	}
+	projects, err := d.Reg.ListProjects()
+	if err != nil {
+		d.Log.Warn("could not invalidate SAP connection for external project", "path", path, "error", err)
+		return
+	}
+	for _, project := range projects {
+		if filepath.Clean(project.RootDir) == root {
+			d.SAP.InvalidateProject(project.ID)
+			return
+		}
+	}
 }
 
 func (d *Daemon) DiscoverExternalInstances(ctx context.Context) ([]discovery.Candidate, error) {
@@ -552,8 +577,15 @@ func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error
 		return "", "", err
 	}
 	for _, in := range instances { // newest first, per ListProcessInstancesByProject's ordering
-		if in.Status == registry.StatusReady {
+		if in.Status == registry.StatusReady && health.PIDAlive(in.PID) && health.SocketResponsive(in.SocketPath, time.Second) {
 			return in.SocketPath, in.Token, nil
+		}
+		if in.Status == registry.StatusReady {
+			// Do not let a stale ready row shadow a live external GUI or a
+			// replacement daemon instance. The process manager performs the
+			// same self-healing check during launch; routing must apply it too.
+			_ = d.Reg.UpdateProcessInstanceStatus(in.ID, registry.StatusCrashed)
+			_ = d.Reg.Audit(in.ProjectID, registry.AuditCrash, "SAP routing found ready instance unhealthy")
 		}
 	}
 
@@ -1179,7 +1211,14 @@ func (d *Daemon) CloseInstance(ctx context.Context, instanceID string) error {
 			return err
 		}
 	}
-	return d.Proc.Close(instanceID)
+	// Proc.Close waits for the child and publishes the closed state. Invalidate
+	// afterward so no existing MCP session can keep using the old pooled SAP
+	// connection between lifecycle generations. Invalidate even when registry
+	// bookkeeping reports an error: the child may already be dead, and keeping
+	// its connection would still permit stale in-memory routing.
+	closeErr := d.Proc.Close(instanceID)
+	d.SAP.InvalidateProject(instance.ProjectID)
+	return closeErr
 }
 
 // --- Generic SAP proxy, per 06-daemon-mcp-proxy.md's proxy requirement ---
