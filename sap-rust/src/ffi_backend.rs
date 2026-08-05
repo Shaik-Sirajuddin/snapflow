@@ -1063,7 +1063,10 @@ impl Backend for FfiBackend {
             path: String,
             in_frame: i64,
             out_frame: i64,
+            #[serde(default = "default_clip_speed")]
+            speed: f64,
         }
+        fn default_clip_speed() -> f64 { 1.0 }
         let raw_clips: Vec<RawClip> = serde_json::from_str(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad clip-list JSON: {e}")))?;
         Ok(raw_clips
@@ -1073,8 +1076,8 @@ impl Backend for FfiBackend {
                 index: c.index,
                 source: json!({"path": c.path}),
                 in_frame: c.in_frame,
-            out_frame: c.out_frame,
-            speed: 1.0,
+                out_frame: c.out_frame,
+                speed: c.speed,
             })
             .collect())
     }
