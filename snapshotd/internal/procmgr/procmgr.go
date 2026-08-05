@@ -202,6 +202,30 @@ func filterEnvKeys(env []string, keys ...string) []string {
 	return out
 }
 
+// bundledMeltBinary resolves the melt executable shipped beside a managed
+// GUI. A daemon-launched child has a project-isolated HOME, so relying on
+// $HOME/.local/bin or the daemon's inherited PATH is not deterministic.
+func bundledMeltBinary(binPath string) string {
+	absolute, err := filepath.Abs(binPath)
+	if err != nil {
+		absolute = binPath
+	}
+	dir := filepath.Dir(absolute)
+	candidates := []string{
+		filepath.Join(dir, "melt"),
+		filepath.Join(dir, "melt.exe"),
+		filepath.Join(dir, "bin", "melt"),
+		filepath.Join(dir, "bin", "melt.exe"),
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
 // randomShortID returns a short (16 hex char) random identifier, used for
 // both the ProcessInstance row id and the socket filename -- see the
 // sun_path length comment in Launch for why this needs to stay short.
@@ -363,13 +387,17 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// appending our own: glibc's getenv returns the *first* match in
 	// envp, so simply appending a second "HOME=..." after os.Environ()'s
 	// original one would silently lose to it.
-	cmd.Env = append(filterEnvKeys(os.Environ(),
+	envKeys := []string{
 		"HOME",
 		"SNAPSHOT_SAP_ENDPOINT",
 		"SNAPSHOT_SAP_SOCKET",
 		"SNAPSHOT_SAP_TOKEN",
 		"SNAPSHOTD_MANAGED",
-	),
+	}
+	if os.Getenv("MELT_BIN") == "" {
+		envKeys = append(envKeys, "MELT_BIN")
+	}
+	cmd.Env = append(filterEnvKeys(os.Environ(), envKeys...),
 		"HOME="+qtHomeDir,
 		"SNAPSHOT_SAP_ENDPOINT="+sockPath,
 		"SNAPSHOT_SAP_SOCKET="+sockPath,
@@ -382,6 +410,11 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_PROJECT_PREOPENED="+strconv.FormatBool(preopened),
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
+	if os.Getenv("MELT_BIN") == "" {
+		if meltBin := bundledMeltBinary(m.BinPath); meltBin != "" {
+			cmd.Env = append(cmd.Env, "MELT_BIN="+meltBin)
+		}
+	}
 	if m.HomeDir != "" {
 		cmd.Env = append(cmd.Env,
 			"SNAPSHOTD_HOME="+m.HomeDir,

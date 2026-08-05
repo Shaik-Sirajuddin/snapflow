@@ -48,6 +48,22 @@ func openTestRegistry(t *testing.T) *registry.Registry {
 	return reg
 }
 
+func TestBundledMeltBinary_FindsAppSiblingWithoutUsingHome(t *testing.T) {
+	appDir := t.TempDir()
+	binDir := filepath.Join(appDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("create app bin dir: %v", err)
+	}
+	melt := filepath.Join(binDir, "melt")
+	if err := os.WriteFile(melt, []byte("fixture"), 0o755); err != nil {
+		t.Fatalf("write bundled melt fixture: %v", err)
+	}
+	got := bundledMeltBinary(filepath.Join(appDir, "snapflow"))
+	if got != melt {
+		t.Fatalf("bundledMeltBinary() = %q, want %q", got, melt)
+	}
+}
+
 func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	fixtureBin := buildFixture(t)
 	reg := openTestRegistry(t)

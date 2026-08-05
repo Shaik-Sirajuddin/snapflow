@@ -49,6 +49,10 @@ require_file "$gui_bin"
 require_file "$daemon_bin"
 require_file "$acpx_bin"
 [ -d "$app_dir" ] || { echo "error: packaged GUI runtime not found: $app_dir" >&2; exit 1; }
+# Upstream's Linux bundle ships the MLT CLI beside the GUI. Snapflow's real
+# export path shells out to that binary, so fail while packaging instead of
+# producing an install that can open projects but cannot export them.
+require_file "$app_dir/bin/melt"
 
 # The local CMake build links the GUI against CuteLogger from the sibling
 # build directory.  The regular release bundler installs this library into
@@ -159,6 +163,8 @@ set -eu
 CURRENT_DIR=$(readlink -f "$0")
 INSTALL_DIR=$(dirname "$CURRENT_DIR")
 export LD_LIBRARY_PATH="$INSTALL_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$INSTALL_DIR/bin${PATH:+:$PATH}"
+export MELT_BIN="$INSTALL_DIR/bin/melt"
 export MLT_REPOSITORY="$INSTALL_DIR/lib/mlt-7"
 export MLT_DATA="$INSTALL_DIR/share/mlt-7"
 export MLT_PROFILES_PATH="$INSTALL_DIR/share/mlt-7/profiles"
