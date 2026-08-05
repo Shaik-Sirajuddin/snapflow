@@ -23,6 +23,24 @@ while IFS= read -r line; do
 done
 "#;
 
+const QUEUE_DISPATCH_RACE_BACKEND: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}\n' "$id"
+  elif printf '%s' "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-queue-race"}}\n' "$id"
+  elif printf '%s' "$line" | grep -q '"method":"session/prompt"'; then
+    text=$(printf '%s' "$line" | sed -n 's/.*"prompt":\[.*"text":"\([^"]*\)".*$/\1/p')
+    printf '%s\n' "$text" >> "$ACPX_QUEUE_CAPTURE"
+    if [ "$text" = "normal" ]; then sleep 0.35; fi
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  fi
+done
+"#;
+
 #[tokio::test]
 async fn router_serves_initial_and_older_transcript_pages_from_server_store() {
     let directory = tempdir().unwrap();
@@ -378,4 +396,91 @@ async fn shared_clients_are_fifo_and_auto_dispatch_promoted_queue_entries() {
         .unwrap()
         .queue
         .is_empty());
+}
+
+#[tokio::test]
+async fn shared_queue_dispatch_cannot_overtake_a_normal_prompt() {
+    let directory = tempdir().unwrap();
+    let capture = directory.path().join("prompts.txt");
+    let backend =
+        QUEUE_DISPATCH_RACE_BACKEND.replace("$ACPX_QUEUE_CAPTURE", &capture.display().to_string());
+    let mut router =
+        Router::new("queue-race-agent").with_queue_store(QueueStore::new(directory.path()));
+    router.register_agent(
+        "queue-race-agent",
+        SpawnSpec::new("sh", vec!["-c".into(), backend]),
+    );
+    let router = Arc::new(Mutex::new(router));
+    let tenant = TenantId::default_tenant();
+    let created = dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"session/new",
+            "params":{"cwd":"/tmp"}
+        }),
+    )
+    .await
+    .unwrap();
+    let session_id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+
+    let normal_router = Arc::clone(&router);
+    let normal_tenant = tenant.clone();
+    let normal_session = session_id.clone();
+    let normal = tokio::spawn(async move {
+        dispatch_shared_for_tenant(
+            &normal_router,
+            &normal_tenant,
+            json!({
+                "jsonrpc":"2.0", "id":2, "method":"session/prompt",
+                "params":{"sessionId":normal_session,"prompt":[{"type":"text","text":"normal"}]}
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::fs::read_to_string(&capture)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        != Some("normal")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "normal prompt never reached backend"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    dispatch_shared_for_tenant(
+        &router,
+        &tenant,
+        json!({
+            "jsonrpc":"2.0", "id":3, "method":"session/queue",
+            "params":{"sessionId":session_id,"operation":"enqueue","text":"queued","idempotencyKey":"race-queued"}
+        }),
+    )
+    .await
+    .unwrap();
+    normal.await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let lines = loop {
+        let lines = std::fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if lines.len() >= 2 {
+            break lines;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queued prompt was not auto-dispatched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(&lines[..2], ["normal", "queued"]);
 }

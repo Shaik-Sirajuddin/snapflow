@@ -723,6 +723,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
     let queue_hub = { router.lock().await.queue_hub() };
+    let queue_store = { router.lock().await.queue_store() };
     let agent_relay = { router.lock().await.agent_request_hub() };
     let client_id = fresh_client_id();
     let interaction_hub = { router.lock().await.interaction_hub() };
@@ -1139,12 +1140,44 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                     let mut rx = queue_hub.subscribe(&session_id).await;
                     let forwarder_sink = Arc::clone(&sink);
                     let forwarder_client_id = client_id.clone();
+                    let forwarder_queue_store = queue_store.clone();
+                    let forwarder_session_id = session_id.clone();
                     let handle = tokio::spawn(async move {
                         loop {
                             let mut update = match rx.recv().await {
                                 Ok(update) => update,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    tracing::warn!(%skipped, "ACPX queue subscriber lagged");
+                                    tracing::warn!(%skipped, session_id = %forwarder_session_id, "ACPX queue subscriber lagged; resyncing snapshot");
+                                    if let Some(store) = &forwarder_queue_store {
+                                        match store.snapshot(forwarder_session_id.clone()).await {
+                                            Ok(snapshot) => {
+                                                let snapshot = serde_json::json!({
+                                                    "jsonrpc": "2.0",
+                                                    "method": "acpx/session/queue",
+                                                    "params": {
+                                                        "sessionId": snapshot.session_id,
+                                                        "queue": snapshot.queue,
+                                                        "paused": snapshot.paused
+                                                    }
+                                                });
+                                                let Ok(payload) = serde_json::to_string(&snapshot)
+                                                else {
+                                                    continue;
+                                                };
+                                                if !send_frame_bounded(
+                                                    &forwarder_sink,
+                                                    Message::Text(payload),
+                                                )
+                                                .await
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, session_id = %forwarder_session_id, "failed to resync lagged ACPX queue subscriber")
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

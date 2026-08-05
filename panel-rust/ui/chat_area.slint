@@ -938,10 +938,15 @@ export component ChatArea inherits Rectangle {
                     width: parent.width;
                     padding-left: Metrics.space-6;
                     padding-right: Metrics.space-6;
-                    padding-top: Metrics.space-3;
-                    padding-bottom: Metrics.space-3;
+                    // Keep the task list compact: this is an inline status
+                    // surface, not a message card. The old 6px vertical
+                    // inset on both sides made a one-item plan look like a
+                    // padded popup and amplified the row's own line height.
+                    padding-top: Metrics.space-1;
+                    padding-bottom: Metrics.space-1;
                     spacing: Metrics.space-1;
                     for entry[i] in root.plan-entries : HorizontalLayout {
+                        alignment: start;
                         spacing: Metrics.space-2;
                         Text {
                             text: entry.status == "completed" ? "✓"
@@ -958,6 +963,7 @@ export component ChatArea inherits Rectangle {
                             font-size: 10px * Theme.font-scale;
                             font-family: Theme.font-mono;
                             wrap: word-wrap;
+                            vertical-alignment: center;
                             horizontal-stretch: 1;
                             preferred-width: 0px;
                             min-width: 0px;

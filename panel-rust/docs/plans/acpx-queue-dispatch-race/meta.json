@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ACPX queue dispatch reservation race",
+  "plan": "acpx-queue-dispatch-race",
+  "status": "completed",
+  "updated": "2026-08-05",
+  "plan_doc": "00-plan.md",
+  "source_task": "Fix server-side queue auto-forward ordering race and run ACPX integration verification.",
+  "ordering_rationale": "Implement reservation and deterministic race coverage before review and runtime verification.",
+  "follow_ups": [
+    "Steer lifecycle now reports durable queued acceptance only; backend dispatch/completion is no longer fabricated.",
+    "Close/resume/load share the reservation in shared and legacy dispatch paths.",
+    "Lagged queue WebSocket subscribers receive an authoritative snapshot resync.",
+    "Crash recovery remains explicitly at-least-once; exact-once requires backend idempotency after a process crash."
+  ],
+  "completed": [
+    {
+      "phase": "reservation_fix",
+      "order": 1,
+      "status": "completed",
+      "evidence": "Per-session weak reservation added in acpx-core/router.rs; normal and queue-dispatched session/prompt calls serialize."
+    },
+    {
+      "phase": "review_gate",
+      "order": 2,
+      "status": "completed",
+      "evidence": "Rust lock audit completed; reservation guard is tokio-owned, held only for prompt dispatch, and weak entries are pruned."
+    },
+    {
+      "phase": "verification_gate",
+      "order": 3,
+      "status": "completed",
+      "evidence": "6/6 session_stream_persistence_test tests pass; acpx-core cargo check passes; git diff --check passes."
+    },
+    {
+      "phase": "runtime_gate",
+      "order": 4,
+      "status": "completed",
+      "evidence": "Built acpx-server process queue matrix smoke passes. The existing WS subscription test fails before dispatch with null snapshots for its fixture; unrelated to changed files."
+    }
+  ],
+  "pending": [
+    {
+      "phase": "reservation_fix",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "description": "Serialize normal prompts and queue dispatch with a per-session reservation.",
+      "verification": "Race test and existing queue tests pass."
+    },
+    {
+      "phase": "review_gate",
+      "order": 2,
+      "tier": "review_gate",
+      "status": "completed",
+      "description": "Audit lock lifetime, cancellation, and durable claim/release paths.",
+      "max_iterations": 2
+    },
+    {
+      "phase": "verification_gate",
+      "order": 3,
+      "tier": "verification_gate",
+      "status": "completed",
+      "description": "Verify implementation against the plan and test matrix.",
+      "misalignments": []
+    },
+    {
+      "phase": "runtime_gate",
+      "order": 4,
+      "tier": "runtime_gate",
+      "status": "completed",
+      "description": "Run local ACPX server/client integration smoke.",
+      "matrix_ref": "00-plan.md",
+      "matrix_rows": [
+        {
+          "scenario": "real binary process queue matrix",
+          "status": "pass",
+          "command": "ACPX_RUN_PROCESS_MATRIX=1 cargo test --manifest-path acpx/acpx-server/Cargo.toml --test process_multiclient_matrix_test process_multi_client_queue_race_and_fanout -- --ignored"
+        },
+        {
+          "scenario": "WS queue subscription fixture",
+          "status": "pre-existing failure",
+          "detail": "snapshots is null instead of the expected session list before dispatch is exercised"
+        }
+      ]
+    },
+    {
+      "phase": "followup_hardening",
+      "order": 5,
+      "status": "completed",
+      "evidence": "Steer no longer fabricates dispatched/completed states; close/resume/load use the per-session reservation in both dispatch paths; lagged WS queue subscribers resync from QueueStore. Crash recovery's external-backend boundary remains explicitly at-least-once with stable queue idempotency keys."
+    }
+  ]
+}

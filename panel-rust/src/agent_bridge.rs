@@ -6431,6 +6431,45 @@ impl AgentBridge {
         ok
     }
 
+    /// PUI-013-style non-blocking Delete. `delete_thread` above does a
+    /// synchronous `runtime.block_on` on the caller -- which for the
+    /// sidebar's delete-thread action (`Effect::DeleteThread` in
+    /// `effect_executor.rs`) is the Slint UI callback thread, freezing the
+    /// whole panel for the duration of the `session/delete` round-trip.
+    /// This fire-and-forget variant runs the same round-trip on the tokio
+    /// runtime instead, and hands the real `Result` to `on_complete` --
+    /// invoked on the runtime thread, never the UI thread, so callers must
+    /// re-enter the event loop themselves (`slint::invoke_from_event_loop`)
+    /// before touching any Slint/`PanelSingleton` state, same as
+    /// `install_agent_async`/`set_agent_enabled_async`/the MCP `*_async`
+    /// methods. Marks the thread `closed` on success, same as the
+    /// synchronous version, but only after the RPC actually succeeds. Kept
+    /// separate from `delete_thread` so the synchronous, bool-returning
+    /// method still backs the unit tests.
+    pub fn delete_thread_async(
+        &self,
+        idx: usize,
+        on_complete: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let Some(slot) = self.slots.get(idx) else {
+            on_complete(Err(format!("no thread at index {idx}")));
+            return;
+        };
+        let slot = slot.clone();
+        let handle = slot.handle.clone();
+        self.runtime.spawn(async move {
+            let result = handle
+                .delete_session()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            if result.is_ok() {
+                *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            }
+            on_complete(result);
+        });
+    }
+
     /// Whether thread `idx` has been explicitly closed via
     /// [`Self::close_thread`]/[`Self::delete_thread`]. `false` for any
     /// out-of-range index or a thread that has never been closed.

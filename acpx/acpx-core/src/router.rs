@@ -346,6 +346,12 @@ pub struct Router {
     queue_store: Option<QueueStore>,
     queue_hub: QueueHub,
     queue_active: Arc<Mutex<HashSet<String>>>,
+    /// Per-session reservation shared by ordinary prompts and the durable
+    /// queue dispatcher. The in-flight bit alone is only an observation; it
+    /// cannot cover the await between checking it and claiming a queue item.
+    /// This reservation closes that TOCTOU window and preserves client order
+    /// across the normal-prompt and auto-forward paths.
+    dispatch_reservations: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     /// Per-idempotency-key async serialization. Weak entries avoid retaining
     /// arbitrary client keys after the last concurrent session/new finishes.
     creation_request_locks: HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
@@ -1270,6 +1276,7 @@ impl Router {
             queue_store: None,
             queue_hub: QueueHub::default(),
             queue_active: Arc::new(Mutex::new(HashSet::new())),
+            dispatch_reservations: Arc::new(Mutex::new(HashMap::new())),
             creation_request_locks: HashMap::new(),
             agent_enablement: None,
             custom_agents: None,
@@ -2153,6 +2160,25 @@ impl Router {
 
     fn queue_dispatch_active(&self) -> Arc<Mutex<HashSet<String>>> {
         self.queue_active.clone()
+    }
+
+    fn dispatch_reservation(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{}\u{1f}{gateway_session_id}", tenant_id.0);
+        let mut reservations = self
+            .dispatch_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reservation) = reservations.get(&key).and_then(std::sync::Weak::upgrade) {
+            return reservation;
+        }
+        let reservation = Arc::new(tokio::sync::Mutex::new(()));
+        reservations.insert(key, Arc::downgrade(&reservation));
+        reservations.retain(|_, weak| weak.strong_count() > 0);
+        reservation
     }
 
     fn session_is_in_flight(&self, tenant_id: &TenantId, gateway_session_id: &str) -> bool {
@@ -4592,6 +4618,19 @@ impl Router {
         if method == "session/cancel" {
             return self.dispatch_session_cancel(tenant_id, request).await;
         }
+        let _reservation = if method_uses_dispatch_reservation(&method) {
+            let gateway_session_id = request
+                .pointer("/params/sessionId")
+                .and_then(|value| value.as_str())
+                .ok_or(RouterError::MissingSessionId)?;
+            Some(
+                self.dispatch_reservation(tenant_id, gateway_session_id)
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         if method == "session/close" {
             if let Some(response) = self.maybe_suppress_close(tenant_id, &mut request).await? {
                 return Ok(response);
@@ -8726,28 +8765,18 @@ async fn dispatch_session_steer_shared(
         "method": "session/cancel",
         "params": {"sessionId": typed.session_id}
     });
-    let _ = dispatch_session_cancel_shared(router, tenant_id, cancel_request).await;
+    if let Err(error) = dispatch_session_cancel_shared(router, tenant_id, cancel_request).await {
+        tracing::warn!(
+            %error,
+            session_id = %typed.session_id,
+            queue_entry_id = ?result.queue_entry_id,
+            "steer queued successfully but active-turn cancellation failed"
+        );
+    }
     spawn_queue_dispatcher(router.clone(), tenant_id.clone(), result.session_id.clone());
-    hub.publish_steer(
-        acpx_proto::session_stream::SessionSteerEvent {
-            session_id: typed.session_id.clone(),
-            state: acpx_proto::session_stream::SessionSteerState::Dispatched,
-            queue_entry_id: result.queue_entry_id.clone(),
-            idempotency_key: Some(typed.idempotency_key.clone()),
-        },
-        origin_client_id.as_deref(),
-    )
-    .await;
-    hub.publish_steer(
-        acpx_proto::session_stream::SessionSteerEvent {
-            session_id: typed.session_id.clone(),
-            state: acpx_proto::session_stream::SessionSteerState::Completed,
-            queue_entry_id: result.queue_entry_id.clone(),
-            idempotency_key: Some(typed.idempotency_key.clone()),
-        },
-        origin_client_id.as_deref(),
-    )
-    .await;
+    // The request only guarantees durable queue acceptance. The dispatcher
+    // owns the eventual backend claim/completion, so do not advertise those
+    // states before a backend response exists.
     Ok(serde_json::to_value(
         acpx_proto::session_stream::SessionSteerResult {
             session_id: result.session_id,
@@ -8819,6 +8848,15 @@ fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, sessi
         }
         let mut retry_delay = std::time::Duration::from_millis(250);
         loop {
+            // Hold the same reservation ordinary session/prompt calls take.
+            // Checking `in_flight` without this lock is a TOCTOU race: a
+            // normal prompt can begin while the dispatcher awaits the durable
+            // queue claim, allowing the queued prompt to overtake it.
+            let reservation = {
+                let router = router.lock().await;
+                router.dispatch_reservation(&tenant_id, &session_id)
+            };
+            let _reservation = reservation.lock().await;
             let (store, hub) = {
                 let router = router.lock().await;
                 if router.session_is_in_flight(&tenant_id, &session_id) {
@@ -8849,7 +8887,8 @@ fn spawn_queue_dispatcher(router: SharedRouterHandle, tenant_id: TenantId, sessi
                     "_acpx": {"queueEntryId": item.queue_entry_id, "idempotencyKey": item.idempotency_key}
                 }
             });
-            if let Err(error) = dispatch_proxied_shared(&router, &tenant_id, request).await {
+            if let Err(error) = dispatch_proxied_shared_reserved(&router, &tenant_id, request).await
+            {
                 tracing::warn!(%session_id, %error, queue_entry_id = %item.queue_entry_id, "queued prompt failed; returning entry to FIFO");
                 match store.release(session_id.clone(), &item).await {
                     Ok(event) => hub.publish(event).await,
@@ -9267,16 +9306,56 @@ fn prompt_blocks_to_text(blocks: &[serde_json::Value]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+fn method_uses_dispatch_reservation(method: &str) -> bool {
+    matches!(
+        method,
+        "session/prompt" | "session/close" | "session/resume" | "session/load"
+    )
+}
+
 async fn dispatch_proxied_shared(
     router: &SharedRouterHandle,
     tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    dispatch_proxied_shared_inner(router, tenant_id, request, false).await
+}
+
+/// Dispatch a queue-promoted prompt while the caller already owns the
+/// session reservation. Keeping this separate prevents the queue dispatcher
+/// from trying to lock its own reservation a second time.
+async fn dispatch_proxied_shared_reserved(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    dispatch_proxied_shared_inner(router, tenant_id, request, true).await
+}
+
+async fn dispatch_proxied_shared_inner(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     mut request: serde_json::Value,
+    reservation_held: bool,
 ) -> Result<serde_json::Value, RouterError> {
     let method = request
         .get("method")
         .and_then(|m| m.as_str())
         .ok_or(RouterError::MissingMethod)?
         .to_string();
+    let _reservation = if method_uses_dispatch_reservation(&method) && !reservation_held {
+        let reservation = {
+            let router = router.lock().await;
+            let gateway_session_id = request
+                .pointer("/params/sessionId")
+                .and_then(|value| value.as_str())
+                .ok_or(RouterError::MissingSessionId)?;
+            router.dispatch_reservation(tenant_id, gateway_session_id)
+        };
+        Some(reservation.lock_owned().await)
+    } else {
+        None
+    };
     if method == "session/close" {
         let mut r = router.lock().await;
         if let Some(response) = r.maybe_suppress_close(tenant_id, &mut request).await? {

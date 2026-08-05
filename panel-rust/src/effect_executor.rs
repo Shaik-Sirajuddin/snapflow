@@ -1117,14 +1117,35 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                         .thread_binding(real_index)
                         .map(|binding| binding.thread_id)
                         .unwrap_or_default();
-                    if !bridge.delete_thread(real_index) {
-                        let message = format!("failed to delete thread {real_index}");
-                        eprintln!("panel-rust: {message}");
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
-                        );
-                    }
+                    // PUI-013-style fix: `delete_thread` blocks the calling
+                    // thread (the Slint UI callback thread here) for the
+                    // full `session/delete` round-trip. `delete_thread_async`
+                    // runs the same RPC on the bridge's own tokio runtime;
+                    // its `on_complete` fires on that runtime thread, so it
+                    // must re-enter the event loop itself before touching
+                    // any Slint/`PanelSingleton` state, same as
+                    // `report_mcp_server_result`/`report_agent_result`.
+                    bridge.delete_thread_async(real_index, move |result| {
+                        if let Err(error) = result {
+                            let message = format!("failed to delete thread {real_index}: {error}");
+                            eprintln!("panel-rust: {message}");
+                            let _ = slint::invoke_from_event_loop(move || {
+                                crate::PANEL.with(|cell| {
+                                    let slot = cell.borrow();
+                                    let Some(panel) = slot.as_ref() else {
+                                        return;
+                                    };
+                                    let _ = update_persistent(
+                                        panel,
+                                        Msg::Effect(EffectResultMsg::StateEffectFailed {
+                                            thread_id,
+                                            message,
+                                        }),
+                                    );
+                                });
+                            });
+                        }
+                    });
                 }
             }
             Effect::SkillDelete { path } => {
