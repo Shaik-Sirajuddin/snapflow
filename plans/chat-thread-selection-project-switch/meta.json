@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "phase-plan execution file",
+  "plan": "chat-thread-selection-project-switch",
+  "plan_doc": "00-plan.md",
+  "source_task": "Fix default panel-rust chat thread selection and verify project-switch thread isolation.",
+  "status": "in_progress",
+  "updated": "2026-08-05 - implementation and targeted verification complete",
+  "ordering_rationale": "Investigate independent selection and lifecycle paths in parallel, integrate tests, then review and verify.",
+  "execution_strategy": {
+    "mode": "parallel_workstreams",
+    "subagents": true,
+    "blocks": [
+      {"id":"selection","name":"default selection","tasks":["Trace and fix implicit archived-thread selection"],"phases":["default_selection"],"depends_on":[]},
+      {"id":"switch","name":"project switch","tasks":["Audit and fix thread lifecycle isolation across project switches"],"phases":["project_switch_isolation"],"depends_on":[]},
+      {"id":"tests","name":"regression coverage","tasks":["Add focused tests for selection and switching"],"phases":["regression_tests"],"depends_on":[]}
+    ]
+  },
+  "completed": [
+    {"phase":"default_selection","order":1,"tier":2,"status":"completed","description":"Fix initial chat thread selection priority.","implementation_evidence":"Durable thread IDs are restored; archived/closed preferences are rejected; fallback selects the first active visible thread or clears the transcript.","verified":[{"description":"cargo test --lib --quiet startup_selection","verdict":"PASS"}]},
+    {"phase":"project_switch_isolation","order":2,"tier":2,"status":"completed","description":"Preserve unrelated threads while switching projects.","implementation_evidence":"Existing scoped release and stale-snapshot guards retained; regression asserts IDs, closure state, and archive state survive A to B switching.","verified":[{"description":"cargo test --lib --quiet project_switch_does_not_close_or_drop_unrelated_threads","verdict":"PASS"}]},
+    {"phase":"regression_tests","order":3,"tier":1,"status":"completed","description":"Add focused regression coverage.","implementation_evidence":"Added durable-ID, archived/closed startup, and project-switch isolation tests.","verified":[{"description":"Targeted panel-rust library tests pass","verdict":"PASS"}]},
+    {"phase":"review","order":4,"tier":"review_gate","status":"completed","description":"Review touched Rust lifecycle and selection code.","implementation_evidence":"Reviewed startup selection, final snapshot guard, and project-switch teardown; no unrelated close/delete is issued.","max_iterations":2},
+    {"phase":"verification","order":5,"tier":"verification_gate","status":"completed","description":"Verify implementation against plan and test matrix.","implementation_evidence":"Plan cases are covered by focused tests; diff check is clean."}
+  ],
+  "pending": [
+    {"phase":"runtime","order":6,"tier":"runtime_gate","status":"not_started","description":"Run available runtime/UI regression scenario.","verification":["startup with archived persisted thread","switch projects with unrelated thread"],"note":"Deferred: repository integration build is currently blocked by an unrelated RemoteSessionOption.busy initializer in tests/slint_component_e2e_test.rs."}
+  ],
+  "open_risks_ref": "00-plan.md#risks"
+}
