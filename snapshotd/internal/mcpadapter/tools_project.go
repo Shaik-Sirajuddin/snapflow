@@ -80,7 +80,7 @@ func projectCreateTool(s *server.MCPServer, h Handler) server.ServerTool {
 			mcp.WithString("name", mcp.Description("Legacy: folder name under daemon projects root when path is omitted")),
 			mcp.WithBoolean("open", mcp.Description("If true, open then project.save so .mlt is written immediately")),
 			mcp.WithString("mltFileName", mcp.Description("MLT filename inside the project folder (default project.mlt)")),
-			mcp.WithString("projectType", mcp.Description("folder (default) or file")),
+			mcp.WithString("projectType", mcp.Enum("folder", "file"), mcp.Description("folder (default) or file")),
 		),
 		Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			raw, err := json.Marshal(req.GetArguments())

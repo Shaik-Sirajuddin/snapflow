@@ -33,6 +33,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backend::{Backend, BackendError};
+use crate::filter_schema;
 use crate::framing::{self, FramingError};
 use crate::protocol::{error_codes, RpcError, RpcNotification, RpcRequest, RpcResponse};
 
@@ -62,7 +63,11 @@ impl ServerConfig {
     /// Windows callers may pass either a canonical `\\.\pipe\...` name or a
     /// bare logical name. The latter is normalized at compile time on Windows
     /// so higher layers never need to branch on the host OS.
-    pub fn new(endpoint: impl Into<PathBuf>, token: impl Into<String>, audio_enabled: bool) -> Self {
+    pub fn new(
+        endpoint: impl Into<PathBuf>,
+        token: impl Into<String>,
+        audio_enabled: bool,
+    ) -> Self {
         Self {
             socket_path: normalize_endpoint(endpoint.into()),
             token: token.into(),
@@ -77,7 +82,10 @@ fn normalize_endpoint(endpoint: PathBuf) -> PathBuf {
     if value.starts_with(r"\\.\pipe\") {
         endpoint
     } else {
-        PathBuf::from(format!(r"\\.\pipe\{}", value.trim_start_matches(['/', '\\'])))
+        PathBuf::from(format!(
+            r"\\.\pipe\{}",
+            value.trim_start_matches(['/', '\\'])
+        ))
     }
 }
 
@@ -261,6 +269,33 @@ fn invalid_params(e: &serde_json::Error) -> RpcError {
         message: format!("invalid params: {e}"),
         data: None,
     }
+}
+
+fn validate_subtitle_style(style: &Value) -> Result<(), RpcError> {
+    let Some(object) = style.as_object() else {
+        return Err(RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "subtitle style must be a JSON object".into(),
+            data: None,
+        });
+    };
+    for (key, value) in object {
+        let valid = match key.as_str() {
+            "fgcolour" | "bgcolour" | "olcolour" | "geometry" | "style" | "valign" | "halign" => {
+                value.is_string()
+            }
+            "outline" | "weight" | "size" => value.is_number(),
+            _ => false,
+        };
+        if !valid {
+            return Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!("unsupported or invalid subtitle style property {key:?}"),
+                data: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn method_not_found(method: &str) -> RpcError {
@@ -1475,6 +1510,13 @@ fn build_op_ext(
                 properties: Value,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            filter_schema::validate_properties(&p.mlt_service, &p.properties).map_err(
+                |message| RpcError {
+                    code: error_codes::INVALID_PARAMS,
+                    message,
+                    data: None,
+                },
+            )?;
             Ok(Box::new(move |b| {
                 match b.filter_add(&project_id, &p.clip_id, &p.mlt_service, p.properties) {
                     Ok(info) => BackendCallResult {
@@ -1486,6 +1528,18 @@ fn build_op_ext(
                     },
                     Err(e) => err_result(e),
                 }
+            }))
+        }
+
+        "filter.describe" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                mlt_service: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |_b| {
+                ok_result(filter_schema::describe(&p.mlt_service))
             }))
         }
 
@@ -1502,6 +1556,18 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
+                if let Ok(filters) = b.filter_list(&project_id, &p.clip_id) {
+                    if let Some(filter) = filters.iter().find(|f| f.index == p.filter_index) {
+                        if let Err(message) = filter_schema::validate_property(
+                            &filter.mlt_service,
+                            &p.property,
+                            &p.value,
+                            p.position.is_some(),
+                        ) {
+                            return err_result(BackendError::InvalidParams(message));
+                        }
+                    }
+                }
                 match b.filter_set_property(
                     &project_id,
                     &p.clip_id,
@@ -1539,6 +1605,18 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
+                if let Ok(filters) = b.filter_list(&project_id, &p.clip_id) {
+                    if let Some(filter) = filters.iter().find(|f| f.index == p.filter_index) {
+                        if let Err(message) = filter_schema::validate_property(
+                            &filter.mlt_service,
+                            &p.property,
+                            &p.value,
+                            true,
+                        ) {
+                            return err_result(BackendError::InvalidParams(message));
+                        }
+                    }
+                }
                 match b.filter_add_keyframe(
                     &project_id,
                     &p.clip_id,
@@ -1829,6 +1907,22 @@ fn build_op_ext(
                         notify: Some(RpcNotification::new(
                             "subtitles.changed",
                             json!({"reason": "burnIn", "trackIndex": p.track_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "subtitles.setStyle" => {
+            validate_subtitle_style(&params)?;
+            Ok(Box::new(move |b| {
+                match b.subtitles_set_style(&project_id, params.clone()) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "subtitles.changed",
+                            json!({"reason": "style"}),
                         )),
                     },
                     Err(e) => err_result(e),

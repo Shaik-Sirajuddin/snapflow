@@ -7,8 +7,7 @@ package mcpadapter_test
 // sap-rust chain (the real Qt/real_ffi shotcut binary, same as
 // sapcall_realsaprust_test.go), not just the sap-rust crate's own
 // server_integration.rs tests. track.enter/clip.enter/currentView are now
-// typed tools (tools_selection.go) rather than reached through the
-// generic sap.call passthrough this comment originally described --
+// typed tools (tools_selection.go), rather than generic passthrough calls --
 // sap.call/sap.search were dropped from the live server once every
 // method they used to reach (including these three, which had no typed
 // tool at the time) got a typed tool of its own; see mcpadapter.go's

@@ -5,9 +5,13 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// filterTools builds the 8 filter.* MLT-filter/keyframe tools.
+// filterTools builds the filter.* MLT-filter/keyframe/description tools.
 func filterTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	return []server.ServerTool{
+		sapTool(s, h, "filter.describe", "filter.describe", "Describe known properties for an MLT filter service.",
+			mcp.WithString("mltService", mcp.Required(), mcp.Description("MLT filter service name")),
+			dynamicOutputSchema[map[string]any](),
+		),
 		sapTool(s, h, "filter.add", "filter.add", "Attach an MLT filter to a clip.",
 			mcp.WithString("clipId", mcp.Required(), mcp.Description("Clip ID")),
 			mcp.WithString("mltService", mcp.Required(), mcp.Description("MLT filter service name, e.g. \"volume\", \"panner\"")),

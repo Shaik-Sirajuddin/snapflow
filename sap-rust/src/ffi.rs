@@ -295,6 +295,14 @@ extern "C" {
     /// no multitrack producer loaded).
     pub fn sap_subtitles_burn_in(main_window_handle: *mut c_void, track_index: c_int) -> c_int;
 
+    /// C++ side: `int sap_subtitles_set_style(void* mainWindowHandle, const
+    /// char* styleJson);` -- updates whitelisted style properties on the
+    /// output tractor's subtitle filters.
+    pub fn sap_subtitles_set_style(
+        main_window_handle: *mut c_void,
+        style_json: *const c_char,
+    ) -> c_int;
+
     /// C++ side: `int sap_notes_set_text(void* mainWindowHandle, const
     /// char* text);` -- real `NotesDock::setText()`. Returns 0 on
     /// success, -1 on error.
