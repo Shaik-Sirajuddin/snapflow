@@ -7,12 +7,174 @@
 
 use crate::raw::{ClientError, GatewayClient};
 use crate::ws::{GatewayNotification, GatewayWsClient, SessionSubscription};
-use agent_client_protocol::schema::v1::{McpServer, ResumeSessionRequest, SessionId};
+use agent_client_protocol::schema::v1::{
+    McpServer, NewSessionRequest, ResumeSessionRequest, SessionId,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+
+/// ACP metadata namespace used to make one logical `session/new` request
+/// identifiable across a lost-response reconnect.
+pub const SESSION_CREATION_META_NAMESPACE: &str = "com.example.client";
+
+/// Client-owned identity for one logical `session/new` operation.
+///
+/// A caller that performs its own higher-level retry should construct this
+/// once and reuse it. [`Gateway::call`] also ensures that raw `session/new`
+/// calls carry a generated identity before their transport attempt, so the
+/// reconnect replay of that call uses the exact same value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCreationMetadata {
+    pub creation_request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+impl SessionCreationMetadata {
+    /// Generate a fresh identity for a new logical creation operation.
+    pub fn generated() -> Self {
+        Self {
+            creation_request_id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: None,
+        }
+    }
+
+    /// Use a caller-supplied UUID, for example when retry state is persisted
+    /// outside this process.
+    pub fn new(creation_request_id: impl Into<String>) -> Result<Self, ClientError> {
+        let metadata = Self {
+            creation_request_id: creation_request_id.into(),
+            workspace_id: None,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    /// Attach optional client correlation metadata. Empty workspace ids are
+    /// rejected so the client and server enforce the same contract.
+    pub fn with_workspace_id(
+        mut self,
+        workspace_id: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        self.workspace_id = Some(workspace_id.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<(), ClientError> {
+        uuid::Uuid::parse_str(&self.creation_request_id).map_err(|err| {
+            ClientError::InvalidParams(format!("creationRequestId must be a UUID: {err}"))
+        })?;
+        if self.workspace_id.as_deref().is_some_and(str::is_empty) {
+            return Err(ClientError::InvalidParams(
+                "workspaceId must not be empty".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Merge creation identity into an ACP `session/new` params object while
+/// preserving unrelated `_meta` namespaces.
+pub fn with_session_creation_metadata(
+    mut params: serde_json::Value,
+    metadata: &SessionCreationMetadata,
+) -> Result<serde_json::Value, ClientError> {
+    metadata.validate()?;
+    let params_object = params.as_object_mut().ok_or_else(|| {
+        ClientError::InvalidParams("session/new params must be an object".to_owned())
+    })?;
+    let meta = params_object
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let meta_object = meta.as_object_mut().ok_or_else(|| {
+        ClientError::InvalidParams("session/new params._meta must be an object".to_owned())
+    })?;
+    meta_object.insert(
+        SESSION_CREATION_META_NAMESPACE.to_owned(),
+        serde_json::to_value(metadata).map_err(|err| {
+            ClientError::InvalidParams(format!(
+                "failed to serialize session creation metadata: {err}"
+            ))
+        })?,
+    );
+    Ok(params)
+}
+
+/// Ensure raw `session/new` params have a client creation identity. Existing
+/// valid metadata is retained verbatim, which is what keeps a caller-supplied
+/// identity stable across higher-level retries.
+pub fn ensure_session_creation_metadata(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ClientError> {
+    match session_creation_metadata(&params)? {
+        Some(_) => Ok(params),
+        None => with_session_creation_metadata(params, &SessionCreationMetadata::generated()),
+    }
+}
+
+fn session_creation_metadata(
+    params: &serde_json::Value,
+) -> Result<Option<SessionCreationMetadata>, ClientError> {
+    let Some(params_object) = params.as_object() else {
+        return Err(ClientError::InvalidParams(
+            "session/new params must be an object".to_owned(),
+        ));
+    };
+    let Some(meta) = params_object.get("_meta") else {
+        return Ok(None);
+    };
+    let meta_object = meta.as_object().ok_or_else(|| {
+        ClientError::InvalidParams("session/new params._meta must be an object".to_owned())
+    })?;
+    let Some(client_meta) = meta_object.get(SESSION_CREATION_META_NAMESPACE) else {
+        return Ok(None);
+    };
+    let metadata: SessionCreationMetadata =
+        serde_json::from_value(client_meta.clone()).map_err(|err| {
+            ClientError::InvalidParams(format!(
+                "invalid {SESSION_CREATION_META_NAMESPACE} session creation metadata: {err}"
+            ))
+        })?;
+    metadata.validate()?;
+    Ok(Some(metadata))
+}
+
+/// Build typed ACP `session/new` params and attach ACPX's client creation
+/// identity extension. The MCP entries are validated at this boundary.
+pub fn build_new_session_params(
+    cwd: impl AsRef<Path>,
+    mcp_servers: &[serde_json::Value],
+    metadata: &SessionCreationMetadata,
+) -> Result<serde_json::Value, ClientError> {
+    let typed_servers = deserialize_mcp_servers(mcp_servers)?;
+    let request = NewSessionRequest::new(PathBuf::from(cwd.as_ref())).mcp_servers(typed_servers);
+    let params = serde_json::to_value(&request).map_err(|err| {
+        ClientError::InvalidParams(format!("failed to serialize NewSessionRequest: {err}"))
+    })?;
+    with_session_creation_metadata(params, metadata)
+}
+
+fn deserialize_mcp_servers(
+    mcp_servers: &[serde_json::Value],
+) -> Result<Vec<McpServer>, ClientError> {
+    mcp_servers
+        .iter()
+        .cloned()
+        .map(|entry| {
+            serde_json::from_value::<McpServer>(entry).map_err(|err| {
+                ClientError::InvalidParams(format!(
+                    "mcpServers entry failed to deserialize as ACP McpServer: {err}"
+                ))
+            })
+        })
+        .collect()
+}
 
 /// Build typed `session/resume` params carrying the current client-computed
 /// MCP server list.
@@ -29,17 +191,7 @@ pub fn build_resume_session_params(
     cwd: impl AsRef<Path>,
     mcp_servers: &[serde_json::Value],
 ) -> Result<serde_json::Value, ClientError> {
-    let typed_servers = mcp_servers
-        .iter()
-        .cloned()
-        .map(|entry| {
-            serde_json::from_value::<McpServer>(entry).map_err(|err| {
-                ClientError::InvalidParams(format!(
-                    "mcpServers entry failed to deserialize as ACP McpServer: {err}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let typed_servers = deserialize_mcp_servers(mcp_servers)?;
     let request =
         ResumeSessionRequest::new(SessionId::new(session_id), PathBuf::from(cwd.as_ref()))
             .mcp_servers(typed_servers);
@@ -401,6 +553,9 @@ impl Gateway {
         params: serde_json::Value,
         profile: Option<&str>,
     ) -> Result<serde_json::Value, ClientError> {
+        // Generate at most once for this logical call, before either the
+        // first send or reconnect branch can clone/replay the params.
+        let params = prepare_call_params(method, params)?;
         match self.current_websocket() {
             Some(websocket) => {
                 // The WS transport binds profile selection into session/new
@@ -434,7 +589,9 @@ impl Gateway {
                     // exactly that) -- the transport silently retrying
                     // underneath it too is redundant at best, a silent
                     // resource leak at worst.
-                    Err(ClientError::WebSocket(_)) if !is_safe_to_retry_after_reconnect(method) => {
+                    Err(ClientError::WebSocket(_))
+                        if !is_safe_to_retry_after_reconnect(method, &params) =>
+                    {
                         Err(ClientError::WebSocket(
                             "not retrying a non-idempotent method after a WebSocket failure \
                              (the request may have already reached the server)"
@@ -457,7 +614,7 @@ impl Gateway {
             // exactly once (reconnecting first if needed -- there's
             // nothing safer to fall back to), but never retry again if
             // that single attempt itself fails.
-            None if !is_safe_to_retry_after_reconnect(method) => {
+            None if !is_safe_to_retry_after_reconnect(method, &params) => {
                 if !self.reconnect().await {
                     return Err(ClientError::WebSocket(
                         "no connection available and reconnect failed".to_owned(),
@@ -510,6 +667,7 @@ impl Gateway {
         params: serde_json::Value,
         profile: Option<&str>,
     ) -> Result<(serde_json::Value, Vec<serde_json::Value>), ClientError> {
+        let params = prepare_call_params(method, params)?;
         match self.current_websocket() {
             Some(websocket) => {
                 let full_params = with_profile(params.clone(), profile);
@@ -606,18 +764,24 @@ impl Gateway {
     }
 }
 
-/// **`acpx-reconnect-retry-duplicates-session-new`.** `false` for methods
-/// whose effect is not safe to risk duplicating -- currently just
-/// `session/new`, the one genuinely confirmed live to leak real, distinct
-/// sessions when retried blindly after a WebSocket failure whose cause
-/// might have been a lost *response* rather than a lost *request*. Other
-/// methods (`session/prompt` is arguably also unsafe; `session/close`/
-/// `session/resume`/`session/load` are closer to idempotent from the
-/// client's perspective) are intentionally left retry-eligible here --
-/// narrowly scoped to the one method with confirmed real-world impact
-/// rather than guessing at every other method's safety up front.
-fn is_safe_to_retry_after_reconnect(method: &str) -> bool {
-    method != "session/new"
+/// Prepare one logical call before its first transport attempt. The returned
+/// params are the sole value used by both the initial send and reconnect
+/// replay, so a generated creation id cannot drift between attempts.
+fn prepare_call_params(
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ClientError> {
+    if method == "session/new" {
+        ensure_session_creation_metadata(params)
+    } else {
+        Ok(params)
+    }
+}
+
+/// A `session/new` replay is safe only when the request carries the durable
+/// server deduplication key. Other methods keep their existing retry policy.
+fn is_safe_to_retry_after_reconnect(method: &str, params: &serde_json::Value) -> bool {
+    method != "session/new" || matches!(session_creation_metadata(params), Ok(Some(_)))
 }
 
 fn with_profile(mut params: serde_json::Value, profile: Option<&str>) -> serde_json::Value {
@@ -686,6 +850,90 @@ mod tests {
             with_profile(serde_json::json!({"cwd": "/tmp"}), None),
             serde_json::json!({"cwd": "/tmp"})
         );
+    }
+
+    #[test]
+    fn session_new_builder_serializes_client_identity_and_preserves_acp_shape() {
+        let metadata = SessionCreationMetadata::new("7ee35d23-17d5-4a62-92cb-d36d857fc272")
+            .expect("valid UUID")
+            .with_workspace_id("project-42")
+            .expect("non-empty workspace id");
+        let params = build_new_session_params(
+            "/tmp/project",
+            &[serde_json::json!({
+                "name": "skills",
+                "command": "/usr/bin/snapflowd-mcp",
+                "args": [],
+                "env": [],
+            })],
+            &metadata,
+        )
+        .expect("well-formed session/new params");
+
+        assert_eq!(params["cwd"], "/tmp/project");
+        assert_eq!(params["mcpServers"][0]["name"], "skills");
+        assert_eq!(
+            params["_meta"][SESSION_CREATION_META_NAMESPACE],
+            serde_json::json!({
+                "creationRequestId": "7ee35d23-17d5-4a62-92cb-d36d857fc272",
+                "workspaceId": "project-42",
+            })
+        );
+    }
+
+    #[test]
+    fn preparation_is_stable_and_preserves_other_meta_namespaces() {
+        let first = prepare_call_params(
+            "session/new",
+            serde_json::json!({
+                "cwd": "/tmp/project",
+                "mcpServers": [],
+                "_meta": {"org.example.trace": {"traceId": "trace-1"}}
+            }),
+        )
+        .expect("first preparation");
+        let retry = prepare_call_params("session/new", first.clone())
+            .expect("retry preparation retains the identity");
+
+        assert_eq!(
+            first["_meta"][SESSION_CREATION_META_NAMESPACE]["creationRequestId"],
+            retry["_meta"][SESSION_CREATION_META_NAMESPACE]["creationRequestId"]
+        );
+        assert!(uuid::Uuid::parse_str(
+            first["_meta"][SESSION_CREATION_META_NAMESPACE]["creationRequestId"]
+                .as_str()
+                .expect("creationRequestId string")
+        )
+        .is_ok());
+        assert_eq!(retry["_meta"]["org.example.trace"]["traceId"], "trace-1");
+        assert!(is_safe_to_retry_after_reconnect("session/new", &retry));
+    }
+
+    #[test]
+    fn caller_supplied_identity_is_not_replaced_and_invalid_metadata_is_rejected() {
+        let supplied = serde_json::json!({
+            "cwd": "/tmp/project",
+            "_meta": {
+                "com.example.client": {
+                    "creationRequestId": "7ee35d23-17d5-4a62-92cb-d36d857fc272"
+                }
+            }
+        });
+        let prepared =
+            prepare_call_params("session/new", supplied.clone()).expect("valid supplied metadata");
+        assert_eq!(prepared, supplied);
+
+        let invalid = serde_json::json!({
+            "cwd": "/tmp/project",
+            "_meta": {
+                "com.example.client": {
+                    "creationRequestId": "not-a-uuid"
+                }
+            }
+        });
+        let err = prepare_call_params("session/new", invalid)
+            .expect_err("invalid caller identity must fail before transport");
+        assert!(matches!(err, ClientError::InvalidParams(_)));
     }
 
     #[test]

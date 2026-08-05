@@ -17,7 +17,11 @@ pub mod pool;
 pub mod raw;
 pub mod ws;
 
-pub use gateway::{build_resume_session_params, AgentRequest, Gateway, TransportMode};
+pub use gateway::{
+    build_new_session_params, build_resume_session_params, ensure_session_creation_metadata,
+    with_session_creation_metadata, AgentRequest, Gateway, SessionCreationMetadata, TransportMode,
+    SESSION_CREATION_META_NAMESPACE,
+};
 pub use pool::{
     LeaseId, OpenError, OpenSpec, PoolError, PoolKey, ProjectSessionPool, SessionLease,
     SessionOpener, ThreadId, TurnState, WARM_TARGET_PER_KEY,
