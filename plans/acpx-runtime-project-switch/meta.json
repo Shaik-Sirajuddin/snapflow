@@ -1,0 +1,21 @@
+{
+  "plan": "acpx-runtime-project-switch",
+  "status": "in_progress",
+  "updated": "2026-08-05",
+  "plan_doc": "00-plan.md",
+  "completed": [
+    {"phase":"runtime_gateway_ownership","status":"completed","evidence":"Removed process-global Gateway cache; each bridge creates Gateway/WS tasks on its own Tokio runtime."},
+    {"phase":"session_state_cleanup","status":"completed","evidence":"CloseSession/DeleteSession clear actor session_id and publish detached state; bridge teardown preserves non-explicit sessions with background close."},
+    {"phase":"rust_audit","status":"completed","evidence":"Reviewed touched async paths: no lock guard crosses await; gateway construction remains runtime-owned and bounded by Gateway connect timeouts."}
+  ],
+  "pending": [
+    {"phase":"runtime_gateway_ownership","order":1,"tier":2,"status":"completed","description":"Remove process-global Gateway reuse across bridge runtimes.","implementation_evidence":"Each AgentBridge creates gateways on its own runtime."},
+    {"phase":"session_state_cleanup","order":2,"tier":2,"status":"completed","description":"Clear actor session state after close/delete.","implementation_evidence":"CloseSession and DeleteSession clear session_id and publish detached state."},
+    {"phase":"verification","order":4,"tier":"verification_gate","status":"in_progress","description":"Run focused panel-rust tests and compile verification.","verification":"Focused tests pass; unrelated baseline model-field errors are documented if present."}
+  ],
+  "verification": {
+    "acpx_client_tests": "PASS: 31/31",
+    "panel_rust_tests": "BLOCKED by pre-existing model.rs mismatches (ThreadSpec.thread_id and InitialState.server_queue/onboarding_completed), unrelated to touched files",
+    "diff_check": "PASS"
+  }
+}

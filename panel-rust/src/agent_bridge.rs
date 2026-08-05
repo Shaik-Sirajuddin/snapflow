@@ -467,16 +467,6 @@ pub struct AgentBridge {
     session_project_path_override: Arc<Mutex<Option<PathBuf>>>,
 }
 
-/// Provider gateways are process-scoped, not project-view-scoped. Keeping a
-/// strong reference here lets the C++ project switch recreate the panel's
-/// project-local bridge without tearing down the multiplexed ACPX connection
-/// that can still serve background sessions from another project.
-fn shared_gateway_cache() -> &'static Mutex<HashMap<String, Arc<acpx_client::Gateway>>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Arc<acpx_client::Gateway>>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// A point-in-time read of a client-local terminal's VT100 screen state
 /// (`AgentBridge::local_terminal_snapshot`) -- what `models::to_local_
 /// terminal_item` turns into the Slint-facing `LocalTerminalItem`.
@@ -3128,12 +3118,11 @@ impl AgentBridge {
 
         for (url, setters) in gateway_setters {
             let gateways = gateways.clone();
-            let cached = shared_gateway_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&url)
-                .cloned();
-            if let Some(gateway) = cached {
+            // GatewayWsClient reader/reconnect tasks belong to the runtime
+            // that creates them. Reusing a process-global Gateway after that
+            // runtime is dropped produces the observed Tokio-shutdown error.
+            runtime.spawn(async move {
+                let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
                 gateways
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3141,22 +3130,7 @@ impl AgentBridge {
                 for setter in setters {
                     setter.set_gateway(gateway.clone());
                 }
-            } else {
-                runtime.spawn(async move {
-                    let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
-                    shared_gateway_cache()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(url.clone(), gateway.clone());
-                    gateways
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(url, gateway.clone());
-                    for setter in setters {
-                        setter.set_gateway(gateway.clone());
-                    }
-                });
-            }
+            });
         }
 
         Ok(AgentBridge {
@@ -3209,25 +3183,9 @@ impl AgentBridge {
         self.gateway_urls.insert(provider.to_string(), url.clone());
         if !url_already_known {
             let gateways = self.gateways.clone();
-            if let Some(gateway) = shared_gateway_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&url)
-                .cloned()
-            {
-                gateways
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(url, gateway);
-                return Ok(());
-            }
             let _guard = self.runtime.enter();
             self.runtime.spawn(async move {
                 let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
-                shared_gateway_cache()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(url.clone(), gateway.clone());
                 gateways
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5204,7 +5162,12 @@ impl Drop for AgentBridge {
             // session before shutting down its actor; an explicitly
             // backgrounded session is reattached through its durable record
             // when the project becomes active again.
-            let background = *slot.background.lock().unwrap_or_else(|e| e.into_inner());
+            // Bridge teardown is an infrastructure lifecycle event, not a
+            // user request to delete the conversation. Preserve the
+            // project/thread ACPX session for the next bridge instance;
+            // only an explicitly closed thread is hard-closed.
+            let explicitly_closed = *slot.closed.lock().unwrap_or_else(|e| e.into_inner());
+            let background = !explicitly_closed;
             let _ = self.runtime.block_on(async {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),

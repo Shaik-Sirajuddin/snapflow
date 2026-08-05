@@ -2027,6 +2027,11 @@ async fn run_thread_actor(
                         }
                     }
                 }
+                // The actor no longer owns this logical session after a
+                // close. Clear both pieces of local state so a subsequent
+                // command cannot send on a released pool lease.
+                session_id = None;
+                let _ = session_tx.send(None);
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::DeleteSession { resp } => {
@@ -2045,6 +2050,8 @@ async fn run_thread_actor(
                         );
                     }
                 }
+                session_id = None;
+                let _ = session_tx.send(None);
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::SetMode { mode_id, resp } => {
