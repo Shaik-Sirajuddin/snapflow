@@ -8,6 +8,9 @@ import (
 // playbackNotesTools builds the 2 playback.* tools and the 2 notes.* tools.
 func playbackNotesTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	return []server.ServerTool{
+		sapTool(s, h, "playback.fastForward", "playback.fastForward", "Temporarily increase the current playback speed for preview.",
+			dynamicOutputSchema[EmptyResult](),
+		),
 		sapTool(s, h, "playback.seek", "playback.seek", "Seek the current project's playhead.",
 			mcp.WithInteger("frame", mcp.Required(), mcp.Description("Frame to seek to")),
 			dynamicOutputSchema[EmptyResult](),
