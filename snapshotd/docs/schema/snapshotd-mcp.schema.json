@@ -657,6 +657,9 @@
           },
           "blendMode": {
             "type": "string"
+          },
+          "composite": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -665,7 +668,8 @@
           "muted",
           "hidden",
           "locked",
-          "blendMode"
+          "blendMode",
+          "composite"
         ],
         "additionalProperties": false
       }
@@ -947,6 +951,9 @@
                 },
                 "blendMode": {
                   "type": "string"
+                },
+                "composite": {
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -955,7 +962,8 @@
                 "muted",
                 "hidden",
                 "locked",
-                "blendMode"
+                "blendMode",
+                "composite"
               ],
               "additionalProperties": false
             }
@@ -1237,6 +1245,9 @@
                 },
                 "blendMode": {
                   "type": "string"
+                },
+                "composite": {
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -1245,7 +1256,8 @@
                 "muted",
                 "hidden",
                 "locked",
-                "blendMode"
+                "blendMode",
+                "composite"
               ],
               "additionalProperties": false
             }
@@ -1253,6 +1265,76 @@
         },
         "required": [
           "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Set a clip's persistent playback speed for timeline playback and export.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip index on the track",
+            "type": "integer"
+          },
+          "speed": {
+            "description": "Playback rate multiplier; must be greater than zero (for example, 2.0 is fast-forward)",
+            "type": "number"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex",
+          "speed"
+        ],
+        "type": "object"
+      },
+      "name": "edit.setClipSpeed",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "clipId": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "inFrame": {
+            "type": "integer"
+          },
+          "outFrame": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "index",
+          "source",
+          "inFrame",
+          "outFrame"
         ],
         "additionalProperties": false
       }
@@ -1290,12 +1372,16 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
-      "description": "Partially update a track's muted/hidden/locked/blendMode; omitted fields are left unchanged.",
+      "description": "Partially update a track's muted/hidden/locked/blendMode/composite; omitted fields are left unchanged. composite enables qtblend overlay over lower tracks (bottom V-track is usually false).",
       "inputSchema": {
         "properties": {
           "blendMode": {
-            "description": "MLT blend mode identifier",
+            "description": "MLT blend mode identifier (qtblend compositing mode)",
             "type": "string"
+          },
+          "composite": {
+            "description": "Enable compositing this video track over lower tracks",
+            "type": "boolean"
           },
           "hidden": {
             "description": "Hide the track",
@@ -1310,13 +1396,11 @@
             "type": "boolean"
           },
           "trackIndex": {
-            "description": "Track index",
+            "description": "Track index; omit to use the current track.enter selection",
             "type": "integer"
           }
         },
-        "required": [
-          "trackIndex"
-        ],
+        "required": [],
         "type": "object"
       },
       "name": "edit.setTrackProperties",
@@ -1343,6 +1427,9 @@
           },
           "blendMode": {
             "type": "string"
+          },
+          "composite": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -1351,7 +1438,8 @@
           "muted",
           "hidden",
           "locked",
-          "blendMode"
+          "blendMode",
+          "composite"
         ],
         "additionalProperties": false
       }
@@ -2806,6 +2894,25 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
+      "description": "Temporarily increase the current playback speed for preview.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "playback.fastForward",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
       "description": "Read a rendered frame from the current project as base64 image data.",
       "inputSchema": {
         "properties": {
@@ -2853,6 +2960,89 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
+      "description": "Read transport state: playing, position, duration.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "playback.getState",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "playing": {
+            "type": "boolean"
+          },
+          "position": {
+            "type": "integer"
+          },
+          "duration": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "playing",
+          "position",
+          "duration"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Pause timeline playback.",
+      "inputSchema": {
+        "properties": {
+          "position": {
+            "description": "Optional frame to pause at; omit to keep current",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "playback.pause",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Start timeline playback (same as the editor Play button).",
+      "inputSchema": {
+        "properties": {
+          "speed": {
+            "description": "Playback speed; default 1.0",
+            "type": "number"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "playback.play",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
       "description": "Seek the current project's playhead.",
       "inputSchema": {
         "properties": {
@@ -2867,6 +3057,25 @@
         "type": "object"
       },
       "name": "playback.seek",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Stop timeline playback and reset transport UI state.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "playback.stop",
       "outputSchema": {
         "type": "object",
         "additionalProperties": false
@@ -2977,6 +3186,70 @@
         "type": "object"
       },
       "name": "playlist.append",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Append a numbered still image sequence (qimage/pixbuf) to the playlist. path is the first frame file; ttl is frames per image (default 1); begin is optional leading frame number string.",
+      "inputSchema": {
+        "properties": {
+          "begin": {
+            "description": "Optional start number string matching filename digits",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path to first frame, e.g. /path/frame_001.png",
+            "type": "string"
+          },
+          "ttl": {
+            "description": "Frames to hold each image; default 1",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.appendImageSequence",
       "outputSchema": {
         "type": "object",
         "properties": {
@@ -3408,6 +3681,45 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
+      "description": "Read the live project canvas width/height/frame rate.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.getProfile",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "width": {
+            "type": "integer"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "frameRateNum": {
+            "type": "integer"
+          },
+          "frameRateDen": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "frameRateNum",
+          "frameRateDen"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
       "description": "Read the bound project's state, including undo/redo stack depths and projectType.",
       "inputSchema": {
         "properties": {},
@@ -3611,6 +3923,66 @@
           "undoDepth",
           "redoDepth",
           "opened"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Set project canvas/video mode. Pass profileName (e.g. atsc_1080p_25) or width+height (optional frameRateNum/frameRateDen, default 25/1).",
+      "inputSchema": {
+        "properties": {
+          "frameRateDen": {
+            "description": "Frame rate denominator",
+            "type": "integer"
+          },
+          "frameRateNum": {
+            "description": "Frame rate numerator",
+            "type": "integer"
+          },
+          "height": {
+            "description": "Canvas height in pixels",
+            "type": "integer"
+          },
+          "profileName": {
+            "description": "MLT/Shotcut profile name",
+            "type": "string"
+          },
+          "width": {
+            "description": "Canvas width in pixels",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.setProfile",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "width": {
+            "type": "integer"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "frameRateNum": {
+            "type": "integer"
+          },
+          "frameRateDen": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "frameRateNum",
+          "frameRateDen"
         ],
         "additionalProperties": false
       }
