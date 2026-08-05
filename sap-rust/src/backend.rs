@@ -52,10 +52,33 @@ pub struct Track {
     /// `"0"` = Source Over / Normal, the default.
     #[serde(default = "default_blend_mode")]
     pub blend_mode: String,
+    /// Whether this video track composites over lower tracks (qtblend
+    /// transition not disabled). Bottom V-track is usually false.
+    #[serde(default)]
+    pub composite: bool,
 }
 
 pub(crate) fn default_blend_mode() -> String {
     "0".to_string()
+}
+
+/// Live project video mode / canvas (`project.getProfile` / `setProfile`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileInfo {
+    pub width: i32,
+    pub height: i32,
+    pub frame_rate_num: i32,
+    pub frame_rate_den: i32,
+}
+
+/// Transport snapshot (`playback.getState`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackState {
+    pub playing: bool,
+    pub position: i64,
+    pub duration: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +258,20 @@ pub trait Backend: Send {
     fn project_undo(&mut self, project_id: &str) -> BackendResult<()>;
     fn project_redo(&mut self, project_id: &str) -> BackendResult<()>;
 
+    /// `project.setProfile` -- named MLT profile and/or explicit canvas size.
+    fn project_set_profile(
+        &mut self,
+        project_id: &str,
+        profile_name: Option<String>,
+        width: Option<i32>,
+        height: Option<i32>,
+        frame_rate_num: Option<i32>,
+        frame_rate_den: Option<i32>,
+    ) -> BackendResult<ProfileInfo>;
+
+    /// `project.getProfile` -- live canvas dimensions / frame rate.
+    fn project_get_profile(&mut self, project_id: &str) -> BackendResult<ProfileInfo>;
+
     fn edit_add_track(&mut self, project_id: &str, kind: &str) -> BackendResult<Track>;
     fn edit_remove_track(&mut self, project_id: &str, track_index: usize) -> BackendResult<()>;
     fn edit_list_tracks(&mut self, project_id: &str) -> BackendResult<Vec<Track>>;
@@ -272,6 +309,16 @@ pub trait Backend: Send {
         project_id: &str,
         source: Value,
         name: Option<String>,
+    ) -> BackendResult<PlaylistEntry>;
+
+    /// `playlist.appendImageSequence` -- open a numbered still sequence
+    /// (qimage/pixbuf) into the playlist bin.
+    fn playlist_append_image_sequence(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        ttl: Option<i32>,
+        begin: Option<String>,
     ) -> BackendResult<PlaylistEntry>;
 
     fn playlist_list(&mut self, project_id: &str) -> BackendResult<Vec<PlaylistEntry>>;
@@ -362,8 +409,8 @@ pub trait Backend: Send {
     ) -> BackendResult<Vec<Track>>;
 
     /// `edit.setTrackProperties` -- partial update of mute/hidden/locked/
-    /// blendMode on one track; `None` fields are left unchanged. Returns
-    /// the updated `Track`.
+    /// blendMode/composite on one track; `None` fields are left unchanged.
+    /// Returns the updated `Track`.
     fn edit_set_track_properties(
         &mut self,
         project_id: &str,
@@ -372,6 +419,7 @@ pub trait Backend: Send {
         hidden: Option<bool>,
         locked: Option<bool>,
         blend_mode: Option<String>,
+        composite: Option<bool>,
     ) -> BackendResult<Track>;
 
     /// `edit.setTrackHeight` -- real Shotcut stores this as ONE
@@ -721,6 +769,30 @@ struct ProjectData {
     /// Project-wide timeline row height, `shotcut:trackHeight` on export.
     /// `0` means "unset" (build_mlt_xml omits the attribute).
     track_height: i64,
+    /// Canvas / video mode (mock profile).
+    profile: ProfileInfo,
+    playback: PlaybackState,
+}
+
+impl Default for ProfileInfo {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            frame_rate_num: 25,
+            frame_rate_den: 1,
+        }
+    }
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            playing: false,
+            position: 0,
+            duration: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -838,6 +910,8 @@ impl Backend for MockBackend {
             hidden: false,
             locked: false,
             blend_mode: default_blend_mode(),
+            // Upper video tracks default composite-on in mock (bottom stays off).
+            composite: kind == "video" && !data.tracks.is_empty(),
         };
         data.tracks.push(track.clone());
         data.dirty = true;
@@ -917,6 +991,7 @@ impl Backend for MockBackend {
         hidden: Option<bool>,
         locked: Option<bool>,
         blend_mode: Option<String>,
+        composite: Option<bool>,
     ) -> BackendResult<Track> {
         let data = self.project_mut(project_id);
         let track = data
@@ -934,6 +1009,9 @@ impl Backend for MockBackend {
         }
         if let Some(v) = blend_mode {
             track.blend_mode = v;
+        }
+        if let Some(v) = composite {
+            track.composite = v;
         }
         let result = track.clone();
         data.dirty = true;
@@ -1148,8 +1226,11 @@ impl Backend for MockBackend {
             .unwrap_or_default())
     }
 
-    fn playback_seek(&mut self, _project_id: &str, _frame: i64) -> BackendResult<()> {
+    fn playback_seek(&mut self, project_id: &str, frame: i64) -> BackendResult<()> {
         // Playback is explicitly "not undo-tracked" per 01-jsonrpc-spec.md.
+        let data = self.project_mut(project_id);
+        data.playback.position = frame.max(0);
+        data.playback.playing = false;
         Ok(())
     }
 
@@ -1289,6 +1370,40 @@ impl Backend for MockBackend {
             name: name.unwrap_or_else(|| format!("clip{}", data.playlist.len())),
             source,
             duration_frames: 0,
+        };
+        data.playlist.push(entry.clone());
+        data.dirty = true;
+        Ok(entry)
+    }
+
+    fn playlist_append_image_sequence(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        ttl: Option<i32>,
+        begin: Option<String>,
+    ) -> BackendResult<PlaylistEntry> {
+        if path.is_empty() {
+            return Err(BackendError::InvalidParams(
+                "playlist.appendImageSequence requires path".into(),
+            ));
+        }
+        let ttl = ttl.unwrap_or(1).max(1) as i64;
+        // Mock: pretend 3-frame sequence * ttl without scanning disk.
+        let duration_frames = 3 * ttl;
+        let data = self.project_mut(project_id);
+        let entry = PlaylistEntry {
+            index: data.playlist.len(),
+            name: begin
+                .clone()
+                .unwrap_or_else(|| format!("seq{}", data.playlist.len())),
+            source: json!({
+                "path": path,
+                "imageSequence": true,
+                "ttl": ttl,
+                "begin": begin,
+            }),
+            duration_frames,
         };
         data.playlist.push(entry.clone());
         data.dirty = true;
@@ -2348,23 +2463,54 @@ mod tests {
         b.edit_add_track("p", "video").unwrap();
 
         let t = b
-            .edit_set_track_properties("p", 0, Some(true), None, None, None)
+            .edit_set_track_properties("p", 0, Some(true), None, None, None, None)
             .unwrap();
         assert!(t.muted);
         assert!(!t.hidden);
         assert!(!t.locked);
         assert_eq!(t.blend_mode, "0");
+        assert!(!t.composite);
 
         let t = b
-            .edit_set_track_properties("p", 0, None, None, None, Some("13".into()))
+            .edit_set_track_properties("p", 0, None, None, None, Some("13".into()), Some(true))
             .unwrap();
         // muted from the previous call must survive this unrelated update.
         assert!(t.muted);
         assert_eq!(t.blend_mode, "13");
+        assert!(t.composite);
 
         assert!(b
-            .edit_set_track_properties("p", 5, Some(true), None, None, None)
+            .edit_set_track_properties("p", 5, Some(true), None, None, None, None)
             .is_err());
+    }
+
+    #[test]
+    fn playback_transport_and_profile_and_image_sequence_mock() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+
+        b.playback_seek("p", 10).unwrap();
+        b.playback_play("p", 1.0).unwrap();
+        let st = b.playback_get_state("p").unwrap();
+        assert!(st.playing);
+        assert_eq!(st.position, 10);
+        b.playback_pause("p", None).unwrap();
+        assert!(!b.playback_get_state("p").unwrap().playing);
+        b.playback_stop("p").unwrap();
+        assert_eq!(b.playback_get_state("p").unwrap().position, 0);
+
+        let prof = b
+            .project_set_profile("p", None, Some(1280), Some(720), Some(30), Some(1))
+            .unwrap();
+        assert_eq!(prof.width, 1280);
+        assert_eq!(prof.height, 720);
+        assert_eq!(b.project_get_profile("p").unwrap().frame_rate_num, 30);
+
+        let entry = b
+            .playlist_append_image_sequence("p", "/tmp/frame_001.png", Some(2), Some("001".into()))
+            .unwrap();
+        assert_eq!(entry.duration_frames, 6);
+        assert_eq!(entry.index, 0);
     }
 
     #[test]
