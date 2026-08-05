@@ -88,12 +88,32 @@ extern "C" {
     /// -1 on error (invalid handle/index, or no blend transition present).
     pub fn sap_set_track_blend_mode(main_window_handle: *mut c_void, track_index: c_int, mode: *const c_char) -> c_int;
 
+    /// C++ side: `int sap_set_track_composite(void*, int trackIndex, int composite);`
+    pub fn sap_set_track_composite(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        composite: c_int,
+    ) -> c_int;
+
     /// C++ side: `int sap_set_track_height(void* mainWindowHandle, int
     /// height);` -- real `MultitrackModel::setTrackHeight()`, a single
     /// project-wide `shotcut:trackHeight` tractor property (not per-track),
     /// clamped to [10, 150] by the real setter. Returns 0 on success, -1 on
     /// error (invalid handle).
     pub fn sap_set_track_height(main_window_handle: *mut c_void, height: c_int) -> c_int;
+
+    /// C++ side: `int sap_set_profile(void*, const char* profileName, int w, int h, int fpsNum, int fpsDen);`
+    pub fn sap_set_profile(
+        main_window_handle: *mut c_void,
+        profile_name: *const c_char,
+        width: c_int,
+        height: c_int,
+        frame_rate_num: c_int,
+        frame_rate_den: c_int,
+    ) -> c_int;
+
+    /// C++ side: `char* sap_get_profile(void*);` -- JSON profile; free via sap_free_string.
+    pub fn sap_get_profile(main_window_handle: *mut c_void) -> *mut c_char;
 
     /// C++ side: `char* sap_filter_add(void* mainWindowHandle, int
     /// trackIndex, int clipIndex, const char* mltService, const char*
@@ -534,6 +554,20 @@ extern "C" {
     pub fn sap_playback_seek(main_window_handle: *mut c_void, frame: c_longlong) -> c_int;
     pub fn sap_playback_fast_forward(main_window_handle: *mut c_void) -> c_int;
     pub fn sap_set_clip_speed(main_window_handle: *mut c_void, track_index: c_int, clip_index: c_int, speed: c_double) -> *mut c_char;
+
+    pub fn sap_playback_play(main_window_handle: *mut c_void, speed: f64) -> c_int;
+    pub fn sap_playback_pause(main_window_handle: *mut c_void, position: c_longlong) -> c_int;
+    pub fn sap_playback_stop(main_window_handle: *mut c_void) -> c_int;
+    /// JSON `{"playing","position","duration"}`; free via sap_free_string.
+    pub fn sap_playback_get_state(main_window_handle: *mut c_void) -> *mut c_char;
+
+    /// Image sequence into playlist bin; free via sap_free_string.
+    pub fn sap_playlist_append_image_sequence(
+        main_window_handle: *mut c_void,
+        path: *const c_char,
+        ttl: c_int,
+        begin: *const c_char,
+    ) -> *mut c_char;
 
     /// C++ side: `int sap_get_undo_depth(void* mainWindowHandle);` -- number
     /// of commands available to undo on `MAIN.undoStack()`. -1 on error.

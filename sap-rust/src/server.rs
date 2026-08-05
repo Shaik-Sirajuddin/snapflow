@@ -482,11 +482,22 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 locked: Option<bool>,
                 #[serde(default)]
                 blend_mode: Option<String>,
+                #[serde(default)]
+                composite: Option<bool>,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             let track_index = p.track_index;
             Ok(Box::new(move |b| {
                 match b.edit_set_track_properties(&project_id, track_index, p.muted, p.hidden, p.locked, p.blend_mode.clone()) {
+                match b.edit_set_track_properties(
+                    &project_id,
+                    track_index,
+                    p.muted,
+                    p.hidden,
+                    p.locked,
+                    p.blend_mode.clone(),
+                    p.composite,
+                ) {
                     Ok(track) => BackendCallResult {
                         result: Ok(serde_json::to_value(&track).expect("Track serializes")),
                         notify: Some(RpcNotification::new(
