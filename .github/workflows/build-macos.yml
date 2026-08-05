@@ -95,17 +95,26 @@ jobs:
       # keeping the brand name; the Go module/source tree keeps its
       # existing snapshotd name internally (not a full repo-wide rename).
       - run: go build -o dist/snapflowd ./cmd/snapshotd
-      - name: Verify native AF_UNIX transport and endpoint consumers
-        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       # macOS's default TMPDIR (/var/folders/<xx>/<hash>/T/) is long enough
       # that once the tests' own random subdirectories are appended, real
       # AF_UNIX sockets bound under a temp RunDir (daemon/procmgr/sapproxy
       # tests) exceed the platform's socket path length limit -- same class
       # of bug build-windows.yml already works around with a short TEMP.
+      # This must run BEFORE the "Verify native AF_UNIX transport" step
+      # below, not after -- it used to run after that required step, so it
+      # never actually took effect for the tests that need it. Confirmed
+      # via job logs across multiple prior macOS runs (including v0.1.26's
+      # snapshotd job, run 30982147594, and an earlier run 30907057454)
+      # that TestNativeRoundTrip/TestServer_.../TestRouter_... have
+      # consistently failed with "bind: invalid argument" as a result --
+      # and reproduced again on a workflow_dispatch validation run of this
+      # same fix branch before this step was reordered.
       - name: Set a short TMPDIR for AF_UNIX socket paths
         run: |
           mkdir -p /tmp/st
           echo "TMPDIR=/tmp/st/" >> "$GITHUB_ENV"
+      - name: Verify native AF_UNIX transport and endpoint consumers
+        run: go test ./internal/transport ./internal/sdp ./internal/sapproxy ./internal/health ./internal/discovery ./internal/config
       - name: Run go test ./... (advisory -- known flaky/pre-existing failures, see workflow header)
         continue-on-error: true
         run: go test ./...
