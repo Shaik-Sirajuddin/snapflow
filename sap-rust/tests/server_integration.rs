@@ -146,6 +146,36 @@ async fn hello_handshake_and_project_select_round_trip() {
 }
 
 #[tokio::test]
+async fn external_export_completion_notification_is_fanned_out() {
+    let socket_path = temp_socket_path("export-notification");
+    let config = ServerConfig {
+        socket_path: socket_path.clone(),
+        token: TOKEN.to_string(),
+        audio_enabled: false,
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let _ = server::serve(config, MockBackend::new(), Some(rx)).await;
+    });
+    for _ in 0..100 {
+        if socket_path.exists() { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut client = Client::connect(&socket_path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "export-proj"})).await;
+    tx.send(RpcNotification::new(
+        "jobs.completed",
+        json!({"jobId": "job-1", "status": "done", "percent": 100.0, "outputPath": "out.mp4"}),
+    )).expect("notification receiver alive");
+    let notification = client.recv_notification_timeout(Duration::from_secs(1)).await
+        .expect("completion notification");
+    assert_eq!(notification.method, "jobs.completed");
+    assert_eq!(notification.params["jobId"], "job-1");
+    assert_eq!(notification.params["status"], "done");
+}
+
+#[tokio::test]
 async fn hello_with_bad_token_is_rejected() {
     let path = start_server("bad-token", TOKEN).await;
     let mut client = Client::connect(&path).await;
