@@ -98,7 +98,11 @@ pub struct Clip {
     pub in_frame: i64,
     #[serde(default)]
     pub out_frame: i64,
+    #[serde(default = "default_clip_speed")]
+    pub speed: f64,
 }
+
+fn default_clip_speed() -> f64 { 1.0 }
 
 /// A `playlist.*` bin entry -- distinct from a timeline `Clip`, per
 /// 01-jsonrpc-spec.md's "Playlist dock: the source bin" namespace.
@@ -281,6 +285,8 @@ pub trait Backend: Send {
         -> BackendResult<Vec<Clip>>;
 
     fn playback_seek(&mut self, project_id: &str, frame: i64) -> BackendResult<()>;
+     fn playback_fast_forward(&mut self, project_id: &str) -> BackendResult<()>;
+     fn edit_set_clip_speed(&mut self, project_id: &str, track_index: usize, clip_index: usize, speed: f64) -> BackendResult<Clip>;
     fn playback_play(&mut self, project_id: &str, speed: f64) -> BackendResult<()>;
     fn playback_pause(&mut self, project_id: &str, position: Option<i64>) -> BackendResult<()>;
     fn playback_stop(&mut self, project_id: &str) -> BackendResult<()>;
@@ -1125,6 +1131,7 @@ impl Backend for MockBackend {
             source,
             in_frame: 0,
             out_frame: 0,
+            speed: 1.0,
         };
         clips.insert(clip_index, clip.clone());
         for (i, c) in clips.iter_mut().enumerate() {
@@ -1162,6 +1169,7 @@ impl Backend for MockBackend {
             source,
             in_frame: 0,
             out_frame: 0,
+            speed: 1.0,
         };
         if clip_index == clips.len() {
             // No clip occupies this slot yet -- behaves like append.
@@ -1196,6 +1204,7 @@ impl Backend for MockBackend {
             source,
             in_frame: 0,
             out_frame: 0,
+            speed: 1.0,
         };
         clips.push(clip.clone());
         data.dirty = true;
@@ -1322,6 +1331,17 @@ impl Backend for MockBackend {
         Ok(self.project_mut(project_id).profile.clone())
     }
 
+     fn playback_fast_forward(&mut self, _project_id: &str) -> BackendResult<()> { Ok(()) }
+
+    fn edit_set_clip_speed(&mut self, project_id: &str, track_index: usize, clip_index: usize, speed: f64) -> BackendResult<Clip> {
+        if !speed.is_finite() || speed <= 0.0 { return Err(BackendError::InvalidParams("speed must be finite and greater than zero".into())); }
+        let data = self.project_mut(project_id);
+        let clips = data.clips.get_mut(&track_index).ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
+        let clip = clips.get_mut(clip_index).ok_or_else(|| BackendError::NotFound(format!("clip {clip_index}")))?;
+        clip.speed = speed;
+        data.dirty = true; data.undo_depth += 1; data.redo_depth = 0;
+        Ok(clip.clone())
+    }
     fn notes_get_text(&mut self, project_id: &str) -> BackendResult<String> {
         Ok(self.project_mut(project_id).notes.clone())
     }
@@ -1573,6 +1593,7 @@ impl Backend for MockBackend {
                 source,
                 in_frame: position,
                 out_frame,
+                speed: 1.0,
             },
         );
         for (i, c) in clips.iter_mut().enumerate() {
@@ -2392,6 +2413,18 @@ pub fn parse_mlt_keyframe_entry(entry: &str) -> Option<KeyframeInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clip_speed_validates_and_updates_mock_clip() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_append_clip("p", 0, json!({"path":"x.mp4"})).unwrap();
+        let c = b.edit_set_clip_speed("p", 0, 0, 2.0).unwrap();
+        assert_eq!(c.speed, 2.0);
+        assert!(b.edit_set_clip_speed("p", 0, 0, 0.0).is_err());
+        assert!(b.edit_set_clip_speed("p", 0, 0, f64::NAN).is_err());
+    }
 
     #[test]
     fn edit_reorder_track_remaps_clips_to_follow_their_track() {

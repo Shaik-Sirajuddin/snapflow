@@ -848,6 +848,7 @@ impl Backend for FfiBackend {
             source: Value::Null,
             in_frame: parsed.in_frame,
             out_frame: parsed.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -911,6 +912,7 @@ impl Backend for FfiBackend {
             source,
             in_frame: appended.in_frame,
             out_frame: appended.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -973,6 +975,7 @@ impl Backend for FfiBackend {
             source,
             in_frame: inserted.in_frame,
             out_frame: inserted.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -1035,6 +1038,7 @@ impl Backend for FfiBackend {
             source,
             in_frame: overwritten.in_frame,
             out_frame: overwritten.out_frame,
+            speed: 1.0,
         })
     }
 
@@ -1069,7 +1073,8 @@ impl Backend for FfiBackend {
                 index: c.index,
                 source: json!({"path": c.path}),
                 in_frame: c.in_frame,
-                out_frame: c.out_frame,
+            out_frame: c.out_frame,
+            speed: 1.0,
             })
             .collect())
     }
@@ -1081,6 +1086,20 @@ impl Backend for FfiBackend {
         } else {
             Err(BackendError::InvalidParams("playback seek failed".into()))
         }
+    }
+
+    fn playback_fast_forward(&mut self, _project_id: &str) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playback_fast_forward(self.main_window) };
+        if rc == 0 { Ok(()) } else { Err(BackendError::InvalidParams("playback fast-forward failed".into())) }
+    }
+
+    fn edit_set_clip_speed(&mut self, _project_id: &str, track_index: usize, clip_index: usize, speed: f64) -> BackendResult<Clip> {
+        if !speed.is_finite() || speed <= 0.0 { return Err(BackendError::InvalidParams("speed must be finite and greater than zero".into())); }
+        let raw = unsafe { ffi::sap_set_clip_speed(self.main_window, track_index as c_int, clip_index as c_int, speed) };
+        if raw.is_null() { return Err(BackendError::InvalidParams("set clip speed failed".into())); }
+        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<Clip>(&text).map_err(|e| BackendError::InvalidParams(format!("bad set speed JSON: {e}")))
     }
 
     fn playback_play(&mut self, _project_id: &str, speed: f64) -> BackendResult<()> {

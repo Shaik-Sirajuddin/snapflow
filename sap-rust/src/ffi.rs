@@ -22,7 +22,7 @@
 #![cfg(feature = "real_ffi")]
 #![allow(dead_code)]
 
-use std::os::raw::{c_char, c_int, c_longlong, c_void};
+use std::os::raw::{c_char, c_double, c_int, c_longlong, c_void};
 
 extern "C" {
     /// C++ side: `int sap_add_video_track(void* mainWindowHandle);`
@@ -587,6 +587,8 @@ extern "C" {
     /// C++ side: `int sap_playback_seek(void* mainWindowHandle, long long frame);`
     /// Returns 0 on success, -1 on failure.
     pub fn sap_playback_seek(main_window_handle: *mut c_void, frame: c_longlong) -> c_int;
+    pub fn sap_playback_fast_forward(main_window_handle: *mut c_void) -> c_int;
+    pub fn sap_set_clip_speed(main_window_handle: *mut c_void, track_index: c_int, clip_index: c_int, speed: c_double) -> *mut c_char;
 
     pub fn sap_playback_play(main_window_handle: *mut c_void, speed: f64) -> c_int;
     pub fn sap_playback_pause(main_window_handle: *mut c_void, position: c_longlong) -> c_int;
