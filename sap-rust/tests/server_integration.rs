@@ -23,7 +23,21 @@ use tokio::net::UnixStream;
 const TOKEN: &str = "test-token-123";
 
 fn temp_socket_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sap-rust-test-{tag}-{}.sock", uuid::Uuid::new_v4()))
+    // `sockaddr_un.sun_path` is capped at ~104 bytes on macOS. On the macOS
+    // CI runner, `std::env::temp_dir()` resolves through `$TMPDIR` to a long
+    // per-process path like `/var/folders/<x>/<y>/T/`, which combined with a
+    // full UUID blows that limit outright -- `bind()` fails, the socket file
+    // never appears, and every test in this suite times out with "server did
+    // not bind ... in time" (not a real protocol/server regression). Use the
+    // short, fixed `/tmp` on macOS instead, and an 8-hex-char id rather than
+    // a full UUID, to stay comfortably under the limit even for the longest
+    // test tag in this file.
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from("/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let base = std::env::temp_dir();
+    let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+    base.join(format!("sap-rust-test-{tag}-{short_id}.sock"))
 }
 
 /// Spins up a real server on a temp Unix socket path in a background task
