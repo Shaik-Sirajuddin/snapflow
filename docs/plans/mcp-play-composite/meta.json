@@ -1,10 +1,15 @@
 {
   "plan": "mcp-play-composite",
   "status": "in_progress",
-  "updated": "2026-08-05 codex P1/P2 fixed: shotcut ffi committed 33ddd78e; realsaprust skip narrowed to -32601/method-not-found",
+  "updated": "2026-08-05 pushed: shotcut origin/master f23c2837; snapflow origin/main 5661d366 after reconsile-base",
   "plan_doc": "00-plan.md",
+  "status": "completed",
   "source_task": "MCP play/pause, track composite, canvas profile, image sequence; skip SVG animation; daemon-style realsaprust tests",
   "ordering_rationale": "C++ FFI first (source of truth), then sap-rust dispatch, then MCP tools, then mock + realsaprust tests",
+  "commits": [
+    "shotcut f23c2837 origin/master",
+    "snapflow 5661d366 origin/main"
+  ],
   "completed": [
     {
       "phase": "cpp_ffi_playback_composite_profile_sequence",
