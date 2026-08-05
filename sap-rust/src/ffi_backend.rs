@@ -56,6 +56,24 @@ use crate::server::{self, ServerConfig};
 /// once and read rarely (only on real Qt-side edits), never on the hot
 /// per-RPC-call path.
 static NOTIFY_BRIDGE_TX: Mutex<Option<mpsc::UnboundedSender<RpcNotification>>> = Mutex::new(None);
+static EXPORT_NOTIFY_TX: Mutex<Option<mpsc::UnboundedSender<RpcNotification>>> = Mutex::new(None);
+
+fn publish_export_notification(status: &JobStatus) {
+    let method = match status.status.as_str() {
+        "done" => "jobs.completed",
+        "error" => "jobs.failed",
+        "stopped" => "jobs.stopped",
+        _ => return,
+    };
+    let mut params = json!({"jobId": status.job_id, "status": status.status, "percent": status.percent});
+    if let Some(obj) = params.as_object_mut() {
+        if let Some(path) = &status.result_path { obj.insert("outputPath".into(), json!(path)); }
+        if let Some(error) = &status.error { obj.insert("error".into(), json!(error)); }
+    }
+    if let Ok(guard) = EXPORT_NOTIFY_TX.lock() {
+        if let Some(tx) = guard.as_ref() { let _ = tx.send(RpcNotification::new(method, params)); }
+    }
+}
 
 /// Set to `true` by `run_dispatcher` (`server.rs`) for the duration of
 /// every single dispatched `Backend` call, regardless of method or which
@@ -2162,6 +2180,7 @@ impl Backend for FfiBackend {
             };
 
             let mut jobs = jobs.lock().expect("jobs mutex poisoned");
+            let mut completed = None;
             if let Some(job) = jobs.get_mut(&job_id_bg) {
                 if job.status != "running" {
                     return; // Don't overwrite a client-initiated stop.
@@ -2187,6 +2206,11 @@ impl Backend for FfiBackend {
                         job.error = Some(format!("failed to wait on melt: {e}"));
                     }
                 }
+                completed = Some(job.clone());
+            }
+            drop(jobs);
+            if let Some(completed) = completed {
+                publish_export_notification(&completed);
             }
         });
 
@@ -2226,7 +2250,7 @@ impl Backend for FfiBackend {
     }
 
     fn jobs_stop(&mut self, _job_id: &str) -> BackendResult<()> {
-        {
+        let stopped = {
             let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
             let job = jobs
                 .get_mut(_job_id)
@@ -2236,7 +2260,9 @@ impl Backend for FfiBackend {
             }
             job.status = "stopped".into();
             job.error = Some("stopped by client".into());
-        }
+            job.clone()
+        };
+        publish_export_notification(&stopped);
         if let Some(slot) = self.job_children.remove(_job_id) {
             if let Some(mut child) = slot.lock().expect("job child mutex poisoned").take() {
                 let _ = child.kill();
@@ -2499,7 +2525,10 @@ pub unsafe extern "C" fn sap_start_server(
     let (notify_tx, notify_rx) = mpsc::unbounded_channel::<RpcNotification>();
     *NOTIFY_BRIDGE_TX
         .lock()
-        .expect("notify bridge mutex poisoned") = Some(notify_tx);
+        .expect("notify bridge mutex poisoned") = Some(notify_tx.clone());
+    *EXPORT_NOTIFY_TX
+        .lock()
+        .expect("export notify bridge mutex poisoned") = Some(notify_tx);
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
