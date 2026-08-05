@@ -23,19 +23,10 @@
 // snapshotd/README.md for this noted as an explicit, honest gap rather than
 // something invented to paper over it.
 //
-// Generic SAP passthrough: rather than trying to keep up with sap-rust's
-// growing project.*/edit.*/playlist.*/filter.*/transitions.*/generator.*/
-// file.*/jobs.*/playback.*/subtitles.* surface (01-jsonrpc-spec.md) as
-// individually typed MCP tools, this adapter exposes exactly one additional
-// tool, "sap.call", that forwards method+params opaquely to
-// Handler.ForwardSAP (internal/daemon.Daemon.ForwardSAP ->
-// internal/sapproxy.Router), the same generic proxy internal/sdp uses for
-// raw clients. This makes every current and future sap-rust method callable
-// over MCP today without this package needing to know its schema. See
-// snapshotd/README.md for the tradeoffs (no per-method typed schema/
-// validation/description over MCP -- only over the generic tool's own
-// method/params shape) and for what a later, fuller typed-tool-surface pass
-// would look like.
+// The live surface exposes individually typed project/edit/playlist/filter/
+// file/jobs/playback/subtitle tools. Their input schemas are validated by
+// mcp-go, including closed enum fields; service-dependent MLT properties are
+// validated separately by the SAP/MLT boundary.
 package mcpadapter
 
 import (
@@ -104,6 +95,7 @@ func New(h Handler) *server.MCPServer {
 		"snapshotd",
 		"0.1.0",
 		server.WithToolCapabilities(false),
+		server.WithInputSchemaValidation(),
 		server.WithHooks(hooks),
 		server.WithInstructions(serverInstructions),
 	)
@@ -213,6 +205,7 @@ var supportedSAPMethods = []sapMethodMetadata{
 	{Method: "edit.appendClip", Description: "Append a source clip to a timeline track.", Params: `{trackIndex, source}`},
 	{Method: "edit.insertClip", Description: "Insert a source clip on a track BEFORE clip-slot clipIndex, rippling downstream clips forward to make room (clipIndex == clip count is append-equivalent).", Params: `{trackIndex, clipIndex, source}`},
 	{Method: "edit.overwriteClip", Description: "Place a source clip on a track starting at clip-slot clipIndex, replacing whatever occupies that slot without rippling downstream clips (clipIndex == clip count is append-equivalent).", Params: `{trackIndex, clipIndex, source}`},
+	{Method: "edit.setClipSpeed", Description: "Set a clip's persistent playback speed for timeline playback and export.", Params: `{trackIndex, clipIndex, speed}`},
 	{Method: "edit.listClips", Description: "List clips on a timeline track.", Params: `{trackIndex}`},
 	{Method: "edit.trimClipIn", Description: "Trim a clip's in point. ripple (default false) shifts downstream clips on the track to close/open the gap instead of leaving a blank.", Params: `{trackIndex, clipIndex, newFrame, ripple?}`},
 	{Method: "edit.trimClipOut", Description: "Trim a clip's out point. ripple (default false) shifts downstream clips on the track to close/open the gap instead of leaving a blank.", Params: `{trackIndex, clipIndex, newFrame, ripple?}`},
@@ -248,12 +241,14 @@ var supportedSAPMethods = []sapMethodMetadata{
 	{Method: "subtitles.importSrt", Description: "Import an SRT file into track 0 (or a new track).", Params: `{path, newTrack?}`},
 	{Method: "subtitles.exportSrt", Description: "Export a subtitle track to an SRT file.", Params: `{path, trackIndex}`},
 	{Method: "subtitles.burnIn", Description: "Attach a burn-in filter on the timeline output so a subtitle track's cues render into exported/previewed frames (idempotent per track).", Params: `{trackIndex}`},
+	{Method: "subtitles.setStyle", Description: "Style subtitle filters attached to the output tractor.", Params: `{fgcolour?, bgcolour?, olcolour?, outline?, weight?, style?, size?, geometry?, valign?, halign?}`},
 	{Method: "file.import", Description: "Import a media file inside the bound project's root.", Params: `{path}`},
 	{Method: "file.probe", Description: "Probe a media file without project binding.", Params: `{path}`},
 	{Method: "file.export", Description: "Start an export job for the bound project.", Params: `{outputPath, codec?, container?}`},
 	{Method: "jobs.list", Description: "List export jobs for the bound project.", Params: "{}"},
 	{Method: "jobs.get", Description: "Read an export job's status.", Params: `{jobId}`},
 	{Method: "jobs.stop", Description: "Stop a running export job.", Params: `{jobId}`},
+	{Method: "playback.fastForward", Description: "Temporarily increase the current playback speed for preview.", Params: `{}`},
 	{Method: "playback.seek", Description: "Seek the bound project's playhead.", Params: `{frame}`},
 	{Method: "playback.getFrame", Description: "Read a rendered frame from the bound project.", Params: `{frame, format?}`},
 	{Method: "notes.getText", Description: "Read the bound project's notes.", Params: "{}"},
@@ -366,8 +361,7 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 
 // sapTool builds one typed MCP tool for a single fixed sap-rust method,
 // used by the tools_*.go files (audio/filter/generator/subtitles/...) for
-// the typed-tool-surface pass this package's own doc comment describes as
-// a future possibility beyond the generic sap.call passthrough above.
+// the live typed-tool surface.
 // Forwarding logic mirrors sapCallTool exactly (same project.select-bound
 // ForwardSAP path, same mcpSink notification relay) except the SAP method
 // is fixed at registration time instead of read from the call's own

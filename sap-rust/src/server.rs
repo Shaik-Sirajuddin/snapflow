@@ -33,6 +33,7 @@ use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backend::{Backend, BackendError};
+use crate::filter_schema;
 use crate::framing::{self, FramingError};
 use crate::protocol::{error_codes, RpcError, RpcNotification, RpcRequest, RpcResponse};
 
@@ -54,6 +55,43 @@ pub struct ServerConfig {
     /// Optional audio convenience methods are not callable until the daemon
     /// explicitly enables this capability for the child process.
     pub audio_enabled: bool,
+}
+
+impl ServerConfig {
+    /// Build server configuration from the transport-neutral endpoint value
+    /// supplied by the launcher. Unix callers pass a filesystem socket path;
+    /// Windows callers may pass either a canonical `\\.\pipe\...` name or a
+    /// bare logical name. The latter is normalized at compile time on Windows
+    /// so higher layers never need to branch on the host OS.
+    pub fn new(
+        endpoint: impl Into<PathBuf>,
+        token: impl Into<String>,
+        audio_enabled: bool,
+    ) -> Self {
+        Self {
+            socket_path: normalize_endpoint(endpoint.into()),
+            token: token.into(),
+            audio_enabled,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn normalize_endpoint(endpoint: PathBuf) -> PathBuf {
+    let value = endpoint.to_string_lossy();
+    if value.starts_with(r"\\.\pipe\") {
+        endpoint
+    } else {
+        PathBuf::from(format!(
+            r"\\.\pipe\{}",
+            value.trim_start_matches(['/', '\\'])
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_endpoint(endpoint: PathBuf) -> PathBuf {
+    endpoint
 }
 
 /// Per-connection session state. Two gates, enforced in order: `sap.hello`
@@ -217,6 +255,33 @@ fn invalid_params(e: &serde_json::Error) -> RpcError {
         message: format!("invalid params: {e}"),
         data: None,
     }
+}
+
+fn validate_subtitle_style(style: &Value) -> Result<(), RpcError> {
+    let Some(object) = style.as_object() else {
+        return Err(RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "subtitle style must be a JSON object".into(),
+            data: None,
+        });
+    };
+    for (key, value) in object {
+        let valid = match key.as_str() {
+            "fgcolour" | "bgcolour" | "olcolour" | "geometry" | "style" | "valign" | "halign" => {
+                value.is_string()
+            }
+            "outline" | "weight" | "size" => value.is_number(),
+            _ => false,
+        };
+        if !valid {
+            return Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!("unsupported or invalid subtitle style property {key:?}"),
+                data: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn method_not_found(method: &str) -> RpcError {
@@ -1340,6 +1405,36 @@ fn build_op_ext(
                     )),
                 },
                 Err(e) => err_result(e),
+            filter_schema::validate_properties(&p.mlt_service, &p.properties).map_err(
+                |message| RpcError {
+                    code: error_codes::INVALID_PARAMS,
+                    message,
+                    data: None,
+                },
+            )?;
+            Ok(Box::new(move |b| {
+                match b.filter_add(&project_id, &p.clip_id, &p.mlt_service, p.properties) {
+                    Ok(info) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
+                        notify: Some(RpcNotification::new(
+                            "filter.changed",
+                            json!({"clipId": p.clip_id, "filterIndex": info.filter_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "filter.describe" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                mlt_service: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |_b| {
+                ok_result(filter_schema::describe(&p.mlt_service))
             }))
         }
 
@@ -1356,6 +1451,18 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
+                if let Ok(filters) = b.filter_list(&project_id, &p.clip_id) {
+                    if let Some(filter) = filters.iter().find(|f| f.index == p.filter_index) {
+                        if let Err(message) = filter_schema::validate_property(
+                            &filter.mlt_service,
+                            &p.property,
+                            &p.value,
+                            p.position.is_some(),
+                        ) {
+                            return err_result(BackendError::InvalidParams(message));
+                        }
+                    }
+                }
                 match b.filter_set_property(
                     &project_id,
                     &p.clip_id,
@@ -1393,6 +1500,18 @@ fn build_op_ext(
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
+                if let Ok(filters) = b.filter_list(&project_id, &p.clip_id) {
+                    if let Some(filter) = filters.iter().find(|f| f.index == p.filter_index) {
+                        if let Err(message) = filter_schema::validate_property(
+                            &filter.mlt_service,
+                            &p.property,
+                            &p.value,
+                            true,
+                        ) {
+                            return err_result(BackendError::InvalidParams(message));
+                        }
+                    }
+                }
                 match b.filter_add_keyframe(
                     &project_id,
                     &p.clip_id,
@@ -1657,6 +1776,22 @@ fn build_op_ext(
                     )),
                 },
                 Err(e) => err_result(e),
+            }))
+        }
+
+        "subtitles.setStyle" => {
+            validate_subtitle_style(&params)?;
+            Ok(Box::new(move |b| {
+                match b.subtitles_set_style(&project_id, params.clone()) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "subtitles.changed",
+                            json!({"reason": "style"}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
             }))
         }
 

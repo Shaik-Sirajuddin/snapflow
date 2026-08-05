@@ -5,7 +5,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// generatorSubtitlesTools builds the 2 generator.* producer tools and the 6
+// generatorSubtitlesTools builds the 2 generator.* producer tools and the 7
 // subtitles.* tools.
 func generatorSubtitlesTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	return []server.ServerTool{
@@ -49,6 +49,19 @@ func generatorSubtitlesTools(s *server.MCPServer, h Handler) []server.ServerTool
 		sapTool(s, h, "subtitles.burnIn", "subtitles.burnIn", "Burn a subtitles track's cues into exported/previewed frames (idempotent per track).",
 			mcp.WithInteger("trackIndex", mcp.Required(), mcp.Description("Subtitles track index")),
 			dynamicOutputSchema[BurnInResult](),
+		),
+		sapTool(s, h, "subtitles.setStyle", "subtitles.setStyle", "Style subtitle filters attached to the output tractor.",
+			mcp.WithString("fgcolour", mcp.Description("Foreground color, e.g. #ffffffff")),
+			mcp.WithString("bgcolour", mcp.Description("Background color, e.g. #00000000")),
+			mcp.WithString("olcolour", mcp.Description("Outline color")),
+			mcp.WithInteger("outline", mcp.Description("Outline width")),
+			mcp.WithInteger("weight", mcp.Description("Font weight")),
+			mcp.WithString("style", mcp.Enum("normal", "italic"), mcp.Description("Font style")),
+			mcp.WithInteger("size", mcp.Description("Font size in points")),
+			mcp.WithString("geometry", mcp.Description("MLT geometry string")),
+			mcp.WithString("valign", mcp.Enum("top", "middle", "bottom"), mcp.Description("Vertical alignment")),
+			mcp.WithString("halign", mcp.Enum("left", "center", "right"), mcp.Description("Horizontal alignment")),
+			dynamicOutputSchema[EmptyResult](),
 		),
 	}
 }

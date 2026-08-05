@@ -14,7 +14,7 @@ func playbackNotesTools(s *server.MCPServer, h Handler) []server.ServerTool {
 		),
 		sapTool(s, h, "playback.getFrame", "playback.getFrame", "Read a rendered frame from the current project as base64 image data.",
 			mcp.WithInteger("frame", mcp.Required(), mcp.Description("Frame to render")),
-			mcp.WithString("format", mcp.DefaultString("jpeg"), mcp.Description("Image format")),
+			mcp.WithString("format", mcp.Enum("jpeg", "png"), mcp.DefaultString("jpeg"), mcp.Description("Image format")),
 			dynamicOutputSchema[FrameDataResult](),
 		),
 		sapTool(s, h, "notes.getText", "notes.getText", "Read the current project's notes.",

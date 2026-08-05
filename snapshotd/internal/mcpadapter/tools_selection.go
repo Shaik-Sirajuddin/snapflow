@@ -18,9 +18,7 @@ type CurrentView struct {
 // clip.enter, and currentView (no fixed "n tools per category" comment
 // count elsewhere in this package applies neatly here since this trio has
 // no dedicated section in the tool-category schema report -- these methods
-// were added after that report was generated and only ever reachable
-// through the generic sap.call passthrough, see mcpadapter.go's New() doc
-// comment for why that passthrough is now gone). Every mutating edit.*/
+// are registered directly on the live typed MCP surface. Every mutating edit.*/
 // filter.* tool that takes an implicit "current selection" (rather than
 // an explicit trackIndex/clipId) depends on track.enter/clip.enter having
 // been called first; an explicitly-passed trackIndex/clipId is never

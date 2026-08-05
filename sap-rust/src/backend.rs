@@ -573,6 +573,14 @@ pub trait Backend: Send {
     /// alone never make cues visible in rendered frames.
     fn subtitles_burn_in(&mut self, project_id: &str, track_index: usize) -> BackendResult<()>;
 
+    /// `subtitles.setStyle` -- update styling on output-tractor subtitle filters.
+    fn subtitles_set_style(&mut self, project_id: &str, style: Value) -> BackendResult<()> {
+        let _ = (project_id, style);
+        Err(BackendError::Unsupported(
+            "subtitles.setStyle is unavailable".into(),
+        ))
+    }
+
     /// `file.export` -- returns a `jobId` immediately per 01's async-job
     /// convention; progress/completion is polled via `jobs_get`.
     fn file_export(

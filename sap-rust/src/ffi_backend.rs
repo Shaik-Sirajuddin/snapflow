@@ -1708,6 +1708,20 @@ impl Backend for FfiBackend {
         Ok(())
     }
 
+    fn subtitles_set_style(&mut self, _project_id: &str, style: Value) -> BackendResult<()> {
+        let json = serde_json::to_string(&style)
+            .map_err(|e| BackendError::InvalidParams(format!("bad subtitle style: {e}")))?;
+        let c_json = CString::new(json)
+            .map_err(|e| BackendError::InvalidParams(format!("bad subtitle style: {e}")))?;
+        let rc = unsafe { ffi::sap_subtitles_set_style(self.main_window, c_json.as_ptr()) };
+        if rc != 0 {
+            return Err(BackendError::NotFound(
+                "no tractor-level subtitle filter is attached".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn file_export(
         &mut self,
         _project_id: &str,

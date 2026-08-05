@@ -1,0 +1,4114 @@
+{
+  "serverInfo": {
+    "name": "snapshotd",
+    "version": "0.1.0"
+  },
+  "tools": [
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Enable or disable autofade (500ms fade_duration); disabling removes autofade filters.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Enable or disable autofade",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "clipId",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "name": "audio.setAutoFade",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "filterIndex": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "mltService": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "removed": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a panner filter (channel -1) for stereo balance 0..1.",
+      "inputSchema": {
+        "properties": {
+          "balance": {
+            "description": "Stereo balance split, 0..1",
+            "type": "number"
+          },
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "position": {
+            "description": "Frame position; omit to set a static balance",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "balance"
+        ],
+        "type": "object"
+      },
+      "name": "audio.setBalance",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "filterIndex": {
+            "type": "integer"
+          },
+          "mltService": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filterIndex",
+          "mltService"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add volume filter(s) with keyframed fade-in/out level envelopes.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "fadeInFrames": {
+            "description": "Fade-in duration in frames",
+            "type": "integer"
+          },
+          "fadeOutFrames": {
+            "description": "Fade-out duration in frames",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId"
+        ],
+        "type": "object"
+      },
+      "name": "audio.setFadeInOut",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "fadeIn": {
+            "type": [
+              "null",
+              "object"
+            ],
+            "properties": {
+              "filterIndex": {
+                "type": "integer"
+              },
+              "mltService": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "filterIndex",
+              "mltService"
+            ],
+            "additionalProperties": false
+          },
+          "fadeOut": {
+            "type": [
+              "null",
+              "object"
+            ],
+            "properties": {
+              "filterIndex": {
+                "type": "integer"
+              },
+              "mltService": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "filterIndex",
+              "mltService"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a volume filter with a gain in dB.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "db": {
+            "description": "Gain in decibels",
+            "type": "number"
+          },
+          "position": {
+            "description": "Frame position; omit to set a static gain",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "db"
+        ],
+        "type": "object"
+      },
+      "name": "audio.setGain",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "filterIndex": {
+            "type": "integer"
+          },
+          "mltService": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filterIndex",
+          "mltService"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add one-pass (dynamic_loudness) or two-pass (loudness) audio normalization.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "mode": {
+            "description": "Normalization pass mode",
+            "enum": [
+              "1pass",
+              "2pass"
+            ],
+            "type": "string"
+          },
+          "targetLevel": {
+            "description": "Target loudness level (defaults to -23.0)",
+            "type": "number"
+          }
+        },
+        "required": [
+          "clipId",
+          "mode"
+        ],
+        "type": "object"
+      },
+      "name": "audio.setNormalize",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "filterIndex": {
+            "type": "integer"
+          },
+          "mltService": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filterIndex",
+          "mltService"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a panner filter (channel 0) with split 0..1.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "pan": {
+            "description": "Pan split, 0..1",
+            "type": "number"
+          },
+          "position": {
+            "description": "Frame position; omit to set a static pan",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "pan"
+        ],
+        "type": "object"
+      },
+      "name": "audio.setPan",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "filterIndex": {
+            "type": "integer"
+          },
+          "mltService": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filterIndex",
+          "mltService"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Select a clip (within the currently selected track) as the current selection scope, for tools that act on a clip implicitly rather than via an explicit clipId.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID to select",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clipId"
+        ],
+        "type": "object"
+      },
+      "name": "clip.enter",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Read the bound project's current selection state (selected track/clip). Selection indices stay mapped to the same logical track/clip even after a reorder/remove changes their numeric index.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "currentView",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "trackIndex": {
+            "type": "integer"
+          },
+          "clipId": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Stop a running process instance.",
+      "inputSchema": {
+        "properties": {
+          "instanceId": {
+            "description": "Process instance ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instanceId"
+        ],
+        "type": "object"
+      },
+      "name": "daemon.close"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "[Deprecated: use project.create] Create a new project folder under the daemon's projects root.",
+      "inputSchema": {
+        "properties": {
+          "name": {
+            "description": "Project folder name to create",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "name": "daemon.createProject"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Delete a project's registry row (does not delete files on disk).",
+      "inputSchema": {
+        "properties": {
+          "projectId": {
+            "description": "Project ID to delete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId"
+        ],
+        "type": "object"
+      },
+      "name": "daemon.deleteProject"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Check whether a process instance's SAP socket is responsive.",
+      "inputSchema": {
+        "properties": {
+          "instanceId": {
+            "description": "Process instance ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instanceId"
+        ],
+        "type": "object"
+      },
+      "name": "daemon.health"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "[Deprecated: use project.open to open/attach; this only spawns the process] Launch a Snapshot child for a project.",
+      "inputSchema": {
+        "properties": {
+          "headless": {
+            "description": "Launch headless (offscreen), no GUI display needed",
+            "type": "boolean"
+          },
+          "projectId": {
+            "description": "Project ID to launch (use this or projectPath)",
+            "type": "string"
+          },
+          "projectPath": {
+            "description": "Filesystem path to a project folder or legacy .mlt file (use this or projectId)",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "daemon.launch"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List daemon-owned and externally launched Snapflow instances. Use active=true to find live SAP-editable instances or active=false for inactive/stale rows.",
+      "inputSchema": {
+        "properties": {
+          "active": {
+            "description": "Optional live-state filter; omitted returns both active and inactive instances.",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "daemon.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "projectId": {
+                  "type": "string"
+                },
+                "projectPath": {
+                  "type": "string"
+                },
+                "pid": {
+                  "type": "integer"
+                },
+                "socketPath": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "active": {
+                  "type": "boolean"
+                },
+                "managed": {
+                  "type": "boolean"
+                },
+                "headless": {
+                  "type": "boolean"
+                },
+                "startedAt": {
+                  "type": "string"
+                },
+                "lastSeenAt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "pid",
+                "status",
+                "active",
+                "managed"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "active",
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "[Deprecated: use project.list] List all known projects.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "daemon.listProjects"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a video or audio timeline track.",
+      "inputSchema": {
+        "properties": {
+          "kind": {
+            "description": "Track kind",
+            "enum": [
+              "video",
+              "audio"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "edit.addTrack",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "muted": {
+            "type": "boolean"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "locked": {
+            "type": "boolean"
+          },
+          "blendMode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "kind",
+          "muted",
+          "hidden",
+          "locked",
+          "blendMode"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Append a source clip to a timeline track.",
+      "inputSchema": {
+        "properties": {
+          "source": {
+            "additionalProperties": false,
+            "description": "Clip source descriptor: exactly one of {\"path\": \"...\"} or {\"playlistIndex\": N}",
+            "properties": {
+              "path": {
+                "description": "Filesystem path to a media file",
+                "type": "string"
+              },
+              "playlistIndex": {
+                "description": "Index of an existing project playlist entry",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "edit.appendClip",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "clipId": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "inFrame": {
+            "type": "integer"
+          },
+          "outFrame": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "index",
+          "source",
+          "inFrame",
+          "outFrame"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Insert a source clip before clip-slot clipIndex, rippling downstream clips forward.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip slot to insert before",
+            "type": "integer"
+          },
+          "source": {
+            "additionalProperties": false,
+            "description": "Clip source descriptor: exactly one of {\"path\": \"...\"} or {\"playlistIndex\": N}",
+            "properties": {
+              "path": {
+                "description": "Filesystem path to a media file",
+                "type": "string"
+              },
+              "playlistIndex": {
+                "description": "Index of an existing project playlist entry",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex",
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "edit.insertClip",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "clipId": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "inFrame": {
+            "type": "integer"
+          },
+          "outFrame": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "index",
+          "source",
+          "inFrame",
+          "outFrame"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List clips on a timeline track.",
+      "inputSchema": {
+        "properties": {
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "type": "object"
+      },
+      "name": "edit.listClips",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "clipId": {
+                  "type": "string"
+                },
+                "index": {
+                  "type": "integer"
+                },
+                "source": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": [
+                      "object",
+                      "string",
+                      "number",
+                      "boolean",
+                      "array",
+                      "null"
+                    ]
+                  }
+                },
+                "inFrame": {
+                  "type": "integer"
+                },
+                "outFrame": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "clipId",
+                "index",
+                "source",
+                "inFrame",
+                "outFrame"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List timeline tracks.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "edit.listTracks",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "muted": {
+                  "type": "boolean"
+                },
+                "hidden": {
+                  "type": "boolean"
+                },
+                "locked": {
+                  "type": "boolean"
+                },
+                "blendMode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "index",
+                "kind",
+                "muted",
+                "hidden",
+                "locked",
+                "blendMode"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Move/reposition a clip within a track or across tracks.",
+      "inputSchema": {
+        "properties": {
+          "fromClipIndex": {
+            "description": "Source clip index",
+            "type": "integer"
+          },
+          "fromTrackIndex": {
+            "description": "Source track index",
+            "type": "integer"
+          },
+          "toClipIndex": {
+            "description": "Destination clip index",
+            "type": "integer"
+          },
+          "toTrackIndex": {
+            "description": "Destination track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fromTrackIndex",
+          "fromClipIndex",
+          "toTrackIndex",
+          "toClipIndex"
+        ],
+        "type": "object"
+      },
+      "name": "edit.moveClip",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "clipId": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "inFrame": {
+            "type": "integer"
+          },
+          "outFrame": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "index",
+          "source",
+          "inFrame",
+          "outFrame"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Replace whatever occupies clip-slot clipIndex with a source clip; does not ripple downstream clips.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip slot to overwrite",
+            "type": "integer"
+          },
+          "source": {
+            "additionalProperties": false,
+            "description": "Clip source descriptor: exactly one of {\"path\": \"...\"} or {\"playlistIndex\": N}",
+            "properties": {
+              "path": {
+                "description": "Filesystem path to a media file",
+                "type": "string"
+              },
+              "playlistIndex": {
+                "description": "Index of an existing project playlist entry",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex",
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "edit.overwriteClip",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "clipId": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "inFrame": {
+            "type": "integer"
+          },
+          "outFrame": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "index",
+          "source",
+          "inFrame",
+          "outFrame"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove a clip from a timeline track.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip index on the track",
+            "type": "integer"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex"
+        ],
+        "type": "object"
+      },
+      "name": "edit.removeClip",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove a timeline track.",
+      "inputSchema": {
+        "properties": {
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "type": "object"
+      },
+      "name": "edit.removeTrack",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Move a timeline track from one index to another, carrying its clips with it.",
+      "inputSchema": {
+        "properties": {
+          "fromIndex": {
+            "description": "Current track index",
+            "type": "integer"
+          },
+          "toIndex": {
+            "description": "Destination track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fromIndex",
+          "toIndex"
+        ],
+        "type": "object"
+      },
+      "name": "edit.reorderTrack",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "muted": {
+                  "type": "boolean"
+                },
+                "hidden": {
+                  "type": "boolean"
+                },
+                "locked": {
+                  "type": "boolean"
+                },
+                "blendMode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "index",
+                "kind",
+                "muted",
+                "hidden",
+                "locked",
+                "blendMode"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Set the project-wide timeline row height (applies to all tracks).",
+      "inputSchema": {
+        "properties": {
+          "height": {
+            "description": "Row height in pixels",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "height"
+        ],
+        "type": "object"
+      },
+      "name": "edit.setTrackHeight",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Partially update a track's muted/hidden/locked/blendMode; omitted fields are left unchanged.",
+      "inputSchema": {
+        "properties": {
+          "blendMode": {
+            "description": "MLT blend mode identifier",
+            "type": "string"
+          },
+          "hidden": {
+            "description": "Hide the track",
+            "type": "boolean"
+          },
+          "locked": {
+            "description": "Lock the track",
+            "type": "boolean"
+          },
+          "muted": {
+            "description": "Mute the track",
+            "type": "boolean"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "type": "object"
+      },
+      "name": "edit.setTrackProperties",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "muted": {
+            "type": "boolean"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "locked": {
+            "type": "boolean"
+          },
+          "blendMode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "kind",
+          "muted",
+          "hidden",
+          "locked",
+          "blendMode"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Split a clip at a source frame into two adjacent clips.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip index on the track",
+            "type": "integer"
+          },
+          "position": {
+            "description": "Source frame to split at",
+            "type": "integer"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex",
+          "position"
+        ],
+        "type": "object"
+      },
+      "name": "edit.splitClip",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "leftClipId": {
+            "type": "string"
+          },
+          "rightClipId": {
+            "type": "string"
+          },
+          "leftIndex": {
+            "type": "integer"
+          },
+          "rightIndex": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "leftClipId",
+          "rightClipId",
+          "leftIndex",
+          "rightIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Trim a clip's in point; ripple shifts downstream clips to close/open the gap.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip index on the track",
+            "type": "integer"
+          },
+          "newFrame": {
+            "description": "New in-point frame",
+            "type": "integer"
+          },
+          "ripple": {
+            "default": false,
+            "description": "Shift downstream clips instead of leaving a blank",
+            "type": "boolean"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex",
+          "newFrame"
+        ],
+        "type": "object"
+      },
+      "name": "edit.trimClipIn",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Trim a clip's out point; ripple shifts downstream clips to close/open the gap.",
+      "inputSchema": {
+        "properties": {
+          "clipIndex": {
+            "description": "Clip index on the track",
+            "type": "integer"
+          },
+          "newFrame": {
+            "description": "New out-point frame",
+            "type": "integer"
+          },
+          "ripple": {
+            "default": false,
+            "description": "Shift downstream clips instead of leaving a blank",
+            "type": "boolean"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "clipIndex",
+          "newFrame"
+        ],
+        "type": "object"
+      },
+      "name": "edit.trimClipOut",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Start an export job for the current project.",
+      "inputSchema": {
+        "properties": {
+          "codec": {
+            "default": "h264",
+            "description": "Video codec",
+            "type": "string"
+          },
+          "container": {
+            "default": "mp4",
+            "description": "Output container format",
+            "type": "string"
+          },
+          "outputPath": {
+            "description": "Filesystem path to write the exported file",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outputPath"
+        ],
+        "type": "object"
+      },
+      "name": "file.export",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "jobId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobId"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Import a media file inside the current project's root.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path to the media file",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "file.import",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Probe a media file's own native metadata (codec, duration) directly via ffprobe, without needing any project bound -- independent of any live project's profile.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path to the media file",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "file.probe",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "durationSeconds": {
+            "type": "number"
+          },
+          "durationFrames": {
+            "type": "integer"
+          },
+          "codec": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "durationSeconds",
+          "durationFrames",
+          "codec"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Attach an MLT filter to a clip.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "mltService": {
+            "description": "MLT filter service name, e.g. \"volume\", \"panner\"",
+            "type": "string"
+          },
+          "properties": {
+            "description": "Initial MLT filter property key/value map",
+            "properties": {},
+            "type": "object"
+          }
+        },
+        "required": [
+          "clipId",
+          "mltService"
+        ],
+        "type": "object"
+      },
+      "name": "filter.add",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "filterIndex": {
+            "type": "integer"
+          },
+          "mltService": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filterIndex",
+          "mltService"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a filter-property keyframe.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "filterIndex": {
+            "description": "Filter index on the clip",
+            "type": "integer"
+          },
+          "interpolation": {
+            "default": "linear",
+            "description": "Keyframe interpolation mode",
+            "enum": [
+              "linear",
+              "smooth",
+              "discrete",
+              "hold"
+            ],
+            "type": "string"
+          },
+          "position": {
+            "description": "Frame position of the keyframe",
+            "type": "integer"
+          },
+          "property": {
+            "description": "Filter property name",
+            "type": "string"
+          },
+          "value": {
+            "description": "Keyframe value; type depends on the filter property (number, string, etc.)"
+          }
+        },
+        "required": [
+          "clipId",
+          "filterIndex",
+          "property",
+          "position",
+          "value"
+        ],
+        "type": "object"
+      },
+      "name": "filter.addKeyframe",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Describe known properties for an MLT filter service.",
+      "inputSchema": {
+        "properties": {
+          "mltService": {
+            "description": "MLT filter service name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mltService"
+        ],
+        "type": "object"
+      },
+      "name": "filter.describe",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": [
+            "object",
+            "string",
+            "number",
+            "boolean",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List filters attached to a clip.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clipId"
+        ],
+        "type": "object"
+      },
+      "name": "filter.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "mltService": {
+                  "type": "string"
+                },
+                "properties": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": [
+                      "object",
+                      "string",
+                      "number",
+                      "boolean",
+                      "array",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "index",
+                "mltService",
+                "properties"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List keyframes for a filter property.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "filterIndex": {
+            "description": "Filter index on the clip",
+            "type": "integer"
+          },
+          "property": {
+            "description": "Filter property name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clipId",
+          "filterIndex",
+          "property"
+        ],
+        "type": "object"
+      },
+      "name": "filter.listKeyframes"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Detach a filter from a clip.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "filterIndex": {
+            "description": "Filter index on the clip",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "filterIndex"
+        ],
+        "type": "object"
+      },
+      "name": "filter.remove",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove a keyframe from a filter property.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "filterIndex": {
+            "description": "Filter index on the clip",
+            "type": "integer"
+          },
+          "position": {
+            "description": "Frame position of the keyframe to remove",
+            "type": "integer"
+          },
+          "property": {
+            "description": "Filter property name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clipId",
+          "filterIndex",
+          "property",
+          "position"
+        ],
+        "type": "object"
+      },
+      "name": "filter.removeKeyframe",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Reorder a filter in a clip's filter chain.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "filterIndex": {
+            "description": "Current filter index",
+            "type": "integer"
+          },
+          "newIndex": {
+            "description": "Destination filter index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "filterIndex",
+          "newIndex"
+        ],
+        "type": "object"
+      },
+      "name": "filter.reorder",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Set a filter property, either statically or at a specific keyframe position.",
+      "inputSchema": {
+        "properties": {
+          "clipId": {
+            "description": "Clip ID",
+            "type": "string"
+          },
+          "filterIndex": {
+            "description": "Filter index on the clip",
+            "type": "integer"
+          },
+          "position": {
+            "description": "Frame position; omit for a static (non-keyframed) property",
+            "type": "integer"
+          },
+          "property": {
+            "description": "Filter property name",
+            "type": "string"
+          },
+          "value": {
+            "description": "Property value; type depends on the filter property (number, string, etc.)"
+          }
+        },
+        "required": [
+          "clipId",
+          "filterIndex",
+          "property",
+          "value"
+        ],
+        "type": "object"
+      },
+      "name": "filter.setProperty",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Create a solid-color producer for the project playlist, e.g. a transparent spacer.",
+      "inputSchema": {
+        "properties": {
+          "hexColor": {
+            "description": "Hex color, e.g. \"#00000000\" for transparent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hexColor"
+        ],
+        "type": "object"
+      },
+      "name": "generator.createColor",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Create a title producer for the project playlist. Requires text or html.",
+      "inputSchema": {
+        "properties": {
+          "bgColour": {
+            "description": "Background color",
+            "type": "string"
+          },
+          "fgColour": {
+            "description": "Foreground text color",
+            "type": "string"
+          },
+          "html": {
+            "description": "Rich-text/HTML title content (text or html is required)",
+            "type": "string"
+          },
+          "mode": {
+            "default": "simple",
+            "description": "Title generator mode",
+            "enum": [
+              "simple"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "Plain-text title content (text or html is required)",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "generator.createTitle",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Read an export job's status.",
+      "inputSchema": {
+        "properties": {
+          "jobId": {
+            "description": "Export job ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobId"
+        ],
+        "type": "object"
+      },
+      "name": "jobs.get",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "percent": {
+            "type": "number"
+          },
+          "resultPath": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "error": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "jobId",
+          "status",
+          "percent"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List export jobs for the current project.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "jobs.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "jobId": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "percent": {
+                  "type": "number"
+                },
+                "resultPath": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "required": [
+                "jobId",
+                "status",
+                "percent"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Stop a running export job.",
+      "inputSchema": {
+        "properties": {
+          "jobId": {
+            "description": "Export job ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobId"
+        ],
+        "type": "object"
+      },
+      "name": "jobs.stop",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Append a timeline marker.",
+      "inputSchema": {
+        "properties": {
+          "color": {
+            "description": "Marker color",
+            "type": "string"
+          },
+          "frame": {
+            "description": "Marker frame",
+            "type": "integer"
+          },
+          "text": {
+            "description": "Marker text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "frame"
+        ],
+        "type": "object"
+      },
+      "name": "markers.append",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "frame": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          },
+          "endFrame": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "frame",
+          "text",
+          "color"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Clear all timeline markers.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "markers.clear",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Get one timeline marker by index.",
+      "inputSchema": {
+        "properties": {
+          "markerIndex": {
+            "description": "Marker index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "markerIndex"
+        ],
+        "type": "object"
+      },
+      "name": "markers.get",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "frame": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          },
+          "endFrame": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "frame",
+          "text",
+          "color"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List all timeline markers.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "markers.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "frame": {
+                  "type": "integer"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "color": {
+                  "type": "string"
+                },
+                "endFrame": {
+                  "type": [
+                    "null",
+                    "integer"
+                  ]
+                }
+              },
+              "required": [
+                "index",
+                "frame",
+                "text",
+                "color"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Move a timeline marker to a new frame range.",
+      "inputSchema": {
+        "properties": {
+          "end": {
+            "description": "New range end frame",
+            "type": "integer"
+          },
+          "markerIndex": {
+            "description": "Marker index",
+            "type": "integer"
+          },
+          "start": {
+            "description": "New range start frame",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "markerIndex",
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "name": "markers.move",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "frame": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          },
+          "endFrame": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "frame",
+          "text",
+          "color"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Find the next marker frame after fromFrame, or null if none.",
+      "inputSchema": {
+        "properties": {
+          "fromFrame": {
+            "description": "Frame to search after",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fromFrame"
+        ],
+        "type": "object"
+      },
+      "name": "markers.next"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Find the previous marker frame before fromFrame, or null if none.",
+      "inputSchema": {
+        "properties": {
+          "fromFrame": {
+            "description": "Frame to search before",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fromFrame"
+        ],
+        "type": "object"
+      },
+      "name": "markers.prev"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove a timeline marker by index.",
+      "inputSchema": {
+        "properties": {
+          "markerIndex": {
+            "description": "Marker index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "markerIndex"
+        ],
+        "type": "object"
+      },
+      "name": "markers.remove",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Set a timeline marker's color.",
+      "inputSchema": {
+        "properties": {
+          "color": {
+            "description": "New marker color",
+            "type": "string"
+          },
+          "markerIndex": {
+            "description": "Marker index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "markerIndex",
+          "color"
+        ],
+        "type": "object"
+      },
+      "name": "markers.setColor",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "frame": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          },
+          "endFrame": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "frame",
+          "text",
+          "color"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Update a timeline marker's frame/text/color.",
+      "inputSchema": {
+        "properties": {
+          "color": {
+            "description": "New marker color",
+            "type": "string"
+          },
+          "frame": {
+            "description": "New marker frame",
+            "type": "integer"
+          },
+          "markerIndex": {
+            "description": "Marker index",
+            "type": "integer"
+          },
+          "text": {
+            "description": "New marker text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "markerIndex"
+        ],
+        "type": "object"
+      },
+      "name": "markers.update",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "frame": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          },
+          "endFrame": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "frame",
+          "text",
+          "color"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Read the current project's notes.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "notes.getText",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Replace the current project's notes.",
+      "inputSchema": {
+        "properties": {
+          "text": {
+            "description": "New notes text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "notes.setText",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Read a rendered frame from the current project as base64 image data.",
+      "inputSchema": {
+        "properties": {
+          "format": {
+            "default": "jpeg",
+            "description": "Image format",
+            "enum": [
+              "jpeg",
+              "png"
+            ],
+            "type": "string"
+          },
+          "frame": {
+            "description": "Frame to render",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "frame"
+        ],
+        "type": "object"
+      },
+      "name": "playback.getFrame",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "data": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "format",
+          "data"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Seek the current project's playhead.",
+      "inputSchema": {
+        "properties": {
+          "frame": {
+            "description": "Frame to seek to",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "frame"
+        ],
+        "type": "object"
+      },
+      "name": "playback.seek",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Append a playlist entry onto a timeline track (equivalent to edit.appendClip by playlistIndex).",
+      "inputSchema": {
+        "properties": {
+          "index": {
+            "description": "Playlist index to place",
+            "type": "integer"
+          },
+          "position": {
+            "description": "Reserved for wire-shape parity; currently always appends at the end of the track",
+            "type": "integer"
+          },
+          "trackIndex": {
+            "description": "Destination track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "trackIndex"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.addToTimeline",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "clipId": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "inFrame": {
+            "type": "integer"
+          },
+          "outFrame": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clipId",
+          "index",
+          "source",
+          "inFrame",
+          "outFrame"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Append a source to the project playlist.",
+      "inputSchema": {
+        "properties": {
+          "name": {
+            "description": "Display name for the playlist entry",
+            "type": "string"
+          },
+          "source": {
+            "additionalProperties": false,
+            "description": "Clip source descriptor: exactly one of {\"path\": \"...\"} or {\"playlistIndex\": N}",
+            "properties": {
+              "path": {
+                "description": "Filesystem path to a media file",
+                "type": "string"
+              },
+              "playlistIndex": {
+                "description": "Index of an existing project playlist entry",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.append",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Get full metadata (including probe data where available) for one playlist entry.",
+      "inputSchema": {
+        "properties": {
+          "index": {
+            "description": "Playlist index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.get",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          },
+          "probe": {
+            "type": [
+              "null",
+              "object"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "durationSeconds": {
+                "type": "number"
+              },
+              "durationFrames": {
+                "type": "integer"
+              },
+              "codec": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "durationSeconds",
+              "durationFrames",
+              "codec"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Insert a source into the project playlist at an index.",
+      "inputSchema": {
+        "properties": {
+          "index": {
+            "description": "Playlist index to insert at",
+            "type": "integer"
+          },
+          "name": {
+            "description": "Display name for the playlist entry",
+            "type": "string"
+          },
+          "source": {
+            "additionalProperties": false,
+            "description": "Clip source descriptor: exactly one of {\"path\": \"...\"} or {\"playlistIndex\": N}",
+            "properties": {
+              "path": {
+                "description": "Filesystem path to a media file",
+                "type": "string"
+              },
+              "playlistIndex": {
+                "description": "Index of an existing project playlist entry",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "index",
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.insert",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "object",
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "source",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List project playlist entries.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "playlist.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": [
+                      "object",
+                      "string",
+                      "number",
+                      "boolean",
+                      "array",
+                      "null"
+                    ]
+                  }
+                },
+                "durationFrames": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "index",
+                "name",
+                "source",
+                "durationFrames"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Move a playlist entry from one index to another.",
+      "inputSchema": {
+        "properties": {
+          "fromIndex": {
+            "description": "Current playlist index",
+            "type": "integer"
+          },
+          "toIndex": {
+            "description": "Destination playlist index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fromIndex",
+          "toIndex"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.move",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove a playlist entry by index.",
+      "inputSchema": {
+        "properties": {
+          "index": {
+            "description": "Playlist index to remove",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "type": "object"
+      },
+      "name": "playlist.remove",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Clone a project by recursively copying its folder to destPath and registering a new project. Optional open attaches this session to the clone.",
+      "inputSchema": {
+        "properties": {
+          "destPath": {
+            "description": "Destination directory (must not exist)",
+            "type": "string"
+          },
+          "open": {
+            "description": "If true, open the clone after copy (default false)",
+            "type": "boolean"
+          },
+          "sourcePath": {
+            "description": "Source project folder or .mlt path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sourcePath",
+          "destPath"
+        ],
+        "type": "object"
+      },
+      "name": "project.clone"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Close this session's binding to its project (session-scoped unbind only). Other sessions and the running process are unaffected. Preferred over project.exit.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.close",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Create a project at an arbitrary path (or under the daemon projects root via name). When open:true, opens the project and saves once so a real .mlt exists on disk. projectType defaults to folder.",
+      "inputSchema": {
+        "properties": {
+          "mltFileName": {
+            "description": "MLT filename inside the project folder (default project.mlt)",
+            "type": "string"
+          },
+          "name": {
+            "description": "Legacy: folder name under daemon projects root when path is omitted",
+            "type": "string"
+          },
+          "open": {
+            "description": "If true, open then project.save so .mlt is written immediately",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Absolute or relative project folder path (preferred)",
+            "type": "string"
+          },
+          "projectType": {
+            "description": "folder (default) or file",
+            "enum": [
+              "folder",
+              "file"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.create"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "[Deprecated: use project.close] Unbind this MCP session from its project.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.exit",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Read the bound project's state, including undo/redo stack depths and projectType.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.getState",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "projectId": {
+            "type": "string"
+          },
+          "dirty": {
+            "type": "boolean"
+          },
+          "undoDepth": {
+            "type": "integer"
+          },
+          "redoDepth": {
+            "type": "integer"
+          },
+          "opened": {
+            "type": "boolean"
+          },
+          "projectType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "dirty",
+          "undoDepth",
+          "redoDepth",
+          "opened"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List known projects. Each row leads with path, projectType, projectId, and active/isOpen (true when the most recent process instance is ready). Optional refresh:true re-probes PID+socket liveness.",
+      "inputSchema": {
+        "properties": {
+          "refresh": {
+            "description": "If true, probe live process liveness per project instead of DB-only ready status",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.list"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Open or attach this session to a project. Accepts projectId and/or path (filesystem folder or .mlt). Launch-or-reuses the child process, loads saved .mlt on first open (safe no-op attach for later sessions). Preferred over project.select.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path to a project folder or .mlt file (preferred addressing)",
+            "type": "string"
+          },
+          "projectId": {
+            "description": "Project ID (from project.create / project.list)",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.open",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "projectId": {
+            "type": "string"
+          },
+          "dirty": {
+            "type": "boolean"
+          },
+          "undoDepth": {
+            "type": "integer"
+          },
+          "redoDepth": {
+            "type": "integer"
+          },
+          "opened": {
+            "type": "boolean"
+          },
+          "projectType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "dirty",
+          "undoDepth",
+          "redoDepth",
+          "opened"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Redo the bound project's latest undone edit.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.redo",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Persist the bound project's current in-memory session to its project.mlt file on disk.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.save",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "[Deprecated: use project.open] Bind this MCP session to a project. Accepts projectId and/or path.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path to project folder or .mlt",
+            "type": "string"
+          },
+          "projectId": {
+            "description": "Project ID",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.select",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "projectId": {
+            "type": "string"
+          },
+          "dirty": {
+            "type": "boolean"
+          },
+          "undoDepth": {
+            "type": "integer"
+          },
+          "redoDepth": {
+            "type": "integer"
+          },
+          "opened": {
+            "type": "boolean"
+          },
+          "projectType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "dirty",
+          "undoDepth",
+          "redoDepth",
+          "opened"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Undo the bound project's latest edit.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "project.undo",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a path to the project-scoped recent-files list.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "recent.add",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "List recent paths, newest first.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "recent.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove a path from the recent-files list.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "recent.remove",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a subtitles track.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "subtitles.addTrack",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "trackIndex": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Append a subtitle cue to a subtitles track.",
+      "inputSchema": {
+        "properties": {
+          "endFrame": {
+            "description": "Cue end frame",
+            "type": "integer"
+          },
+          "startFrame": {
+            "description": "Cue start frame",
+            "type": "integer"
+          },
+          "text": {
+            "description": "Cue text",
+            "type": "string"
+          },
+          "trackIndex": {
+            "description": "Subtitles track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "startFrame",
+          "endFrame",
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "subtitles.appendItem",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Burn a subtitles track's cues into exported/previewed frames (idempotent per track).",
+      "inputSchema": {
+        "properties": {
+          "trackIndex": {
+            "description": "Subtitles track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "type": "object"
+      },
+      "name": "subtitles.burnIn",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "trackIndex": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Export a subtitles track to an SRT file.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Filesystem path to write the SRT file",
+            "type": "string"
+          },
+          "trackIndex": {
+            "description": "Subtitles track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "trackIndex"
+        ],
+        "type": "object"
+      },
+      "name": "subtitles.exportSrt",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Import an SRT file into track 0, or a new track.",
+      "inputSchema": {
+        "properties": {
+          "newTrack": {
+            "default": false,
+            "description": "Import into a newly created track instead of track 0",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Filesystem path to the SRT file",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "subtitles.importSrt",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "trackIndex": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Remove subtitle cues by 0-based index.",
+      "inputSchema": {
+        "properties": {
+          "itemIndices": {
+            "description": "0-based subtitle cue indices to remove",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "trackIndex": {
+            "description": "Subtitles track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "itemIndices"
+        ],
+        "type": "object"
+      },
+      "name": "subtitles.removeItems",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Style subtitle filters attached to the output tractor.",
+      "inputSchema": {
+        "properties": {
+          "bgcolour": {
+            "description": "Background color, e.g. #00000000",
+            "type": "string"
+          },
+          "fgcolour": {
+            "description": "Foreground color, e.g. #ffffffff",
+            "type": "string"
+          },
+          "geometry": {
+            "description": "MLT geometry string",
+            "type": "string"
+          },
+          "halign": {
+            "description": "Horizontal alignment",
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ],
+            "type": "string"
+          },
+          "olcolour": {
+            "description": "Outline color",
+            "type": "string"
+          },
+          "outline": {
+            "description": "Outline width",
+            "type": "integer"
+          },
+          "size": {
+            "description": "Font size in points",
+            "type": "integer"
+          },
+          "style": {
+            "description": "Font style",
+            "enum": [
+              "normal",
+              "italic"
+            ],
+            "type": "string"
+          },
+          "valign": {
+            "description": "Vertical alignment",
+            "enum": [
+              "top",
+              "middle",
+              "bottom"
+            ],
+            "type": "string"
+          },
+          "weight": {
+            "description": "Font weight",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "subtitles.setStyle",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Select a timeline track by native track name or numeric index as the current selection scope. trackName is optional; omit it and use trackIndex when the backend does not provide a name. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
+      "inputSchema": {
+        "properties": {
+          "trackIndex": {
+            "description": "Zero-based track index to select",
+            "type": "integer"
+          },
+          "trackName": {
+            "description": "Native track name; use edit.listTracks to discover names",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "track.enter",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "description": "Add a crossfade transition between two adjacent clips on a track.",
+      "inputSchema": {
+        "properties": {
+          "betweenClips": {
+            "description": "The two adjacent clip indices to cross-fade between, e.g. [0, 1]",
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "durationFrames": {
+            "description": "Crossfade duration in frames",
+            "type": "integer"
+          },
+          "trackIndex": {
+            "description": "Track index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "betweenClips",
+          "durationFrames"
+        ],
+        "type": "object"
+      },
+      "name": "transitions.addCrossfade",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "trackIndex": {
+            "type": "integer"
+          },
+          "transitionIndex": {
+            "type": "integer"
+          },
+          "betweenClips": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "integer"
+            }
+          },
+          "durationFrames": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trackIndex",
+          "transitionIndex",
+          "betweenClips",
+          "durationFrames"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
