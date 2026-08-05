@@ -72,7 +72,11 @@ pub struct Clip {
     pub in_frame: i64,
     #[serde(default)]
     pub out_frame: i64,
+    #[serde(default = "default_clip_speed")]
+    pub speed: f64,
 }
+
+fn default_clip_speed() -> f64 { 1.0 }
 
 /// A `playlist.*` bin entry -- distinct from a timeline `Clip`, per
 /// 01-jsonrpc-spec.md's "Playlist dock: the source bin" namespace.
@@ -240,6 +244,12 @@ pub trait Backend: Send {
     fn edit_list_clips(&mut self, project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>>;
 
     fn playback_seek(&mut self, project_id: &str, frame: i64) -> BackendResult<()>;
+    fn playback_fast_forward(&mut self, project_id: &str) -> BackendResult<()>;
+    fn edit_set_clip_speed(&mut self, project_id: &str, track_index: usize, clip_index: usize, speed: f64) -> BackendResult<Clip>;
+    fn playback_play(&mut self, project_id: &str, speed: f64) -> BackendResult<()>;
+    fn playback_pause(&mut self, project_id: &str, position: Option<i64>) -> BackendResult<()>;
+    fn playback_stop(&mut self, project_id: &str) -> BackendResult<()>;
+    fn playback_get_state(&mut self, project_id: &str) -> BackendResult<PlaybackState>;
 
     fn notes_get_text(&mut self, project_id: &str) -> BackendResult<String>;
     fn notes_set_text(&mut self, project_id: &str, text: &str) -> BackendResult<()>;
@@ -1005,6 +1015,14 @@ impl Backend for MockBackend {
             )));
         }
         let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        let clip = Clip {
+            clip_id,
+            index: clip_index,
+            source,
+            in_frame: 0,
+            out_frame: 0,
+            speed: 1.0,
+        };
         clips.insert(clip_index, clip.clone());
         for (i, c) in clips.iter_mut().enumerate() {
             c.index = i;
@@ -1036,6 +1054,14 @@ impl Backend for MockBackend {
             )));
         }
         let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        let clip = Clip {
+            clip_id,
+            index: clip_index,
+            source,
+            in_frame: 0,
+            out_frame: 0,
+            speed: 1.0,
+        };
         if clip_index == clips.len() {
             // No clip occupies this slot yet -- behaves like append.
             clips.push(clip.clone());
@@ -1064,6 +1090,14 @@ impl Backend for MockBackend {
         let clip_id = format!("clip-{}", data.next_clip_id);
         let clips = data.clips.entry(track_index).or_default();
         let clip = Clip { clip_id, index: clips.len(), source, in_frame: 0, out_frame: 0 };
+        let clip = Clip {
+            clip_id,
+            index: clips.len(),
+            source,
+            in_frame: 0,
+            out_frame: 0,
+            speed: 1.0,
+        };
         clips.push(clip.clone());
         data.dirty = true;
         data.undo_depth += 1;
@@ -1078,6 +1112,115 @@ impl Backend for MockBackend {
     fn playback_seek(&mut self, _project_id: &str, _frame: i64) -> BackendResult<()> {
         // Playback is explicitly "not undo-tracked" per 01-jsonrpc-spec.md.
         Ok(())
+    }
+
+    fn playback_play(&mut self, project_id: &str, _speed: f64) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        data.playback.playing = true;
+        Ok(())
+    }
+
+    fn playback_pause(&mut self, project_id: &str, position: Option<i64>) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        data.playback.playing = false;
+        if let Some(p) = position {
+            if p >= 0 {
+                data.playback.position = p;
+            }
+        }
+        Ok(())
+    }
+
+    fn playback_stop(&mut self, project_id: &str) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        data.playback.playing = false;
+        data.playback.position = 0;
+        Ok(())
+    }
+
+    fn playback_get_state(&mut self, project_id: &str) -> BackendResult<PlaybackState> {
+        Ok(self.project_mut(project_id).playback.clone())
+    }
+
+    fn project_set_profile(
+        &mut self,
+        project_id: &str,
+        profile_name: Option<String>,
+        width: Option<i32>,
+        height: Option<i32>,
+        frame_rate_num: Option<i32>,
+        frame_rate_den: Option<i32>,
+    ) -> BackendResult<ProfileInfo> {
+        let data = self.project_mut(project_id);
+        if let Some(name) = profile_name.as_deref() {
+            // Named profiles: map a few common Shotcut/MLT names in mock.
+            match name {
+                "atsc_720p_25" => {
+                    data.profile.width = 1280;
+                    data.profile.height = 720;
+                    data.profile.frame_rate_num = 25;
+                    data.profile.frame_rate_den = 1;
+                }
+                "atsc_1080p_25" | "" => {
+                    data.profile.width = 1920;
+                    data.profile.height = 1080;
+                    data.profile.frame_rate_num = 25;
+                    data.profile.frame_rate_den = 1;
+                }
+                "atsc_1080p_30" => {
+                    data.profile.width = 1920;
+                    data.profile.height = 1080;
+                    data.profile.frame_rate_num = 30;
+                    data.profile.frame_rate_den = 1;
+                }
+                other => {
+                    return Err(BackendError::InvalidParams(format!(
+                        "unknown mock profileName {other:?}"
+                    )));
+                }
+            }
+        } else {
+            let w = width.ok_or_else(|| {
+                BackendError::InvalidParams(
+                    "project.setProfile requires profileName or width+height".into(),
+                )
+            })?;
+            let h = height.ok_or_else(|| {
+                BackendError::InvalidParams(
+                    "project.setProfile requires profileName or width+height".into(),
+                )
+            })?;
+            if w <= 0 || h <= 0 {
+                return Err(BackendError::InvalidParams(
+                    "width and height must be positive".into(),
+                ));
+            }
+            data.profile.width = w;
+            data.profile.height = h;
+            if let Some(n) = frame_rate_num {
+                data.profile.frame_rate_num = n;
+            }
+            if let Some(d) = frame_rate_den {
+                data.profile.frame_rate_den = d.max(1);
+            }
+        }
+        Ok(data.profile.clone())
+    }
+
+    fn project_get_profile(&mut self, project_id: &str) -> BackendResult<ProfileInfo> {
+        Ok(self.project_mut(project_id).profile.clone())
+    }
+
+    fn playback_fast_forward(&mut self, _project_id: &str) -> BackendResult<()> { Ok(()) }
+
+    fn edit_set_clip_speed(&mut self, project_id: &str, track_index: usize, clip_index: usize, speed: f64) -> BackendResult<Clip> {
+        if !speed.is_finite() || speed <= 0.0 { return Err(BackendError::InvalidParams("speed must be finite and greater than zero".into())); }
+        let data = self.project_mut(project_id);
+        let clips = data.clips.get_mut(&track_index).ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
+        let clip = clips.get_mut(clip_index).ok_or_else(|| BackendError::NotFound(format!("clip {clip_index}")))?;
+        clip.speed = speed;
+        data.dirty = true; data.undo_depth += 1; data.redo_depth = 0;
+        Ok(clip.clone())
     }
 
     fn notes_get_text(&mut self, project_id: &str) -> BackendResult<String> {
@@ -1282,6 +1425,7 @@ impl Backend for MockBackend {
                 source,
                 in_frame: position,
                 out_frame,
+                speed: 1.0,
             },
         );
         for (i, c) in clips.iter_mut().enumerate() {
@@ -2049,6 +2193,18 @@ pub fn parse_mlt_keyframe_entry(entry: &str) -> Option<KeyframeInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clip_speed_validates_and_updates_mock_clip() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_append_clip("p", 0, json!({"path":"x.mp4"})).unwrap();
+        let c = b.edit_set_clip_speed("p", 0, 0, 2.0).unwrap();
+        assert_eq!(c.speed, 2.0);
+        assert!(b.edit_set_clip_speed("p", 0, 0, 0.0).is_err());
+        assert!(b.edit_set_clip_speed("p", 0, 0, f64::NAN).is_err());
+    }
 
     #[test]
     fn edit_reorder_track_remaps_clips_to_follow_their_track() {

@@ -142,6 +142,7 @@ const TRACK_INDEX_METHODS: &[&str] = &[
     "edit.appendClip",
     "edit.insertClip",
     "edit.overwriteClip",
+    "edit.setClipSpeed",
     "edit.listClips",
 ];
 
@@ -658,6 +659,138 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| match b.playback_seek(&project_id, p.frame) {
                 Ok(()) => ok_result(json!({})),
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "playback.play" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default = "default_play_speed")]
+                speed: f64,
+            }
+            fn default_play_speed() -> f64 {
+                1.0
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.playback_play(&project_id, p.speed) {
+                    Ok(()) => ok_result(json!({})),
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "playback.pause" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                #[serde(default)]
+                position: Option<i64>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.playback_pause(&project_id, p.position) {
+                    Ok(()) => ok_result(json!({})),
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "playback.stop" => Ok(Box::new(move |b| match b.playback_stop(&project_id) {
+            Ok(()) => ok_result(json!({})),
+            Err(e) => err_result(e),
+        })),
+
+        "playback.getState" => Ok(Box::new(move |b| match b.playback_get_state(&project_id) {
+            Ok(s) => ok_result(serde_json::to_value(&s).expect("PlaybackState serializes")),
+            Err(e) => err_result(e),
+        })),
+
+        "project.setProfile" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                #[serde(default)]
+                profile_name: Option<String>,
+                #[serde(default)]
+                width: Option<i32>,
+                #[serde(default)]
+                height: Option<i32>,
+                #[serde(default)]
+                frame_rate_num: Option<i32>,
+                #[serde(default)]
+                frame_rate_den: Option<i32>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.project_set_profile(
+                    &project_id,
+                    p.profile_name.clone(),
+                    p.width,
+                    p.height,
+                    p.frame_rate_num,
+                    p.frame_rate_den,
+                ) {
+                    Ok(info) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&info).expect("ProfileInfo serializes")),
+                        notify: Some(RpcNotification::new(
+                            "project.changed",
+                            json!({"reason": "setProfile"}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "project.getProfile" => Ok(Box::new(move |b| match b.project_get_profile(&project_id) {
+            Ok(info) => ok_result(serde_json::to_value(&info).expect("ProfileInfo serializes")),
+            Err(e) => err_result(e),
+        })),
+
+        "playlist.appendImageSequence" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                path: String,
+                #[serde(default)]
+                ttl: Option<i32>,
+                #[serde(default)]
+                begin: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.playlist_append_image_sequence(
+                    &project_id,
+                    &p.path,
+                    p.ttl,
+                    p.begin.clone(),
+                ) {
+                    Ok(entry) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
+                        notify: Some(RpcNotification::new(
+                            "playlist.changed",
+                            json!({"reason": "appendImageSequence"}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "playback.fastForward" => Ok(Box::new(move |b| match b.playback_fast_forward(&project_id) {
+            Ok(()) => ok_result(json!({})),
+            Err(e) => err_result(e),
+        })),
+
+        "edit.setClipSpeed" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P { track_index: usize, clip_index: usize, speed: f64 }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.edit_set_clip_speed(&project_id, p.track_index, p.clip_index, p.speed) {
+                Ok(clip) => BackendCallResult { result: Ok(serde_json::to_value(clip).unwrap()), notify: Some(RpcNotification::new("edit.changed", json!({"reason":"setClipSpeed", "trackIndex":p.track_index, "clipIndex":p.clip_index}))) },
                 Err(e) => err_result(e),
             }))
         }
