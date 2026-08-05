@@ -282,3 +282,85 @@ func TestMCPAdapter_TypedToolForwardsToSAP(t *testing.T) {
 		t.Fatalf("expected arguments forwarded verbatim as SAP params, got %+v", gotParams)
 	}
 }
+
+// TestMCPAdapter_NewTypedMethods verifies the newly exposed native surfaces
+// are real MCP tools (not just entries in the documentation schema), forward
+// their arguments to SAP, and remain callable over the same SSE transport as
+// existing tools.
+func TestMCPAdapter_NewTypedMethods(t *testing.T) {
+	h := &fakeHandler{}
+	mcpServer := mcpadapter.New(h)
+	testServer := server.NewTestServer(mcpServer)
+	defer testServer.Close()
+
+	c, err := mcpclient.NewSSEMCPClient(testServer.URL + "/sse")
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := c.Initialize(ctx, mcp.InitializeRequest{}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	selectReq := mcp.CallToolRequest{}
+	selectReq.Params.Name = "project.select"
+	selectReq.Params.Arguments = map[string]any{"projectId": "proj-1"}
+	if res, err := c.CallTool(ctx, selectReq); err != nil || res.IsError {
+		t.Fatalf("project.select: err=%v result=%s", err, toolResultText(res))
+	}
+
+	cases := []struct {
+		name   string
+		params map[string]any
+	}{
+		{name: "filter.describe", params: map[string]any{"mltService": "brightness"}},
+		{name: "subtitles.setStyle", params: map[string]any{"style": "italic", "valign": "bottom", "halign": "center", "size": 24}},
+		{name: "playback.fastForward", params: map[string]any{}},
+		{name: "edit.setClipSpeed", params: map[string]any{"trackIndex": 0, "clipIndex": 1, "speed": 1.5}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := mcp.CallToolRequest{}
+			req.Params.Name = tc.name
+			req.Params.Arguments = tc.params
+			res, err := c.CallTool(ctx, req)
+			if err != nil {
+				t.Fatalf("call %s: %v", tc.name, err)
+			}
+			if res.IsError {
+				t.Fatalf("%s returned tool error: %s", tc.name, toolResultText(res))
+			}
+			if h.lastMethod != tc.name {
+				t.Fatalf("expected ForwardSAP method %q, got %q", tc.name, h.lastMethod)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(h.lastParams, &got); err != nil {
+				t.Fatalf("decode %s params: %v", tc.name, err)
+			}
+			for key, want := range tc.params {
+				if string(mustJSON(t, got[key])) != string(mustJSON(t, want)) {
+					t.Fatalf("%s param %s=%v, want %v (all=%+v)", tc.name, key, got[key], want, got)
+				}
+			}
+		})
+	}
+
+	// Closed enum values are enforced at the MCP boundary before SAP sees the
+	// request; this guards against silently accepting a style the C++ layer
+	// cannot apply.
+	invalid := mcp.CallToolRequest{}
+	invalid.Params.Name = "subtitles.setStyle"
+	invalid.Params.Arguments = map[string]any{"style": "oblique"}
+	invalidRes, err := c.CallTool(ctx, invalid)
+	if err != nil {
+		t.Fatalf("call invalid subtitles.setStyle: %v", err)
+	}
+	if !invalidRes.IsError {
+		t.Fatalf("expected invalid subtitle style enum to be rejected, got %s", toolResultText(invalidRes))
+	}
+}

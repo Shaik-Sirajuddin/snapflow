@@ -95,6 +95,9 @@ func TestClosedEnumsAreAdvertised(t *testing.T) {
 	}
 	assertEnum("project.create", "projectType", []any{"folder", "file"})
 	assertEnum("playback.getFrame", "format", []any{"jpeg", "png"})
+	assertEnum("subtitles.setStyle", "style", []any{"normal", "italic"})
+	assertEnum("subtitles.setStyle", "valign", []any{"top", "middle", "bottom"})
+	assertEnum("subtitles.setStyle", "halign", []any{"left", "center", "right"})
 }
 
 func mustJSON(t *testing.T, value any) []byte {

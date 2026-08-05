@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "phase-plan execution file",
+  "plan": "mcp-local-build-integration",
+  "plan_doc": "00-plan.md",
+  "source_task": "Build local MCP stack and verify newly added methods with Go integration tests before local-main reconciliation.",
+  "status": "completed",
+  "updated": "2026-08-05 - local build and focused MCP verification complete",
+  "execution_strategy": {"mode":"parallel_workstreams","subagents":true,"blocks":[
+    {"id":"build","name":"local build","tasks":["Build snapshotd and regenerate schema"],"phases":["local_build"],"depends_on":[]},
+    {"id":"tests","name":"MCP coverage","tasks":["Audit and add focused Go tests for new methods"],"phases":["mcp_tests"],"depends_on":[]}
+  ]},
+  "completed": [
+    {"phase":"local_build","order":1,"tier":1,"status":"completed","description":"Build local snapshotd and regenerate MCP schema.","implementation_evidence":"snapshotd builds and schema generation succeeds using temporary Go build/cache directories to avoid the full /tmp quota.","verified":[{"description":"go build -o /dev/shm/snapshotd-local ./cmd/snapshotd; gen_mcp_schema.sh","verdict":"PASS"}]},
+    {"phase":"mcp_tests","order":2,"tier":2,"status":"completed","description":"Add focused integration coverage for newly added MCP methods.","implementation_evidence":"Added SSE/fake-backend coverage for filter.describe, subtitles.setStyle, playback.fastForward, edit.setClipSpeed, invalid subtitle enum rejection, and subtitle enums. Made edit.setTrackProperties.trackIndex optional to match selection-scoped backend behavior.","verified":[{"description":"Focused MCP adapter tests and schema drift test","verdict":"PASS"}]},
+    {"phase":"verification","order":3,"tier":"verification_gate","status":"completed","description":"Review test/schema alignment and classify failures.","implementation_evidence":"Focused tests pass. Full package execution is environment-limited by disk quota/socket-path limits and unrelated real-FFI fixture assumptions; no focused typed-method failure remains."}
+  ],
+  "pending": [],
+  "open_risks_ref": "00-plan.md#acceptance-matrix"
+}

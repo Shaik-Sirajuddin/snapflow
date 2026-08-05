@@ -28,7 +28,7 @@ func editTools(s *server.MCPServer, h Handler) []server.ServerTool {
 			dynamicOutputSchema[TrackList](),
 		),
 		sapTool(s, h, "edit.setTrackProperties", "edit.setTrackProperties", "Partially update a track's muted/hidden/locked/blendMode/composite; omitted fields are left unchanged. composite enables qtblend overlay over lower tracks (bottom V-track is usually false).",
-			mcp.WithInteger("trackIndex", mcp.Required(), mcp.Description("Track index")),
+			mcp.WithInteger("trackIndex", mcp.Description("Track index; omit to use the current track.enter selection")),
 			mcp.WithBoolean("muted", mcp.Description("Mute the track")),
 			mcp.WithBoolean("hidden", mcp.Description("Hide the track")),
 			mcp.WithBoolean("locked", mcp.Description("Lock the track")),
