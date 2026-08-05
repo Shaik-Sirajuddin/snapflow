@@ -745,6 +745,14 @@ impl Backend for FfiBackend {
                 return Err(BackendError::NotFound(format!("track {track_index}")));
             }
         }
+        if let Some(v) = composite {
+            let rc = unsafe {
+                ffi::sap_set_track_composite(self.main_window, track_index as c_int, v as c_int)
+            };
+            if rc != 0 {
+                return Err(BackendError::NotFound(format!("track {track_index}")));
+            }
+        }
         if let Some(v) = blend_mode {
             // Real Timeline::ChangeBlendModeCommand via the qtblend/
             // movit.overlay/cairoblend transition lookup in sap_ffi.cpp

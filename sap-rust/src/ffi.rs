@@ -122,6 +122,13 @@ extern "C" {
         composite: c_int,
     ) -> c_int;
 
+    /// C++ side: `int sap_set_track_composite(void*, int trackIndex, int composite);`
+    pub fn sap_set_track_composite(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        composite: c_int,
+    ) -> c_int;
+
     /// C++ side: `int sap_set_track_height(void* mainWindowHandle, int
     /// height);` -- real `MultitrackModel::setTrackHeight()`, a single
     /// project-wide `shotcut:trackHeight` tractor property (not per-track),
