@@ -1,0 +1,12 @@
+{
+  "plan": "clip-speed-fast-forward",
+  "status": "completed",
+  "updated": "2026-08-05",
+  "execution_strategy": {"mode": "parallel_workstreams", "subagents": true},
+  "phases": [
+    {"phase": "native_ffi", "status": "completed", "evidence": "shotcut submodule 0e1a6136; Debug C++ build passed"},
+    {"phase": "mcp_surface", "status": "completed", "evidence": "Rust/Go MCP surfaces and schemas committed"},
+    {"phase": "integration_debug", "status": "completed", "evidence": "cmake Debug build and real MCP E2E passed"},
+    {"phase": "runtime", "status": "completed", "evidence": "fast-forward PASS; setClipSpeed missing-clip routing PASS; successful real-clip retime/export deferred"}
+  ]
+}
