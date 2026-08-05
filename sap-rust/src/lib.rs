@@ -5,6 +5,7 @@
 //! for the design this crate implements.
 
 pub mod backend;
+pub mod filter_schema;
 pub mod framing;
 pub mod protocol;
 pub mod server;
