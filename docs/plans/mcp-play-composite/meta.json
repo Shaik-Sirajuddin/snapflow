@@ -1,0 +1,56 @@
+{
+  "plan": "mcp-play-composite",
+  "status": "in_progress",
+  "updated": "2026-08-05 codex P1/P2 fixed: shotcut ffi committed 33ddd78e; realsaprust skip narrowed to -32601/method-not-found",
+  "plan_doc": "00-plan.md",
+  "source_task": "MCP play/pause, track composite, canvas profile, image sequence; skip SVG animation; daemon-style realsaprust tests",
+  "ordering_rationale": "C++ FFI first (source of truth), then sap-rust dispatch, then MCP tools, then mock + realsaprust tests",
+  "completed": [
+    {
+      "phase": "cpp_ffi_playback_composite_profile_sequence",
+      "status": "completed",
+      "implementation_evidence": "sap_ffi.h/cpp: play/pause/stop/get_state, set_track_composite + listTracks composite, set/get_profile, playlist_append_image_sequence"
+    },
+    {
+      "phase": "sap_rust_backend_server",
+      "status": "completed",
+      "implementation_evidence": "cargo test --lib 22 ok; cargo test --test server_integration 28 ok"
+    },
+    {
+      "phase": "snapshotd_mcp_tools",
+      "status": "completed",
+      "implementation_evidence": "MCP tools registered for playback.*, project.set/getProfile, playlist.appendImageSequence, edit.setTrackProperties.composite"
+    },
+    {
+      "phase": "realsaprust_daemon_tests",
+      "status": "completed",
+      "implementation_evidence": "play_composite_realsaprust_test.go; skips cleanly until shotcut real_ffi rebuild (method not found project.setProfile)"
+    }
+  ],
+  "pending": [
+    {
+      "phase": "review_gate",
+      "order": 5,
+      "tier": "review_gate",
+      "status": "not_started",
+      "description": "Quick audit of lock/thread safety on new FFI invoke paths.",
+      "max_iterations": 2
+    },
+    {
+      "phase": "verification_gate",
+      "order": 6,
+      "tier": "verification_gate",
+      "status": "not_started",
+      "description": "Verify implementation against 00-plan.md phases.",
+      "misalignments": []
+    },
+    {
+      "phase": "rebuild_shotcut_real_ffi",
+      "order": 7,
+      "tier": "runtime_gate",
+      "status": "not_started",
+      "description": "Rebuild shotcut with new sap_ffi symbols so realsaprust test exercises live path instead of skip.",
+      "verification": "go test -run PlayCompositeProfileImageSequence_RealSapRust passes without Skip"
+    }
+  ]
+}
