@@ -379,6 +379,19 @@ impl Gateway {
                 GatewayWsClient::connect(&self.base_url),
             )
             .await;
+            if let Ok(Err(error)) = &attempt_result {
+                if error.is_runtime_shutdown() {
+                    eprintln!(
+                        "acpx-client: gateway reconnect to {} aborted -- local Tokio runtime is shutting down ({error})",
+                        self.base_url
+                    );
+                    *self
+                        .websocket
+                        .write()
+                        .expect("gateway websocket lock poisoned") = None;
+                    return false;
+                }
+            }
             if let Ok(Ok(client)) = attempt_result {
                 *self
                     .websocket

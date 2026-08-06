@@ -54,6 +54,10 @@ impl AcpxThreadError {
     pub(crate) fn is_authentication_or_capacity(&self) -> bool {
         matches!(self, Self::Gateway(error) if error.is_authentication_or_capacity())
     }
+
+    pub(crate) fn is_runtime_shutdown(&self) -> bool {
+        matches!(self, Self::Gateway(error) if error.is_runtime_shutdown())
+    }
 }
 
 fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
