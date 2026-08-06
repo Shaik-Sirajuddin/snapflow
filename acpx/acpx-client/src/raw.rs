@@ -41,6 +41,13 @@ pub enum ClientError {
     WebSocket(String),
 }
 
+const RUNTIME_SHUTDOWN_ERROR_SUBSTR: &str = "being shutdown";
+
+pub fn is_runtime_shutdown_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("tokio") && message.contains(RUNTIME_SHUTDOWN_ERROR_SUBSTR)
+}
+
 impl ClientError {
     /// Only transport loss and gateway-startup/recovery responses are safe
     /// to retry. Authentication and capacity errors are stable server-side
@@ -48,7 +55,7 @@ impl ClientError {
     /// pressure while the user still has no valid credentials/capacity.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::WebSocket(_) => true,
+            Self::WebSocket(message) => !is_runtime_shutdown_error(message),
             Self::Http(error) => error.is_connect() || error.is_timeout(),
             Self::Rpc { message, .. } => {
                 let message = message.to_ascii_lowercase();
@@ -68,6 +75,10 @@ impl ClientError {
             }
             _ => false,
         }
+    }
+
+    pub fn is_runtime_shutdown(&self) -> bool {
+        matches!(self, Self::WebSocket(message) if is_runtime_shutdown_error(message))
     }
 }
 
@@ -104,6 +115,16 @@ mod tests {
                 .into(),
         }
         .is_authentication_or_capacity());
+    }
+
+    #[test]
+    fn runtime_shutdown_websocket_errors_are_not_transient() {
+        let error = ClientError::WebSocket(
+            "IO error: A Tokio 1.x context was found, but it is being shutdown.".into(),
+        );
+        assert!(!error.is_transient());
+        assert!(error.is_runtime_shutdown());
+        assert!(ClientError::WebSocket("connection reset by peer".into()).is_transient());
     }
 }
 
