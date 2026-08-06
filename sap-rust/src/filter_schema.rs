@@ -11,6 +11,14 @@ fn known(service: &str, property: &str) -> Option<bool> {
             "level" | "alpha" | "start" | "end" | "threads" | "rgb_only"
         ),
         "qtcrop" => property == "rect",
+        // MLT's core `crop` filter removes edge pixels. It does not use the
+        // commonly assumed x/y/width/height rectangle API; those keys are
+        // silently retained by MLT's generic property bag but have no
+        // rendering effect. Use left/right/top/bottom (or center) instead.
+        "crop" => matches!(
+            property,
+            "active" | "left" | "right" | "top" | "bottom" | "center" | "center_bias" | "use_profile"
+        ),
         "volume" => matches!(property, "level" | "gain"),
         "panner" => matches!(property, "start" | "end" | "channel"),
         "affine" => {
@@ -144,6 +152,19 @@ pub fn describe(service: &str) -> Value {
         .into_iter()
         .map(|k| (k.into(), json!({"type":"scalar"})))
         .collect(),
+        "crop" => [
+            ("active", json!({"type":"integer","minimum":0,"maximum":1})),
+            ("left", json!({"type":"integer","minimum":0,"unit":"pixels"})),
+            ("right", json!({"type":"integer","minimum":0,"unit":"pixels"})),
+            ("top", json!({"type":"integer","minimum":0,"unit":"pixels"})),
+            ("bottom", json!({"type":"integer","minimum":0,"unit":"pixels"})),
+            ("center", json!({"type":"integer","minimum":0,"maximum":1})),
+            ("center_bias", json!({"type":"integer","minimum":0,"unit":"pixels"})),
+            ("use_profile", json!({"type":"integer","minimum":0,"maximum":1})),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v))
+        .collect(),
         _ => Map::new(),
     };
     json!({"mltService": service, "schemaAvailable": !properties.is_empty(), "properties": properties})
@@ -156,6 +177,8 @@ mod tests {
     fn rejects_silent_noop_properties() {
         assert!(validate_property("brightness", "opacity", &json!(0.5), false).is_err());
         assert!(validate_property("affine", "transition.geometry", &json!("x"), false).is_err());
+        assert!(validate_property("crop", "width", &json!(100), false).is_err());
+        assert!(validate_property("crop", "left", &json!(10), false).is_ok());
         assert!(validate_property("brightness", "alpha", &json!(0.5), true).is_ok());
         assert!(validate_property("frei0r.any", "plugin_property", &json!(1), false).is_ok());
     }

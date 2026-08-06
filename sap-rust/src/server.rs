@@ -431,7 +431,6 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                 kind: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            filter_schema::validate_properties(&p.mlt_service, &p.properties).map_err(|message| RpcError { code: error_codes::INVALID_PARAMS, message, data: None })?;
             Ok(Box::new(move |b| {
                 match b.edit_add_track(&project_id, &p.kind) {
                     Ok(track) => BackendCallResult {
