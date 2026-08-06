@@ -126,9 +126,6 @@ jobs:
   shotcut-rebrand:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: shotcut-rebrand
     steps:
       # This repo, for sap-rust and panel-rust -- shotcut-rebrand/
       # CMakeLists.txt builds both via Corrosion at
@@ -193,6 +190,7 @@ jobs:
           brew install qt@6 mlt fftw pkg-config cmake ninja
 
       - name: Configure + build
+        working-directory: shotcut-rebrand
         run: |
           QT_PREFIX=$(brew --prefix qt@6)
           cmake -B build -G Ninja \
@@ -201,6 +199,7 @@ jobs:
           cmake --build build --parallel
 
       - name: Bundle app + Qt frameworks
+        working-directory: shotcut-rebrand
         run: |
           QT_PREFIX=$(brew --prefix qt@6)
           APP=$(find build -maxdepth 2 -name "*.app" -print -quit)
@@ -208,6 +207,7 @@ jobs:
           "$QT_PREFIX/bin/macdeployqt" "$APP"
 
       - name: Embed MLT modules + data (Homebrew MLT is not statically bundled by macdeployqt)
+        working-directory: shotcut-rebrand
         run: |
           MLT_PREFIX=$(brew --prefix mlt)
           mkdir -p "$APP/Contents/lib" "$APP/Contents/share"
@@ -222,6 +222,7 @@ jobs:
           chmod +x "$APP/Contents/MacOS/mlt-env.sh"
 
       - name: Create unsigned dmg
+        working-directory: shotcut-rebrand
         run: |
           VERSION=$(date +"%y.%-m.%-d")
           hdiutil create -fs HFS+ -srcfolder "$APP" -volname Snapflow -format UDBZ \
