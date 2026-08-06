@@ -390,10 +390,12 @@ async fn ext_registry_agents_list_and_status_and_install_round_trip() {
         .await
         .expect("agents/install");
     assert_eq!(install["id"], codex_id);
-    assert!(install["outcome"]
-        .as_str()
-        .unwrap()
-        .contains("RuntimeConfirmed"));
+    // The gateway serializes `InstallOutcome::PackageReady` with its
+    // distribution-specific variant name.  `RuntimeConfirmed` was the old
+    // prefetch outcome and is no longer emitted by the current registry
+    // installer; asserting the current wire contract keeps this end-to-end
+    // test aligned with the implementation.
+    assert!(install["outcome"].as_str().unwrap().contains("PackageReady"));
 }
 
 /// **acpx-client SDK level, end to end**: proves the whole interactive
