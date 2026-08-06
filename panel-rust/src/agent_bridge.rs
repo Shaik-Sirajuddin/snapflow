@@ -7323,6 +7323,7 @@ impl AgentBridge {
     pub fn request_gateway_catalog_refresh(&self, idx: usize) {
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
         const FETCHING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        const RUNTIME_SHUTDOWN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         {
             let Ok(cache) = self.gateway_catalog.try_lock() else {
                 return;
@@ -7338,7 +7339,9 @@ impl AgentBridge {
                         Some(crate::protocol_types::McpToolCatalog::Fetching)
                     )
                 });
-            let min_interval = if any_tools_fetching {
+            let min_interval = if acpx_client::raw::is_runtime_shutdown_error(&cache.agent_catalog_error) {
+                RUNTIME_SHUTDOWN_INTERVAL
+            } else if any_tools_fetching {
                 FETCHING_INTERVAL
             } else {
                 MIN_INTERVAL
@@ -7398,6 +7401,13 @@ impl AgentBridge {
                 loop {
                     match handle.list_agents().await {
                         Ok(agents) => return Ok(agents),
+                        Err(error) if error.is_runtime_shutdown() => {
+                            eprintln!(
+                                "panel-rust: agents/list attempt {} aborted ({error}) -- caller's Tokio runtime is shutting down, not retrying",
+                                attempt + 1
+                            );
+                            return Err(error);
+                        }
                         Err(error) if attempt + 1 < AGENTS_LIST_MAX_ATTEMPTS => {
                             attempt += 1;
                             let backoff = std::time::Duration::from_millis(
