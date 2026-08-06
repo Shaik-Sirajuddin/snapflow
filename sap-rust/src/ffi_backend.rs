@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 use serde_json::Value;
@@ -225,7 +225,7 @@ fn reset_child_signals(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
-/// Spawn `cmd` (which must already have `.stdout(Stdio::null())` and
+/// Spawn `cmd` (which must already have `.stdout(Stdio::piped())` and
 /// `.stderr(Stdio::piped())` set) and immediately start a background
 /// thread continuously draining the child's stderr into a shared buffer.
 ///
@@ -306,19 +306,44 @@ fn assign_to_kill_on_close_job(child: &Child) {
     }
 }
 
-fn spawn_melt_draining_stderr(mut cmd: Command) -> std::io::Result<(Child, Arc<Mutex<String>>)> {
+/// Spawn Melt and continuously drain both output streams. Melt writes its
+/// frame/progress heartbeat to stdout; keeping that pipe drained is essential
+/// because an undrained pipe can block the encoder before it writes the MP4.
+/// The heartbeat counter is deliberately advisory: a render is allowed to
+/// remain quiet while constructing a complex frame, and completion/explicit
+/// `jobs.stop` are the only terminal conditions.
+fn spawn_melt_draining_stderr(
+    mut cmd: Command,
+) -> std::io::Result<(Child, Arc<Mutex<String>>, Arc<std::sync::atomic::AtomicU64>)> {
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
     assign_to_kill_on_close_job(&child);
     let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let heartbeat = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if let Some(mut pipe) = child.stdout.take() {
+        let beat = heartbeat.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        beat.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
     if let Some(mut pipe) = child.stderr.take() {
         let buf = stderr_buf.clone();
+        let beat = heartbeat.clone();
         std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        beat.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut b) = buf.lock() {
                             b.push_str(&String::from_utf8_lossy(&chunk[..n]));
                         }
@@ -327,7 +352,7 @@ fn spawn_melt_draining_stderr(mut cmd: Command) -> std::io::Result<(Child, Arc<M
             }
         });
     }
-    Ok((child, stderr_buf))
+    Ok((child, stderr_buf, heartbeat))
 }
 
 impl FfiBackend {
@@ -2111,7 +2136,7 @@ impl Backend for FfiBackend {
             .arg(format!("vcodec={vcodec}"))
             .arg("acodec=aac")
             .env("QT_QPA_PLATFORM", &qt_platform)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         // Only forward DISPLAY when the melt child is explicitly NOT running
@@ -2133,7 +2158,7 @@ impl Backend for FfiBackend {
         }
         reset_child_signals(&mut cmd);
 
-        let (child, stderr_buf) = spawn_melt_draining_stderr(cmd).map_err(|e| {
+        let (child, stderr_buf, heartbeat) = spawn_melt_draining_stderr(cmd).map_err(|e| {
             BackendError::InvalidParams(format!(
                 "failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)"
             ))
@@ -2172,126 +2197,38 @@ impl Backend for FfiBackend {
 
         let jobs = self.jobs.clone();
         let job_id_bg = job_id.clone();
-        // melt, when forked directly from this live Qt/FFI process (as
-        // opposed to a plain shell), has been observed to occasionally
-        // wedge completely -- confirmed by hand: 129 threads all parked in
-        // futex_do_wait, output file size frozen, zero forward CPU time,
-        // for many minutes straight, while the exact same project XML run
-        // through a freshly-spawned `melt` from a normal shell (same HOME,
-        // same live-GUI contention) completes cleanly in under two
-        // minutes every time. The trigger wasn't pinned down (DISPLAY,
-        // HOME, and GUI concurrency were all ruled out by direct A/B
-        // testing), so treat it as a transient race in whatever this
-        // process forks rather than a deterministic bug: detect "no output
-        // file growth for STALL_TIMEOUT" and kill-and-respawn a fresh melt
-        // child (up to MAX_ATTEMPTS total) instead of hanging the job
-        // forever.
-        const STALL_TIMEOUT: Duration = Duration::from_secs(45);
-        const MAX_ATTEMPTS: u32 = 3;
-        let resolved_output_bg = resolved_output.clone();
-        let melt_bin_bg = melt_bin.clone();
-        let mlt_path_bg = mlt_path.clone();
-        let vcodec_bg = vcodec.clone();
-        let qt_platform_bg = qt_platform.clone();
+        // Melt may remain quiet while constructing a large first frame. Its
+        // stdout/stderr are drained continuously by the helper above, so the
+        // heartbeat pipes cannot deadlock the encoder. Completion or explicit
+        // jobs.stop are the terminal conditions; there is no wall-clock
+        // deadline to kill a valid long render.
         std::thread::spawn(move || {
-            let build_cmd = || {
-                let mut cmd = Command::new(&melt_bin_bg);
-                cmd.arg(&mlt_path_bg)
-                    .arg("-consumer")
-                    .arg(format!("avformat:{}", resolved_output_bg.display()))
-                    .arg(format!("vcodec={vcodec_bg}"))
-                    .arg("acodec=aac")
-                    .env("QT_QPA_PLATFORM", &qt_platform_bg)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped());
-                if qt_platform_bg != "offscreen" {
-                    if let Ok(display) = std::env::var("DISPLAY") {
-                        cmd.env("DISPLAY", display);
-                    }
-                } else {
-                    cmd.env_remove("DISPLAY");
-                }
-                reset_child_signals(&mut cmd);
-                cmd
-            };
-
-            let mut attempt = 1u32;
-            let mut current_stderr_buf = stderr_buf;
-            let outcome = 'attempts: loop {
-                let mut last_size = fs::metadata(&resolved_output_bg)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                let mut last_progress_at = Instant::now();
-                let per_attempt_outcome = loop {
-                    let mut guard = child_slot.lock().expect("job child mutex poisoned");
-                    match guard.as_mut() {
-                        None => return, // jobs_stop already took it and set status.
-                        Some(child) => match child.try_wait() {
-                            Ok(Some(status)) => {
-                                let _finished = guard.take().expect("child present after try_wait");
-                                // stderr was drained continuously by
-                                // `spawn_melt_draining_stderr`'s background
-                                // reader thread rather than buffered up in
-                                // the pipe -- see that function's doc
-                                // comment for why reading it only here
-                                // (after exit, from a `Stdio::piped()` pipe
-                                // nobody had been draining) was the actual
-                                // cause of the export stall.
-                                let stderr = current_stderr_buf
-                                    .lock()
-                                    .map(|b| b.clone())
-                                    .unwrap_or_default();
-                                break Some(Ok((status, stderr)));
-                            }
-                            Ok(None) => {
-                                let size = fs::metadata(&resolved_output_bg)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                if size != last_size {
-                                    last_size = size;
-                                    last_progress_at = Instant::now();
-                                }
-                                if last_progress_at.elapsed() >= STALL_TIMEOUT {
-                                    // Stalled: reclaim and kill this attempt's
-                                    // child, then either retry or give up.
-                                    let mut stalled =
-                                        guard.take().expect("child present while stalled");
-                                    drop(guard);
-                                    let _ = stalled.kill();
-                                    let _ = stalled.wait();
-                                    break None; // signals "stalled, not a real outcome"
-                                }
-                                drop(guard);
-                                std::thread::sleep(Duration::from_millis(50));
-                            }
-                            Err(e) => {
-                                *guard = None;
-                                break Some(Err(e));
-                            }
-                        },
-                    }
-                };
-                match per_attempt_outcome {
-                    Some(result) => break 'attempts result,
-                    None => {
-                        if attempt >= MAX_ATTEMPTS {
-                            break 'attempts Err(std::io::Error::other(format!(
-                                "melt stalled (no output progress for {:?}) on all {attempt} attempts",
-                                STALL_TIMEOUT
-                            )));
+            let mut heartbeat_seen = heartbeat.load(Ordering::Relaxed);
+            let outcome = loop {
+                let mut guard = child_slot.lock().expect("job child mutex poisoned");
+                match guard.as_mut() {
+                    None => return, // jobs_stop already took it and set status.
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let _finished = guard.take().expect("child present after try_wait");
+                            let stderr = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+                            break Ok((status, stderr));
                         }
-                        attempt += 1;
-                        match spawn_melt_draining_stderr(build_cmd()) {
-                            Ok((fresh_child, fresh_stderr_buf)) => {
-                                current_stderr_buf = fresh_stderr_buf;
-                                *child_slot.lock().expect("job child mutex poisoned") =
-                                    Some(fresh_child);
+                        Ok(None) => {
+                            // A relaxed atomic read is the complete heartbeat
+                            // path: no rendering work, allocation, or timer.
+                            let current = heartbeat.load(Ordering::Relaxed);
+                            if current != heartbeat_seen {
+                                heartbeat_seen = current;
                             }
-                            Err(e) => {
-                                break 'attempts Err(e);
-                            }
+                            drop(guard);
+                            std::thread::sleep(Duration::from_millis(50));
                         }
-                    }
+                        Err(e) => {
+                            *guard = None;
+                            break Err(e);
+                        }
+                    },
                 }
             };
 
