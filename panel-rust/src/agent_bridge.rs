@@ -374,6 +374,7 @@ struct GatewayCatalogCache {
     profiles: Vec<crate::gateway_actor::ProfileSummary>,
     mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    agent_catalog_error: String,
     recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     recovery_provider: String,
     /// Monotonic generation; UI can detect "never filled" as gen == 0.
@@ -4426,12 +4427,44 @@ impl AgentBridge {
     /// bridge tokio runtime (canonical push pattern; same as `poll` drain).
     pub fn request_gateway_catalog_refresh(&self, idx: usize) {
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const FETCHING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        // The "owning Tokio runtime is shutting down" class of failure
+        // (see `acpx_client::raw::is_runtime_shutdown_error`) cannot
+        // self-heal by retrying -- it means this bridge's own background
+        // runtime lost its execution context, so every future RPC on it
+        // will fail identically no matter how soon we ask again. Falling
+        // back to `MIN_INTERVAL`'s 2s cadence in that state is what
+        // produced the "agents/list attempt 1 failed ... retrying"
+        // spam observed looping forever on `nitro` (2026-08-05, once per
+        // frame-driven refresh tick, indefinitely, until the app was
+        // restarted): back off far more aggressively instead so the
+        // condition is still visible in logs but stops flooding them.
+        const RUNTIME_SHUTDOWN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         {
             let Ok(cache) = self.gateway_catalog.try_lock() else {
                 return;
             };
+            let ops = self.mcp_operations.try_lock().ok();
+            let any_tools_fetch_op = ops
+                .as_ref()
+                .is_some_and(|set| set.iter().any(|k| k.starts_with("tools_fetch:")));
+            let any_tools_fetching = any_tools_fetch_op
+                || cache.mcp_servers.iter().any(|entry| {
+                    matches!(
+                        entry.tool_catalog,
+                        Some(crate::protocol_types::McpToolCatalog::Fetching)
+                    )
+                });
+            let min_interval =
+                if acpx_client::raw::is_runtime_shutdown_error(&cache.agent_catalog_error) {
+                    RUNTIME_SHUTDOWN_INTERVAL
+                } else if any_tools_fetching {
+                    FETCHING_INTERVAL
+                } else {
+                    MIN_INTERVAL
+                };
             if let Some(at) = cache.last_refresh {
-                if cache.gen > 0 && at.elapsed() < MIN_INTERVAL {
+                if cache.gen > 0 && at.elapsed() < min_interval {
                     return;
                 }
             }
@@ -4460,9 +4493,77 @@ impl AgentBridge {
         let refreshing = self.gateway_catalog_refreshing.clone();
         let admin_creds = resolve_admin_creds();
         self.runtime.spawn(async move {
-            let profiles = handle.list_profiles().await.unwrap_or_default();
-            let mcp_servers = handle.list_mcp_servers().await.unwrap_or_default();
-            let mut agents = handle.list_agents().await.unwrap_or_default();
+            // `agents/list` gets its own bounded retry-with-backoff on top of
+            // the transport's own reconnect-then-HTTP-fallback (see
+            // `Gateway::call`/`call_after_reconnect` in acpx-client): by the
+            // time this returns `Err`, the transport has *already* tried a
+            // fresh WS reconnect and a full HTTP-transport fallback, so a
+            // failure here means both of those failed too -- retrying the
+            // whole thing a few more times, spaced out, gives a genuinely
+            // slow-to-come-up acpx-server (not just a dead one) more real
+            // wall-clock time to recover before this surfaces as
+            // `agent_catalog_error` in Settings. Bounded (not literally
+            // "forever") so a truly dead gateway still degrades to a visible
+            // error instead of silently retrying indefinitely with no
+            // feedback.
+            const AGENTS_LIST_MAX_ATTEMPTS: u32 = 5;
+            let list_agents_with_retry = async {
+                let mut attempt = 0u32;
+                loop {
+                    match handle.list_agents().await {
+                        Ok(agents) => return Ok(agents),
+                        // The "owning Tokio runtime is shutting down" class
+                        // (see `ClientError::is_runtime_shutdown`) is not a
+                        // transient disconnect -- the transport's own
+                        // reconnect loop (`Gateway::reconnect`) already
+                        // gave up immediately rather than re-dialing a dead
+                        // context, so every further attempt here would fail
+                        // identically. Bail out now instead of burning the
+                        // rest of the backoff budget on a hopeless retry --
+                        // observed live on `nitro` (2026-08-05) looping
+                        // this way, once per ~2s catalog-refresh tick,
+                        // indefinitely until the app was restarted.
+                        Err(error) if error.is_runtime_shutdown() => {
+                            eprintln!(
+                                "panel-rust: agents/list attempt {} aborted ({error}) -- \
+                                 caller's Tokio runtime is shutting down, not retrying",
+                                attempt + 1
+                            );
+                            return Err(error);
+                        }
+                        Err(error) if attempt + 1 < AGENTS_LIST_MAX_ATTEMPTS => {
+                            attempt += 1;
+                            let backoff = std::time::Duration::from_millis(
+                                500u64 * (1u64 << (attempt - 1)),
+                            );
+                            eprintln!(
+                                "panel-rust: agents/list attempt {attempt} failed ({error}), retrying in {backoff:?}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            // These four RPCs are independent of each other (only the admin-enablement
+            // merge below depends on `agents` having resolved), so run them concurrently
+            // via `tokio::join!` instead of paying for N sequential round-trips.
+            let (profiles, mcp_servers, agents_result, sessions_result) = tokio::join!(
+                handle.list_profiles(),
+                handle.list_mcp_servers(),
+                list_agents_with_retry,
+                handle.list_sessions_for_agent(provider.clone())
+            );
+            let profiles = profiles.unwrap_or_default();
+            let mcp_servers = mcp_servers.unwrap_or_default();
+            let (mut agents, agent_catalog_error) = match agents_result {
+                Ok(agents) => (agents, String::new()),
+                Err(error) => {
+                    let message = error.to_string();
+                    eprintln!("panel-rust: agents/list failed: {message}");
+                    (Vec::new(), message)
+                }
+            };
             if let Some((admin_url, admin_token)) = admin_creds {
                 let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
                 if let Ok(entries) = client.list_agents().await {
@@ -4489,6 +4590,7 @@ impl AgentBridge {
                     c.profiles = profiles;
                     c.mcp_servers = mcp_servers;
                     c.agents = agents;
+                    c.agent_catalog_error = agent_catalog_error;
                     c.recoverable_sessions = recoverable_sessions;
                     c.recovery_provider = provider;
                     c.gen = c.gen.saturating_add(1).max(1);
