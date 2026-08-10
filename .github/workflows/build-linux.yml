@@ -171,8 +171,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          # Pin the shipped GUI source to the branch containing the AI rollout gate.
-          ref: snapflow-ai-disable-rollout-v2
+          ref: master
           path: shotcut-rebrand
 
       # Caches build-shotcut.sh's vendored dependencies (FFmpeg/x264/x265/
@@ -378,7 +377,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: snapflow-ai-disable-rollout-v2
+          ref: master
           path: shotcut-rebrand
           sparse-checkout: |
             packaging/linux

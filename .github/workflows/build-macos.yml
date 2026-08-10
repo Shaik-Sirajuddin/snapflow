@@ -169,8 +169,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          # Pin the shipped GUI source to the branch containing the AI rollout gate.
-          ref: snapflow-ai-disable-rollout-v2
+          ref: master
           path: shotcut-rebrand
 
       # Place sap-rust AND panel-rust (+ panel-rust's own path deps: acpx,
