@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -512,6 +512,8 @@ impl SnapshotdRegistration {
                     let mut current_project_path = initial_project_path.clone();
                     let mut current_reason = "opened".to_owned();
                     let mut current_generation = 0u64;
+                    let mut managed_pending = managed;
+                    let mut last_heartbeat = Instant::now();
                     let mut current_id = if managed { managed_instance_id.clone() } else {
                         runtime.block_on(async { register_and_extract_id(&client, &registration).await })
                     };
@@ -520,13 +522,13 @@ impl SnapshotdRegistration {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
                         if managed {
-                            let _ = runtime.block_on(client.instance_project_changed(
+                            managed_pending = runtime.block_on(client.instance_project_changed(
                                 "managed", id, None, current_project_path.as_deref(),
-                                &current_reason, current_generation));
+                                &current_reason, current_generation)).is_err();
                         }
                     }
                     loop {
-                        match receiver.recv_timeout(Duration::from_secs(10)) {
+                        match receiver.recv_timeout(Duration::from_millis(250)) {
                             Ok(RegistrationCommand::Update {
                                 project_path,
                                 reason,
@@ -536,7 +538,11 @@ impl SnapshotdRegistration {
                                 current_reason = reason;
                                 current_generation = generation;
                                 if let Some(id) = current_id.as_deref() {
-                                    let _ = if managed { runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)) } else { runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation)) };
+                                    if managed {
+                                        managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                    } else {
+                                        let _ = runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation));
+                                    }
                                 }
                             }
                             Ok(RegistrationCommand::Stop)
@@ -549,6 +555,13 @@ impl SnapshotdRegistration {
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 if let Some(id) = current_id.as_deref() {
+                                    if managed && managed_pending {
+                                        managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                    }
+                                    if last_heartbeat.elapsed() < Duration::from_secs(10) {
+                                        continue;
+                                    }
+                                    last_heartbeat = Instant::now();
                                     if runtime.block_on(client.heartbeat(id)).is_err() {
                                         registration.project_path = current_project_path.clone();
                                         current_id = if managed { managed_instance_id.clone() } else { runtime.block_on(async { register_and_extract_id(&client, &registration).await }) };
@@ -557,7 +570,11 @@ impl SnapshotdRegistration {
                                                 .lock()
                                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                                 Some(id.clone());
-                                            let _ = if managed { runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)) } else { runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation)) };
+                                            if managed {
+                                                managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                            } else {
+                                                let _ = runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation));
+                                            }
                                         }
                                     }
                                 } else {
@@ -568,7 +585,11 @@ impl SnapshotdRegistration {
                                             .lock()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                             Some(id.clone());
-                                        let _ = if managed { runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)) } else { runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation)) };
+                                        if managed {
+                                            managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                        } else {
+                                            let _ = runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation));
+                                        }
                                     }
                                 }
                             }
