@@ -86,8 +86,13 @@ curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scri
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
+irm -UseBasicParsing https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
 ```
+
+Windows PowerShell 5.1 may prompt before reading web content after recent
+security updates. `-UseBasicParsing` avoids that prompt; PowerShell 7 does not
+need the switch. If using curl, call `curl.exe` (not the Windows PowerShell
+`curl` alias): `curl.exe -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex`.
 
 Each detects your OS/arch, downloads the matching release bundle from
 [Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases) with a live progress
