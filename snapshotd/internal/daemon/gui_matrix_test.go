@@ -63,6 +63,48 @@ func TestGUIMatrix_DaemonAvailableAtGUIStart(t *testing.T) {
 	}
 }
 
+func TestInstanceProjectChanged_CoalescesStaleExternalGeneration(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	a, err := d.CreateProject(ctx, CreateProjectParams{Name: "switch-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := d.CreateProject(ctx, CreateProjectParams{Name: "switch-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "switch-nonce", PID: os.Getpid(), ProcessStart: mustProcessStart(t),
+		ProjectPath: filepath.Join(a.RootDir, a.MltFileName),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := d.InstanceProjectChanged(ctx, InstanceProjectChangedParams{
+		Owner: "external", InstanceID: reg.Instance.ID, InstanceNonce: reg.Instance.InstanceNonce,
+		PID: os.Getpid(), ProcessStart: mustProcessStart(t),
+		ProjectPath: filepath.Join(b.RootDir, b.MltFileName), Reason: "switched", Generation: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.(registry.ExternalInstance).Generation != 2 {
+		t.Fatalf("expected generation 2")
+	}
+	stale, err := d.InstanceProjectChanged(ctx, InstanceProjectChangedParams{
+		Owner: "external", InstanceID: reg.Instance.ID, InstanceNonce: reg.Instance.InstanceNonce,
+		PID: os.Getpid(), ProcessStart: mustProcessStart(t),
+		ProjectPath: filepath.Join(a.RootDir, a.MltFileName), Reason: "opened", Generation: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.(registry.ExternalInstance).Generation != 2 {
+		t.Fatalf("stale callback regressed generation")
+	}
+}
+
 func TestGUIMatrix_GUIRegistrationPreventsHeadlessDuplicateOnProjectOpen(t *testing.T) {
 	d := newTestDaemon(t, buildFixture(t))
 	ctx := context.Background()

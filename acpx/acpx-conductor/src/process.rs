@@ -362,6 +362,13 @@ impl BackendProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // Backend processes are implementation details of the GUI/daemon.
+        // Do not flash a console window for npx/cmd/agent children on Windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }

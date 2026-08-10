@@ -421,6 +421,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"MLT_REPOSITORY",
 		"MLT_DATA",
 		"MLT_PROFILES_PATH",
+		"SNAPSHOTD_INSTANCE_ID",
 	}
 	if os.Getenv("MELT_BIN") == "" {
 		envKeys = append(envKeys, "MELT_BIN")
@@ -431,6 +432,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_SAP_SOCKET="+sockPath,
 		"SNAPSHOT_SAP_TOKEN="+token,
 		"SNAPSHOTD_MANAGED=1",
+		"SNAPSHOTD_INSTANCE_ID="+instanceID,
 		"SNAPSHOT_HEADLESS="+headlessVal,
 		"SNAPSHOT_PROJECT_ROOT="+opts.ProjectRoot,
 		"SNAPSHOT_PROJECT_MLT_FILENAME="+opts.MltFileName,
@@ -508,10 +510,12 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
 	}
 
+	processStart, _ := health.ProcessStartIdentity(cmd.Process.Pid)
 	pi := registry.ProcessInstance{
 		ID:               instanceID,
 		ProjectID:        projectID,
 		PID:              cmd.Process.Pid,
+		ProcessStart:     processStart,
 		SocketPath:       sockPath,
 		Token:            token,
 		DaemonInstanceID: m.DaemonInstanceID,

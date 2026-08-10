@@ -15,14 +15,11 @@ name: build-macos
 # job's first real validation has to happen on an actual GitHub-hosted
 # macos-latest runner, not locally.
 
-# Auto-rebuild on every push to main is paused (ag-pipelines-setup task) --
-# main only rebuilds via a tag push or an explicit workflow_dispatch now,
-# to stop burning CI minutes on every commit.
+# macOS release builds are currently disabled. Keep a manual dispatch escape
+# hatch for an intentional macOS validation run without starting them from
+# release tags or pull requests.
 
 on:
-  push:
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch: {}
 
 # package's "Publish to GitHub Release" step needs contents: write --
