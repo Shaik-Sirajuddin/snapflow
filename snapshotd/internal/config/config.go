@@ -78,6 +78,11 @@ type Config struct {
 	// until an operator explicitly enables it.
 	AudioEnabled bool
 
+	// DisableAIMode is the temporary rollout switch for the embedded AI panel
+	// and bundled ACPX gateway. It defaults to true until the UI path is
+	// explicitly re-enabled with SNAPFLOW_DISABLE_AI_MODE=0/false/no.
+	DisableAIMode bool
+
 	// AcpxEnabled starts an optional long-lived acpx-server child under serve
 	// (snapshotd-bundled-acpx-gateway). Default: on when AcpxBinPath is found
 	// and SNAPSHOTD_ACPX_ENABLED is unset; explicit 0/1 always wins.
@@ -179,11 +184,20 @@ func Default() Config {
 		acpxAdminBind = "127.0.0.1:8791"
 	}
 	acpxEnabled := false
+	disableAIMode := true
+	if v, ok := os.LookupEnv("SNAPFLOW_DISABLE_AI_MODE"); ok {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			disableAIMode = parsed
+		}
+	}
 	if v, ok := os.LookupEnv("SNAPSHOTD_ACPX_ENABLED"); ok {
 		acpxEnabled, _ = strconv.ParseBool(v)
 	} else {
 		// Default on only when a binary is discoverable so plain serve stays quiet.
 		acpxEnabled = acpxBin != ""
+	}
+	if disableAIMode {
+		acpxEnabled = false
 	}
 	acpxDefaultAcpCommand := os.Getenv("SNAPSHOTD_ACPX_DEFAULT_ACP_COMMAND")
 	if acpxDefaultAcpCommand == "" {
@@ -202,6 +216,7 @@ func Default() Config {
 		LaunchConnectTimeout:  launchTimeout,
 		MCPSSEAddr:            mcpAddr,
 		AudioEnabled:          audioEnabled,
+		DisableAIMode:         disableAIMode,
 		AcpxEnabled:           acpxEnabled,
 		AcpxBinPath:           acpxBin,
 		AcpxHttpBind:          acpxBind,
