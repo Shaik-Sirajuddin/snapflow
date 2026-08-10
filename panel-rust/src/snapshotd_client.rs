@@ -386,7 +386,7 @@ impl SnapshotdRegistration {
         // process-instance rows in snapshotd. They must not also register as
         // external GUI owners, or a cold project.open can observe two owners
         // and fail to drain the headless child deterministically.
-        if std::env::var("SNAPSHOTD_MANAGED").ok().as_deref() == Some("1") {
+        if is_daemon_managed(std::env::var("SNAPSHOTD_MANAGED").ok().as_deref()) {
             return None;
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -640,6 +640,12 @@ impl SnapshotdRegistration {
     pub fn take_project_inventory_notification(&self) -> bool {
         self.take_project_inventory().is_some()
     }
+}
+
+/// Daemon-launched GUI children already have a managed process-instance row.
+/// Only a native/self-launched GUI should create an external-instance lease.
+fn is_daemon_managed(marker: Option<&str>) -> bool {
+    marker == Some("1")
 }
 
 impl Drop for SnapshotdRegistration {
@@ -1105,6 +1111,13 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[test]
+    fn managed_children_do_not_register_as_external_instances() {
+        assert!(is_daemon_managed(Some("1")));
+        assert!(!is_daemon_managed(None));
+        assert!(!is_daemon_managed(Some("0")));
+    }
 
     #[test]
     fn sap_endpoint_selection_never_falls_back_to_discovery_socket() {
