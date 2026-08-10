@@ -99,6 +99,14 @@ impl TerminalHandle {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // ACP terminal commands are backend implementation details.  On
+        // Windows a console-subsystem child otherwise creates a visible
+        // console even though both streams are captured by the gateway.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }

@@ -212,6 +212,7 @@ func platformArch() (string, error) {
 
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	configureHiddenProcess(cmd)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
