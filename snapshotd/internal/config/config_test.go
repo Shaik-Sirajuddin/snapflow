@@ -34,6 +34,24 @@ func TestDefaultReadsPersistedRuntimeConfigWithEnvPrecedence(t *testing.T) {
 	}
 }
 
+func TestDefaultReadsUtf8BomOnFirstRuntimeConfigKey(t *testing.T) {
+	tmp := t.TempDir()
+	configFile := filepath.Join(tmp, "runtime.env")
+	if err := os.WriteFile(configFile, []byte("\xef\xbb\xbfSNAPSHOTD_HOME=/bom/home\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldFile, oldHome := os.Getenv("SNAPFLOW_CONFIG_FILE"), os.Getenv("SNAPSHOTD_HOME")
+	t.Cleanup(func() {
+		setOrUnset("SNAPFLOW_CONFIG_FILE", oldFile)
+		setOrUnset("SNAPSHOTD_HOME", oldHome)
+	})
+	os.Setenv("SNAPFLOW_CONFIG_FILE", configFile)
+	os.Unsetenv("SNAPSHOTD_HOME")
+	if got := Default().HomeDir; got != "/bom/home" {
+		t.Fatalf("BOM-prefixed key was not read: %q", got)
+	}
+}
+
 func TestDiscoverShotcutBinPathFindsInstalledProductionBundle(t *testing.T) {
 	root := t.TempDir()
 	app := filepath.Join(root, "Snapflow.app")

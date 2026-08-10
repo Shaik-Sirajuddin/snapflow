@@ -255,6 +255,10 @@ func readPersistedRuntimeConfig() map[string]string {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		// Windows PowerShell 5.1's default UTF-8 writer emits a BOM. Be
+		// tolerant of an existing runtime.env written by that version (or by
+		// another editor) so the first key is not silently ignored.
+		line = strings.TrimPrefix(line, "\ufeff")
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}

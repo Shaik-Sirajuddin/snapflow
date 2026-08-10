@@ -15,17 +15,39 @@
 #   SNAPFLOW_ASSET_URL    skip the GitHub API lookup and install this zip URL directly
 #                         (mainly for testing against a non-published build)
 #
-# No service auto-start yet (install.sh's setup_linux_service/
-# setup_macos_service equivalent) -- Windows needs either a Scheduled Task
-# or NSSM-style wrapper to run snapflowd.exe unattended at logon, which is
-# a real enough design decision (elevation? per-user vs per-machine task?)
-# that it's deliberately left out of this first pass rather than guessed
-# at. Run `snapflowd.exe serve` manually for now.
-
 $ErrorActionPreference = "Stop"
 
 function Info($msg) { Write-Host "==> $msg" }
 function Die($msg) { Write-Error "error: $msg"; exit 1 }
+
+function Start-DaemonAndWait($daemonPath) {
+    # A responsive daemon owns the lock already; reuse it and never restart
+    # the user's live projects during an upgrade. status is also the portable
+    # readiness check: on Windows it dials the named pipe directly.
+    & $daemonPath status *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Info "snapflowd is already running; reusing the existing daemon."
+        return
+    }
+
+    $logDir = Join-Path $env:LOCALAPPDATA "snapflow"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $stdout = Join-Path $logDir "snapflowd-install.stdout.log"
+    $stderr = Join-Path $logDir "snapflowd-install.stderr.log"
+    Info "Starting snapflowd in the background..."
+    Start-Process -FilePath $daemonPath -ArgumentList @("serve") -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        Start-Sleep -Milliseconds 250
+        & $daemonPath status *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Info "snapflowd is ready."
+            return
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Die "snapflowd did not become ready within 15 seconds; see $stderr"
+}
 
 if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64" -and $env:PROCESSOR_ARCHITEW6432 -ne "AMD64") {
     Die "unsupported architecture: $env:PROCESSOR_ARCHITECTURE -- only x86_64/AMD64 builds are published"
@@ -71,7 +93,7 @@ if (Test-Path $VersionFile) {
     $snapflowdExe = Join-Path $BinDir "snapflowd.exe"
     if ($installedVersion -and $installedVersion.Trim() -eq $targetVersion -and (Test-Path $snapflowdExe)) {
         Info "snapflow $targetVersion is already installed and up to date -- nothing to do."
-        Info "(force a reinstall by removing $VersionFile, or set SNAPFLOW_VERSION to a different tag)"
+        Start-DaemonAndWait $snapflowdExe
         exit 0
     }
 }
@@ -176,7 +198,11 @@ if ($snapshotBinPath) {
     $runtimeConfigFile = Join-Path $runtimeConfigDir "runtime.env"
     New-Item -ItemType Directory -Path $runtimeConfigDir -Force | Out-Null
     $existing = if (Test-Path $runtimeConfigFile) { Get-Content $runtimeConfigFile | Where-Object { $_ -notmatch '^SNAPSHOT_BIN_PATH=' } } else { @() }
-    @($existing + "SNAPSHOT_BIN_PATH=$snapshotBinPath") | Set-Content -Path $runtimeConfigFile -Encoding utf8
+    # .NET's UTF8Encoding(false) avoids the BOM emitted by Windows
+    # PowerShell 5.1's `-Encoding utf8`; snapshotd also accepts BOM files for
+    # compatibility with older installs.
+    $runtimeLines = @($existing + "SNAPSHOT_BIN_PATH=$snapshotBinPath")
+    [IO.File]::WriteAllText($runtimeConfigFile, (($runtimeLines -join [Environment]::NewLine) + [Environment]::NewLine), ([System.Text.UTF8Encoding]::new($false)))
     Info "Configured production snapshot child -> $snapshotBinPath"
 } else {
     Write-Warning "no snapflow.exe found in the installed bundle; daemon launch --gui requires SNAPSHOT_BIN_PATH"
@@ -204,4 +230,5 @@ if ($updatedPath) {
     Info "Added $($pathDirs -join ', ') to your User PATH (new terminals will pick it up automatically)"
 }
 
-Info "Done. Run 'snapflowd.exe serve' to start the daemon, or 'snapflow.exe' to launch the editor."
+Start-DaemonAndWait (Join-Path $BinDir "snapflowd.exe")
+Info "Done. snapflowd is running; launch 'snapflow.exe' to open the editor."
