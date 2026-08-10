@@ -1680,7 +1680,6 @@ pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
 // bridge shape as every UI domain above.
 
 pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option<String>) {
-    crate::snapshotd_lifecycle::project_changed(path.clone());
     let (effects, _) =
         update_persistent(panel, Msg::Host(HostMsg::ProjectPathChanged(path.clone())));
     execute_effects(panel, effects);
