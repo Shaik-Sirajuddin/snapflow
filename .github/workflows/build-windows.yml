@@ -83,6 +83,7 @@ jobs:
       # despite being verified locally -- back to advisory.
       - name: Run cargo test --release (advisory -- known flaky tests, see workflow header)
         continue-on-error: true
+        timeout-minutes: 20
         env:
           RUST_TEST_THREADS: "4"
         run: cargo test --release

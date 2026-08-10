@@ -93,6 +93,7 @@ jobs:
       # locally-verified) -- don't let it block packaging/release again.
       - name: Run cargo test --release (advisory -- known flaky tests, see workflow header)
         continue-on-error: true
+        timeout-minutes: 20
         env:
           RUST_TEST_THREADS: "4"
         run: cargo test --release
