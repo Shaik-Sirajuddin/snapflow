@@ -235,10 +235,16 @@ func bundledMeltBinary(binPath string) string {
 func appendBundledMltEnv(env []string, binPath string) []string {
 	appDir := filepath.Dir(binPath)
 	repo := filepath.Join(appDir, "lib", "mlt-7")
+	dataDirName := "mlt-7"
 	if st, err := os.Stat(repo); err != nil || !st.IsDir() {
-		return env
+		// Some Windows MLT builds use the unversioned MSYS2 directory name.
+		repo = filepath.Join(appDir, "lib", "mlt")
+		dataDirName = "mlt"
+		if st, err := os.Stat(repo); err != nil || !st.IsDir() {
+			return env
+		}
 	}
-	data := filepath.Join(appDir, "share", "mlt-7")
+	data := filepath.Join(appDir, "share", dataDirName)
 	result := append([]string{}, env...)
 	result = append(result, "MLT_REPOSITORY="+repo, "MLT_DATA="+data,
 		"MLT_PROFILES_PATH="+filepath.Join(data, "profiles"))
