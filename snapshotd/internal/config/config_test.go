@@ -68,6 +68,34 @@ func TestDiscoverShotcutBinPathFindsInstalledProductionBundle(t *testing.T) {
 	}
 }
 
+func TestDisableAIModeOnlySuppressesBundledACPX(t *testing.T) {
+	oldDisable, oldAcpx := os.Getenv("SNAPFLOW_DISABLE_AI_MODE"), os.Getenv("SNAPSHOTD_ACPX_ENABLED")
+	t.Cleanup(func() {
+		setOrUnset("SNAPFLOW_DISABLE_AI_MODE", oldDisable)
+		setOrUnset("SNAPSHOTD_ACPX_ENABLED", oldAcpx)
+	})
+
+	// An explicit ACPX enable must not override the rollout kill switch.
+	os.Setenv("SNAPFLOW_DISABLE_AI_MODE", "true")
+	os.Setenv("SNAPSHOTD_ACPX_ENABLED", "true")
+	cfg := Default()
+	if !cfg.DisableAIMode {
+		t.Fatal("disable AI mode flag was not read")
+	}
+	if cfg.AcpxEnabled {
+		t.Fatal("bundled ACPX remained enabled while AI mode was disabled")
+	}
+
+	// Re-enabling AI mode restores the explicit ACPX setting. The MCP adapter
+	// is independent of this flag and is started by cmd/snapshotd/main.go
+	// whenever --no-mcp is not supplied.
+	os.Setenv("SNAPFLOW_DISABLE_AI_MODE", "false")
+	cfg = Default()
+	if cfg.DisableAIMode || !cfg.AcpxEnabled {
+		t.Fatalf("AI mode enable did not restore ACPX: disable=%v acpx=%v", cfg.DisableAIMode, cfg.AcpxEnabled)
+	}
+}
+
 func setOrUnset(key, value string) {
 	if value == "" {
 		_ = os.Unsetenv(key)
