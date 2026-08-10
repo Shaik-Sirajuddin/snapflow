@@ -6,8 +6,6 @@
 
 Snapflow is a video editor with a builtin Agent Harness.
 
-Snapflow is a video editor for humans and Agents.
-
 <div align="center">
 
 <img src="staging/penpot-slide-assets/Snapflow-Live-Preview-v3.png" alt="Snapflow live preview" width="800" />
