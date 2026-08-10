@@ -143,14 +143,20 @@ async fn warm_npx_cache_if_needed(spec: &SpawnSpec) {
                 }
             }
         }
-        let status = std::process::Command::new(&program)
+        let mut command = std::process::Command::new(&program);
+        command
             .args(&args)
             .arg("--version")
             .envs(&env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let status = command.status();
         if let Err(error) = status {
             tracing::debug!(?error, "npx warm-up run failed (non-fatal)");
         }
