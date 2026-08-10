@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -31,7 +32,10 @@ func Acquire(homeDir string) (*Lock, error) {
 	path := filepath.Join(homeDir, "daemon.lock")
 	// A named mutex is released by Windows when the owning process exits, so
 	// a crash cannot strand a lock file and block the next install/start.
-	digest := sha256.Sum256([]byte(filepath.Clean(homeDir)))
+	// Windows volume paths are case-insensitive. Normalize case before
+	// deriving the mutex name so `C:\Users\Alice` and `c:\users\alice`
+	// cannot start two daemons for the same profile.
+	digest := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(homeDir))))
 	name := fmt.Sprintf("Local\\SnapflowSnapshotd-%x", digest[:12])
 	mutex, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(name))
 	if err != nil {
