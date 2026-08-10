@@ -62,10 +62,11 @@ const DefaultMltFileName = "project.mlt"
 // ProcessInstance is a running (or previously running) child process for a
 // Project, per 07-daemon-persistence.md's schema.
 type ProcessInstance struct {
-	ID         string `gorm:"primaryKey"`
-	ProjectID  string `gorm:"index"`
-	PID        int
-	SocketPath string
+	ID           string `gorm:"primaryKey"`
+	ProjectID    string `gorm:"index"`
+	PID          int
+	ProcessStart string
+	SocketPath   string
 	// Token is the per-launch SNAPSHOT_SAP_TOKEN generated for this
 	// instance's sap.hello handshake. Persisted (not just held in-process)
 	// so the daemon's own generic SAP proxy (internal/sapproxy) can
@@ -84,7 +85,8 @@ type ProcessInstance struct {
 	// so a caller needs this (together with LaunchResult.Reused) to know
 	// whether it actually got the visible/headful instance it may have
 	// wanted or is attaching to an existing headless one instead.
-	Headless bool
+	Headless   bool
+	Generation uint64
 }
 
 func (ProcessInstance) TableName() string { return "process_instances" }

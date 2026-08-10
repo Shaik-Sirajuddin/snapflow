@@ -348,6 +348,13 @@ func (r *Registry) ListProcessInstancesByProject(projectID string) ([]ProcessIns
 	return out, nil
 }
 
+func (r *Registry) UpdateProcessInstanceProject(id, projectID string, generation uint64) error {
+	return r.db.Model(&ProcessInstance{}).Where("id = ?", id).Updates(map[string]any{
+		"project_id": projectID, "generation": generation,
+		"last_health_check_at": time.Now().UTC(),
+	}).Error
+}
+
 func (r *Registry) UpdateProcessInstanceStatus(id, status string) error {
 	return r.db.Model(&ProcessInstance{}).Where("id = ?", id).Updates(map[string]any{
 		"status":               status,

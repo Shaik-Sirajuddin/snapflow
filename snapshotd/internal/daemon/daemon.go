@@ -291,6 +291,77 @@ type UpdateExternalProjectParams struct {
 	Generation  uint64 `json:"generation"`
 }
 
+// InstanceProjectChangedParams is the single lifecycle notification used by
+// both GUI ownership modes. Owner is "managed" for a process launched by
+// snapshotd and "external" for a self-launched GUI. Identity fields are
+// mandatory so a delayed callback cannot mutate a recycled PID/instance.
+type InstanceProjectChangedParams struct {
+	Owner         string `json:"owner"`
+	InstanceID    string `json:"instanceId"`
+	InstanceNonce string `json:"instanceNonce,omitempty"`
+	PID           int    `json:"pid"`
+	ProcessStart  string `json:"processStart"`
+	ProjectPath   string `json:"projectPath,omitempty"`
+	Reason        string `json:"reason"`
+	Generation    uint64 `json:"generation"`
+}
+
+func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectChangedParams) (any, error) {
+	if p.InstanceID == "" || p.PID <= 0 || p.ProcessStart == "" || p.Reason == "" {
+		return nil, fmt.Errorf("daemon: instanceProjectChanged: instance identity and reason are required")
+	}
+	if !health.ProcessIdentityMatches(p.PID, p.ProcessStart) {
+		return nil, fmt.Errorf("daemon: instanceProjectChanged: process identity does not match a live process")
+	}
+	var projectID string
+	if p.ProjectPath != "" {
+		path, err := canonicalExternalPath(p.ProjectPath)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: instanceProjectChanged: projectPath: %w", err)
+		}
+		project, err := d.Reg.EnsureProjectForPath(path)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: instanceProjectChanged: project: %w", err)
+		}
+		projectID = project.ID
+	}
+	switch p.Owner {
+	case "managed":
+		pi, err := d.Reg.GetProcessInstance(p.InstanceID)
+		if err != nil {
+			return nil, err
+		}
+		if pi.PID != p.PID || (pi.ProcessStart != "" && pi.ProcessStart != p.ProcessStart) {
+			return nil, fmt.Errorf("daemon: instanceProjectChanged: managed ownership mismatch")
+		}
+		if p.Generation < pi.Generation {
+			return *pi, nil
+		}
+		if err := d.Reg.UpdateProcessInstanceProject(pi.ID, projectID, p.Generation); err != nil {
+			return nil, err
+		}
+		updated, err := d.Reg.GetProcessInstance(pi.ID)
+		if err != nil {
+			return nil, err
+		}
+		return *updated, nil
+	case "external":
+		instance, err := d.Reg.GetExternalInstance(p.InstanceID)
+		if err != nil {
+			return nil, err
+		}
+		if p.InstanceNonce == "" || instance.InstanceNonce != p.InstanceNonce || instance.PID != p.PID || instance.ProcessStart != p.ProcessStart {
+			return nil, fmt.Errorf("daemon: instanceProjectChanged: external ownership mismatch")
+		}
+		if p.Generation < instance.Generation {
+			return *instance, nil
+		}
+		return d.UpdateOpenProject(ctx, UpdateExternalProjectParams{InstanceID: p.InstanceID, ProjectPath: p.ProjectPath, Reason: p.Reason, Generation: p.Generation})
+	default:
+		return nil, fmt.Errorf("daemon: instanceProjectChanged: owner must be managed or external")
+	}
+}
+
 func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectParams) (registry.ExternalInstance, error) {
 	d.externalMu.Lock()
 	defer d.externalMu.Unlock()
@@ -300,6 +371,9 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 	}
 	if p.Reason == "" {
 		return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: reason is required")
+	}
+	if p.Generation < instance.Generation {
+		return *instance, nil
 	}
 	if p.ProjectPath != "" {
 		path, err := canonicalExternalPath(p.ProjectPath)
@@ -1601,6 +1675,13 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return d.UpdateOpenProject(ctx, p)
+
+	case "daemon.instanceProjectChanged":
+		var p InstanceProjectChangedParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.InstanceProjectChanged(ctx, p)
 
 	case "daemon.heartbeat":
 		var p struct {
