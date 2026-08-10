@@ -25,12 +25,27 @@ $PSDefaultParameterValues['Invoke-RestMethod:UseBasicParsing'] = $true
 function Info($msg) { Write-Host "==> $msg" }
 function Die($msg) { Write-Error "error: $msg"; exit 1 }
 
+function Test-DaemonReady($daemonPath) {
+    # A failed native probe is expected before the first serve. Keep the
+    # installer's Stop preference from turning that expected stderr into a
+    # terminating PowerShell 5.1 error.
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $daemonPath status *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Start-DaemonAndWait($daemonPath) {
     # A responsive daemon owns the lock already; reuse it and never restart
     # the user's live projects during an upgrade. status is also the portable
     # readiness check: on Windows it dials the named pipe directly.
-    & $daemonPath status *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-DaemonReady $daemonPath) {
         Info "snapflowd is already running; reusing the existing daemon."
         return
     }
@@ -40,13 +55,16 @@ function Start-DaemonAndWait($daemonPath) {
     $stdout = Join-Path $logDir "snapflowd-install.stdout.log"
     $stderr = Join-Path $logDir "snapflowd-install.stderr.log"
     Info "Starting snapflowd in the background..."
-    Start-Process -FilePath $daemonPath -ArgumentList @("serve") -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
+    $daemon = Start-Process -FilePath $daemonPath -ArgumentList @("serve") -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
         Start-Sleep -Milliseconds 250
-        & $daemonPath status *> $null
-        if ($LASTEXITCODE -eq 0) {
+        if ($daemon.HasExited) {
+            $detail = if (Test-Path $stderr) { (Get-Content $stderr -Raw).Trim() } else { "no daemon stderr captured" }
+            Die "snapflowd exited before its control pipe became ready (code $($daemon.ExitCode)): $detail"
+        }
+        if (Test-DaemonReady $daemonPath) {
             Info "snapflowd is ready."
             return
         }
