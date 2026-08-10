@@ -17,6 +17,11 @@
 #
 $ErrorActionPreference = "Stop"
 
+# Windows PowerShell 5.1 may prompt before parsing web responses. The
+# installer only consumes JSON/bytes, so opt out of the legacy HTML parser.
+$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing'] = $true
+$PSDefaultParameterValues['Invoke-RestMethod:UseBasicParsing'] = $true
+
 function Info($msg) { Write-Host "==> $msg" }
 function Die($msg) { Write-Error "error: $msg"; exit 1 }
 
@@ -72,7 +77,7 @@ function Resolve-AssetUrl {
 
     Info "Looking up release ($Version) for windows..."
     try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "snapflow-install.ps1" }
+        $release = Invoke-RestMethod -UseBasicParsing -Uri $apiUrl -Headers @{ "User-Agent" = "snapflow-install.ps1" }
     } catch {
         Die "failed to query $apiUrl -- has a Windows release been published yet? ($_)"
     }
@@ -105,7 +110,7 @@ try {
     $archive = Join-Path $tmpDir $archiveName
 
     Info "Downloading $archiveName..."
-    Invoke-WebRequest -Uri $assetUrl -OutFile $archive -UserAgent "snapflow-install.ps1"
+    Invoke-WebRequest -UseBasicParsing -Uri $assetUrl -OutFile $archive -UserAgent "snapflow-install.ps1"
 
     # Only the sidecar *download* is allowed to fail soft (some assets may
     # not have one published) -- a genuine checksum mismatch below must be
@@ -117,7 +122,7 @@ try {
     $shaFile = "$archive.sha256"
     $haveSha = $true
     try {
-        Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UserAgent "snapflow-install.ps1" -ErrorAction Stop
+        Invoke-WebRequest -UseBasicParsing -Uri $shaUrl -OutFile $shaFile -UserAgent "snapflow-install.ps1" -ErrorAction Stop
     } catch {
         $haveSha = $false
         Write-Warning "no .sha256 found for this asset, skipping checksum verification"

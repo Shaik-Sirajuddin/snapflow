@@ -86,8 +86,12 @@ curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scri
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
+irm -UseBasicParsing https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
 ```
+
+For Windows PowerShell 5.1, `-UseBasicParsing` avoids the web-content
+confirmation prompt. If using curl, call `curl.exe` rather than the PowerShell
+`curl` alias.
 
 Each detects your OS/arch, downloads the matching release bundle from
 [Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases) with a live progress
