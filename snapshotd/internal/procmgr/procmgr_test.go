@@ -64,6 +64,24 @@ func TestBundledMeltBinary_FindsAppSiblingWithoutUsingHome(t *testing.T) {
 	}
 }
 
+func TestAppendBundledMltEnv_UsesAbsoluteBundlePaths(t *testing.T) {
+	appDir := t.TempDir()
+	bin := filepath.Join(appDir, "snapflow.exe")
+	repo := filepath.Join(appDir, "lib", "mlt-7")
+	data := filepath.Join(appDir, "share", "mlt-7")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := appendBundledMltEnv([]string{"PATH=x", "MLT_REPOSITORY=stale"}, bin)
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "MLT_REPOSITORY="+repo) || !strings.Contains(joined, "MLT_DATA="+data) {
+		t.Fatalf("bundle MLT paths missing: %s", joined)
+	}
+}
+
 func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	fixtureBin := buildFixture(t)
 	reg := openTestRegistry(t)

@@ -226,6 +226,25 @@ func bundledMeltBinary(binPath string) string {
 	return ""
 }
 
+// appendBundledMltEnv makes a relocatable GUI bundle independent of the
+// daemon's working directory. MLT's default repository lookup is relative on
+// Windows and can otherwise resolve to <daemon-install>\\lib\\mlt, while the
+// packaged modules live beside snapflow.exe under lib/mlt-7 and share/mlt-7.
+// Only advertise the paths when the repository exists; source-checkout and
+// test launches must continue using their normal system MLT configuration.
+func appendBundledMltEnv(env []string, binPath string) []string {
+	appDir := filepath.Dir(binPath)
+	repo := filepath.Join(appDir, "lib", "mlt-7")
+	if st, err := os.Stat(repo); err != nil || !st.IsDir() {
+		return env
+	}
+	data := filepath.Join(appDir, "share", "mlt-7")
+	result := append([]string{}, env...)
+	result = append(result, "MLT_REPOSITORY="+repo, "MLT_DATA="+data,
+		"MLT_PROFILES_PATH="+filepath.Join(data, "profiles"))
+	return result
+}
+
 // randomShortID returns a short (16 hex char) random identifier, used for
 // both the ProcessInstance row id and the socket filename -- see the
 // sun_path length comment in Launch for why this needs to stay short.
@@ -393,6 +412,9 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_SAP_SOCKET",
 		"SNAPSHOT_SAP_TOKEN",
 		"SNAPSHOTD_MANAGED",
+		"MLT_REPOSITORY",
+		"MLT_DATA",
+		"MLT_PROFILES_PATH",
 	}
 	if os.Getenv("MELT_BIN") == "" {
 		envKeys = append(envKeys, "MELT_BIN")
@@ -410,6 +432,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_PROJECT_PREOPENED="+strconv.FormatBool(preopened),
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
+	cmd.Env = appendBundledMltEnv(cmd.Env, m.BinPath)
 	if os.Getenv("MELT_BIN") == "" {
 		if meltBin := bundledMeltBinary(m.BinPath); meltBin != "" {
 			cmd.Env = append(cmd.Env, "MELT_BIN="+meltBin)
