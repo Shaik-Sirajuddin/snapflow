@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -90,13 +90,60 @@ impl Drop for ProjectUpdateSubscription {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct LifecycleUpdate {
+    project_path: Option<String>,
+    reason: String,
+    generation: u64,
+}
+
 enum RegistrationCommand {
-    Update {
-        project_path: Option<String>,
-        reason: String,
-        generation: u64,
-    },
+    Wake,
     Stop,
+}
+
+static LATEST_LIFECYCLE: OnceLock<Mutex<Option<LifecycleUpdate>>> = OnceLock::new();
+static LIFECYCLE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn latest_lifecycle() -> &'static Mutex<Option<LifecycleUpdate>> {
+    LATEST_LIFECYCLE.get_or_init(|| Mutex::new(None))
+}
+
+fn scoped_generation(epoch: u64, generation: u64) -> u64 {
+    epoch
+        .saturating_mul(1u64 << 32)
+        .saturating_add(generation.min(u32::MAX as u64))
+}
+
+fn accept_latest(slot: &mut Option<LifecycleUpdate>, candidate: LifecycleUpdate) -> bool {
+    if slot
+        .as_ref()
+        .is_some_and(|current| candidate.generation <= current.generation)
+    {
+        return false;
+    }
+    *slot = Some(candidate);
+    true
+}
+
+fn seed_lifecycle(epoch: u64, initial_project_path: Option<String>) -> LifecycleUpdate {
+    let mut slot = latest_lifecycle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = initial_project_path
+            .clone()
+            .map(|project_path| LifecycleUpdate {
+                project_path: Some(project_path),
+                reason: "opened".to_owned(),
+                generation: scoped_generation(epoch, 0),
+            });
+    }
+    slot.clone().unwrap_or(LifecycleUpdate {
+        project_path: initial_project_path,
+        reason: "opened".to_owned(),
+        generation: scoped_generation(epoch, 0),
+    })
 }
 
 #[cfg(any(unix, windows))]
@@ -180,10 +227,7 @@ impl DiscoveryEndpoint {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &descriptor,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(&descriptor, std::fs::Permissions::from_mode(0o600));
         }
         let (stop, stop_rx) = mpsc::channel();
         let descriptor_for_thread = descriptor.clone();
@@ -370,6 +414,7 @@ impl Drop for DiscoveryEndpoint {
 pub struct SnapshotdRegistration {
     commands: Sender<RegistrationCommand>,
     instance_id: Arc<Mutex<Option<String>>>,
+    epoch: u64,
     #[cfg(any(unix, windows))]
     discovery: DiscoveryEndpoint,
     #[cfg(unix)]
@@ -395,6 +440,8 @@ impl SnapshotdRegistration {
         }
         #[cfg(any(unix, windows))]
         {
+            let epoch = LIFECYCLE_EPOCH.fetch_add(1, Ordering::SeqCst);
+            let seeded = seed_lifecycle(epoch, initial_project_path.clone());
             let home = std::env::var_os("SNAPSHOTD_HOME")
                 .map(PathBuf::from)
                 .or_else(|| {
@@ -418,7 +465,7 @@ impl SnapshotdRegistration {
             let client = SnapshotdControlClient::from_default_runtime()?;
             let nonce = uuid::Uuid::new_v4().to_string();
             let discovery =
-                match DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone()) {
+                match DiscoveryEndpoint::start(&home, &nonce, seeded.project_path.clone()) {
                     Some(discovery) => discovery,
                     None => {
                         eprintln!(
@@ -504,59 +551,112 @@ impl SnapshotdRegistration {
                         instance_nonce: nonce.clone(),
                         pid: std::process::id(),
                         process_start: process_start_identity(),
-                        project_path: initial_project_path.clone(),
+                        project_path: seeded.project_path.clone(),
                         sap_socket_path: sap_endpoint_from_env(),
                         sap_token: std::env::var("SNAPSHOT_SAP_TOKEN").ok(),
                         capabilities: Some(json!({"lifecycle": true, "mcpContexts": true})),
                     };
-                    let mut current_project_path = initial_project_path.clone();
-                    let mut current_reason = "opened".to_owned();
-                    let mut current_generation = 0u64;
+                    let mut current_project_path = seeded.project_path.clone();
+                    let mut current_reason = seeded.reason.clone();
+                    let mut current_generation = seeded.generation;
                     let mut managed_pending = managed;
+                    let mut pending_update = false;
                     let mut last_heartbeat = Instant::now();
-                    let mut current_id = if managed { managed_instance_id.clone() } else {
-                        runtime.block_on(async { register_and_extract_id(&client, &registration).await })
+                    let mut current_id = if managed {
+                        managed_instance_id.clone()
+                    } else {
+                        runtime.block_on(async {
+                            register_and_extract_id(&client, &registration).await
+                        })
                     };
                     if let Some(id) = current_id.as_ref() {
                         *published_id
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
                         if managed {
-                            managed_pending = runtime.block_on(client.instance_project_changed(
-                                "managed", id, None, current_project_path.as_deref(),
-                                &current_reason, current_generation)).is_err();
+                            managed_pending = runtime
+                                .block_on(client.instance_project_changed(
+                                    "managed",
+                                    id,
+                                    None,
+                                    current_project_path.as_deref(),
+                                    &current_reason,
+                                    current_generation,
+                                ))
+                                .is_err();
                         }
                     }
                     loop {
                         match receiver.recv_timeout(Duration::from_millis(250)) {
-                            Ok(RegistrationCommand::Update {
-                                project_path,
-                                reason,
-                                generation,
-                            }) => {
-                                current_project_path = project_path;
-                                current_reason = reason;
-                                current_generation = generation;
+                            Ok(RegistrationCommand::Wake) => {
+                                let latest = latest_lifecycle()
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone();
+                                let Some(latest) = latest else { continue };
+                                if latest.generation <= current_generation {
+                                    continue;
+                                }
+                                current_project_path = latest.project_path;
+                                current_reason = latest.reason;
+                                current_generation = latest.generation;
                                 if let Some(id) = current_id.as_deref() {
                                     if managed {
-                                        managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                        managed_pending = runtime
+                                            .block_on(client.instance_project_changed(
+                                                "managed",
+                                                id,
+                                                None,
+                                                current_project_path.as_deref(),
+                                                &current_reason,
+                                                current_generation,
+                                            ))
+                                            .is_err();
                                     } else {
-                                        let _ = runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation));
+                                        pending_update = runtime
+                                            .block_on(client.update_open_project(
+                                                id,
+                                                current_project_path.as_deref(),
+                                                &current_reason,
+                                                current_generation,
+                                            ))
+                                            .is_err();
                                     }
                                 }
                             }
                             Ok(RegistrationCommand::Stop)
                             | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                if !managed { if let Some(id) = current_id.take() {
-                                    let _ =
-                                        runtime.block_on(client.unregister_external_instance(&id));
-                                }}
+                                if !managed {
+                                    if let Some(id) = current_id.take() {
+                                        let _ = runtime
+                                            .block_on(client.unregister_external_instance(&id));
+                                    }
+                                }
                                 return;
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 if let Some(id) = current_id.as_deref() {
                                     if managed && managed_pending {
-                                        managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                        managed_pending = runtime
+                                            .block_on(client.instance_project_changed(
+                                                "managed",
+                                                id,
+                                                None,
+                                                current_project_path.as_deref(),
+                                                &current_reason,
+                                                current_generation,
+                                            ))
+                                            .is_err();
+                                    }
+                                    if !managed && pending_update {
+                                        pending_update = runtime
+                                            .block_on(client.update_open_project(
+                                                id,
+                                                current_project_path.as_deref(),
+                                                &current_reason,
+                                                current_generation,
+                                            ))
+                                            .is_err();
                                     }
                                     if last_heartbeat.elapsed() < Duration::from_secs(10) {
                                         continue;
@@ -564,31 +664,76 @@ impl SnapshotdRegistration {
                                     last_heartbeat = Instant::now();
                                     if runtime.block_on(client.heartbeat(id)).is_err() {
                                         registration.project_path = current_project_path.clone();
-                                        current_id = if managed { managed_instance_id.clone() } else { runtime.block_on(async { register_and_extract_id(&client, &registration).await }) };
+                                        current_id = if managed {
+                                            managed_instance_id.clone()
+                                        } else {
+                                            runtime.block_on(async {
+                                                register_and_extract_id(&client, &registration)
+                                                    .await
+                                            })
+                                        };
                                         if let Some(id) = current_id.as_ref() {
                                             *published_id
                                                 .lock()
                                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                                 Some(id.clone());
                                             if managed {
-                                                managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                                managed_pending = runtime
+                                                    .block_on(client.instance_project_changed(
+                                                        "managed",
+                                                        id,
+                                                        None,
+                                                        current_project_path.as_deref(),
+                                                        &current_reason,
+                                                        current_generation,
+                                                    ))
+                                                    .is_err();
                                             } else {
-                                                let _ = runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation));
+                                                pending_update = runtime
+                                                    .block_on(client.update_open_project(
+                                                        id,
+                                                        current_project_path.as_deref(),
+                                                        &current_reason,
+                                                        current_generation,
+                                                    ))
+                                                    .is_err();
                                             }
                                         }
                                     }
                                 } else {
                                     registration.project_path = current_project_path.clone();
-                                    current_id = if managed { managed_instance_id.clone() } else { runtime.block_on(async { register_and_extract_id(&client, &registration).await }) };
+                                    current_id = if managed {
+                                        managed_instance_id.clone()
+                                    } else {
+                                        runtime.block_on(async {
+                                            register_and_extract_id(&client, &registration).await
+                                        })
+                                    };
                                     if let Some(id) = current_id.as_ref() {
                                         *published_id
                                             .lock()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                             Some(id.clone());
                                         if managed {
-                                            managed_pending = runtime.block_on(client.instance_project_changed("managed", id, None, current_project_path.as_deref(), &current_reason, current_generation)).is_err();
+                                            managed_pending = runtime
+                                                .block_on(client.instance_project_changed(
+                                                    "managed",
+                                                    id,
+                                                    None,
+                                                    current_project_path.as_deref(),
+                                                    &current_reason,
+                                                    current_generation,
+                                                ))
+                                                .is_err();
                                         } else {
-                                            let _ = runtime.block_on(client.update_open_project(id, current_project_path.as_deref(), &current_reason, current_generation));
+                                            pending_update = runtime
+                                                .block_on(client.update_open_project(
+                                                    id,
+                                                    current_project_path.as_deref(),
+                                                    &current_reason,
+                                                    current_generation,
+                                                ))
+                                                .is_err();
                                         }
                                     }
                                 }
@@ -600,6 +745,7 @@ impl SnapshotdRegistration {
             Some(Self {
                 commands,
                 instance_id,
+                epoch,
                 discovery,
                 #[cfg(unix)]
                 project_inventory,
@@ -612,13 +758,23 @@ impl SnapshotdRegistration {
     }
 
     pub fn update(&self, project_path: Option<String>, reason: impl Into<String>, generation: u64) {
-        #[cfg(any(unix, windows))]
-        self.discovery.update(project_path.clone());
-        let _ = self.commands.send(RegistrationCommand::Update {
+        let candidate = LifecycleUpdate {
             project_path,
             reason: reason.into(),
-            generation,
-        });
+            generation: scoped_generation(self.epoch, generation),
+        };
+        let accepted = {
+            let mut latest = latest_lifecycle()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            accept_latest(&mut latest, candidate.clone())
+        };
+        if !accepted {
+            return;
+        }
+        #[cfg(any(unix, windows))]
+        self.discovery.update(candidate.project_path);
+        let _ = self.commands.send(RegistrationCommand::Wake);
     }
 
     pub fn instance_id(&self) -> Option<String> {
@@ -780,7 +936,9 @@ impl SnapshotdControlClient {
                         }
                     })
                     .collect();
-                Some(PathBuf::from(format!("\\\\.\\pipe\\snapflow-{scope}-control")))
+                Some(PathBuf::from(format!(
+                    "\\\\.\\pipe\\snapflow-{scope}-control"
+                )))
             })?;
         Some(Self::new(endpoint))
     }
@@ -854,14 +1012,24 @@ impl SnapshotdControlClient {
         .await
     }
 
-    pub async fn instance_project_changed(&self, owner: &str, instance_id: &str,
-        instance_nonce: Option<&str>, project_path: Option<&str>, reason: &str,
-        generation: u64) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.instanceProjectChanged", json!({
-            "owner": owner, "instanceId": instance_id, "instanceNonce": instance_nonce,
-            "pid": std::process::id(), "processStart": process_start_identity(),
-            "projectPath": project_path, "reason": reason, "generation": generation,
-        })).await
+    pub async fn instance_project_changed(
+        &self,
+        owner: &str,
+        instance_id: &str,
+        instance_nonce: Option<&str>,
+        project_path: Option<&str>,
+        reason: &str,
+        generation: u64,
+    ) -> Result<Value, SnapshotdClientError> {
+        self.call(
+            "daemon.instanceProjectChanged",
+            json!({
+                "owner": owner, "instanceId": instance_id, "instanceNonce": instance_nonce,
+                "pid": std::process::id(), "processStart": process_start_identity(),
+                "projectPath": project_path, "reason": reason, "generation": generation,
+            }),
+        )
+        .await
     }
 
     pub async fn heartbeat(&self, instance_id: &str) -> Result<Value, SnapshotdClientError> {
@@ -1134,6 +1302,37 @@ mod tests {
         assert!(is_daemon_managed(Some("1")));
         assert!(!is_daemon_managed(None));
         assert!(!is_daemon_managed(Some("0")));
+    }
+
+    #[test]
+    fn lifecycle_coalescing_rejects_stale_close_after_newer_open() {
+        let mut latest = Some(LifecycleUpdate {
+            project_path: Some("new.mlt".into()),
+            reason: "opened".into(),
+            generation: 10,
+        });
+        assert!(!accept_latest(
+            &mut latest,
+            LifecycleUpdate {
+                project_path: None,
+                reason: "closed".into(),
+                generation: 9,
+            }
+        ));
+        assert!(!accept_latest(
+            &mut latest,
+            LifecycleUpdate {
+                project_path: None,
+                reason: "closed".into(),
+                generation: 10,
+            }
+        ));
+        assert_eq!(latest.unwrap().project_path.as_deref(), Some("new.mlt"));
+    }
+
+    #[test]
+    fn lifecycle_epoch_keeps_recreated_panel_newer_than_old_events() {
+        assert!(scoped_generation(2, 1) > scoped_generation(1, u64::MAX));
     }
 
     #[test]
