@@ -40,19 +40,43 @@ fn runtime_command(program: &str) -> Command {
             if is_script_launcher {
                 let mut cmd = Command::new("cmd");
                 cmd.arg("/C").arg(resolved);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                }
                 return cmd;
             }
-            return Command::new(resolved);
+            let mut cmd = Command::new(resolved);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            return cmd;
         }
     }
-    Command::new(program)
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
 }
 
 #[cfg(windows)]
 fn resolve_windows_runtime_program(program: &str) -> Option<(PathBuf, bool)> {
     let path = Path::new(program);
-    let is_script_ext = |ext: &str| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat");
-    if path.extension().is_some() || path.parent().filter(|p| !p.as_os_str().is_empty()).is_some() {
+    let is_script_ext =
+        |ext: &str| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat");
+    if path.extension().is_some()
+        || path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .is_some()
+    {
         let is_script = path
             .extension()
             .and_then(|e| e.to_str())
@@ -251,8 +275,7 @@ async fn install_uvx(agent: &Agent, adapters_root: &Path) -> Result<InstallOutco
 /// Network + first-time cache populate can be slow (especially the Codex ACP
 /// package on a cold npm cache), so the production default is five minutes;
 /// the operation still fails closed rather than hanging the gateway forever.
-const DEFAULT_PACKAGE_PREFETCH_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(300);
+const DEFAULT_PACKAGE_PREFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Allow operators/tests to tune the cold-cache ceiling without rebuilding.
 /// Keep the range bounded so an accidental environment value cannot turn a

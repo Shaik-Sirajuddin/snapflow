@@ -2728,6 +2728,7 @@ fn spawn_gateway_process(
     cache_dir: Option<&PathBuf>,
 ) -> Result<(), String> {
     let mut cmd = std::process::Command::new(resolve_acpx_server_bin());
+    configure_hidden_process(&mut cmd);
     cmd.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
         .env("ACPX_DEFAULT_AGENT_ID", provider)
         .env("RUI_MOCK_AGENT_PERSONA", provider)
@@ -3318,7 +3319,9 @@ fn system_node_toolchain_available(path: &str) -> bool {
     let Some(npx) = find("npx") else {
         return false;
     };
-    std::process::Command::new(node)
+    let mut node_cmd = std::process::Command::new(node);
+    configure_hidden_process(&mut node_cmd);
+    node_cmd
         .arg("--version")
         .env("PATH", path)
         .stdout(std::process::Stdio::null())
@@ -3326,7 +3329,10 @@ fn system_node_toolchain_available(path: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-        && std::process::Command::new(npm)
+        && {
+            let mut npm_cmd = std::process::Command::new(npm);
+            configure_hidden_process(&mut npm_cmd);
+            npm_cmd
             .arg("--version")
             .env("PATH", path)
             .stdout(std::process::Stdio::null())
@@ -3334,8 +3340,18 @@ fn system_node_toolchain_available(path: &str) -> bool {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+        }
         && executable_file(&npx)
 }
+
+#[cfg(windows)]
+fn configure_hidden_process(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+
+#[cfg(not(windows))]
+fn configure_hidden_process(_cmd: &mut std::process::Command) {}
 
 fn executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
