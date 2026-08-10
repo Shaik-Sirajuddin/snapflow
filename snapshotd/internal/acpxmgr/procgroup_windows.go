@@ -13,7 +13,11 @@ import (
 // path currently exercised by this repository (see daemonlock's own
 // Windows placeholder for the same caveat).
 func setpgidAttr() *syscall.SysProcAttr {
-	return nil
+	// CREATE_NO_WINDOW keeps the bundled ACPX gateway (and its npx/agent
+	// descendants) from flashing a console when snapshotd is started by the
+	// GUI or installer.  The flag is ignored by the process-group helpers
+	// below; Windows has no POSIX process groups.
+	return &syscall.SysProcAttr{CreationFlags: 0x08000000}
 }
 
 // killProcessGroup falls back to a single-process kill on Windows -- there
