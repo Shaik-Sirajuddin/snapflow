@@ -510,7 +510,18 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
 	}
 
-	processStart, _ := health.ProcessStartIdentity(cmd.Process.Pid)
+	processStart, processStartErr := health.ProcessStartIdentity(cmd.Process.Pid)
+	if processStartErr != nil || processStart == "" {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		if processStartErr != nil {
+			return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: process start identity unavailable: %w", processStartErr)
+		}
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: process start identity unavailable")
+	}
 	pi := registry.ProcessInstance{
 		ID:               instanceID,
 		ProjectID:        projectID,

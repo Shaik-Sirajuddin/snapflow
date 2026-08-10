@@ -331,7 +331,10 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		if err != nil {
 			return nil, err
 		}
-		if pi.PID != p.PID || (pi.ProcessStart != "" && pi.ProcessStart != p.ProcessStart) {
+		// Managed rows must carry a start identity. Treat an old/malformed row
+		// with an empty identity as untrusted rather than allowing a PID-only
+		// update, which could target a recycled process.
+		if pi.PID != p.PID || pi.ProcessStart == "" || pi.ProcessStart != p.ProcessStart {
 			return nil, fmt.Errorf("daemon: instanceProjectChanged: managed ownership mismatch")
 		}
 		if p.Generation < pi.Generation {

@@ -105,6 +105,40 @@ func TestInstanceProjectChanged_CoalescesStaleExternalGeneration(t *testing.T) {
 	}
 }
 
+func TestInstanceProjectChanged_ManagedRequiresProcessStartIdentity(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	start := mustProcessStart(t)
+	if err := d.Reg.CreateProcessInstance(&registry.ProcessInstance{
+		ID: "managed-identity", PID: os.Getpid(), ProcessStart: start,
+		Status: registry.StatusReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base := InstanceProjectChangedParams{
+		Owner: "managed", InstanceID: "managed-identity", PID: os.Getpid(),
+		ProcessStart: start, Reason: "switched", Generation: 1,
+	}
+	if _, err := d.InstanceProjectChanged(ctx, InstanceProjectChangedParams{
+		Owner: base.Owner, InstanceID: base.InstanceID, PID: base.PID,
+		Reason: base.Reason, Generation: base.Generation,
+	}); err == nil {
+		t.Fatal("empty process identity must be rejected")
+	}
+	base.ProcessStart = "not-the-current-process"
+	if _, err := d.InstanceProjectChanged(ctx, base); err == nil {
+		t.Fatal("mismatched process identity must be rejected")
+	}
+	base.ProcessStart = start
+	updated, err := d.InstanceProjectChanged(ctx, base)
+	if err != nil {
+		t.Fatalf("matching process identity rejected: %v", err)
+	}
+	if got := updated.(registry.ProcessInstance).Generation; got != 1 {
+		t.Fatalf("generation = %d, want 1", got)
+	}
+}
+
 func TestGUIMatrix_GUIRegistrationPreventsHeadlessDuplicateOnProjectOpen(t *testing.T) {
 	d := newTestDaemon(t, buildFixture(t))
 	ctx := context.Background()
