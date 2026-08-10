@@ -4,60 +4,46 @@
 
 # Snapflow
 
-**The editor got an upgrade — an assistant for your craft.**
+Snapflow is a video editor with a builtin Agent Harness.
 
-A free, open source, cross-platform **video editor**, now with an inbuilt AI agent that
-edits alongside you.
+Snapflow is a video editor for humans and Agents.
 
 <div align="center">
 
-<!-- TODO: replace with a real product screenshot/GIF -->
-<img src="docs/img/preview.png" alt="Snapflow preview" width="800" />
+<img src="staging/penpot-slide-assets/Snapflow-Live-Preview-v3.png" alt="Snapflow live preview" width="800" />
 
 </div>
 
-## What's new: an agent that edits with you
+Snapflow can be accessed by agents connecting via [MCP](https://modelcontextprotocol.io/).
 
-Snapflow keeps the full manual editor and adds an inbuilt chat panel to prepare
-timelines, edit media, and craft your video alongside an AI agent — you stay the
-artist, the agent handles the busywork.
+## MCP tools
 
-The agent can act on:
+MCP tools made available are:
 
-- **Frame** — inspect and adjust individual frames
-- **Timeline** — arrange, trim, and reorder clips
-- **Animations** — add and tune keyframed motion
-- **Crop** — reframe shots
-- **Timing** — adjust pacing, speed, and sync
+| Category | Use case | Tools count |
+|---|---|---:|
+| Daemon lifecycle | Create, launch, list, inspect, and close project instances | 7 |
+| Project | Open, create, clone, save, undo/redo, and inspect project state | 13 |
+| Selection | Select the active track or clip and read the current view | 3 |
+| Editing | Add, trim, move, split, and remove timeline tracks and clips | 16 |
+| Playlist and transitions | Manage playlist entries and add crossfade transitions | 8 |
+| Filters and keyframes | Add, inspect, reorder, and animate MLT filters | 9 |
+| Audio | Manage gain, pan, balance, normalization, and fades (when enabled) | 6 |
+| Generators | Add title and color producers | 2 |
+| Subtitles | Manage subtitle tracks and cues, including import/export and burn-in | 7 |
+| Files | Import, probe, and export media | 3 |
+| Export jobs | List, inspect, and stop export jobs | 3 |
+| Playback | Control transport, seek, and render frame previews | 7 |
+| Notes | Manage project notes | 2 |
+| Markers | Create, update, remove, and navigate timeline markers | 10 |
+| Recent files | Manage project-scoped recent file paths | 3 |
 
-### Bring your own model
+The daemon advertises 99 typed tools when the audio namespace is enabled (93
+otherwise), including the 7 lifecycle tools.
 
-Use your existing subscription — Snapflow talks to OpenAI (ChatGPT), Anthropic
-(Claude), and other providers through a pluggable model layer, so you're not locked
-into one vendor.
+## Project daemon and headless mode
 
-### MCP tool integrations
-
-The agent connects to your editing and production tools over the
-[Model Context Protocol](https://modelcontextprotocol.io/). Verified, widely-used MCP
-servers you can wire in today:
-
-| Server | Use in Snapflow |
-|---|---|
-| [Filesystem](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem) | Read/write project media and export files |
-| [GitHub](https://github.com/modelcontextprotocol/servers/tree/main/src/github) | Version-control project files, script assets |
-| [Fetch](https://github.com/modelcontextprotocol/servers/tree/main/src/fetch) | Pull reference media/pages from the web |
-| [Memory](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) | Persist project/style notes across sessions |
-| [Puppeteer](https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer) | Capture web content as source footage |
-| [Slack](https://github.com/modelcontextprotocol/servers) | Pull feedback/review threads into the edit |
-| [Google Drive](https://github.com/modelcontextprotocol/servers) | Import/export project media |
-| [Postgres](https://github.com/modelcontextprotocol/servers/tree/main/src/postgres) | Query production/asset metadata |
-| [Sentry](https://github.com/modelcontextprotocol/servers) | Surface render/export errors |
-| [Notion](https://github.com/makenotion/notion-mcp-server) | Pull shot lists / scripts into the timeline |
-
-> This list is a starting point, not an endorsement of exclusivity — any spec-compliant
-> MCP server works. Check each server's own repo for current install/auth steps before
-> relying on it.
+Use `snapflowd` to launch and manage project instances, including headless mode.
 
 Use Snapflow itself as an MCP server so other agents/tools can drive the editor:
 
