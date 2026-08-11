@@ -137,6 +137,7 @@ esac
 resolve_asset_url() {
   local requested_asset="${asset_arg:-${SNAPFLOW_ASSET_URL:-}}"
   if [ -n "$requested_asset" ]; then
+    asset_source="direct"
     # A local path is converted to a file:// URL so the rest of the download
     # and optional .sha256 verification path stays identical to release
     # installs. URL arguments (http(s), file, etc.) are passed through.
@@ -159,7 +160,12 @@ resolve_asset_url() {
   info "Looking up release ($VERSION) for $platform..." >&2
   release_json="$(curl -fsSL "$api_url")" || die "failed to query $api_url -- has a release been published yet?"
 
-  resolved_tag="$(printf '%s' "$release_json" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  if command -v jq >/dev/null 2>&1; then
+    resolved_tag="$(printf '%s' "$release_json" | jq -r '.tag_name // empty')"
+  else
+    resolved_tag="$(printf '%s' "$release_json" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  fi
+  [ -n "$resolved_tag" ] || die "GitHub release response did not contain a valid tag_name"
 
   # Pick the tarball asset for this platform (snapflow-linux-x86_64-*.tar.gz /
   # snapflow-macos-*.tar.gz), skipping the .sha256 sidecar.
@@ -169,15 +175,29 @@ resolve_asset_url() {
     | head -n1 \
     | sed -E 's/.*"(https:[^"]+)"/\1/')"
 
+  if command -v jq >/dev/null 2>&1; then
+    asset_url="$(printf '%s' "$release_json" \
+      | jq -r --arg platform "$platform" '.assets[]?.browser_download_url // empty
+        | select(contains("snapflow-" + $platform) and endswith(".tar.gz"))' \
+      | head -n1)"
+  fi
   [ -n "$asset_url" ] || die "no $platform tarball found in release $VERSION -- check https://github.com/$REPO/releases"
   printf '%s' "$asset_url"
 }
 
 resolved_tag=""
+asset_source="release"
 asset_url="$(resolve_asset_url)"
-target_version="${resolved_tag:-$(basename "$asset_url")}"
+if [ "$asset_source" = "release" ]; then
+  target_version="$resolved_tag"
+else
+  direct_asset_name="$(basename "${asset_url%%\?*}")"
+  target_version="direct:$direct_asset_name"
+fi
 
-if [ -f "$VERSION_FILE" ]; then
+# Direct assets have no trusted release identity; always install them instead
+# of allowing a reused filename or stale marker to masquerade as a release.
+if [ "$asset_source" = "release" ] && [ -f "$VERSION_FILE" ]; then
   installed_version="$(cat "$VERSION_FILE" 2>/dev/null || true)"
   if [ -n "$installed_version" ] && [ "$installed_version" = "$target_version" ] && [ -x "$BIN_DIR/snapflowd" ]; then
     info "snapflow $target_version is already installed and up to date -- nothing to do."
