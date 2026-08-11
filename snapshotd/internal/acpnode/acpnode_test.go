@@ -3,6 +3,7 @@ package acpnode
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -31,6 +32,9 @@ func TestPrefixOKAndBundledResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"node", "npm", "npx"} {
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
 		p := filepath.Join(bin, name)
 		if err := os.WriteFile(p, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
 			t.Fatal(err)

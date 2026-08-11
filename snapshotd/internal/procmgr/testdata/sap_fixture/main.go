@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"snapshotd/internal/transport"
 )
 
 func main() {
@@ -38,7 +40,7 @@ func main() {
 		}
 	}
 
-	ln, err := net.Listen("unix", sock)
+	ln, err := transport.Listen(sock)
 	if err != nil {
 		os.Exit(2)
 	}

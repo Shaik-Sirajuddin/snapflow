@@ -1,3 +1,5 @@
+//go:build !windows
+
 package daemon
 
 // GUI discovery matrix edge cases from

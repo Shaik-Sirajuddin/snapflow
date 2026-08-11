@@ -1,3 +1,5 @@
+//go:build !windows
+
 package daemon
 
 import (
@@ -6,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -16,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"snapshotd/internal/config"
 	"snapshotd/internal/health"
 	"snapshotd/internal/registry"
 )
@@ -42,26 +42,6 @@ func buildFixture(t *testing.T) string {
 		t.Fatalf("building fixture: %v\n%s", err, outBytes)
 	}
 	return out
-}
-
-func newTestDaemon(t *testing.T, binPath string) *Daemon {
-	t.Helper()
-	cfg := config.Config{
-		HomeDir:         t.TempDir(),
-		ProjectsRoot:    filepath.Join(t.TempDir(), "projects"),
-		RunDir:          filepath.Join(t.TempDir(), "run"),
-		SnapshotBinPath: binPath,
-	}
-	cfg.DBPath = filepath.Join(cfg.HomeDir, "registry.db")
-	cfg.ControlSocketPath = filepath.Join(cfg.HomeDir, "control.sock")
-
-	d, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	if err != nil {
-		t.Fatalf("new daemon: %v", err)
-	}
-	d.Proc.ConnectTimeout = 3 * time.Second
-	t.Cleanup(func() { _ = d.Close() })
-	return d
 }
 
 func TestDaemon_ProjectAndLaunchLifecycle(t *testing.T) {

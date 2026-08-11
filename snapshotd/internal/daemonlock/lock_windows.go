@@ -38,10 +38,10 @@ func Acquire(homeDir string) (*Lock, error) {
 	digest := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(homeDir))))
 	name := fmt.Sprintf("Local\\SnapflowSnapshotd-%x", digest[:12])
 	mutex, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(name))
-	if err != nil {
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 		return nil, fmt.Errorf("daemonlock: create mutex: %w", err)
 	}
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		_ = windows.CloseHandle(mutex)
 		return nil, fmt.Errorf("%w: %s", ErrAlreadyRunning, homeDir)
 	}

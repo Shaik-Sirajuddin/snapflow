@@ -1,3 +1,5 @@
+//go:build !windows
+
 package registry
 
 import (
@@ -8,17 +10,6 @@ import (
 	"testing"
 	"time"
 )
-
-func openTestRegistry(t *testing.T) *Registry {
-	t.Helper()
-	dir := t.TempDir()
-	reg, err := Open(filepath.Join(dir, "registry.db"))
-	if err != nil {
-		t.Fatalf("open registry: %v", err)
-	}
-	t.Cleanup(func() { _ = reg.Close() })
-	return reg
-}
 
 func seedProjectAndInstance(t *testing.T, reg *Registry, pid int, socketPath string) (Project, ProcessInstance) {
 	t.Helper()

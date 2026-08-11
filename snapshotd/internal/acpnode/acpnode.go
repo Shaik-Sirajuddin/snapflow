@@ -53,15 +53,25 @@ func BundleHome() string {
 }
 
 func prefixOK(home string) bool {
-	return executable(filepath.Join(home, "bin", "node")) &&
-		executable(filepath.Join(home, "bin", "npm")) &&
-		executable(filepath.Join(home, "bin", "npx"))
+	return executable(bundledToolPath(home, "node")) &&
+		executable(bundledToolPath(home, "npm")) &&
+		executable(bundledToolPath(home, "npx"))
+}
+
+func bundledToolPath(home, name string) string {
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return filepath.Join(home, "bin", name)
 }
 
 func executable(path string) bool {
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
 		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
 	}
 	return st.Mode()&0o111 != 0
 }
@@ -101,9 +111,9 @@ func Resolve() Resolved {
 		return Resolved{
 			Source: SourceBundled,
 			Home:   home,
-			Node:   filepath.Join(home, "bin", "node"),
-			Npm:    filepath.Join(home, "bin", "npm"),
-			Npx:    filepath.Join(home, "bin", "npx"),
+			Node:   bundledToolPath(home, "node"),
+			Npm:    bundledToolPath(home, "npm"),
+			Npx:    bundledToolPath(home, "npx"),
 		}
 	}
 	return Resolved{Source: SourceMissing}
