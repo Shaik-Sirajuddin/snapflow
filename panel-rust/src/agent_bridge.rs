@@ -1537,6 +1537,13 @@ fn parse_daemon_list_and_projects(
     list_jsonl: &str,
     projects_jsonl: &str,
 ) -> Vec<DaemonProjectInstance> {
+    fn field<'a>(
+        value: &'a serde_json::Value,
+        legacy: &str,
+        wire: &str,
+    ) -> Option<&'a serde_json::Value> {
+        value.get(legacy).or_else(|| value.get(wire))
+    }
     let mut project_paths_by_id: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for line in projects_jsonl
@@ -1546,15 +1553,13 @@ fn parse_daemon_list_and_projects(
         let Ok(project) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let Some(id) = project.get("ID").and_then(|v| v.as_str()) else {
+        let Some(id) = field(&project, "ID", "id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let root_dir = project
-            .get("RootDir")
+        let root_dir = field(&project, "RootDir", "rootDir")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let mlt_file_name = project
-            .get("MltFileName")
+        let mlt_file_name = field(&project, "MltFileName", "mltFileName")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         if root_dir.is_empty() || mlt_file_name.is_empty() {
@@ -1573,17 +1578,17 @@ fn parse_daemon_list_and_projects(
         let Ok(instance) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if instance.get("Status").and_then(|v| v.as_str()) != Some("ready") {
+        if field(&instance, "Status", "status").and_then(|v| v.as_str()) != Some("ready") {
             continue;
         }
-        let Some(project_id) = instance.get("ProjectID").and_then(|v| v.as_str()) else {
+        let Some(project_id) = field(&instance, "ProjectID", "projectId").and_then(|v| v.as_str())
+        else {
             continue;
         };
         let Some(project_path) = project_paths_by_id.get(project_id) else {
             continue;
         };
-        let headless = instance
-            .get("Headless")
+        let headless = field(&instance, "Headless", "headless")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         live.push(DaemonProjectInstance {
@@ -13865,6 +13870,19 @@ done
             !live[0].headless,
             "a project the user has open headful (PISO-9's headful-wins reuse) must not be \
              misreported as headless"
+        );
+    }
+
+    #[test]
+    fn parse_daemon_list_and_projects_accepts_current_lower_camel_cli_wire_shape() {
+        let list_jsonl = r#"{"id":"inst-a","projectId":"proj-a","status":"ready","headless":true}"#;
+        let projects_jsonl = r#"{"id":"proj-a","rootDir":"/p","mltFileName":"project.mlt"}"#;
+        assert_eq!(
+            parse_daemon_list_and_projects(list_jsonl, projects_jsonl),
+            vec![DaemonProjectInstance {
+                project_path: "/p/project.mlt".to_string(),
+                headless: true,
+            }]
         );
     }
 
