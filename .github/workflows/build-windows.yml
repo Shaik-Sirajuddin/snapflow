@@ -250,7 +250,10 @@ jobs:
           # MSYS2 tree (upstream's own build-shotcut-msys2.sh deploy() step
           # explicitly names this same DLL set as a known-missing case on
           # some targets). Install them directly so bundle_dlls's recursive
-          # walk can find and bundle them.
+          # walk can find and bundle them. The package is named
+          # mingw-w64-x86_64-sox, not -libsox -- confirmed via a real
+          # windows-latest run failing pacman's dependency resolution with
+          # "error: target not found: mingw-w64-x86_64-libsox".
           pacman -S --noconfirm \
             zip \
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
@@ -259,7 +262,7 @@ jobs:
             mingw-w64-x86_64-fftw \
             mingw-w64-x86_64-libsamplerate mingw-w64-x86_64-rubberband \
             mingw-w64-x86_64-rnnoise mingw-w64-x86_64-libebur128 \
-            mingw-w64-x86_64-libsox \
+            mingw-w64-x86_64-sox \
             mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-charts \
             mingw-w64-x86_64-qt6-declarative mingw-w64-x86_64-qt6-imageformats \
             mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-svg \
