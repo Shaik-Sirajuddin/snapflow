@@ -342,6 +342,12 @@ impl DiscoveryEndpoint {
                 else {
                     return;
                 };
+                // Tokio's Windows named-pipe registration consults the
+                // reactor while `ServerOptions::create` is called. Merely
+                // owning a runtime is insufficient: this worker thread must
+                // enter it before creating the pipe, or Tokio panics with
+                // "there is no reactor running" and lifecycle discovery dies.
+                let _runtime_guard = runtime.enter();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
