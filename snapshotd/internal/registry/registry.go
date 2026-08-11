@@ -117,6 +117,54 @@ func (r *Registry) Close() error {
 	return sqlDB.Close()
 }
 
+// GetProjectActiveOwner returns the durable owner marker for a project.
+func (r *Registry) GetProjectActiveOwner(projectID string) (*ProjectActiveOwner, error) {
+	var owner ProjectActiveOwner
+	if err := r.db.First(&owner, "project_id = ?", projectID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &owner, nil
+}
+
+func (r *Registry) SaveProjectActiveOwner(owner *ProjectActiveOwner) error {
+	return r.db.Save(owner).Error
+}
+
+// UpsertPendingProjectCandidate retains a conflicting lifecycle identity.
+// Repeated callbacks refresh the same candidate instead of growing rows.
+func (r *Registry) UpsertPendingProjectCandidate(candidate *PendingProjectCandidate) error {
+	var existing PendingProjectCandidate
+	err := r.db.Where("project_id = ? AND owner = ? AND instance_id = ? AND instance_nonce = ? AND process_start = ?", candidate.ProjectID, candidate.Owner, candidate.InstanceID, candidate.InstanceNonce, candidate.ProcessStart).First(&existing).Error
+	if err == nil {
+		candidate.ID = existing.ID
+		candidate.CreatedAt = existing.CreatedAt
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if candidate.ID == "" {
+		candidate.ID = uuid.NewString()
+	}
+	if err := r.db.Save(candidate).Error; err != nil {
+		return err
+	}
+	var pending []PendingProjectCandidate
+	if err := r.db.Where("project_id = ? AND status = ?", candidate.ProjectID, PendingStatus).Order("created_at DESC").Find(&pending).Error; err != nil {
+		return err
+	}
+	if len(pending) <= MaxPendingCandidatesPerProject {
+		return nil
+	}
+	for _, stale := range pending[MaxPendingCandidatesPerProject:] {
+		if err := r.db.Model(&stale).Update("status", StaleStatus).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- Project operations ---
 
 func (r *Registry) CreateProject(p *Project) error {
