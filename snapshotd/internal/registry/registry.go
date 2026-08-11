@@ -141,7 +141,14 @@ func (r *Registry) ReleaseProjectOwnership(owner, instanceID, nonce, processStar
 	if nonce != "" {
 		q = q.Where("instance_nonce = ?", nonce)
 	}
-	return q.Delete(&ProjectActiveOwner{}).Error
+	if err := q.Delete(&ProjectActiveOwner{}).Error; err != nil {
+		return err
+	}
+	pq := r.db.Model(&PendingProjectCandidate{}).Where("owner = ? AND instance_id = ? AND process_start = ? AND status = ?", owner, instanceID, processStart, PendingStatus)
+	if nonce != "" {
+		pq = pq.Where("instance_nonce = ?", nonce)
+	}
+	return pq.Updates(map[string]any{"status": StaleStatus, "updated_at": time.Now().UTC()}).Error
 }
 
 // UpsertPendingProjectCandidate retains a conflicting lifecycle identity.

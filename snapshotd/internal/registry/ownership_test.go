@@ -84,4 +84,18 @@ func TestReleaseProjectOwnershipOnSwitch(t *testing.T) {
 	if _, err := r.GetProjectActiveOwner("new"); err != nil {
 		t.Fatalf("new marker should remain: %v", err)
 	}
+	candidate := &PendingProjectCandidate{ProjectID: "new", Owner: OwnershipExternal, InstanceID: "gui", InstanceNonce: "nonce", PID: 7, ProcessStart: "start", Generation: 2, Status: PendingStatus, LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now}
+	if err := r.UpsertPendingProjectCandidate(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReleaseProjectOwnership(OwnershipExternal, "gui", "nonce", "start", ""); err != nil {
+		t.Fatal(err)
+	}
+	var got PendingProjectCandidate
+	if err := r.DB().First(&got, "id = ?", candidate.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StaleStatus {
+		t.Fatalf("pending identity should be stale after release: %s", got.Status)
+	}
 }

@@ -562,6 +562,7 @@ func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID stri
 	// already-pooled SAP connection before a later MCP call can continue
 	// mutating the now-unregistered GUI/in-memory instance.
 	d.invalidateProjectForPath(instance.ProjectPath)
+	_ = d.Reg.ReleaseProjectOwnership(registry.OwnershipExternal, instance.ID, instance.InstanceNonce, instance.ProcessStart, "")
 	return nil
 }
 
@@ -1495,6 +1496,7 @@ func (d *Daemon) CloseInstance(ctx context.Context, instanceID string) error {
 	// its connection would still permit stale in-memory routing.
 	closeErr := d.Proc.Close(instanceID)
 	d.SAP.InvalidateProject(instance.ProjectID)
+	_ = d.Reg.ReleaseProjectOwnership(registry.OwnershipManaged, instance.ID, "", instance.ProcessStart, "")
 	return closeErr
 }
 
