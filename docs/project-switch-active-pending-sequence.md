@@ -24,7 +24,7 @@ sequenceDiagram
     alt PID A is alive and valid
         R-->>D: PID A still active
         D->>R: Store PID B in pendingByProject[P]
-        D-->>G2: Accepted as pending; do not replace PID A
+        D-->>G2: Accepted as pending, do not replace PID A
         D-->>G1: Keep project operations routed to PID A
     else PID A is stale or cleared
         R-->>D: PID A invalid
