@@ -72,7 +72,14 @@ See [Build from source](#how-to-build) for a local development build.
 
 ### Windows
 
-Download the current Windows build from the
+🔵 **Install command**
+
+```powershell
+irm -UseBasicParsing https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
+```
+
+For Windows PowerShell 5.1, `-UseBasicParsing` avoids the web-content
+confirmation prompt. You can also download the current build from the
 [Snapflow release page](https://github.com/Zealbase/snapflow/releases).
 
 ### macOS
