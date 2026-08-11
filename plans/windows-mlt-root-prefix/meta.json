@@ -64,6 +64,10 @@
         {
           "description": "Two review passes confirmed BUNDLE_ROOT scope, root-level archive contents, module dependency recursion, and preserved DLL reuse.",
           "verdict": "PASS"
+        },
+        {
+          "description": "Second self-review confirmed the final-package assertions, one native SetDllDirectoryA call before MLT setup, and main/submodule refs aligned.",
+          "verdict": "PASS"
         }
       ]
     },
@@ -74,15 +78,38 @@
       "status": "completed",
       "description": "Verify implementation against this plan.",
       "verification": "go test ./internal/procmgr and git diff --check; no unresolved misalignments.",
-      "misalignments": []
+      "misalignments": [],
+      "verified": [
+        {
+          "description": "Focused Go test, diff check, workflow assertions, and main/master ref checks passed.",
+          "verdict": "PASS"
+        }
+      ]
     },
     {
       "phase": "runtime_gate",
       "order": 4,
       "tier": "runtime_gate",
-      "status": "not_started",
+      "status": "in_progress",
       "description": "Install the resulting Windows artifact on Nitro and verify the first MLT repository log.",
-      "verification": "Fresh native and daemon launches report the root-level lib/mlt path and load plugins."
+      "verification": "Fresh native and daemon launches report the root-level lib/mlt path and load plugins.",
+      "matrix_rows": [
+        {
+          "scenario": "Windows workflow_dispatch from main",
+          "flag": "run 31513735513",
+          "matrix_status": "IN_PROGRESS"
+        },
+        {
+          "scenario": "Final ZIP contains MLT/frei0r and avdevice/avfilter",
+          "flag": "package assertions",
+          "matrix_status": "PENDING"
+        },
+        {
+          "scenario": "Native and daemon MLT startup on Nitro",
+          "flag": "fresh artifact install",
+          "matrix_status": "PENDING"
+        }
+      ]
     }
   ]
 }
