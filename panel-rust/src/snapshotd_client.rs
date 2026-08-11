@@ -14,6 +14,32 @@ use thiserror::Error;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_ATTEMPTS: usize = 3;
 
+/// Opt-in diagnostics for Windows/project-switch lifecycle investigations.
+/// Keep this disabled by default: paths, instance ids, and RPC timings are
+/// only emitted when SNAPFLOW_PROJECT_SWITCH_DEBUG is set to 1/true/yes.
+fn project_switch_debug_enabled() -> bool {
+    std::env::var("SNAPFLOW_PROJECT_SWITCH_DEBUG")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn project_hint(path: Option<&str>) -> String {
+    path.map(|value| {
+        let name = Path::new(value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unnamed>");
+        format!("{name} ({} chars)", value.chars().count())
+    })
+    .unwrap_or_else(|| "<none>".to_owned())
+}
+
+fn project_switch_debug(message: impl std::fmt::Display) {
+    if project_switch_debug_enabled() {
+        eprintln!("panel-rust: project-switch-debug: {message}");
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SnapshotdClientError {
     #[error("snapshotd control socket is unavailable: {0}")]
@@ -315,12 +341,19 @@ impl DiscoveryEndpoint {
                     "\\\\.\\pipe\\snapflow-discovery-{}",
                     std::process::id()
                 ))
-            });
+        });
         let descriptor = apps.join(format!("{}.json", std::process::id()));
+        let initial_project_hint = project_hint(project_path.as_deref());
         let project_path = Arc::new(Mutex::new(project_path));
         let project_for_thread = Arc::clone(&project_path);
         let nonce_for_thread = nonce.to_owned();
         let process_start = process_start_identity();
+        project_switch_debug(format_args!(
+            "windows discovery starting pid={} project={} home_name={}",
+            std::process::id(),
+            initial_project_hint,
+            home.file_name().and_then(|name| name.to_str()).unwrap_or("<unknown>")
+        ));
         let descriptor_value = json!({
             "endpoint": socket,
             "pid": std::process::id(),
@@ -340,6 +373,7 @@ impl DiscoveryEndpoint {
                     .enable_time()
                     .build()
                 else {
+                    project_switch_debug("windows discovery runtime creation failed");
                     return;
                 };
                 // Tokio's Windows named-pipe registration consults the
@@ -360,12 +394,20 @@ impl DiscoveryEndpoint {
                         .create(&socket_for_thread)
                     {
                         Ok(server) => server,
-                        Err(_) => break,
+                        Err(error) => {
+                            project_switch_debug(format_args!("windows discovery pipe create failed: {error}"));
+                            break;
+                        }
                     };
+                    project_switch_debug("windows discovery pipe instance created; waiting for client");
                     let connected = runtime.block_on(async {
                         tokio::time::timeout(Duration::from_millis(50), server.connect()).await
                     });
-                    if !matches!(connected, Ok(Ok(()))) { continue; }
+                    if !matches!(connected, Ok(Ok(()))) {
+                        project_switch_debug("windows discovery pipe connect timed out or failed");
+                        continue;
+                    }
+                    project_switch_debug("windows discovery client connected");
                     runtime.block_on(async {
                         let (read, mut write) = tokio::io::split(&mut server);
                         let mut line = String::new();
@@ -373,6 +415,7 @@ impl DiscoveryEndpoint {
                             if let Ok(request) = serde_json::from_str::<Value>(&line) {
                                 let challenge = request["params"]["challenge"].as_str().unwrap_or_default();
                                 let project = project_for_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                                project_switch_debug(format_args!("discovery response project={}", project_hint(project.as_deref())));
                                 let response = json!({"jsonrpc":"2.0", "id":request["id"], "result": {
                                     "instanceNonce": nonce_for_thread, "pid": std::process::id(), "processStart": process_start,
                                     "projectPath": project,
@@ -385,6 +428,7 @@ impl DiscoveryEndpoint {
                         }
                     });
                 }
+                project_switch_debug("windows discovery worker stopped");
                 let _ = std::fs::remove_file(descriptor_for_thread);
             })
             .ok()?;
@@ -482,6 +526,11 @@ impl SnapshotdRegistration {
                     }
                 };
             let (commands, receiver) = mpsc::channel();
+            project_switch_debug(format_args!(
+                "registration starting managed={} initial_project={}",
+                managed,
+                project_hint(seeded.project_path.as_deref())
+            ));
             let instance_id = Arc::new(Mutex::new(None));
             let project_inventory = Arc::new(Mutex::new(None));
             let project_inventory_dirty = Arc::new(AtomicBool::new(false));
@@ -595,6 +644,7 @@ impl SnapshotdRegistration {
                     loop {
                         match receiver.recv_timeout(Duration::from_millis(250)) {
                             Ok(RegistrationCommand::Wake) => {
+                                project_switch_debug("registration wake received");
                                 let latest = latest_lifecycle()
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -606,6 +656,12 @@ impl SnapshotdRegistration {
                                 current_project_path = latest.project_path;
                                 current_reason = latest.reason;
                                 current_generation = latest.generation;
+                                project_switch_debug(format_args!(
+                                    "lifecycle update generation={} reason={} project={}",
+                                    current_generation,
+                                    current_reason,
+                                    project_hint(current_project_path.as_deref())
+                                ));
                                 if let Some(id) = current_id.as_deref() {
                                     if managed {
                                         managed_pending = runtime
@@ -776,11 +832,15 @@ impl SnapshotdRegistration {
             accept_latest(&mut latest, candidate.clone())
         };
         if !accepted {
+            project_switch_debug(format_args!("lifecycle update ignored generation={} project={}", candidate.generation, project_hint(candidate.project_path.as_deref())));
             return;
         }
+        project_switch_debug(format_args!("lifecycle update queued generation={} reason={} project={}", candidate.generation, candidate.reason, project_hint(candidate.project_path.as_deref())));
         #[cfg(any(unix, windows))]
         self.discovery.update(candidate.project_path);
-        let _ = self.commands.send(RegistrationCommand::Wake);
+        if self.commands.send(RegistrationCommand::Wake).is_err() {
+            project_switch_debug("registration wake send failed");
+        }
     }
 
     pub fn instance_id(&self) -> Option<String> {
@@ -1006,7 +1066,9 @@ impl SnapshotdControlClient {
         reason: &str,
         generation: u64,
     ) -> Result<Value, SnapshotdClientError> {
-        self.call(
+        let started = Instant::now();
+        project_switch_debug(format_args!("RPC updateOpenProject begin generation={} project={}", generation, project_hint(project_path)));
+        let result = self.call(
             "daemon.updateOpenProject",
             json!({
                 "instanceId": instance_id,
@@ -1015,7 +1077,9 @@ impl SnapshotdControlClient {
                 "generation": generation,
             }),
         )
-        .await
+        .await;
+        project_switch_debug(format_args!("RPC updateOpenProject end elapsed_ms={} result={}", started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "error" }));
+        result
     }
 
     pub async fn instance_project_changed(
@@ -1027,7 +1091,9 @@ impl SnapshotdControlClient {
         reason: &str,
         generation: u64,
     ) -> Result<Value, SnapshotdClientError> {
-        self.call(
+        let started = Instant::now();
+        project_switch_debug(format_args!("RPC instanceProjectChanged begin owner={} generation={} reason={} project={}", owner, generation, reason, project_hint(project_path)));
+        let result = self.call(
             "daemon.instanceProjectChanged",
             json!({
                 "owner": owner, "instanceId": instance_id, "instanceNonce": instance_nonce,
@@ -1035,7 +1101,9 @@ impl SnapshotdControlClient {
                 "projectPath": project_path, "reason": reason, "generation": generation,
             }),
         )
-        .await
+        .await;
+        project_switch_debug(format_args!("RPC instanceProjectChanged end elapsed_ms={} result={}", started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "error" }));
+        result
     }
 
     pub async fn heartbeat(&self, instance_id: &str) -> Result<Value, SnapshotdClientError> {
