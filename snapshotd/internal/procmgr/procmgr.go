@@ -228,16 +228,19 @@ func bundledMeltBinary(binPath string) string {
 
 // appendBundledMltEnv makes a relocatable GUI bundle independent of the
 // daemon's working directory. The Windows package has one canonical prefix:
-// the directory containing snapflow.exe, with unversioned lib/mlt and
-// share/mlt directories beside it. Only advertise paths when the repository
+// the directory containing snapflow.exe, with versioned lib/mlt-7 and
+// share/mlt-7 directories beside it. MLT's Windows relocatable loader uses
+// this versioned ABI directory; MLT_REPOSITORY is retained for platforms
+// where it is honored, while MLT_DATA and MLT_PROFILES_PATH provide the
+// explicit data/profile locations. Only advertise paths when the repository
 // exists; source-checkout and test launches continue using system MLT.
 func appendBundledMltEnv(env []string, binPath string) []string {
 	appDir := filepath.Dir(binPath)
-	repo := filepath.Join(appDir, "lib", "mlt")
+	repo := filepath.Join(appDir, "lib", "mlt-7")
 	if st, err := os.Stat(repo); err != nil || !st.IsDir() {
 		return env
 	}
-	data := filepath.Join(appDir, "share", "mlt")
+	data := filepath.Join(appDir, "share", "mlt-7")
 	result := append([]string{}, env...)
 	result = append(result, "MLT_REPOSITORY="+repo, "MLT_DATA="+data,
 		"MLT_PROFILES_PATH="+filepath.Join(data, "profiles"))

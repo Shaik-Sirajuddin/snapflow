@@ -336,17 +336,15 @@ jobs:
           }
           bundle_dlls "$APPDIR/snapflow.exe"
 
-          # /mingw64/lib/mlt-7 does not exist -- confirmed via a real
-          # `find` on a windows-latest run; the MSYS2 mingw-w64-x86_64-mlt
-          # package installs its modules/data unversioned, at
-          # /mingw64/lib/mlt and /mingw64/share/mlt. The destination name
-          # (mlt-7) is an upstream build detail only. Normalize the shipped
-          # tree to an unversioned app-local prefix, matching Shotcut.
-          # Native startup and daemon launches explicitly use this same
-          # unversioned app-local repository/data prefix.
+          # MSYS2 installs the modules/data unversioned, at /mingw64/lib/mlt
+          # and /mingw64/share/mlt. Windows' relocatable MLT loader derives
+          # the repository from libmlt-7.dll and expects the versioned
+          # app-local names beside the executable, so preserve the upstream
+          # runtime ABI name in the shipped bundle. Native startup and daemon
+          # launches explicitly use this same versioned prefix.
           mkdir -p "$APPDIR/lib" "$APPDIR/share"
-          cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt"
-          cp -r /mingw64/share/mlt "$APPDIR/share/mlt"
+          cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt-7"
+          cp -r /mingw64/share/mlt "$APPDIR/share/mlt-7"
 
           # Qt plugins: fixed list matching what Shotcut (and this fork)
           # actually use, identical to upstream's own build-shotcut-msys2.sh.
@@ -408,7 +406,7 @@ jobs:
             find "$OUT" -maxdepth 4 -type f -iname 'snapflow*.exe' -print >&2 || true
             exit 1
           }
-          test -f "$OUT/Snapflow/lib/mlt/libmltxml.dll" || {
+          test -f "$OUT/Snapflow/lib/mlt-7/libmltxml.dll" || {
             echo "bundled app-local MLT repository missing" >&2
             exit 1
           }
