@@ -72,6 +72,82 @@ function Start-DaemonAndWait($daemonPath) {
     Die "snapflowd did not become ready within 15 seconds; see $stderr"
 }
 
+function Stop-DaemonForUpgrade($daemonPath) {
+    # Replacing a running Windows executable is not reliable: the old
+    # snapflowd can keep its image (and the daemon lock) open while the
+    # installer renames/extracts $InstallDir.  Stop only the daemon that the
+    # installed CLI can address, and wait for its control endpoint to close
+    # before touching the bundle.  A missing/unresponsive endpoint is handled
+    # below using the daemon's own PID marker, but we never terminate an
+    # unrelated process.
+    if (-not (Test-Path $daemonPath)) {
+        return
+    }
+
+    $wasReady = Test-DaemonReady $daemonPath
+
+    $logDir = Join-Path $env:LOCALAPPDATA "snapflow"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $stopLog = Join-Path $logDir "snapflowd-install.stop.log"
+    $stopExit = 0
+    if ($wasReady) {
+        Info "Stopping the running snapflowd before upgrading..."
+        $previous = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            (& $daemonPath stop 2>&1 | Out-File -FilePath $stopLog -Encoding utf8)
+            $stopExit = $LASTEXITCODE
+        } catch {
+            $stopExit = 1
+            $_ | Out-File -FilePath $stopLog -Encoding utf8
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    if ($wasReady) {
+        do {
+            Start-Sleep -Milliseconds 250
+            if (-not (Test-DaemonReady $daemonPath)) {
+                Info "The previous snapflowd stopped."
+                return
+            }
+        } while ([DateTime]::UtcNow -lt $deadline)
+    }
+
+    # A daemon can be alive with a stale/broken control pipe (for example
+    # after a discovery listener panic).  If its PID marker identifies that
+    # exact executable, terminate only that process so the upgrade cannot
+    # leave a stale lock and an old binary behind.  Do not guess from a bare
+    # process name: PID reuse must not kill an unrelated snapflowd.
+    $daemonHome = if ($env:SNAPSHOTD_HOME) { $env:SNAPSHOTD_HOME } else { Join-Path $env:USERPROFILE ".snapshotd" }
+    $pidFile = Join-Path $daemonHome "daemon.pid"
+    $pidText = if (Test-Path $pidFile) { (Get-Content $pidFile -Raw -ErrorAction SilentlyContinue).Trim() } else { "" }
+    $daemonPid = 0
+    if ([int]::TryParse($pidText, [ref]$daemonPid) -and $daemonPid -gt 0) {
+        $proc = Get-Process -Id $daemonPid -ErrorAction SilentlyContinue
+        if ($proc) {
+            $procPath = $null
+            try { $procPath = $proc.Path } catch { }
+            $expectedPath = $daemonPath
+            try { $expectedPath = (Resolve-Path $daemonPath -ErrorAction Stop).Path } catch { }
+            $resolvedProcPath = $null
+            if ($procPath) { $resolvedProcPath = (Resolve-Path $procPath -ErrorAction SilentlyContinue).Path }
+            if ($resolvedProcPath -and ($resolvedProcPath -ieq $expectedPath)) {
+                Info "snapflowd control endpoint is unresponsive; terminating stale daemon PID $daemonPid."
+                Stop-Process -Id $daemonPid -Force -ErrorAction Stop
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+
+    if (Test-DaemonReady $daemonPath) {
+        Die "could not stop the existing snapflowd before upgrade (exit code $stopExit); see $stopLog"
+    }
+    Info "The previous snapflowd stopped after stale-process cleanup."
+}
+
 if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64" -and $env:PROCESSOR_ARCHITEW6432 -ne "AMD64") {
     Die "unsupported architecture: $env:PROCESSOR_ARCHITECTURE -- only x86_64/AMD64 builds are published"
 }
@@ -110,12 +186,17 @@ function Resolve-AssetUrl {
 $resolved = Resolve-AssetUrl
 $assetUrl = $resolved.Url
 $targetVersion = if ($resolved.Tag) { $resolved.Tag } else { Split-Path $assetUrl -Leaf }
+$snapflowdExe = Join-Path $BinDir "snapflowd.exe"
 
 if (Test-Path $VersionFile) {
     $installedVersion = Get-Content $VersionFile -Raw -ErrorAction SilentlyContinue
-    $snapflowdExe = Join-Path $BinDir "snapflowd.exe"
     if ($installedVersion -and $installedVersion.Trim() -eq $targetVersion -and (Test-Path $snapflowdExe)) {
         Info "snapflow $targetVersion is already installed and up to date -- nothing to do."
+        # Keep a healthy exact-version daemon, but recover an instance whose
+        # control listener died while its process/lock remained behind.
+        if (-not (Test-DaemonReady $snapflowdExe)) {
+            Stop-DaemonForUpgrade $snapflowdExe
+        }
         Start-DaemonAndWait $snapflowdExe
         exit 0
     }
@@ -162,6 +243,7 @@ try {
     # static application content -- real user/project data lives under
     # snapshotd's own data dir, a separate tree this script never touches.
     if (Test-Path $InstallDir) {
+        Stop-DaemonForUpgrade $snapflowdExe
         Info "Backing up previous install to $InstallDir.prev..."
         $prevDir = "$InstallDir.prev"
         if (Test-Path $prevDir) { Remove-Item -Recurse -Force $prevDir }
