@@ -54,7 +54,7 @@ func Open(path string) (*Registry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: open %s: %w", path, err)
 	}
-	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &ExternalInstance{}, &McpContext{}, &ClientLease{}, &AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &ExternalInstance{}, &ProjectActiveOwner{}, &PendingProjectCandidate{}, &McpContext{}, &ClientLease{}, &AuditEvent{}); err != nil {
 		return nil, fmt.Errorf("registry: automigrate: %w", err)
 	}
 	return &Registry{db: db}, nil
