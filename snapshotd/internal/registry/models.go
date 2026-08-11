@@ -144,6 +144,7 @@ type PendingProjectCandidate struct {
 	InstanceNonce  string    `json:"instanceNonce,omitempty"`
 	PID            int       `json:"pid"`
 	ProcessStart   string    `json:"processStart"`
+	ProjectPath    string    `json:"projectPath,omitempty"`
 	Generation     uint64    `gorm:"index:idx_pending_project_generation" json:"generation"`
 	Status         string    `json:"status"` // pending | promoted | stale | closed
 	LastSeenAt     time.Time `json:"lastSeenAt"`

@@ -165,6 +165,34 @@ func (r *Registry) UpsertPendingProjectCandidate(candidate *PendingProjectCandid
 	return nil
 }
 
+// ListPendingProjectCandidates returns newest pending identities first.
+func (r *Registry) ListPendingProjectCandidates(projectID string) ([]PendingProjectCandidate, error) {
+	var out []PendingProjectCandidate
+	err := r.db.Where("project_id = ? AND status = ?", projectID, PendingStatus).
+		Order("generation DESC, created_at DESC").Find(&out).Error
+	return out, err
+}
+
+// PromoteProjectCandidate atomically replaces the active marker and retires
+// the candidate. Callers must validate liveness before invoking this method.
+func (r *Registry) PromoteProjectCandidate(projectID string, candidate *PendingProjectCandidate, now time.Time) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		owner := ProjectActiveOwner{ProjectID: projectID, Owner: candidate.Owner,
+			InstanceID: candidate.InstanceID, InstanceNonce: candidate.InstanceNonce,
+			PID: candidate.PID, ProcessStart: candidate.ProcessStart,
+			Generation: candidate.Generation, LastSeenAt: now,
+			LeaseExpiresAt: candidate.LeaseExpiresAt, UpdatedAt: now}
+		if err := tx.Save(&owner).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&PendingProjectCandidate{}).Where("id = ?", candidate.ID).
+			Updates(map[string]any{"status": PromotedStatus, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 // --- Project operations ---
 
 func (r *Registry) CreateProject(p *Project) error {

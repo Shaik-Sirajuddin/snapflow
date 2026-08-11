@@ -367,7 +367,7 @@ func (d *Daemon) claimProjectOwner(p InstanceProjectChangedParams, projectID str
 	if err := d.Reg.UpsertPendingProjectCandidate(&registry.PendingProjectCandidate{
 		ProjectID: projectID, Owner: p.Owner, InstanceID: p.InstanceID,
 		InstanceNonce: p.InstanceNonce, PID: p.PID, ProcessStart: p.ProcessStart,
-		Generation: p.Generation, Status: registry.PendingStatus, LastSeenAt: now,
+		ProjectPath: p.ProjectPath, Generation: p.Generation, Status: registry.PendingStatus, LastSeenAt: now,
 		LeaseExpiresAt: now.Add(externalInstanceLease), CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		return false, err
@@ -639,6 +639,75 @@ func (d *Daemon) ReconcileExternalInstances(ctx context.Context) ([]registry.Ext
 	return d.Reg.ListExternalInstances()
 }
 
+// ReconcileProjectOwnerships expires an invalid active marker and promotes the
+// newest still-live pending identity. The active marker is only a routing
+// pointer; lifecycle rows remain authoritative for liveness and cleanup.
+func (d *Daemon) ReconcileProjectOwnerships(ctx context.Context) error {
+	projects, err := d.Reg.ListProjects()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, project := range projects {
+		active, err := d.Reg.GetProjectActiveOwner(project.ID)
+		if errors.Is(err, registry.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if d.projectOwnerLive(active, now) {
+			continue
+		}
+		candidates, err := d.Reg.ListPendingProjectCandidates(project.ID)
+		if err != nil {
+			return err
+		}
+		for i := range candidates {
+			candidate := &candidates[i]
+			if !d.pendingCandidateLive(candidate, now) {
+				_ = d.Reg.DB().Model(candidate).Update("status", registry.StaleStatus).Error
+				continue
+			}
+			if err := d.Reg.PromoteProjectCandidate(project.ID, candidate, now); err != nil {
+				return err
+			}
+			if candidate.Owner == registry.OwnershipManaged {
+				_ = d.Reg.UpdateProcessInstanceProject(candidate.InstanceID, project.ID, candidate.Generation)
+			} else {
+				_, _ = d.UpdateOpenProject(ctx, UpdateExternalProjectParams{InstanceID: candidate.InstanceID, ProjectPath: candidate.ProjectPath, Reason: "promote", Generation: candidate.Generation})
+			}
+			d.projectSwitchDebug("pending project owner promoted", "project_id", projectSwitchIDHint(project.ID), "instance", projectSwitchIDHint(candidate.InstanceID))
+			break
+		}
+	}
+	return nil
+}
+
+func (d *Daemon) projectOwnerLive(owner *registry.ProjectActiveOwner, now time.Time) bool {
+	if owner == nil || owner.LeaseExpiresAt.Before(now) || !health.ProcessIdentityMatches(owner.PID, owner.ProcessStart) {
+		return false
+	}
+	if owner.Owner == registry.OwnershipManaged {
+		row, err := d.Reg.GetProcessInstance(owner.InstanceID)
+		return err == nil && row.Status == registry.StatusReady && row.PID == owner.PID && row.ProcessStart == owner.ProcessStart
+	}
+	row, err := d.Reg.GetExternalInstance(owner.InstanceID)
+	return err == nil && row.Status == registry.ExternalStatusOpen && row.InstanceNonce == owner.InstanceNonce && row.PID == owner.PID && row.ProcessStart == owner.ProcessStart
+}
+
+func (d *Daemon) pendingCandidateLive(candidate *registry.PendingProjectCandidate, now time.Time) bool {
+	if candidate == nil || candidate.LeaseExpiresAt.Before(now) || !health.ProcessIdentityMatches(candidate.PID, candidate.ProcessStart) {
+		return false
+	}
+	if candidate.Owner == registry.OwnershipManaged {
+		row, err := d.Reg.GetProcessInstance(candidate.InstanceID)
+		return err == nil && row.Status == registry.StatusReady && row.PID == candidate.PID && row.ProcessStart == candidate.ProcessStart
+	}
+	row, err := d.Reg.GetExternalInstance(candidate.InstanceID)
+	return err == nil && row.Status == registry.ExternalStatusOpen && row.InstanceNonce == candidate.InstanceNonce && row.PID == candidate.PID && row.ProcessStart == candidate.ProcessStart
+}
+
 type RegisterMcpContextParams struct {
 	ContextToken           string `json:"contextToken"`
 	ACPSessionID           string `json:"acpSessionId"`
@@ -842,6 +911,9 @@ func (d *Daemon) Reconcile(ctx context.Context) ([]registry.ReconcileOutcome, er
 	}
 	if _, err := d.ReconcileExternalInstances(ctx); err != nil {
 		return nil, fmt.Errorf("daemon: reconcile external instances: %w", err)
+	}
+	if err := d.ReconcileProjectOwnerships(ctx); err != nil {
+		return nil, fmt.Errorf("daemon: reconcile project ownerships: %w", err)
 	}
 	return outcomes, nil
 }
