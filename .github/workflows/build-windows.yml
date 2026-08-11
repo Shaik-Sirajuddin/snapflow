@@ -168,12 +168,13 @@ jobs:
           grep -m1 '^version = ' multi-media-main/panel-rust/Cargo.toml
 
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry
-      # -- pushed separately to Shaik-Sirajuddin/shotcut.git's
-      # master branch), so check it out on its own.
+      # -- pushed separately to Shaik-Sirajuddin/shotcut.git), so check it
+      # out on its own at the exact commit that contains the app-local MLT
+      # startup fix used by this release.
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: master
+          ref: bed3a67f8878fc0e80413c2e2c806a3e9a9dae16
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
@@ -341,13 +342,8 @@ jobs:
           # /mingw64/lib/mlt and /mingw64/share/mlt. The destination name
           # (mlt-7) is an upstream build detail only. Normalize the shipped
           # tree to an unversioned app-local prefix, matching Shotcut.
-          # default module-repository lookup (Mlt::Factory::init() is
-          # called with no explicit path in mltcontroller.cpp, matching
-          # upstream shotcut's own main.cpp, which also never sets
-          # MLT_REPOSITORY/MLT_DATA) auto-detects lib/mlt-7 and
-          # share/mlt-7 relative to wherever libmlt-7.dll itself sits --
-          # a versioned name baked into libmlt-7.dll regardless of how
-          # MSYS2 happened to lay out its own system install.
+          # Native startup and daemon launches explicitly use this same
+          # unversioned app-local repository/data prefix.
           mkdir -p "$APPDIR/lib" "$APPDIR/share"
           cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt"
           cp -r /mingw64/share/mlt "$APPDIR/share/mlt"
