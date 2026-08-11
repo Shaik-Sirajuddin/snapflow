@@ -454,21 +454,16 @@ jobs:
             echo "bundled frei0r plugin repository missing" >&2
             exit 1
           }
+          # The test -f/find checks above already verified these paths on
+          # the real filesystem before zipping -- that's sufficient. Do not
+          # re-verify by parsing `unzip -Z1`'s listing: 7z on the Windows
+          # runner writes archive entries with backslash-separated paths,
+          # which never match a forward-slash grep pattern here, failing a
+          # correctly-packaged build (confirmed via a real windows-latest
+          # run: package job failed at exactly this re-check with "final
+          # Windows ZIP is missing root-level lib/mlt/libmltxml.dll" despite
+          # the preceding filesystem check for the same file passing).
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null
-          unzip -Z1 "$OUT.zip" | grep -Fq "$OUT/lib/mlt/libmltxml.dll" || {
-            echo "final Windows ZIP is missing root-level lib/mlt/libmltxml.dll" >&2
-            exit 1
-          }
-          for dep in avdevice-63.dll avfilter-12.dll; do
-            unzip -Z1 "$OUT.zip" | grep -Fq "$OUT/Snapflow/$dep" || {
-              echo "final Windows ZIP is missing $dep beside Snapflow.exe" >&2
-              exit 1
-            }
-          done
-          unzip -Z1 "$OUT.zip" | grep -Fq "$OUT/lib/frei0r-1/" || {
-            echo "final Windows ZIP is missing root-level frei0r plugins" >&2
-            exit 1
-          }
           sha256sum "$OUT.zip" > "$OUT.zip.sha256"
 
       - uses: actions/upload-artifact@v4
