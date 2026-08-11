@@ -345,45 +345,20 @@ func (d *Daemon) claimProjectOwner(p InstanceProjectChangedParams, projectID str
 	if projectID == "" {
 		return false, nil
 	}
-	active, err := d.Reg.GetProjectActiveOwner(projectID)
-	if err != nil && !errors.Is(err, registry.ErrNotFound) {
-		return false, err
-	}
 	now := time.Now().UTC()
-	if active == nil {
-		if err := d.Reg.ReleaseProjectOwnership(p.Owner, p.InstanceID, p.InstanceNonce, p.ProcessStart, projectID); err != nil {
-			return false, err
-		}
-		return false, d.Reg.SaveProjectActiveOwner(&registry.ProjectActiveOwner{
-			ProjectID: projectID, Owner: p.Owner, InstanceID: p.InstanceID,
-			InstanceNonce: p.InstanceNonce, PID: p.PID, ProcessStart: p.ProcessStart,
-			Generation: p.Generation, LastSeenAt: now, LeaseExpiresAt: now.Add(externalInstanceLease), UpdatedAt: now,
-		})
-	}
-	same := active.Owner == p.Owner && active.InstanceID == p.InstanceID &&
-		active.InstanceNonce == p.InstanceNonce && active.PID == p.PID && active.ProcessStart == p.ProcessStart
-	if same {
-		active.Generation = maxUint64(active.Generation, p.Generation)
-		active.LastSeenAt, active.LeaseExpiresAt, active.UpdatedAt = now, now.Add(externalInstanceLease), now
-		return false, d.Reg.SaveProjectActiveOwner(active)
-	}
-	if err := d.Reg.UpsertPendingProjectCandidate(&registry.PendingProjectCandidate{
+	pending, active, err := d.Reg.ClaimProjectOwner(registry.PendingProjectCandidate{
 		ProjectID: projectID, Owner: p.Owner, InstanceID: p.InstanceID,
 		InstanceNonce: p.InstanceNonce, PID: p.PID, ProcessStart: p.ProcessStart,
 		ProjectPath: p.ProjectPath, Generation: p.Generation, Status: registry.PendingStatus, LastSeenAt: now,
 		LeaseExpiresAt: now.Add(externalInstanceLease), CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
+	}, now)
+	if err != nil {
 		return false, err
 	}
-	d.projectSwitchDebug("project ownership conflict retained pending", "project_id", projectSwitchIDHint(projectID), "active_instance", projectSwitchIDHint(active.InstanceID), "pending_instance", projectSwitchIDHint(p.InstanceID))
-	return true, nil
-}
-
-func maxUint64(a, b uint64) uint64 {
-	if a > b {
-		return a
+	if pending {
+		d.projectSwitchDebug("project ownership conflict retained pending", "project_id", projectSwitchIDHint(projectID), "active_instance", projectSwitchIDHint(active.InstanceID), "pending_instance", projectSwitchIDHint(p.InstanceID))
 	}
-	return b
+	return pending, nil
 }
 
 func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectChangedParams) (any, error) {
@@ -428,9 +403,6 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		if p.Generation < pi.Generation {
 			return *pi, nil
 		}
-		if err := d.Reg.ReleaseProjectOwnership(p.Owner, p.InstanceID, p.InstanceNonce, p.ProcessStart, projectID); err != nil {
-			return nil, fmt.Errorf("daemon: instanceProjectChanged: release prior ownership: %w", err)
-		}
 		pending, err := d.claimProjectOwner(p, projectID)
 		if err != nil {
 			return nil, err
@@ -457,9 +429,6 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		}
 		if p.Generation < instance.Generation {
 			return *instance, nil
-		}
-		if err := d.Reg.ReleaseProjectOwnership(p.Owner, p.InstanceID, p.InstanceNonce, p.ProcessStart, projectID); err != nil {
-			return nil, fmt.Errorf("daemon: instanceProjectChanged: release prior ownership: %w", err)
 		}
 		pending, err := d.claimProjectOwner(p, projectID)
 		if err != nil {

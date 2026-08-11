@@ -133,6 +133,87 @@ func (r *Registry) SaveProjectActiveOwner(owner *ProjectActiveOwner) error {
 	return r.db.Save(owner).Error
 }
 
+// ClaimProjectOwner serializes active-marker selection with pending retention.
+// The project primary key makes the transaction authoritative when multiple
+// GUI callbacks race to become the first owner; only the loser is queued.
+func (r *Registry) ClaimProjectOwner(candidate PendingProjectCandidate, now time.Time) (bool, *ProjectActiveOwner, error) {
+	var pending bool
+	var active ProjectActiveOwner
+	var found bool
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.First(&active, "project_id = ?", candidate.ProjectID)
+		if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return result.Error
+		}
+		found = result.Error == nil
+		if !found {
+			// A successful switch clears this identity's old marker only after
+			// this transaction has established the new active owner.
+			q := tx.Where("owner = ? AND instance_id = ? AND process_start = ? AND project_id <> ?", candidate.Owner, candidate.InstanceID, candidate.ProcessStart, candidate.ProjectID)
+			if candidate.InstanceNonce != "" {
+				q = q.Where("instance_nonce = ?", candidate.InstanceNonce)
+			}
+			if err := q.Delete(&ProjectActiveOwner{}).Error; err != nil {
+				return err
+			}
+			active = ProjectActiveOwner{ProjectID: candidate.ProjectID, Owner: candidate.Owner,
+				InstanceID: candidate.InstanceID, InstanceNonce: candidate.InstanceNonce,
+				PID: candidate.PID, ProcessStart: candidate.ProcessStart, Generation: candidate.Generation,
+				LastSeenAt: now, LeaseExpiresAt: candidate.LeaseExpiresAt, UpdatedAt: now}
+			return tx.Create(&active).Error
+		}
+		same := active.Owner == candidate.Owner && active.InstanceID == candidate.InstanceID &&
+			active.InstanceNonce == candidate.InstanceNonce && active.PID == candidate.PID && active.ProcessStart == candidate.ProcessStart
+		if same {
+			active.Generation = maxGeneration(active.Generation, candidate.Generation)
+			active.LastSeenAt, active.LeaseExpiresAt, active.UpdatedAt = now, candidate.LeaseExpiresAt, now
+			return tx.Save(&active).Error
+		}
+		pending = true
+		var existing PendingProjectCandidate
+		lookup := tx.Where("project_id = ? AND owner = ? AND instance_id = ? AND instance_nonce = ? AND process_start = ?", candidate.ProjectID, candidate.Owner, candidate.InstanceID, candidate.InstanceNonce, candidate.ProcessStart).First(&existing)
+		if lookup.Error == nil {
+			candidate.ID, candidate.CreatedAt = existing.ID, existing.CreatedAt
+		} else if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+			return lookup.Error
+		}
+		if candidate.ID == "" {
+			candidate.ID = uuid.NewString()
+		}
+		if err := tx.Save(&candidate).Error; err != nil {
+			return err
+		}
+		var queued []PendingProjectCandidate
+		if err := tx.Where("project_id = ? AND status = ?", candidate.ProjectID, PendingStatus).Order("created_at DESC").Find(&queued).Error; err != nil {
+			return err
+		}
+		for _, stale := range queued[minInt(len(queued), MaxPendingCandidatesPerProject):] {
+			if err := tx.Model(&stale).Update("status", StaleStatus).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, nil, err
+	}
+	return pending, &active, nil
+}
+
+func maxGeneration(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // ReleaseProjectOwnership removes active markers held by an instance for
 // projects other than keepProjectID. A GUI switch therefore cannot leave its
 // previous project permanently owned after claiming the new one.

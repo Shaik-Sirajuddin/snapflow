@@ -2,6 +2,7 @@ package registry
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,5 +98,76 @@ func TestReleaseProjectOwnershipOnSwitch(t *testing.T) {
 	}
 	if got.Status != StaleStatus {
 		t.Fatalf("pending identity should be stale after release: %s", got.Status)
+	}
+}
+
+func TestClaimProjectOwnerConcurrentFirstCallbacksKeepOneActive(t *testing.T) {
+	r, err := Open(filepath.Join(t.TempDir(), "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	now := time.Now().UTC()
+	candidates := []PendingProjectCandidate{
+		{ProjectID: "project", Owner: OwnershipExternal, InstanceID: "a", InstanceNonce: "na", PID: 1, ProcessStart: "sa", Generation: 1, Status: PendingStatus, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now},
+		{ProjectID: "project", Owner: OwnershipExternal, InstanceID: "b", InstanceNonce: "nb", PID: 2, ProcessStart: "sb", Generation: 1, Status: PendingStatus, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now},
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(candidates))
+	for i := range candidates {
+		wg.Add(1)
+		go func(candidate PendingProjectCandidate) {
+			defer wg.Done()
+			_, _, callErr := r.ClaimProjectOwner(candidate, now)
+			errs <- callErr
+		}(candidates[i])
+	}
+	wg.Wait()
+	close(errs)
+	for callErr := range errs {
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+	}
+	active, err := r.GetProjectActiveOwner("project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.InstanceID != "a" && active.InstanceID != "b" {
+		t.Fatalf("unexpected active owner: %+v", active)
+	}
+	pending, err := r.ListPendingProjectCandidates("project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].InstanceID == active.InstanceID {
+		t.Fatalf("expected losing callback to remain pending: active=%+v pending=%+v", active, pending)
+	}
+}
+
+func TestPromoteProjectCandidateAtomicallyUpdatesMarkerAndStatus(t *testing.T) {
+	r, err := Open(filepath.Join(t.TempDir(), "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	now := time.Now().UTC()
+	candidate := &PendingProjectCandidate{ProjectID: "project", Owner: OwnershipExternal, InstanceID: "next", InstanceNonce: "nonce", PID: 9, ProcessStart: "start", Generation: 3, Status: PendingStatus, LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now}
+	if err := r.UpsertPendingProjectCandidate(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PromoteProjectCandidate("project", candidate, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	active, err := r.GetProjectActiveOwner("project")
+	if err != nil || active.InstanceID != "next" || active.Generation != 3 {
+		t.Fatalf("promotion did not install active marker: %+v, err=%v", active, err)
+	}
+	var stored PendingProjectCandidate
+	if err := r.DB().First(&stored, "id = ?", candidate.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != PromotedStatus {
+		t.Fatalf("candidate status = %q, want promoted", stored.Status)
 	}
 }
