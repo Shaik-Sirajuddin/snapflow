@@ -5,6 +5,15 @@
   "source_task": "Fix live GUI project propagation by making external registration process-scoped and self-healing.",
   "status": "in_progress",
   "updated": "2026-08-11",
+  "checks_count": 2,
+  "last_verification": {
+    "passes": 2,
+    "result": "no findings",
+    "evidence": [
+      "Pass 1 reviewed process-scoped ownership, panel recreation, lifecycle generations, recovery ordering, and managed-process isolation.",
+      "Pass 2 ran git diff --check, shell syntax validation, cargo check, focused Rust tests, and focused Go tests."
+    ]
+  },
   "ordering_rationale": "Implement the lifecycle ownership and recovery first, then review, verify against the plan, and finally run non-destructive runtime checks.",
   "completed": [
     {
