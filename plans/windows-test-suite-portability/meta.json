@@ -5,7 +5,7 @@
   "plan_doc": "00-plan.md",
   "source_task": "Fix Windows snapshotd test-suite failures on a branch, validate with Windows CI, then merge to main.",
   "status": "in_progress",
-  "updated": "2026-08-11: phases 1-3 implemented; local Linux and Windows cross-compile checks pass",
+  "updated": "2026-08-11: branch Windows workflow passed; preparing main merge",
   "ordering_rationale": "Repair shared fixtures and platform selection before deterministic Windows unit assumptions, then run CI before merging.",
   "completed": [
     {
@@ -38,19 +38,21 @@
       "phase": "branch_ci",
       "order": 4,
       "tier": "runtime_gate",
-      "status": "in_progress",
+      "status": "completed",
       "description": "Push branch and run the Windows workflow.",
       "verification": "build-windows required jobs pass on the branch.",
       "matrix_ref": "00-plan.md",
       "matrix_rows": [
-        {"scenario": "snapshotd Windows tests", "flag": "build-windows", "matrix_status": "not_started"}
+        {"scenario": "snapshotd Windows tests", "flag": "build-windows", "matrix_status": "pass", "run": "https://github.com/Zealbase/snapflow/actions/runs/31483782473"},
+        {"scenario": "panel-rust Windows checks", "flag": "build-windows", "matrix_status": "pass", "run": "https://github.com/Zealbase/snapflow/actions/runs/31483782473"},
+        {"scenario": "Shotcut Windows package", "flag": "build-windows", "matrix_status": "pass", "run": "https://github.com/Zealbase/snapflow/actions/runs/31483782473"}
       ]
     },
     {
       "phase": "main_merge",
       "order": 5,
       "tier": "ci_fix",
-      "status": "not_started",
+      "status": "in_progress",
       "description": "Merge the verified branch into main.",
       "verification": "main contains the branch commit only after branch CI is green.",
       "depends_on": ["branch_ci"]
