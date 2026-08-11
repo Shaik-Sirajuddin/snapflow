@@ -67,8 +67,8 @@ func TestBundledMeltBinary_FindsAppSiblingWithoutUsingHome(t *testing.T) {
 func TestAppendBundledMltEnv_UsesAbsoluteBundlePaths(t *testing.T) {
 	appDir := t.TempDir()
 	bin := filepath.Join(appDir, "snapflow.exe")
-	repo := filepath.Join(appDir, "lib", "mlt-7")
-	data := filepath.Join(appDir, "share", "mlt-7")
+	repo := filepath.Join(appDir, "lib", "mlt")
+	data := filepath.Join(appDir, "share", "mlt")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -227,24 +227,17 @@ func bundledMeltBinary(binPath string) string {
 }
 
 // appendBundledMltEnv makes a relocatable GUI bundle independent of the
-// daemon's working directory. MLT's default repository lookup is relative on
-// Windows and can otherwise resolve to <daemon-install>\\lib\\mlt, while the
-// packaged modules live beside snapflow.exe under lib/mlt-7 and share/mlt-7.
-// Only advertise the paths when the repository exists; source-checkout and
-// test launches must continue using their normal system MLT configuration.
+// daemon's working directory. The Windows package has one canonical prefix:
+// the directory containing snapflow.exe, with unversioned lib/mlt and
+// share/mlt directories beside it. Only advertise paths when the repository
+// exists; source-checkout and test launches continue using system MLT.
 func appendBundledMltEnv(env []string, binPath string) []string {
 	appDir := filepath.Dir(binPath)
-	repo := filepath.Join(appDir, "lib", "mlt-7")
-	dataDirName := "mlt-7"
+	repo := filepath.Join(appDir, "lib", "mlt")
 	if st, err := os.Stat(repo); err != nil || !st.IsDir() {
-		// Some Windows MLT builds use the unversioned MSYS2 directory name.
-		repo = filepath.Join(appDir, "lib", "mlt")
-		dataDirName = "mlt"
-		if st, err := os.Stat(repo); err != nil || !st.IsDir() {
-			return env
-		}
+		return env
 	}
-	data := filepath.Join(appDir, "share", dataDirName)
+	data := filepath.Join(appDir, "share", "mlt")
 	result := append([]string{}, env...)
 	result = append(result, "MLT_REPOSITORY="+repo, "MLT_DATA="+data,
 		"MLT_PROFILES_PATH="+filepath.Join(data, "profiles"))

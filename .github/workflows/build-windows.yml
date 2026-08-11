@@ -339,7 +339,8 @@ jobs:
           # `find` on a windows-latest run; the MSYS2 mingw-w64-x86_64-mlt
           # package installs its modules/data unversioned, at
           # /mingw64/lib/mlt and /mingw64/share/mlt. The destination name
-          # (mlt-7) is still correct and must be kept: MLT's own compiled
+          # (mlt-7) is an upstream build detail only. Normalize the shipped
+          # tree to an unversioned app-local prefix, matching Shotcut.
           # default module-repository lookup (Mlt::Factory::init() is
           # called with no explicit path in mltcontroller.cpp, matching
           # upstream shotcut's own main.cpp, which also never sets
@@ -348,8 +349,8 @@ jobs:
           # a versioned name baked into libmlt-7.dll regardless of how
           # MSYS2 happened to lay out its own system install.
           mkdir -p "$APPDIR/lib" "$APPDIR/share"
-          cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt-7"
-          cp -r /mingw64/share/mlt "$APPDIR/share/mlt-7"
+          cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt"
+          cp -r /mingw64/share/mlt "$APPDIR/share/mlt"
 
           # Qt plugins: fixed list matching what Shotcut (and this fork)
           # actually use, identical to upstream's own build-shotcut-msys2.sh.
@@ -403,17 +404,6 @@ jobs:
           cp dist/snapflowd-windows/snapflowd.exe "$OUT/bin/snapflowd.exe"
           cp dist/panel-rust-staticlib-windows/panel_rust.lib "$OUT/bin/panel_rust.lib"
           unzip -q dist/shotcut-rebrand-windows/snapflow-win64-*.zip -d "$OUT"
-          # MLT's Windows runtime resolver in the Qt app can resolve its
-          # repository relative to the install root (one level above the
-          # Snapflow executable), yielding <install>\\lib\\mlt. Keep the
-          # versioned directories beside the executable for explicit
-          # MLT_REPOSITORY users, and add compatibility aliases at the bundle
-          # root for native/self-launched GUI processes that rely on MLT's
-          # default lookup. This avoids requiring a wrapper or a modified
-          # Qt binary to set environment variables before MLT initializes.
-          mkdir -p "$OUT/lib" "$OUT/share"
-          cp -r "$OUT/Snapflow/lib/mlt-7" "$OUT/lib/mlt"
-          cp -r "$OUT/Snapflow/share/mlt-7" "$OUT/share/mlt"
           # snapshotd launch --gui must have the real production
           # FfiBackend-linked child in the shipped bundle. The Windows
           # installer persists this executable as SNAPSHOT_BIN_PATH.
@@ -422,8 +412,8 @@ jobs:
             find "$OUT" -maxdepth 4 -type f -iname 'snapflow*.exe' -print >&2 || true
             exit 1
           }
-          test -f "$OUT/lib/mlt/libmltxml.dll" || {
-            echo "bundled root-level MLT repository missing" >&2
+          test -f "$OUT/Snapflow/lib/mlt/libmltxml.dll" || {
+            echo "bundled app-local MLT repository missing" >&2
             exit 1
           }
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null
