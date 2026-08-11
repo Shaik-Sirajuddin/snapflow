@@ -115,6 +115,62 @@ type ExternalInstance struct {
 	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
+// ProjectActiveOwner is the durable single-owner marker for a project. It is
+// intentionally separate from process/external rows so ownership remains
+// explicit while a conflicting candidate is retained in PendingProjectCandidate.
+type ProjectActiveOwner struct {
+	ProjectID      string    `gorm:"primaryKey" json:"projectId"`
+	Owner          string    `json:"owner"` // managed | external
+	InstanceID     string    `json:"instanceId"`
+	InstanceNonce  string    `json:"instanceNonce,omitempty"`
+	PID            int       `json:"pid"`
+	ProcessStart   string    `json:"processStart"`
+	Generation     uint64    `json:"generation"`
+	LastSeenAt     time.Time `json:"lastSeenAt"`
+	LeaseExpiresAt time.Time `json:"leaseExpiresAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+func (ProjectActiveOwner) TableName() string { return "project_active_owners" }
+
+// PendingProjectCandidate is a fully managed, durable candidate retained
+// when a project already has a valid active owner. It is not routed edits
+// until promoted. Identity is PID + process-start + nonce, never PID alone.
+type PendingProjectCandidate struct {
+	ID             string    `gorm:"primaryKey" json:"id"`
+	ProjectID      string    `gorm:"index:idx_pending_project_generation" json:"projectId"`
+	Owner          string    `json:"owner"`
+	InstanceID     string    `json:"instanceId"`
+	InstanceNonce  string    `json:"instanceNonce,omitempty"`
+	PID            int       `json:"pid"`
+	ProcessStart   string    `json:"processStart"`
+	Generation     uint64    `gorm:"index:idx_pending_project_generation" json:"generation"`
+	Status         string    `json:"status"` // pending | promoted | stale | closed
+	LastSeenAt     time.Time `json:"lastSeenAt"`
+	LeaseExpiresAt time.Time `json:"leaseExpiresAt"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+func (PendingProjectCandidate) TableName() string { return "project_pending_candidates" }
+
+const (
+	OwnershipManaged  = "managed"
+	OwnershipExternal = "external"
+	PendingStatus     = "pending"
+	PromotedStatus    = "promoted"
+	StaleStatus       = "stale"
+	ClosedStatus      = "closed"
+	// MaxPendingCandidatesPerProject bounds retained conflicts during a GUI
+	// restart storm while leaving enough room to preserve newest identities.
+	MaxPendingCandidatesPerProject = 8
+)
+
+// IdentityKey is stable across lifecycle callbacks and rejects PID reuse.
+func (p PendingProjectCandidate) IdentityKey() string {
+	return p.Owner + "|" + p.InstanceID + "|" + p.InstanceNonce + "|" + p.ProcessStart
+}
+
 func (ExternalInstance) TableName() string { return "external_instances" }
 
 const (
