@@ -338,6 +338,51 @@ type InstanceProjectChangedParams struct {
 	Generation    uint64 `json:"generation"`
 }
 
+// claimProjectOwner records the first valid lifecycle identity as active. A
+// different identity is retained as pending and is never routed to project
+// edits while the active owner remains valid.
+func (d *Daemon) claimProjectOwner(p InstanceProjectChangedParams, projectID string) (bool, error) {
+	if projectID == "" {
+		return false, nil
+	}
+	active, err := d.Reg.GetProjectActiveOwner(projectID)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return false, err
+	}
+	now := time.Now().UTC()
+	if active == nil {
+		return false, d.Reg.SaveProjectActiveOwner(&registry.ProjectActiveOwner{
+			ProjectID: projectID, Owner: p.Owner, InstanceID: p.InstanceID,
+			InstanceNonce: p.InstanceNonce, PID: p.PID, ProcessStart: p.ProcessStart,
+			Generation: p.Generation, LastSeenAt: now, LeaseExpiresAt: now.Add(externalInstanceLease), UpdatedAt: now,
+		})
+	}
+	same := active.Owner == p.Owner && active.InstanceID == p.InstanceID &&
+		active.InstanceNonce == p.InstanceNonce && active.PID == p.PID && active.ProcessStart == p.ProcessStart
+	if same {
+		active.Generation = maxUint64(active.Generation, p.Generation)
+		active.LastSeenAt, active.LeaseExpiresAt, active.UpdatedAt = now, now.Add(externalInstanceLease), now
+		return false, d.Reg.SaveProjectActiveOwner(active)
+	}
+	if err := d.Reg.UpsertPendingProjectCandidate(&registry.PendingProjectCandidate{
+		ProjectID: projectID, Owner: p.Owner, InstanceID: p.InstanceID,
+		InstanceNonce: p.InstanceNonce, PID: p.PID, ProcessStart: p.ProcessStart,
+		Generation: p.Generation, Status: registry.PendingStatus, LastSeenAt: now,
+		LeaseExpiresAt: now.Add(externalInstanceLease), CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		return false, err
+	}
+	d.projectSwitchDebug("project ownership conflict retained pending", "project_id", projectSwitchIDHint(projectID), "active_instance", projectSwitchIDHint(active.InstanceID), "pending_instance", projectSwitchIDHint(p.InstanceID))
+	return true, nil
+}
+
+func maxUint64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectChangedParams) (any, error) {
 	started := time.Now()
 	d.projectSwitchDebug("request received", "owner", p.Owner, "instance", projectSwitchIDHint(p.InstanceID), "pid", p.PID, "generation", p.Generation, "reason", p.Reason, "project", projectSwitchPathHint(p.ProjectPath))
@@ -380,6 +425,13 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		if p.Generation < pi.Generation {
 			return *pi, nil
 		}
+		pending, err := d.claimProjectOwner(p, projectID)
+		if err != nil {
+			return nil, err
+		}
+		if pending {
+			return map[string]any{"pending": true, "projectId": projectID, "instanceId": p.InstanceID, "generation": p.Generation}, nil
+		}
 		if err := d.Reg.UpdateProcessInstanceProject(pi.ID, projectID, p.Generation); err != nil {
 			return nil, err
 		}
@@ -399,6 +451,13 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		}
 		if p.Generation < instance.Generation {
 			return *instance, nil
+		}
+		pending, err := d.claimProjectOwner(p, projectID)
+		if err != nil {
+			return nil, err
+		}
+		if pending {
+			return map[string]any{"pending": true, "projectId": projectID, "instanceId": p.InstanceID, "generation": p.Generation}, nil
 		}
 		return d.UpdateOpenProject(ctx, UpdateExternalProjectParams{InstanceID: p.InstanceID, ProjectPath: p.ProjectPath, Reason: p.Reason, Generation: p.Generation})
 	default:
