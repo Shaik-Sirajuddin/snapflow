@@ -242,7 +242,8 @@ jobs:
             zip \
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
             mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf \
-            mingw-w64-x86_64-mlt mingw-w64-x86_64-fftw \
+            mingw-w64-x86_64-mlt mingw-w64-x86_64-frei0r-plugins \
+            mingw-w64-x86_64-fftw \
             mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-charts \
             mingw-w64-x86_64-qt6-declarative mingw-w64-x86_64-qt6-imageformats \
             mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-svg \
@@ -345,14 +346,15 @@ jobs:
           cp -r /mingw64/lib/mlt "$BUNDLE_ROOT/lib/mlt"
           cp -r /mingw64/share/mlt "$BUNDLE_ROOT/share/mlt"
 
-          # MLT modules are loaded after the main executable, so their
-          # transitive FFmpeg/audio/filter dependencies are not discovered by
-          # bundle_dlls(snapflow.exe). Walk every shipped module as well and
-          # place its dependencies beside snapflow.exe, where Windows' DLL
-          # loader and both native/daemon launches can find them.
-          for module in "$BUNDLE_ROOT/lib/mlt"/*.dll; do
-            [ -e "$module" ] && bundle_dlls "$module"
-          done
+          # MLT and frei0r modules are loaded after the main executable, so
+          # their transitive FFmpeg/audio/filter dependencies are not
+          # discovered by bundle_dlls(snapflow.exe). Walk the entire install
+          # tree recursively, matching upstream's deploy() sweep and avoiding
+          # assumptions about nested module directories.
+          cp -pr /mingw64/lib/frei0r-1 "$BUNDLE_ROOT/lib/"
+          while IFS= read -r -d '' module; do
+            bundle_dlls "$module"
+          done < <(find "$BUNDLE_ROOT/lib" -type f -iname '*.dll' -print0)
 
           # Qt plugins: fixed list matching what Shotcut (and this fork)
           # actually use, identical to upstream's own build-shotcut-msys2.sh.
@@ -416,6 +418,10 @@ jobs:
           }
           test -f "$OUT/lib/mlt/libmltxml.dll" || {
             echo "bundled root-level MLT repository missing" >&2
+            exit 1
+          }
+          find "$OUT/lib/frei0r-1" -type f -iname '*.dll' -print -quit | grep -q . || {
+            echo "bundled frei0r plugin repository missing" >&2
             exit 1
           }
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null

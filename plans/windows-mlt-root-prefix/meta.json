@@ -22,6 +22,15 @@
       "description": "Bundle transitive dependencies of every MLT module, not only the main executable.",
       "verification": "Workflow loops over OUT/lib/mlt/*.dll and invokes the existing recursive bundle_dlls helper.",
       "implementation_evidence": "Added module dependency walk after root-level MLT copy."
+    },
+    {
+      "phase": "implementation_frei0r_recursive",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "description": "Install frei0r plugins and recursively bundle dependencies across nested module directories.",
+      "verification": "Workflow installs mingw-w64-x86_64-frei0r-plugins, copies lib/frei0r-1, recursively scans all DLLs, and asserts a packaged frei0r DLL.",
+      "implementation_evidence": "Updated the Windows MSYS2 package list, recursive find sweep, and package assertions."
     }
   ],
   "pending": [

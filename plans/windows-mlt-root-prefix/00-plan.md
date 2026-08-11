@@ -31,4 +31,6 @@ hooks. Both launch modes must point to the same repository and data paths.
 The Nitro v0.1.45 trial confirmed the directory path, but exposed a second
 packaging gap: module-specific FFmpeg/audio/filter dependencies were not
 walked by `bundle_dlls`, so several plugins failed to load. The workflow now
-walks every copied MLT module and bundles its transitive DLL dependencies.
+walks every copied MLT/frei0r module recursively and bundles its transitive
+DLL dependencies. frei0r is explicitly installed and asserted in the final
+package rather than omitted as an accidental side effect of the minimal build.
