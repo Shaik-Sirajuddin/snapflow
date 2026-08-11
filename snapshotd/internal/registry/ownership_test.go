@@ -62,3 +62,26 @@ func TestPendingCandidateUpsertIsIdentityStable(t *testing.T) {
 		t.Fatalf("expected one pending row, got %d", count)
 	}
 }
+
+func TestReleaseProjectOwnershipOnSwitch(t *testing.T) {
+	r, err := Open(filepath.Join(t.TempDir(), "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	now := time.Now().UTC()
+	for _, project := range []string{"old", "new"} {
+		if err := r.SaveProjectActiveOwner(&ProjectActiveOwner{ProjectID: project, Owner: OwnershipExternal, InstanceID: "gui", InstanceNonce: "nonce", PID: 7, ProcessStart: "start", LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.ReleaseProjectOwnership(OwnershipExternal, "gui", "nonce", "start", "new"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetProjectActiveOwner("old"); err != ErrNotFound {
+		t.Fatalf("old marker should be released: %v", err)
+	}
+	if _, err := r.GetProjectActiveOwner("new"); err != nil {
+		t.Fatalf("new marker should remain: %v", err)
+	}
+}
