@@ -239,21 +239,28 @@ jobs:
         shell: msys2 {0}
         run: |
           # mingw-w64-x86_64-mlt's own package metadata does not declare
-          # libsamplerate/rubberband/rnnoise/libebur128/libsox as hard
-          # dependencies, even though it ships libmltresample.dll,
-          # libmltrubberband.dll, libmltrnnoise.dll, libmltplus.dll, and
-          # libmltsox.dll linked against them -- confirmed across two real
-          # windows-latest runs: MLT logged "failed to dlopen ... The
-          # specified module could not be found" for exactly those modules,
-          # and none of librubberband-2.dll/libsamplerate-0.dll/
-          # libebur128.dll/libsox-3.dll existed anywhere in the installed
-          # MSYS2 tree (upstream's own build-shotcut-msys2.sh deploy() step
-          # explicitly names this same DLL set as a known-missing case on
-          # some targets). Install them directly so bundle_dlls's recursive
-          # walk can find and bundle them. The package is named
-          # mingw-w64-x86_64-sox, not -libsox -- confirmed via a real
-          # windows-latest run failing pacman's dependency resolution with
-          # "error: target not found: mingw-w64-x86_64-libsox".
+          # libsamplerate/rubberband/rnnoise/libebur128/libsox/rtaudio as
+          # hard dependencies, even though it ships libmltresample.dll,
+          # libmltrubberband.dll, libmltrnnoise.dll, libmltplus.dll,
+          # libmltsox.dll, and libmltrtaudio.dll linked against them --
+          # confirmed across three real windows-latest runs: MLT logged
+          # "failed to dlopen ... The specified module could not be found"
+          # for exactly those modules, and none of librubberband-2.dll/
+          # libsamplerate-0.dll/libebur128.dll/libsox-3.dll/
+          # librtaudio-7.dll existed anywhere in the installed MSYS2 tree
+          # (upstream's own build-shotcut-msys2.sh deploy() step explicitly
+          # names most of this same DLL set as a known-missing case on some
+          # targets). librtaudio-7.dll was found by parsing
+          # libmltrtaudio.dll's own PE import table directly on a live
+          # Windows install -- CMakeLists.txt's target_link_libraries only
+          # lists system libs (ole32/dsound/winmm/etc) for the Windows
+          # branch, which was misleading; the actual MSYS2-built binary
+          # also links the shared RtAudio library dynamically. Install them
+          # directly so bundle_dlls's recursive walk can find and bundle
+          # them. The package is named mingw-w64-x86_64-sox, not -libsox --
+          # confirmed via a real windows-latest run failing pacman's
+          # dependency resolution with "error: target not found:
+          # mingw-w64-x86_64-libsox".
           pacman -S --noconfirm \
             zip \
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
@@ -262,6 +269,7 @@ jobs:
             mingw-w64-x86_64-fftw \
             mingw-w64-x86_64-libsamplerate mingw-w64-x86_64-rubberband \
             mingw-w64-x86_64-rnnoise mingw-w64-x86_64-libebur128 \
+            mingw-w64-x86_64-rtaudio \
             mingw-w64-x86_64-sox \
             mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-charts \
             mingw-w64-x86_64-qt6-declarative mingw-w64-x86_64-qt6-imageformats \
