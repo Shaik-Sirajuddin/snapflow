@@ -428,6 +428,9 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		if p.Generation < pi.Generation {
 			return *pi, nil
 		}
+		if err := d.Reg.ReleaseProjectOwnership(p.Owner, p.InstanceID, p.InstanceNonce, p.ProcessStart, projectID); err != nil {
+			return nil, fmt.Errorf("daemon: instanceProjectChanged: release prior ownership: %w", err)
+		}
 		pending, err := d.claimProjectOwner(p, projectID)
 		if err != nil {
 			return nil, err
@@ -454,6 +457,9 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		}
 		if p.Generation < instance.Generation {
 			return *instance, nil
+		}
+		if err := d.Reg.ReleaseProjectOwnership(p.Owner, p.InstanceID, p.InstanceNonce, p.ProcessStart, projectID); err != nil {
+			return nil, fmt.Errorf("daemon: instanceProjectChanged: release prior ownership: %w", err)
 		}
 		pending, err := d.claimProjectOwner(p, projectID)
 		if err != nil {
