@@ -1,8 +1,11 @@
 # Project Switch Active/Pending Ownership
 
-The daemon keeps one authoritative instance per project. Conflicting
+The daemon keeps one authoritative instance marker per project. Conflicting
 notifications are retained as pending candidates rather than replacing the
-active instance.
+active marker. The active marker and every pending candidate use the same
+managed lifecycle: PID/process-start validation, nonce validation, heartbeat,
+lease expiry, generation ordering, and cleanup. `activeByProject` is only a
+pointer/marker; the lifecycle records remain in the instance registry.
 
 ```mermaid
 sequenceDiagram
@@ -43,8 +46,8 @@ sequenceDiagram
     R-->>D: Validate PID A
 
     alt PID A remains valid
-        D->>R: Keep PID A active
-        D->>R: Retain valid pending candidates
+        D->>R: Keep activeByProject[P] = PID A
+        D->>R: Heartbeat and retain valid pending candidates
     else PID A is gone
         D->>R: Validate pending PID B
         R-->>D: PID B is alive
@@ -53,7 +56,8 @@ sequenceDiagram
     end
 ```
 
-Each pending candidate should retain its PID/process-start identity, instance
-ID/nonce, project path, lifecycle generation, and last-seen timestamp. Cleanup
-must validate the active owner first, then promote the newest valid candidate
-only after the active owner is confirmed stale.
+Each active or pending record should retain its PID/process-start identity,
+instance ID/nonce, project path, lifecycle generation, heartbeat/lease state,
+and last-seen timestamp. Cleanup validates both classes of records. Promotion
+only atomically changes `activeByProject[P]` to the newest valid pending record;
+it does not create a second lifecycle model or reset the candidate's identity.
