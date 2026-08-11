@@ -133,6 +133,17 @@ func (r *Registry) SaveProjectActiveOwner(owner *ProjectActiveOwner) error {
 	return r.db.Save(owner).Error
 }
 
+// ReleaseProjectOwnership removes active markers held by an instance for
+// projects other than keepProjectID. A GUI switch therefore cannot leave its
+// previous project permanently owned after claiming the new one.
+func (r *Registry) ReleaseProjectOwnership(owner, instanceID, nonce, processStart, keepProjectID string) error {
+	q := r.db.Where("owner = ? AND instance_id = ? AND process_start = ? AND project_id <> ?", owner, instanceID, processStart, keepProjectID)
+	if nonce != "" {
+		q = q.Where("instance_nonce = ?", nonce)
+	}
+	return q.Delete(&ProjectActiveOwner{}).Error
+}
+
 // UpsertPendingProjectCandidate retains a conflicting lifecycle identity.
 // Repeated callbacks refresh the same candidate instead of growing rows.
 func (r *Registry) UpsertPendingProjectCandidate(candidate *PendingProjectCandidate) error {

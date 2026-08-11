@@ -351,6 +351,9 @@ func (d *Daemon) claimProjectOwner(p InstanceProjectChangedParams, projectID str
 	}
 	now := time.Now().UTC()
 	if active == nil {
+		if err := d.Reg.ReleaseProjectOwnership(p.Owner, p.InstanceID, p.InstanceNonce, p.ProcessStart, projectID); err != nil {
+			return false, err
+		}
 		return false, d.Reg.SaveProjectActiveOwner(&registry.ProjectActiveOwner{
 			ProjectID: projectID, Owner: p.Owner, InstanceID: p.InstanceID,
 			InstanceNonce: p.InstanceNonce, PID: p.PID, ProcessStart: p.ProcessStart,
