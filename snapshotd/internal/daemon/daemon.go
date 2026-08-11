@@ -678,13 +678,17 @@ func (d *Daemon) ReconcileProjectOwnerships(ctx context.Context) error {
 				_ = d.Reg.DB().Model(candidate).Update("status", registry.StaleStatus).Error
 				continue
 			}
+			if candidate.Owner == registry.OwnershipManaged {
+				if err := d.Reg.UpdateProcessInstanceProject(candidate.InstanceID, project.ID, candidate.Generation); err != nil {
+					continue
+				}
+			} else {
+				if _, err := d.UpdateOpenProject(ctx, UpdateExternalProjectParams{InstanceID: candidate.InstanceID, ProjectPath: candidate.ProjectPath, Reason: "promote", Generation: candidate.Generation}); err != nil {
+					continue
+				}
+			}
 			if err := d.Reg.PromoteProjectCandidate(project.ID, candidate, now); err != nil {
 				return err
-			}
-			if candidate.Owner == registry.OwnershipManaged {
-				_ = d.Reg.UpdateProcessInstanceProject(candidate.InstanceID, project.ID, candidate.Generation)
-			} else {
-				_, _ = d.UpdateOpenProject(ctx, UpdateExternalProjectParams{InstanceID: candidate.InstanceID, ProjectPath: candidate.ProjectPath, Reason: "promote", Generation: candidate.Generation})
 			}
 			d.projectSwitchDebug("pending project owner promoted", "project_id", projectSwitchIDHint(project.ID), "instance", projectSwitchIDHint(candidate.InstanceID))
 			break
