@@ -145,6 +145,37 @@ func TestClaimProjectOwnerConcurrentFirstCallbacksKeepOneActive(t *testing.T) {
 	}
 }
 
+func TestClaimProjectOwnerConflictReleasesPriorProjectMarker(t *testing.T) {
+	r, err := Open(filepath.Join(t.TempDir(), "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	now := time.Now().UTC()
+	if err := r.SaveProjectActiveOwner(&ProjectActiveOwner{ProjectID: "old", Owner: OwnershipExternal, InstanceID: "b", InstanceNonce: "nb", PID: 2, ProcessStart: "sb", LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SaveProjectActiveOwner(&ProjectActiveOwner{ProjectID: "new", Owner: OwnershipExternal, InstanceID: "a", InstanceNonce: "na", PID: 1, ProcessStart: "sa", LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := PendingProjectCandidate{ProjectID: "new", Owner: OwnershipExternal, InstanceID: "b", InstanceNonce: "nb", PID: 2, ProcessStart: "sb", Generation: 2, Status: PendingStatus, LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now}
+	pending, active, err := r.ClaimProjectOwner(candidate, now.Add(time.Second))
+	if err != nil || !pending || active.InstanceID != "a" {
+		t.Fatalf("expected conflict pending under active owner a: pending=%v active=%+v err=%v", pending, active, err)
+	}
+	if _, err := r.GetProjectActiveOwner("old"); err != ErrNotFound {
+		t.Fatalf("prior project marker should be released: %v", err)
+	}
+	current, err := r.GetProjectActiveOwner("new")
+	if err != nil || current.InstanceID != "a" {
+		t.Fatalf("conflicting active owner changed unexpectedly: %+v err=%v", current, err)
+	}
+	queued, err := r.ListPendingProjectCandidates("new")
+	if err != nil || len(queued) != 1 || queued[0].InstanceID != "b" {
+		t.Fatalf("expected one pending candidate for new project: %+v err=%v", queued, err)
+	}
+}
+
 func TestPromoteProjectCandidateAtomicallyUpdatesMarkerAndStatus(t *testing.T) {
 	r, err := Open(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {

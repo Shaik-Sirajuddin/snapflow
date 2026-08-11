@@ -170,6 +170,24 @@ func (r *Registry) ClaimProjectOwner(candidate PendingProjectCandidate, now time
 			return tx.Save(&active).Error
 		}
 		pending = true
+		// A switch away from another project relinquishes this identity's old
+		// active marker even when the requested project is currently owned by a
+		// different identity. Keep the new request pending, but never leave the
+		// instance active for two projects at once.
+		q := tx.Where("owner = ? AND instance_id = ? AND process_start = ? AND project_id <> ?", candidate.Owner, candidate.InstanceID, candidate.ProcessStart, candidate.ProjectID)
+		if candidate.InstanceNonce != "" {
+			q = q.Where("instance_nonce = ?", candidate.InstanceNonce)
+		}
+		if err := q.Delete(&ProjectActiveOwner{}).Error; err != nil {
+			return err
+		}
+		pq := tx.Model(&PendingProjectCandidate{}).Where("owner = ? AND instance_id = ? AND process_start = ? AND project_id <> ? AND status = ?", candidate.Owner, candidate.InstanceID, candidate.ProcessStart, candidate.ProjectID, PendingStatus)
+		if candidate.InstanceNonce != "" {
+			pq = pq.Where("instance_nonce = ?", candidate.InstanceNonce)
+		}
+		if err := pq.Updates(map[string]any{"status": StaleStatus, "updated_at": now}).Error; err != nil {
+			return err
+		}
 		var existing PendingProjectCandidate
 		lookup := tx.Where("project_id = ? AND owner = ? AND instance_id = ? AND instance_nonce = ? AND process_start = ?", candidate.ProjectID, candidate.Owner, candidate.InstanceID, candidate.InstanceNonce, candidate.ProcessStart).First(&existing)
 		if lookup.Error == nil {
