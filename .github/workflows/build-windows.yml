@@ -408,6 +408,36 @@ jobs:
           cp dist/snapflowd-windows/snapflowd.exe "$OUT/bin/snapflowd.exe"
           cp dist/panel-rust-staticlib-windows/panel_rust.lib "$OUT/bin/panel_rust.lib"
           unzip -q dist/shotcut-rebrand-windows/snapflow-win64-*.zip -d "$OUT"
+          # Normalize the final install root defensively. The Shotcut job
+          # emits root-level lib/share, but keep the package contract stable
+          # if an older/intermediate GUI artifact only contains the historical
+          # Snapflow/lib/mlt-7 layout.
+          if [ ! -f "$OUT/lib/mlt/libmltxml.dll" ] && [ -f "$OUT/Snapflow/lib/mlt-7/libmltxml.dll" ]; then
+            mkdir -p "$OUT/lib" "$OUT/share"
+            cp -a "$OUT/Snapflow/lib/mlt-7" "$OUT/lib/mlt"
+            [ -d "$OUT/Snapflow/share/mlt-7" ] && cp -a "$OUT/Snapflow/share/mlt-7" "$OUT/share/mlt"
+          fi
+          if [ ! -d "$OUT/lib/frei0r-1" ] && [ -d "$OUT/Snapflow/lib/frei0r-1" ]; then
+            mkdir -p "$OUT/lib"
+            cp -a "$OUT/Snapflow/lib/frei0r-1" "$OUT/lib/frei0r-1"
+          fi
+          # The Shotcut GUI artifact normally places runtime DLLs beside the
+          # executable.  If an intermediate artifact nested one of these
+          # files elsewhere, promote it into the executable directory before
+          # creating the install ZIP; if it is absent, fail here instead of
+          # publishing a bundle whose MLT modules cannot load.
+          for dep in avdevice-63.dll avfilter-12.dll; do
+            if [ ! -f "$OUT/Snapflow/$dep" ]; then
+              found=$(find "$OUT" -type f -iname "$dep" -print -quit)
+              if [ -n "$found" ]; then
+                cp -p "$found" "$OUT/Snapflow/$dep"
+              fi
+            fi
+            test -f "$OUT/Snapflow/$dep" || {
+              echo "final Windows bundle is missing required MLT dependency: $dep" >&2
+              exit 1
+            }
+          done
           # snapshotd launch --gui must have the real production
           # FfiBackend-linked child in the shipped bundle. The Windows
           # installer persists this executable as SNAPSHOT_BIN_PATH.
@@ -425,6 +455,20 @@ jobs:
             exit 1
           }
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null
+          unzip -Z1 "$OUT.zip" | grep -Fq "$OUT/lib/mlt/libmltxml.dll" || {
+            echo "final Windows ZIP is missing root-level lib/mlt/libmltxml.dll" >&2
+            exit 1
+          }
+          for dep in avdevice-63.dll avfilter-12.dll; do
+            unzip -Z1 "$OUT.zip" | grep -Fq "$OUT/Snapflow/$dep" || {
+              echo "final Windows ZIP is missing $dep beside Snapflow.exe" >&2
+              exit 1
+            }
+          done
+          unzip -Z1 "$OUT.zip" | grep -Fq "$OUT/lib/frei0r-1/" || {
+            echo "final Windows ZIP is missing root-level frei0r plugins" >&2
+            exit 1
+          }
           sha256sum "$OUT.zip" > "$OUT.zip.sha256"
 
       - uses: actions/upload-artifact@v4

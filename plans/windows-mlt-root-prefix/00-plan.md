@@ -34,3 +34,11 @@ walked by `bundle_dlls`, so several plugins failed to load. The workflow now
 walks every copied MLT/frei0r module recursively and bundles its transitive
 DLL dependencies. frei0r is explicitly installed and asserted in the final
 package rather than omitted as an accidental side effect of the minimal build.
+
+The final-package boundary is now guarded independently of the intermediate
+GUI ZIP. The package job promotes a misplaced dependency into `Snapflow/` when
+it can be found, and fails otherwise; the final archive must contain
+`avdevice-63.dll`, `avfilter-12.dll`, `lib/mlt/libmltxml.dll`, and frei0r.
+Native Qt also adds the executable directory to the Windows DLL search path so
+modules loaded from the sibling `lib/mlt` repository can resolve dependencies
+kept beside `Snapflow.exe`, matching upstream deployment layout.
