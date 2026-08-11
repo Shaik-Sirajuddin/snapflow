@@ -130,6 +130,13 @@ enum RegistrationCommand {
 
 static LATEST_LIFECYCLE: OnceLock<Mutex<Option<LifecycleUpdate>>> = OnceLock::new();
 static LIFECYCLE_EPOCH: AtomicU64 = AtomicU64::new(1);
+// The GUI owns one SAP endpoint for its entire process lifetime. Keep the
+// registration and discovery endpoint above any panel/plugin instance so a
+// panel reload cannot unregister a still-running GUI process. The daemon's
+// lease and PID/start-identity checks clean up the row after an unexpected
+// process exit; project changes are sent through the shared handle below.
+static PROCESS_REGISTRATION: OnceLock<Arc<SnapshotdRegistration>> = OnceLock::new();
+static PROCESS_REGISTRATION_INIT: Mutex<()> = Mutex::new(());
 
 fn latest_lifecycle() -> &'static Mutex<Option<LifecycleUpdate>> {
     LATEST_LIFECYCLE.get_or_init(|| Mutex::new(None))
@@ -476,7 +483,45 @@ pub struct SnapshotdRegistration {
 }
 
 impl SnapshotdRegistration {
-    pub fn start(initial_project_path: Option<String>) -> Option<Self> {
+    /// Return the process-scoped registration. A panel/plugin may be created
+    /// more than once during one GUI process, but all instances must share the
+    /// same PID/nonce/SAP discovery endpoint and registration worker.
+    pub fn start(initial_project_path: Option<String>) -> Option<Arc<Self>> {
+        let _init_guard = PROCESS_REGISTRATION_INIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = PROCESS_REGISTRATION.get() {
+            // The Qt host destroys and recreates the Rust panel on File >
+            // Close followed by opening another project.  The process-level
+            // registration must survive that recreation, but the new panel's
+            // initial identity still has to advance the shared lifecycle.
+            // `start()` used to return the existing handle without publishing
+            // this path, leaving snapshotd with an open row whose last reason
+            // was still `closed` and whose project_path was empty.
+            if let Some(project_path) = initial_project_path {
+                let local_generation = latest_lifecycle()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .map(|current| {
+                        current
+                            .generation
+                            .saturating_sub(existing.epoch.saturating_mul(1u64 << 32))
+                            .min(u32::MAX as u64)
+                            .saturating_add(1)
+                    })
+                    .unwrap_or(1);
+                existing.update(Some(project_path), "opened", local_generation);
+            }
+            return Some(existing.clone());
+        }
+
+        let registration = Arc::new(Self::start_inner(initial_project_path)?);
+        let _ = PROCESS_REGISTRATION.set(registration);
+        PROCESS_REGISTRATION.get().cloned()
+    }
+
+    fn start_inner(initial_project_path: Option<String>) -> Option<Self> {
         // Daemon-owned Snapflow children already have authoritative
         // process-instance rows in snapshotd. They must not also register as
         // external GUI owners, or a cold project.open can observe two owners
@@ -662,6 +707,23 @@ impl SnapshotdRegistration {
                                     current_reason,
                                     project_hint(current_project_path.as_deref())
                                 ));
+                                // A daemon may have expired or reconciled the
+                                // external lease while the GUI stayed alive.
+                                // Project selection is an immediate recovery
+                                // edge; do not wait for the 10-second heartbeat
+                                // interval before registering this process again.
+                                if current_id.is_none() && !managed {
+                                    registration.project_path = current_project_path.clone();
+                                    current_id = runtime.block_on(async {
+                                        register_and_extract_id(&client, &registration).await
+                                    });
+                                    if let Some(id) = current_id.as_ref() {
+                                        *published_id
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some(id.clone());
+                                    }
+                                }
                                 if let Some(id) = current_id.as_deref() {
                                     if managed {
                                         managed_pending = runtime

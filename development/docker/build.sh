@@ -32,7 +32,9 @@ run_step() {
 }
 
 worktree="$(realpath "$WORKTREE")"
-if [[ -f "$worktree/shotcut/CMakeLists.txt" ]]; then
+if [[ -f "$worktree/shotcut-rebrand/CMakeLists.txt" ]]; then
+  cmake_source="$worktree/shotcut-rebrand"
+elif [[ -f "$worktree/shotcut/CMakeLists.txt" ]]; then
   cmake_source="$worktree/shotcut"
 else
   cmake_source="$REPO_ROOT/shotcut-rebrand"

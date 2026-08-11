@@ -145,8 +145,8 @@ ensure_shared_build_points_at() {
 
     local current=""
     local current_source=""
-    local cmake_source="$SHOTCUT_DIR"
-    if [ -f "$worktree_dir/shotcut/CMakeLists.txt" ]; then
+    local cmake_source="$worktree_dir/shotcut-rebrand"
+    if [ ! -f "$cmake_source/CMakeLists.txt" ] && [ -f "$worktree_dir/shotcut/CMakeLists.txt" ]; then
         cmake_source="$worktree_dir/shotcut"
     fi
     [ -f "$ACTIVE_MARKER" ] && current="$(cat "$ACTIVE_MARKER")"
@@ -364,7 +364,14 @@ PY
     snapshotd_home="$(snapshotd_scratch_for "$worktree_dir")/snapshotd-home"
     mkdir -p "$snapshotd_home/run"
     local admin_token
-    admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null)" || die "daemon-managed acpx admin token was not created"
+    # acpxmgr provisions this file during child startup, which can finish
+    # just after snapshotd's MCP health probe succeeds.
+    for _ in {1..30}; do
+        admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null || cat "$state_dir/snapshotd-scratch/snapshotd-home/admin-token" 2>/dev/null || true)"
+        [ -n "$admin_token" ] && break
+        sleep 0.2
+    done
+    [ -n "$admin_token" ] || die "daemon-managed acpx admin token was not created"
     [ -n "$admin_token" ] || die "daemon-managed acpx admin token is empty"
     # The embedded SAP endpoint must be present before panel-rust registers
     # the GUI with snapshotd; otherwise MCP can see the project path but has
@@ -388,6 +395,9 @@ PY
     echo "==> waiting for daemon-managed acpx-server..."
     local acpx_config="$snapshotd_home/acpx-config.json"
     local acpx_pid_file="$snapshotd_home/acpx-server.pid"
+    local acpx_state_home="$state_dir/snapshotd-scratch/snapshotd-home"
+    [ -s "$acpx_pid_file" ] || acpx_pid_file="$acpx_state_home/acpx-server.pid"
+    [ -f "$acpx_config" ] || acpx_config="$acpx_state_home/acpx-config.json"
     local server_pid=""
     local fifo_keeper_pid=""
     for _ in $(seq 1 100); do

@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "plan": "process-level-external-registration",
+  "plan_doc": "00-plan.md",
+  "source_task": "Fix live GUI project propagation by making external registration process-scoped and self-healing.",
+  "status": "in_progress",
+  "updated": "2026-08-11",
+  "ordering_rationale": "Implement the lifecycle ownership and recovery first, then review, verify against the plan, and finally run non-destructive runtime checks.",
+  "completed": [
+    {
+      "phase": "implementation_registration_ownership",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "evidence": "PROCESS_REGISTRATION is a process-local Arc singleton guarded against concurrent initialization; project-selection Wake re-registers immediately when the lease row is missing."
+    },
+    {
+      "phase": "implementation_tests",
+      "order": 2,
+      "tier": 1,
+      "status": "completed",
+      "evidence": "cargo test --manifest-path panel-rust/Cargo.toml snapshotd_client:: --lib (6 passed); go test ./internal/daemon ./internal/registry (pass)."
+    },
+    {
+      "phase": "review_gate",
+      "order": 3,
+      "tier": "review_gate",
+      "status": "completed",
+      "evidence": "Two self-review passes completed. Found and removed one duplicate updateOpenProject on recovery; re-check found no lock guard held across await, initialization race, cross-process sharing, or new unbounded channel."
+    },
+    {
+      "phase": "verification_gate",
+      "order": 4,
+      "tier": "verification_gate",
+      "status": "completed",
+      "misalignments": [],
+      "evidence": "Implementation matches process-level ownership, immediate recovery, and independent-process isolation decision."
+    },
+    {
+      "phase": "loop_gate",
+      "order": 5,
+      "tier": "loop_gate",
+      "status": "completed",
+      "evidence": "No verification-gate misalignments remained."
+    },
+    {
+      "phase": "runtime_local_dev_make_gate",
+      "order": 6,
+      "tier": "runtime_gate",
+      "status": "partial",
+      "evidence": "Remote origin/main and origin/master bases were confirmed. Full dev.make vnc-up passed C++ Snapflow, ACPX, snapshotd bootstrap, VNC launch, and real SAP registration. Project E->F switch passed over the live SAP socket with the same PID 1329917 and instance ID. Two independent GUI processes registered distinct PIDs/nonces while targeting the same project path; daemon.instanceProjectChanged made the second pending. Shutdown marked both rows inactive, but stale discovery descriptor files remained after process death and require a daemon cleanup fix. Panel recreation was not separately exercised."
+    }
+  ],
+  "pending": ["runtime_local_dev_make_gate"]
+}

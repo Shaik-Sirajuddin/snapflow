@@ -1030,7 +1030,7 @@ struct PanelSingleton {
     /// Suppress self-write feedback from settings save for a short window.
     settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
     _settings_watcher: Option<settings_file::SettingsWatcher>,
-    snapshotd_registration: Option<snapshotd_client::SnapshotdRegistration>,
+    snapshotd_registration: Option<Arc<snapshotd_client::SnapshotdRegistration>>,
     /// markdown-render-cache-layer plan, Phase 7 trigger-wiring: shared
     /// across every thread's background markdown render (unlike
     /// `ThreadModel::markdown_epoch`/`markdown_in_flight`, which are
