@@ -63,11 +63,15 @@ daemon it talks to:
 
 **Linux / macOS:**
 
+🔵 **Install command**
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell):**
+
+🔵 **Install command**
 
 ```powershell
 irm -UseBasicParsing https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
