@@ -382,6 +382,17 @@ jobs:
           sparse-checkout: |
             packaging/linux
 
+      # The package job is isolated from the build checkout. Pull the shared
+      # runtime-dependency checker from this exact Snapflow revision so the
+      # release artifact gets the same MLT safety net as local packaging.
+      - uses: actions/checkout@v4
+        with:
+          repository: Zealbase/snapflow
+          ref: ${{ github.sha }}
+          path: snapflow-main
+          sparse-checkout: |
+            scripts/check-linux-runtime-deps.sh
+
       - name: Assemble install bundle
         run: |
           set -euo pipefail
@@ -391,6 +402,12 @@ jobs:
           cp dist/snapflowd-linux-x86_64/snapflowd "$OUT/bin/snapflowd"
           chmod +x "$OUT/bin/snapflowd"
           tar -xJf dist/shotcut-rebrand-linux-x86_64/snapflow-linux-x86_64-*.txz -C "$OUT"
+          # MLT modules are dlopen'ed after startup. Validate their complete
+          # dependency closure in the release package, just as the local
+          # packager does: XML is required for project open/save, while
+          # optional media modules are removed when their closure is absent.
+          chmod +x snapflow-main/scripts/check-linux-runtime-deps.sh
+          snapflow-main/scripts/check-linux-runtime-deps.sh --app "$OUT/Snapflow.app"
           # snapshotd launch --gui must have the real production
           # FfiBackend-linked child in the shipped bundle. The installer
           # persists this wrapper as SNAPSHOT_BIN_PATH; fail packaging rather
