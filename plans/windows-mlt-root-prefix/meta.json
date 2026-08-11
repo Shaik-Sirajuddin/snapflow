@@ -1,0 +1,61 @@
+{
+  "plan": "windows-mlt-root-prefix",
+  "status": "in_progress",
+  "updated": "2026-08-11",
+  "plan_doc": "00-plan.md",
+  "source_task": "Restore the v0.1.45 Windows MLT package naming on latest code and unify native/daemon resolution.",
+  "completed": [
+    {
+      "phase": "implementation_paths",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "description": "Restore root-level unversioned MLT packaging and use it from native and daemon launch paths.",
+      "verification": "Workflow diff, C++ path diff, Go path diff, and focused unit test.",
+      "implementation_evidence": "Updated build-windows.yml, shotcut/src/main.cpp, procmgr.go, and procmgr_test.go."
+    },
+    {
+      "phase": "implementation_module_dependencies",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "description": "Bundle transitive dependencies of every MLT module, not only the main executable.",
+      "verification": "Workflow loops over OUT/lib/mlt/*.dll and invokes the existing recursive bundle_dlls helper.",
+      "implementation_evidence": "Added module dependency walk after root-level MLT copy."
+    }
+  ],
+  "pending": [
+    {
+      "phase": "review_gate",
+      "order": 2,
+      "tier": "review_gate",
+      "status": "completed",
+      "description": "Review packaging, DLL reuse, and root-path consistency.",
+      "verification": "No DLL-copy step removed; all launch paths target the same root-level paths.",
+      "max_iterations": 2,
+      "verified": [
+        {
+          "description": "Two review passes confirmed BUNDLE_ROOT scope, root-level archive contents, module dependency recursion, and preserved DLL reuse.",
+          "verdict": "PASS"
+        }
+      ]
+    },
+    {
+      "phase": "verification_gate",
+      "order": 3,
+      "tier": "verification_gate",
+      "status": "completed",
+      "description": "Verify implementation against this plan.",
+      "verification": "go test ./internal/procmgr and git diff --check; no unresolved misalignments.",
+      "misalignments": []
+    },
+    {
+      "phase": "runtime_gate",
+      "order": 4,
+      "tier": "runtime_gate",
+      "status": "not_started",
+      "description": "Install the resulting Windows artifact on Nitro and verify the first MLT repository log.",
+      "verification": "Fresh native and daemon launches report the root-level lib/mlt path and load plugins."
+    }
+  ]
+}
