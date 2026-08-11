@@ -58,10 +58,9 @@ Use Snapflow itself as an MCP server so other agents/tools can drive the editor:
 
 ## Install
 
-One command installs everything — the `snapflow` editor and the `snapflowd` agent
-daemon it talks to:
+One command to begin.
 
-**Linux / macOS:**
+### Linux
 
 🔵 **Install command**
 
@@ -69,28 +68,16 @@ daemon it talks to:
 curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
 ```
 
-**Windows (PowerShell):**
+See [Build from source](#how-to-build) for a local development build.
 
-🔵 **Install command**
+### Windows
 
-```powershell
-irm -UseBasicParsing https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
-```
+Download the current Windows build from the
+[Snapflow release page](https://github.com/Zealbase/snapflow/releases).
 
-For Windows PowerShell 5.1, `-UseBasicParsing` avoids the web-content
-confirmation prompt. If using curl, call `curl.exe` rather than the PowerShell
-`curl` alias.
+### macOS
 
-Each detects your OS/arch, downloads the matching release bundle from
-[Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases) with a live progress
-bar, verifies its checksum, and installs both `snapflow` and `snapflowd` (on Linux, a
-desktop launcher entry is also added to your applications menu; on macOS,
-`Snapflow.app` is installed to `/Applications`). All three platforms (Linux, macOS,
-Windows; x86_64) are supported. See [scripts/install.sh](scripts/install.sh) /
-[scripts/install.ps1](scripts/install.ps1) for details/env overrides, or grab a release
-archive manually from the Releases page. Windows service auto-start isn't wired up yet
-(`install.ps1` installs the binaries and PATH but not a Scheduled Task) -- run
-`snapflowd.exe serve` manually for now.
+macOS support is coming soon.
 
 For a local Linux build, assemble the production-shaped archive first, then use the
 same installer without any asset environment variable:
