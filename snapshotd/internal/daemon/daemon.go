@@ -37,6 +37,25 @@ const externalSAPReadyTimeout = 5 * time.Second
 const externalDiscoveryGrace = 1500 * time.Millisecond
 const instanceSaveTimeout = 5 * time.Second
 
+func projectSwitchDebugEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("SNAPFLOW_PROJECT_SWITCH_DEBUG")))
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func projectSwitchPathHint(path string) string {
+	if path == "" {
+		return "<none>"
+	}
+	return fmt.Sprintf("%s (%d chars)", filepath.Base(path), len([]rune(path)))
+}
+
+func projectSwitchIDHint(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8] + "…"
+}
+
 // Daemon is the shared core described above.
 type Daemon struct {
 	Cfg      config.Config
@@ -80,6 +99,12 @@ type Daemon struct {
 	externalMu sync.Mutex
 }
 
+func (d *Daemon) projectSwitchDebug(message string, args ...any) {
+	if projectSwitchDebugEnabled() && d.Log != nil {
+		d.Log.Debug("project-switch "+message, args...)
+	}
+}
+
 type RegisterExternalInstanceParams struct {
 	InstanceNonce string         `json:"instanceNonce"`
 	PID           int            `json:"pid"`
@@ -101,6 +126,7 @@ type discardSink struct{}
 func (discardSink) Notify(string, json.RawMessage) {}
 
 func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExternalInstanceParams) (ExternalInstanceResult, error) {
+	d.projectSwitchDebug("external registration received", "pid", p.PID, "project", projectSwitchPathHint(p.ProjectPath), "sap_endpoint_present", p.SAPSocketPath != "")
 	d.externalMu.Lock()
 	defer d.externalMu.Unlock()
 	if strings.TrimSpace(p.InstanceNonce) == "" || p.PID <= 0 || strings.TrimSpace(p.ProcessStart) == "" {
@@ -142,6 +168,9 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	}
 	if instance == nil {
 		instance = &registry.ExternalInstance{ID: uuid.NewString(), InstanceNonce: p.InstanceNonce, CreatedAt: now}
+		d.projectSwitchDebug("external registration creates registry row")
+	} else {
+		d.projectSwitchDebug("external registration reuses registry row", "instance", projectSwitchIDHint(instance.ID), "previous_pid", instance.PID, "previous_status", instance.Status)
 	}
 	capabilities, err := json.Marshal(p.Capabilities)
 	if err != nil {
@@ -202,6 +231,7 @@ func (d *Daemon) rejectDiscoveryEndpoint(path string) error {
 // prevents daemon-first -> GUI-open from ever exposing two live processes for
 // one canonical project path.
 func (d *Daemon) handoffDaemonProjectToGUI(ctx context.Context, projectPath string) error {
+	d.projectSwitchDebug("handoff preflight", "project", projectSwitchPathHint(projectPath))
 	project, err := d.Reg.EnsureProjectForPath(projectPath)
 	if err != nil {
 		return err
@@ -210,8 +240,10 @@ func (d *Daemon) handoffDaemonProjectToGUI(ctx context.Context, projectPath stri
 	if err != nil {
 		return err
 	}
+	d.projectSwitchDebug("handoff candidates", "project", projectSwitchPathHint(projectPath), "managed_count", len(instances))
 	for _, instance := range instances {
 		if instance.Status != registry.StatusReady || !health.PIDAlive(instance.PID) {
+			d.projectSwitchDebug("handoff candidate skipped", "pid", instance.PID, "ready", instance.Status == registry.StatusReady, "alive", health.PIDAlive(instance.PID))
 			continue
 		}
 		sessionID := "gui-handoff-" + instance.ID
@@ -307,10 +339,17 @@ type InstanceProjectChangedParams struct {
 }
 
 func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectChangedParams) (any, error) {
+	started := time.Now()
+	d.projectSwitchDebug("request received", "owner", p.Owner, "instance", projectSwitchIDHint(p.InstanceID), "pid", p.PID, "generation", p.Generation, "reason", p.Reason, "project", projectSwitchPathHint(p.ProjectPath))
+	defer func() {
+		d.projectSwitchDebug("request finished", "instance", projectSwitchIDHint(p.InstanceID), "elapsed_ms", time.Since(started).Milliseconds())
+	}()
 	if p.InstanceID == "" || p.PID <= 0 || p.ProcessStart == "" || p.Reason == "" {
+		d.projectSwitchDebug("request rejected: missing identity or reason")
 		return nil, fmt.Errorf("daemon: instanceProjectChanged: instance identity and reason are required")
 	}
 	if !health.ProcessIdentityMatches(p.PID, p.ProcessStart) {
+		d.projectSwitchDebug("request rejected: process identity mismatch", "pid", p.PID)
 		return nil, fmt.Errorf("daemon: instanceProjectChanged: process identity does not match a live process")
 	}
 	var projectID string
@@ -335,6 +374,7 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 		// with an empty identity as untrusted rather than allowing a PID-only
 		// update, which could target a recycled process.
 		if pi.PID != p.PID || pi.ProcessStart == "" || pi.ProcessStart != p.ProcessStart {
+			d.projectSwitchDebug("managed ownership mismatch", "pid_match", pi.PID == p.PID, "start_present", pi.ProcessStart != "", "start_match", pi.ProcessStart == p.ProcessStart)
 			return nil, fmt.Errorf("daemon: instanceProjectChanged: managed ownership mismatch")
 		}
 		if p.Generation < pi.Generation {
@@ -354,6 +394,7 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 			return nil, err
 		}
 		if p.InstanceNonce == "" || instance.InstanceNonce != p.InstanceNonce || instance.PID != p.PID || instance.ProcessStart != p.ProcessStart {
+			d.projectSwitchDebug("external ownership mismatch", "nonce_match", p.InstanceNonce != "" && instance.InstanceNonce == p.InstanceNonce, "pid_match", instance.PID == p.PID, "start_match", instance.ProcessStart == p.ProcessStart)
 			return nil, fmt.Errorf("daemon: instanceProjectChanged: external ownership mismatch")
 		}
 		if p.Generation < instance.Generation {
@@ -366,6 +407,11 @@ func (d *Daemon) InstanceProjectChanged(ctx context.Context, p InstanceProjectCh
 }
 
 func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectParams) (registry.ExternalInstance, error) {
+	started := time.Now()
+	d.projectSwitchDebug("update begin", "instance", projectSwitchIDHint(p.InstanceID), "generation", p.Generation, "reason", p.Reason, "project", projectSwitchPathHint(p.ProjectPath))
+	defer func() {
+		d.projectSwitchDebug("update finished", "instance", projectSwitchIDHint(p.InstanceID), "elapsed_ms", time.Since(started).Milliseconds())
+	}()
 	d.externalMu.Lock()
 	defer d.externalMu.Unlock()
 	instance, err := d.Reg.GetExternalInstance(p.InstanceID)
@@ -388,9 +434,15 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 			return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: project: %w", err)
 		}
 		if instance.SAPSocketPath != "" && health.SocketResponsive(instance.SAPSocketPath, time.Second) {
+			handoffStarted := time.Now()
+			d.projectSwitchDebug("GUI handoff begin", "instance", projectSwitchIDHint(p.InstanceID))
 			if err := d.handoffDaemonProjectToGUI(ctx, path); err != nil {
+				d.projectSwitchDebug("GUI handoff failed", "elapsed_ms", time.Since(handoffStarted).Milliseconds())
 				return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: GUI handoff: %w", err)
 			}
+			d.projectSwitchDebug("GUI handoff finished", "elapsed_ms", time.Since(handoffStarted).Milliseconds())
+		} else if instance.SAPSocketPath != "" {
+			d.projectSwitchDebug("GUI handoff skipped: SAP endpoint not responsive", "instance", projectSwitchIDHint(p.InstanceID))
 		}
 	} else {
 		instance.ProjectPath = ""
@@ -1046,6 +1098,7 @@ type LaunchResult struct {
 }
 
 func (d *Daemon) Launch(ctx context.Context, p LaunchParams) (LaunchResult, error) {
+	d.projectSwitchDebug("launch request", "project", projectSwitchPathHint(p.ProjectPath), "project_id_present", p.ProjectID != "")
 	projectID := p.ProjectID
 	if projectID == "" {
 		if p.ProjectPath == "" {
@@ -1075,6 +1128,7 @@ func (d *Daemon) Launch(ctx context.Context, p LaunchParams) (LaunchResult, erro
 	if err != nil {
 		return LaunchResult{}, err
 	}
+	d.projectSwitchDebug("launch result", "instance", projectSwitchIDHint(pi.ID), "reused", reused, "pid", pi.PID)
 	return LaunchResult{ProcessInstance: pi, Reused: reused}, nil
 }
 
@@ -1090,6 +1144,7 @@ func (d *Daemon) AudioNamespaceEnabled() bool {
 // for a missing path; callers must use project.create (and explicitly confirm
 // creation) before opening a new project.
 func (d *Daemon) resolveOrRegisterProjectByPath(path string) (registry.Project, error) {
+	d.projectSwitchDebug("resolve project", "project", projectSwitchPathHint(path))
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return registry.Project{}, fmt.Errorf("daemon: resolving path %s: %w", path, err)
@@ -1116,6 +1171,7 @@ func (d *Daemon) resolveOrRegisterProjectByPath(path string) (registry.Project, 
 	}
 	for _, p := range projects {
 		if p.RootDir == rootDir {
+			d.projectSwitchDebug("resolve project reused existing registry project", "project_id", projectSwitchIDHint(p.ID))
 			_ = d.Reg.TouchProjectOpened(p.ID)
 			return p, nil
 		}

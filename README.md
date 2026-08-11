@@ -82,6 +82,15 @@ For Windows PowerShell 5.1, `-UseBasicParsing` avoids the web-content
 confirmation prompt. You can also download the current build from the
 [Snapflow release page](https://github.com/Zealbase/snapflow/releases).
 
+#### Project-switch diagnostics
+
+For a temporary investigation of project-open/close propagation, set
+`SNAPFLOW_PROJECT_SWITCH_DEBUG=1` before starting Snapflow and snapflowd.
+Panel-rust and the daemon then emit lifecycle enqueue/wake, Windows discovery
+pipe, RPC timing, ownership, and registry-update diagnostics. The flag is
+disabled by default; diagnostics intentionally report only project basenames
+and path lengths, never full paths, tokens, or request payloads.
+
 ### macOS
 
 macOS support is coming soon.

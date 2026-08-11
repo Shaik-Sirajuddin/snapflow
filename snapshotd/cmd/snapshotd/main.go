@@ -113,6 +113,9 @@ func cmdServe(cfg config.Config, args []string) error {
 	} else if debug, _ := strconv.ParseBool(os.Getenv("SNAPSHOTD_DEBUG")); debug {
 		logLevel = slog.LevelDebug
 	}
+	if debug, _ := strconv.ParseBool(os.Getenv("SNAPFLOW_PROJECT_SWITCH_DEBUG")); debug {
+		logLevel = slog.LevelDebug
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 
 	lock, err := daemonlock.Acquire(cfg.HomeDir)
