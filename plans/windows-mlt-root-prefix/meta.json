@@ -47,8 +47,8 @@
       "tier": 2,
       "status": "completed",
       "description": "Make the Snapflow executable directory an explicit Windows DLL search location before MLT initialization.",
-      "verification": "configureBundledMltPaths calls SetDllDirectoryA before setting MLT paths.",
-      "implementation_evidence": "Updated shotcut/src/main.cpp to add the executable directory to the native search path."
+      "verification": "Application constructs the executable directory and calls SetDllDirectoryA before configureBundledMltPaths and MLT initialization.",
+      "implementation_evidence": "The existing native startup hook is retained and covered by the final Shotcut gitlink."
     }
   ],
   "pending": [
