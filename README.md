@@ -1,6 +1,6 @@
-[![build-linux](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-linux.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-linux.yml)
-[![build-macos](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-macos.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-macos.yml)
-[![build-windows](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-windows.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-windows.yml)
+[![build-linux](https://github.com/Zealbase/snapflow/actions/workflows/build-linux.yml/badge.svg)](https://github.com/Zealbase/snapflow/actions/workflows/build-linux.yml)
+[![build-macos](https://github.com/Zealbase/snapflow/actions/workflows/build-macos.yml/badge.svg)](https://github.com/Zealbase/snapflow/actions/workflows/build-macos.yml)
+[![build-windows](https://github.com/Zealbase/snapflow/actions/workflows/build-windows.yml/badge.svg)](https://github.com/Zealbase/snapflow/actions/workflows/build-windows.yml)
 
 # Snapflow
 
@@ -65,7 +65,7 @@ One command to begin.
 🔵 **Install command**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Zealbase/snapflow/main/scripts/install.sh | bash
 ```
 
 See [Build from source](#how-to-build) for a local development build.
@@ -75,7 +75,7 @@ See [Build from source](#how-to-build) for a local development build.
 🔵 **Install command**
 
 ```powershell
-irm -UseBasicParsing https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
+irm -UseBasicParsing https://raw.githubusercontent.com/Zealbase/snapflow/main/scripts/install.ps1 | iex
 ```
 
 For Windows PowerShell 5.1, `-UseBasicParsing` avoids the web-content
