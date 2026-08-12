@@ -129,6 +129,7 @@ func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	t.Setenv("SNAPSHOT_SAP_ENDPOINT", filepath.Join(t.TempDir(), "stale.sock"))
 	t.Setenv("SNAPSHOT_SAP_SOCKET", filepath.Join(t.TempDir(), "stale.sock"))
 	t.Setenv("SNAPSHOT_SAP_TOKEN", "stale-token")
+	t.Setenv("MELT_BIN", filepath.Join(t.TempDir(), "stale-melt.exe"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

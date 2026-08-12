@@ -112,14 +112,10 @@ pub(crate) fn prune_finished_jobs(jobs: &mut HashMap<String, JobStatus>) -> Vec<
 }
 
 pub(crate) fn resolve_melt_binary() -> String {
-    if let Ok(p) = std::env::var("MELT_BIN") {
-        if !p.is_empty() && Path::new(&p).exists() {
-            return p;
-        }
-    }
-
-    // Release bundles put the MLT CLI beside the running Snapflow binary.
-    // This must be checked before HOME/PATH: snapshotd intentionally gives
+	// Release bundles put the MLT CLI beside the running Snapflow binary.
+	// This must be checked before MELT_BIN/HOME/PATH: a stale user override
+	// must not redirect an installed bundle away from its own runtime.
+	// snapshotd intentionally gives
     // each launched project a sandbox HOME, so `$HOME/.local/bin/melt` is not
     // the user's real install and a systemd-launched child may have a stale
     // PATH. `current_exe` is the post-wrapper `Snapflow.app/bin/snapflow`
@@ -139,9 +135,18 @@ pub(crate) fn resolve_melt_binary() -> String {
         candidates.push(install_dir.join("Snapflow.app/bin/melt"));
         candidates.push(install_dir.join("Snapflow.app/bin/melt.exe"));
     }
-    if let Some(candidate) = candidates.into_iter().find(|path| path.is_file()) {
-        return candidate.to_string_lossy().into_owned();
-    }
+	if let Some(candidate) = candidates.into_iter().find(|path| path.is_file()) {
+		return candidate.to_string_lossy().into_owned();
+	}
+
+	// Source/developer installations can explicitly provide MELT_BIN when no
+	// packaged sibling exists. It is deliberately lower priority than the
+	// relocatable bundle paths above.
+	if let Ok(p) = std::env::var("MELT_BIN") {
+		if !p.is_empty() && Path::new(&p).is_file() {
+			return p;
+		}
+	}
 
     if let Ok(home) = std::env::var("HOME") {
         let candidate = format!("{home}/.local/bin/melt");

@@ -27,7 +27,8 @@
       "implementation_evidence": "Windows bundling copies /mingw64/bin/melt.exe, runs bundle_dlls on it, and final packaging asserts Snapflow/melt.exe.",
       "verified": [
         {"description": "Workflow and cross-platform bundled-melt resolver test updated.", "verdict": "IMPLEMENTED"},
-        {"description": "Review found and corrected stale Shotcut checkout pin; workflow now uses c33b9cca6.", "verdict": "FIXED"}
+        {"description": "Review found and corrected stale Shotcut checkout pin; workflow now uses c33b9cca6.", "verdict": "FIXED"},
+        {"description": "Precedence audit found inherited MELT_BIN could override the bundle; daemon and native resolver precedence was corrected.", "verdict": "FIXED"}
       ]
     },
     {
@@ -37,7 +38,7 @@
       "status": "completed",
       "description": "Make daemon and GUI resolution converge on the packaged absolute executable and improve errors.",
       "implementation_evidence": "Existing Go and Rust resolvers both search beside the packaged executable; Launch now has a regression assertion for absolute MELT_BIN injection.",
-      "verified": [{"description": "procmgr package and Launch tests pass.", "verdict": "PASS"}]
+      "verified": [{"description": "procmgr package and Launch tests pass; bundled sibling takes precedence over inherited MELT_BIN.", "verdict": "PASS"}]
     }
   ],
   "pending": [

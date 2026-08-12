@@ -420,9 +420,9 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"MLT_PROFILES_PATH",
 		"SNAPSHOTD_INSTANCE_ID",
 	}
-	if os.Getenv("MELT_BIN") == "" {
-		envKeys = append(envKeys, "MELT_BIN")
-	}
+	// Always remove the inherited value first. If this is an installed bundle,
+	// the sibling melt.exe below must win over a stale system/user override.
+	envKeys = append(envKeys, "MELT_BIN")
 	cmd.Env = append(filterEnvKeys(os.Environ(), envKeys...),
 		"HOME="+qtHomeDir,
 		"SNAPSHOT_SAP_ENDPOINT="+sockPath,
@@ -438,10 +438,12 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
 	cmd.Env = appendBundledMltEnv(cmd.Env, m.BinPath)
-	if os.Getenv("MELT_BIN") == "" {
-		if meltBin := bundledMeltBinary(m.BinPath); meltBin != "" {
-			cmd.Env = append(cmd.Env, "MELT_BIN="+meltBin)
-		}
+	if meltBin := bundledMeltBinary(m.BinPath); meltBin != "" {
+		cmd.Env = append(cmd.Env, "MELT_BIN="+meltBin)
+	} else if override := os.Getenv("MELT_BIN"); override != "" {
+		// Preserve source/developer overrides only when no packaged sibling
+		// exists to provide the production export CLI.
+		cmd.Env = append(cmd.Env, "MELT_BIN="+override)
 	}
 	if m.HomeDir != "" {
 		cmd.Env = append(cmd.Env,
