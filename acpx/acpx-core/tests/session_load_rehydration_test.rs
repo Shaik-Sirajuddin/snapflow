@@ -149,6 +149,29 @@ async fn session_delete_also_rehydrates_from_persistence() {
         .await
         .unwrap_or_else(|err| panic!("session/delete should rehydrate from persistence: {err}"));
     assert!(delete_response.get("error").is_none());
+
+    assert!(
+        store
+            .get_session(gateway_id.clone())
+            .await
+            .expect("get deleted session")
+            .is_none(),
+        "session/delete must remove the durable row"
+    );
+    let list_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "session/list", "params": {}
+        }))
+        .await
+        .expect("session/list after delete");
+    assert_eq!(
+        list_response["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "deleted session must not remain discoverable"
+    );
 }
 
 /// **`acpx-session-transparent-revival`.** An ordinary `session/prompt`

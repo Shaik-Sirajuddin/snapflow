@@ -1,0 +1,38 @@
+import { Theme } from "../theme.slint";
+
+export component StatusChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-busy;
+
+    // Use alpha channels directly for the soft background colors
+    background: is-busy ? #f9e2af22 : #a6e3a122;
+    border-radius: Theme.radius-sm; // Uses the small border radius variant
+    border-width: 1px;
+    border-color: is-busy ? Theme.status-busy : Theme.status-ok;
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        padding-top: Theme.space-xs;
+        padding-bottom: Theme.space-xs;
+        spacing: Theme.space-sm;
+        alignment: center;
+
+        // Status Indicator Dot
+        Rectangle {
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: is-busy ? Theme.status-busy : Theme.status-ok;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.text;
+            font-size: Theme.font-xs;
+            font-weight: 500;
+            color: is-busy ? Theme.status-busy : Theme.status-ok;
+            vertical-alignment: center;
+        }
+    }
+}

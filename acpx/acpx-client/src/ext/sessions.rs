@@ -57,6 +57,21 @@ pub async fn list(client: &GatewayClient) -> Result<Vec<SessionSummary>, ClientE
     Ok(parse_sessions(result))
 }
 
+/// Permanently delete a session from the gateway. Unlike `session/close`,
+/// this removes the session from durable recovery and future `session/list`
+/// responses. Panel consumers should call this explicitly when they want
+/// that destructive lifecycle transition.
+pub async fn delete(client: &GatewayClient, session_id: &str) -> Result<(), ClientError> {
+    client
+        .call(
+            "session/delete",
+            serde_json::json!({ "sessionId": session_id }),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 /// The same aggregate list via the transport-neutral [`Gateway`] facade.
 /// Consumers that need WebSocket-primary behavior must use this instead of
 /// the HTTP-only [`list`] compatibility helper above.
@@ -65,6 +80,18 @@ pub async fn list_gateway(gateway: &Gateway) -> Result<Vec<SessionSummary>, Clie
         .call("session/list", serde_json::json!({}), None)
         .await?;
     Ok(parse_sessions(result))
+}
+
+/// Transport-neutral variant of [`delete`].
+pub async fn delete_gateway(gateway: &Gateway, session_id: &str) -> Result<(), ClientError> {
+    gateway
+        .call(
+            "session/delete",
+            serde_json::json!({ "sessionId": session_id }),
+            None,
+        )
+        .await?;
+    Ok(())
 }
 
 /// Real per-backend ACP `session/list`, selected by the ACPX supervisor

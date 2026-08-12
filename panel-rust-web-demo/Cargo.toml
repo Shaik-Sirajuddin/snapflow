@@ -1,0 +1,17 @@
+[package]
+name = "panel-rust-web-demo"
+version = "0.1.0"
+edition = "2021"
+description = "WASM demo build of the Snapflow Slint panel with dummy data."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+console_error_panic_hook = "0.1"
+i-slint-backend-winit = { version = "1.17.1", default-features = false, features = ["renderer-femtovg"] }
+slint = { version = "1.17.1", default-features = false, features = ["backend-winit", "renderer-femtovg", "compat-1-2", "std"] }
+wasm-bindgen = "0.2"
+
+[build-dependencies]
+slint-build = "1.17.1"

@@ -1,0 +1,45 @@
+import { Theme } from "../theme.slint";
+import { ThreadData, MessageData } from "../models.slint";
+import { ThreadsSidebar } from "threads-sidebar.slint";
+import { ChatPanel } from "chat-panel.slint";
+import { VerticalDivider } from "../components/divider.slint";
+
+export component ChatShell inherits Rectangle {
+    in property <[ThreadData]> threads;
+    in-out property <int> selected-index: 0;
+    in property <[MessageData]> messages;
+    in property <string> agent-name;
+    in property <string> permission-mode;
+    in property <bool> is-busy: false;
+    in-out property <string> draft;
+    callback message-submitted(string);
+    callback settings-clicked;
+
+    background: Theme.bg-base;
+
+    HorizontalLayout {
+        spacing: 0;
+
+        ThreadsSidebar {
+            threads: root.threads;
+            selected-index <=> root.selected-index;
+            settings-clicked => {
+                root.settings-clicked();
+            }
+        }
+
+        VerticalDivider {}
+
+        ChatPanel {
+            thread-title: root.threads[root.selected-index].title;
+            agent-name: root.agent-name;
+            permission-mode: root.permission-mode;
+            is-busy: root.is-busy;
+            messages: root.messages;
+            draft <=> root.draft;
+            message-submitted(text) => {
+                root.message-submitted(text);
+            }
+        }
+    }
+}

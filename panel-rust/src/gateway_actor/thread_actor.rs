@@ -3087,15 +3087,22 @@ async fn run_thread_actor(
                             .get("truncated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let exit_status = value
-                            .get("exitStatus")
-                            .filter(|v| !v.is_null())
-                            .map(|status| {
-                                (
-                                    status.get("exitCode").and_then(|v| v.as_i64()).map(|v| v as i32),
-                                    status.get("signal").and_then(|v| v.as_i64()).map(|v| v as i32),
-                                )
-                            });
+                        let exit_status =
+                            value
+                                .get("exitStatus")
+                                .filter(|v| !v.is_null())
+                                .map(|status| {
+                                    (
+                                        status
+                                            .get("exitCode")
+                                            .and_then(|v| v.as_i64())
+                                            .map(|v| v as i32),
+                                        status
+                                            .get("signal")
+                                            .and_then(|v| v.as_i64())
+                                            .map(|v| v as i32),
+                                    )
+                                });
                         TerminalOutputEvent {
                             terminal_id: terminal_id.clone(),
                             output,

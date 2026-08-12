@@ -4207,6 +4207,16 @@ impl Router {
         {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
+        // A deliberate close is recoverable, but only through an explicit
+        // session establishment method. Do not let an implicit prompt/cancel
+        // (or another active-session operation) resurrect a closed session.
+        if (record.closed_at.is_some() || record.status == RecoveryStatus::Closed)
+            && method != "session/load"
+            && method != "session/resume"
+            && method != "session/delete"
+        {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
         let mut entry = crate::session_registry::SessionEntry {
             agent_id: record.agent_id,
             backend_session_id: BackendSessionId(record.backend_session_id),
@@ -4416,7 +4426,7 @@ impl Router {
 
         // Promote discovery-only list-import rows to capacity-counted
         // live sessions on first real use (not on close/cancel).
-        if method != "session/close" {
+        if !matches!(method.as_str(), "session/close" | "session/delete") {
             self.ensure_capacity_for_active_turn(tenant_id, &gateway_session_id)?;
         }
 
@@ -4464,6 +4474,11 @@ impl Router {
         }
         mark_successful_recovery_retry(self.persistence.clone(), &gateway_session_id, &method)
             .await?;
+        if matches!(method.as_str(), "session/load" | "session/resume") {
+            if let Some(store) = self.persistence.clone() {
+                store.reopen_session(gateway_session_id.clone()).await?;
+            }
+        }
         self.spawn_state_revision_for_event(gateway_session_id.clone());
         if method == "session/close" {
             if let Some(store) = self.persistence.clone() {
@@ -4491,6 +4506,22 @@ impl Router {
             // ever able to stop it again (its supervisor key is unique to
             // this one session, so no other session/reap ever revisits
             // it). A no-op for the default shared-process model.
+            if let Some(removed) = self.sessions.remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            ) {
+                self.release_live_session_if_counted(tenant_id, removed.capacity_counted);
+                self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
+            }
+        }
+        if method == "session/delete" && response.get("error").is_none() {
+            // Delete is stronger than close: only forget the gateway mapping
+            // and durable metadata after the backend acknowledged the
+            // request, so a failed proxied call leaves the session recoverable.
+            if let Some(store) = self.persistence.clone() {
+                store.delete_session(gateway_session_id.clone()).await?;
+            }
             if let Some(removed) = self.sessions.remove(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
@@ -5026,7 +5057,7 @@ impl Router {
                             .await?
                     }
                     None => {
-                        let sessions: Vec<serde_json::Value> = self
+                        let mut sessions: Vec<serde_json::Value> = self
                             .sessions
                             .list(tenant_id)
                             .map(|(gateway_id, entry)| {
@@ -5037,6 +5068,32 @@ impl Router {
                                 })
                             })
                             .collect();
+                        // Keep durable closed sessions discoverable. They are
+                        // not eagerly rehydrated, but an agent-backed row is
+                        // still a valid catalog entry and can be explicitly
+                        // re-established with session/resume or session/load.
+                        if let Some(store) = self.persistence.clone() {
+                            let known: std::collections::HashSet<String> = sessions
+                                .iter()
+                                .filter_map(|session| {
+                                    session
+                                        .get("sessionId")
+                                        .and_then(|id| id.as_str())
+                                        .map(str::to_owned)
+                                })
+                                .collect();
+                            for record in store.list_sessions().await? {
+                                if record.tenant_id == tenant_id.0
+                                    && !known.contains(&record.gateway_session_id)
+                                {
+                                    sessions.push(serde_json::json!({
+                                        "sessionId": record.gateway_session_id,
+                                        "agentId": record.agent_id,
+                                        "cwd": record.cwd,
+                                    }));
+                                }
+                            }
+                        }
                         serde_json::json!({ "sessions": sessions })
                     }
                 }

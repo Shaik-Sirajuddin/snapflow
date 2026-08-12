@@ -109,13 +109,19 @@ pub enum McpClientError {
     #[error("MCP server stdio framing error: {0}")]
     Framing(#[from] acpx_conductor::framing::FramingError),
     #[error("MCP server returned a JSON-RPC error for {method}: {message}")]
-    RpcError { method: &'static str, message: String },
+    RpcError {
+        method: &'static str,
+        message: String,
+    },
     #[error("timed out waiting for the MCP server's {0} response")]
     Timeout(&'static str),
     #[error("MCP server HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("MCP server HTTP response for {method} was not valid JSON: {detail}")]
-    MalformedHttpResponse { method: &'static str, detail: String },
+    MalformedHttpResponse {
+        method: &'static str,
+        detail: String,
+    },
 }
 
 /// What to spawn for a stdio-transport MCP server -- deliberately the
@@ -489,9 +495,14 @@ mod tests {
     #[test]
     fn probe_spec_from_entry_returns_none_for_incomplete_or_unknown_entries() {
         assert!(probe_spec_from_entry(&serde_json::json!({"name": "x"})).is_none());
-        assert!(probe_spec_from_entry(&serde_json::json!({"name": "x", "type": "stdio"})).is_none());
+        assert!(
+            probe_spec_from_entry(&serde_json::json!({"name": "x", "type": "stdio"})).is_none()
+        );
         assert!(probe_spec_from_entry(&serde_json::json!({"name": "x", "type": "http"})).is_none());
-        assert!(probe_spec_from_entry(&serde_json::json!({"name": "x", "type": "carrier-pigeon"})).is_none());
+        assert!(
+            probe_spec_from_entry(&serde_json::json!({"name": "x", "type": "carrier-pigeon"}))
+                .is_none()
+        );
     }
 
     /// Real subprocess, real stdio framing, real `initialize`/`tools/
@@ -578,7 +589,10 @@ done
         .await;
         assert!(matches!(
             result,
-            Err(McpClientError::RpcError { method: "tools/list", .. })
+            Err(McpClientError::RpcError {
+                method: "tools/list",
+                ..
+            })
         ));
     }
 
@@ -719,13 +733,17 @@ done
         .await;
         assert!(matches!(
             result,
-            Err(McpClientError::RpcError { method: "initialize", .. })
+            Err(McpClientError::RpcError {
+                method: "initialize",
+                ..
+            })
         ));
     }
 
     #[test]
     fn extract_sse_json_data_unwraps_a_single_event() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
         let value = extract_sse_json_data(body).expect("should extract the data payload");
         assert_eq!(value["id"], 1);
         assert_eq!(value["result"]["tools"], serde_json::json!([]));
@@ -858,8 +876,14 @@ done
         .await;
 
         match result {
-            Err(McpClientError::MalformedHttpResponse { method: "initialize", detail }) => {
-                assert!(detail.contains("502"), "expected status in detail: {detail}");
+            Err(McpClientError::MalformedHttpResponse {
+                method: "initialize",
+                detail,
+            }) => {
+                assert!(
+                    detail.contains("502"),
+                    "expected status in detail: {detail}"
+                );
                 assert!(
                     detail.contains("Bad Gateway"),
                     "expected body snippet in detail: {detail}"

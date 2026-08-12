@@ -180,10 +180,7 @@ impl DiscoveryEndpoint {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &descriptor,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(&descriptor, std::fs::Permissions::from_mode(0o600));
         }
         let (stop, stop_rx) = mpsc::channel();
         let descriptor_for_thread = descriptor.clone();
@@ -767,7 +764,9 @@ impl SnapshotdControlClient {
                         }
                     })
                     .collect();
-                Some(PathBuf::from(format!("\\\\.\\pipe\\snapflow-{scope}-control")))
+                Some(PathBuf::from(format!(
+                    "\\\\.\\pipe\\snapflow-{scope}-control"
+                )))
             })?;
         Some(Self::new(endpoint))
     }

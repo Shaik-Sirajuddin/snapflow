@@ -3610,7 +3610,11 @@ mod jsonl_append_offload_tests {
             }
         });
         let cached = store.load("thread").expect("load");
-        let texts: Vec<_> = cached.messages.iter().map(|message| message.text.as_str()).collect();
+        let texts: Vec<_> = cached
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
         assert_eq!(texts, ["first", "second", "third"]);
     }
 }
@@ -3737,12 +3741,8 @@ fn spawn_event_forwarder(
                         pending_visual_messages = 0;
                     }
                     if let Some(store) = &store_for_task {
-                        if let Err(e) = append_jsonl_offloaded(
-                            store,
-                            &slot_for_task.thread_id,
-                            msg,
-                        )
-                        .await
+                        if let Err(e) =
+                            append_jsonl_offloaded(store, &slot_for_task.thread_id, msg).await
                         {
                             eprintln!(
                                 "panel-rust: jsonl append failed for {}: {e}",
@@ -5958,12 +5958,9 @@ impl AgentBridge {
                                 }
                                 replayed_any = true;
                                 if let Some(store) = &store {
-                                    if let Err(error) = append_jsonl_offloaded(
-                                        store,
-                                        &slot.thread_id,
-                                        message,
-                                    )
-                                    .await
+                                    if let Err(error) =
+                                        append_jsonl_offloaded(store, &slot.thread_id, message)
+                                            .await
                                     {
                                         eprintln!(
                                             "panel-rust: jsonl append failed for {}: {error}",
@@ -13393,13 +13390,19 @@ done
             let _ = second.poll();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(second.has_older_page(0), "initial remote page had no continuation");
+        assert!(
+            second.has_older_page(0),
+            "initial remote page had no continuation"
+        );
         let newest_page = second.history(0);
         assert!(!newest_page.is_empty(), "initial remote page was empty");
         let newest_first = newest_page[0].text.clone();
         let newest_len = newest_page.len();
 
-        assert!(second.load_older_page(0), "remote pagination dispatch was rejected");
+        assert!(
+            second.load_older_page(0),
+            "remote pagination dispatch was rejected"
+        );
         let older_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < older_deadline
             && second.has_older_page(0)
@@ -13420,7 +13423,10 @@ done
         // updates each turn emitted.
         let mut pages = 1usize;
         while second.has_older_page(0) && pages < 8 {
-            assert!(second.load_older_page(0), "remote continuation dispatch was rejected");
+            assert!(
+                second.load_older_page(0),
+                "remote continuation dispatch was rejected"
+            );
             let before_len = second.history(0).len();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < deadline
@@ -13430,10 +13436,16 @@ done
                 let _ = second.poll();
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            assert!(second.history(0).len() > before_len, "remote page was empty");
+            assert!(
+                second.history(0).len() > before_len,
+                "remote page was empty"
+            );
             pages += 1;
         }
-        assert!(!second.has_older_page(0), "remote continuation cursor was not exhausted");
+        assert!(
+            !second.has_older_page(0),
+            "remote continuation cursor was not exhausted"
+        );
     }
 
     /// `skill_injection_verification` phase: `snapflowd_mcp_servers_entry`'s

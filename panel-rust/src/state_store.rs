@@ -1221,7 +1221,10 @@ mod tests {
     fn runtime_snapshot_round_trips_in_panel_state_store() {
         let store = PanelStateStore::in_memory().unwrap();
         store
-            .save_runtime_snapshot("thread-runtime", r#"{"pendingRequests":[],"archived":true}"#)
+            .save_runtime_snapshot(
+                "thread-runtime",
+                r#"{"pendingRequests":[],"archived":true}"#,
+            )
             .unwrap();
         assert_eq!(
             store.runtime_snapshot("thread-runtime").unwrap(),

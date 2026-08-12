@@ -1573,8 +1573,7 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
             // mcp-servers-settings follow-up: same reasoning again -- a
             // thread switch can land on a thread whose OWN first-attach
             // is (or isn't) in flight.
-            component
-                .set_selected_first_attach_in_flight(chat_view_first_attach_in_flight(model));
+            component.set_selected_first_attach_in_flight(chat_view_first_attach_in_flight(model));
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());

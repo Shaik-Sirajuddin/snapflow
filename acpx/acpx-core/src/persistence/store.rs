@@ -195,6 +195,51 @@ impl PersistenceStore {
         .await
     }
 
+    /// Permanently remove a session's durable metadata. This is the
+    /// destructive counterpart to [`close_session`]: deleted sessions no
+    /// longer participate in startup/on-demand recovery or session/list.
+    /// Deletion is idempotent so a client can safely repeat `session/delete`
+    /// after a lost response.
+    pub async fn delete_session(
+        &self,
+        gateway_session_id: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "DELETE FROM sessions WHERE gateway_session_id = ?1",
+                params![gateway_session_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Mark a previously closed session active again after a successful
+    /// explicit `session/resume` or `session/load`.
+    pub async fn reopen_session(
+        &self,
+        gateway_session_id: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let rows = conn.execute(
+                "UPDATE sessions SET closed_at = NULL, status = 'active', last_recovery_error = NULL \
+                 WHERE gateway_session_id = ?1",
+                params![gateway_session_id],
+            )?;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(gateway_session_id));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Fetch one session's metadata row, if it exists.
     pub async fn get_session(
         &self,

@@ -132,10 +132,7 @@ impl ThreadViewModels {
             };
             slot_keys[start] = Some(key.clone());
             for (offset, slot) in row_slots[start..end].iter_mut().enumerate() {
-                *slot = Some((
-                    key.clone(),
-                    offset,
-                ));
+                *slot = Some((key.clone(), offset));
             }
             start = end;
         }
@@ -237,19 +234,17 @@ impl ThreadViewModels {
     pub(crate) fn set_keys(&self, thread_id: &str, keys: Vec<String>) {
         if let Some(state) = self.by_thread_id.get(thread_id) {
             *state.keys.borrow_mut() = keys;
-            let index = state
-                .keys
-                .borrow()
-                .iter()
-                .enumerate()
-                .fold(HashMap::new(), |mut index, (row, key)| {
+            let index = state.keys.borrow().iter().enumerate().fold(
+                HashMap::new(),
+                |mut index, (row, key)| {
                     // A malformed/partially streamed transcript can
                     // briefly produce duplicate fallback keys. Keep the
                     // first row authoritative; overwriting here silently
                     // redirected keyed updates to the last duplicate.
                     index.entry(key.clone()).or_insert(row);
                     index
-                });
+                },
+            );
             *state.row_index.borrow_mut() = index;
         }
     }
@@ -417,7 +412,10 @@ mod tests {
     fn duplicate_keys_keep_first_row_index() {
         let mut views = ThreadViewModels::default();
         views.ensure("thread-a");
-        views.set_keys("thread-a", vec!["same".into(), "other".into(), "same".into()]);
+        views.set_keys(
+            "thread-a",
+            vec!["same".into(), "other".into(), "same".into()],
+        );
         assert_eq!(views.row_index_for("thread-a", "same"), Some(0));
         assert_eq!(views.row_index_for("thread-a", "other"), Some(1));
     }

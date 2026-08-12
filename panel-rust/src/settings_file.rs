@@ -493,11 +493,7 @@ mod tests {
         // through to a CWD-relative ".config" and produced the reported
         // Windows "access is denied, os error 5".
         assert_eq!(
-            dirs_fallback_config_from(
-                None,
-                Some("C:\\Users\\u\\AppData\\Roaming".into()),
-                None,
-            ),
+            dirs_fallback_config_from(None, Some("C:\\Users\\u\\AppData\\Roaming".into()), None,),
             PathBuf::from("C:\\Users\\u\\AppData\\Roaming"),
         );
         assert_eq!(

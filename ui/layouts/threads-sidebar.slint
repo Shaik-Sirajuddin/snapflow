@@ -1,0 +1,164 @@
+import { Theme } from "../theme.slint";
+import { ThreadData } from "../models.slint";
+import { ThreadItem } from "../components/thread-item.slint";
+import { HorizontalDivider } from "../components/divider.slint";
+
+export component ThreadsSidebar inherits Rectangle {
+    in property <[ThreadData]> threads;
+    in-out property <int> selected-index: 0;
+    callback settings-clicked;
+
+    width: Theme.sidebar-width;
+    background: Theme.bg-surface;
+
+    VerticalLayout {
+        // 1. Sidebar Header
+        VerticalLayout {
+            padding: Theme.space-lg;
+            spacing: Theme.space-sm;
+
+            HorizontalLayout {
+                alignment: space-between;
+                spacing: Theme.space-xs;
+
+                HorizontalLayout {
+                    spacing: Theme.space-sm;
+                    alignment: start;
+                    
+                    // Logo Box
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        background: Theme.accent;
+                        border-radius: Theme.radius-sm; // Logo uses small border radius
+
+                        Text {
+                            text: "M";
+                            font-size: Theme.font-sm;
+                            font-weight: 900;
+                            color: Theme.bg-base;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "MultiMedia";
+                        font-size: Theme.font-md;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Search Bar Placeholder
+            Rectangle {
+                background: Theme.bg-base;
+                border-radius: Theme.radius-sm; // Search bar uses small radius
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                height: 28px;
+
+                Text {
+                    text: "Search threads...";
+                    font-size: Theme.font-xs;
+                    color: Theme.text-muted;
+                    x: Theme.space-md;
+                    y: (parent.height - self.height) / 2;
+                }
+            }
+        }
+
+        HorizontalDivider {}
+
+        // 2. Scrollable Thread List
+        Flickable {
+            viewport-y: 0;
+            viewport-height: root.threads.length * 76px; // Approx height per ThreadItem
+
+            VerticalLayout {
+                padding: Theme.space-md;
+                spacing: Theme.space-sm;
+                alignment: start;
+
+                for thread[idx] in root.threads : ThreadItem {
+                    title: thread.title;
+                    preview: thread.preview;
+                    selected: idx == root.selected-index;
+                    clicked => {
+                        root.selected-index = idx;
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider {}
+
+        // 3. User Session Footer
+        HorizontalLayout {
+            padding: Theme.space-md;
+            alignment: space-between;
+            spacing: Theme.space-sm;
+
+            HorizontalLayout {
+                spacing: Theme.space-sm;
+                alignment: start;
+
+                // User Avatar
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    border-radius: 16px;
+                    background: Theme.bg-elevated;
+
+                    Text {
+                        text: "U";
+                        font-size: Theme.font-xs;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Local User";
+                        font-size: Theme.font-xs;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                    }
+                    Text {
+                        text: "usr_9011";
+                        font-size: 9px;
+                        color: Theme.text-muted;
+                    }
+                }
+            }
+
+            // Settings button
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: Theme.radius-sm; // Control button uses small radius
+                background: touch-settings.has-hover ? Theme.bg-hover : transparent;
+
+                touch-settings := TouchArea {
+                    clicked => {
+                        root.settings-clicked();
+                    }
+                }
+
+                Text {
+                    text: "⚙️";
+                    font-size: Theme.font-sm;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

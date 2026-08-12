@@ -594,7 +594,8 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     // provider..." pulse stuck forever waiting on an
                     // event that is never coming. See `EffectResultMsg::
                     // ProviderProbeSkipped`'s doc comment.
-                    if !bridge.probe_provider_selection(real_index, provider.clone(), profile_name) {
+                    if !bridge.probe_provider_selection(real_index, provider.clone(), profile_name)
+                    {
                         let _ = update_persistent(
                             panel,
                             Msg::Effect(crate::effect::EffectResultMsg::ProviderProbeSkipped {

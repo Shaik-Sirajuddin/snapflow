@@ -4896,9 +4896,7 @@ mod transcript_model_tests {
         assert!(is_missing_runtime_prerequisite_error(
             "uv: command not found"
         ));
-        assert!(is_missing_runtime_prerequisite_error(
-            "spawn python ENOENT"
-        ));
+        assert!(is_missing_runtime_prerequisite_error("spawn python ENOENT"));
     }
 
     #[test]

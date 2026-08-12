@@ -1,0 +1,100 @@
+import { Theme } from "../theme.slint";
+
+export component ChatInput inherits Rectangle {
+    in-out property <string> draft: "";
+    in property <bool> is-busy: false;
+    callback message-submitted(string);
+
+    background: Theme.bg-surface;
+    border-radius: Theme.radius-lg; // Outer wrapper uses large radius
+    border-width: 1px;
+    border-color: Theme.border-strong;
+
+    VerticalLayout {
+        padding: Theme.space-sm;
+        spacing: Theme.space-sm;
+
+        // Message Input Field
+        Rectangle {
+            background: Theme.bg-base;
+            border-radius: Theme.radius-md; // Input field uses medium radius
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            height: 64px;
+
+            input := TextInput {
+                text <=> root.draft;
+                font-size: Theme.font-sm;
+                color: Theme.text-primary;
+                wrap: word-wrap;
+                x: Theme.space-md;
+                y: Theme.space-sm;
+                width: parent.width - 2 * Theme.space-md;
+                height: parent.height - 2 * Theme.space-sm;
+            }
+
+            if root.draft == "" : Text {
+                text: "Message your agent...";
+                font-size: Theme.font-sm;
+                color: Theme.text-muted;
+                x: Theme.space-md;
+                y: Theme.space-sm;
+            }
+        }
+
+        // Bottom Controls
+        HorizontalLayout {
+            alignment: space-between;
+
+            // Attachment icons / status placeholder
+            HorizontalLayout {
+                spacing: Theme.space-sm;
+                alignment: start;
+                
+                // Placeholder attachment button
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: Theme.radius-sm; // Buttons use small radius
+                    background: touch-attach.has-hover ? Theme.bg-hover : transparent;
+                    
+                    touch-attach := TouchArea {}
+                    
+                    Text {
+                        text: "📎";
+                        font-size: Theme.font-sm;
+                        color: Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Send Button
+            btn := Rectangle {
+                width: 72px;
+                height: 28px;
+                background: root.draft == "" || root.is-busy ? Theme.bg-elevated : Theme.accent;
+                border-radius: Theme.radius-sm; // Controls/Buttons use small radius
+                
+                touch-send := TouchArea {
+                    clicked => {
+                        if (root.draft != "" && !root.is-busy) {
+                            root.message-submitted(root.draft);
+                            root.draft = "";
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.is-busy ? "Wait..." : "Send";
+                    font-size: Theme.font-xs;
+                    font-weight: 700;
+                    color: root.draft == "" || root.is-busy ? Theme.text-muted : Theme.bg-base;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

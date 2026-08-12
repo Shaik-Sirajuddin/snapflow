@@ -1,0 +1,48 @@
+import { Theme } from "../panel-rust/ui/tokens/theme.slint";
+import { ChatPanel as ProductionChatPanel } from "../panel-rust/ui/app.slint";
+import { MessageItem, ThreadItem } from "../panel-rust/ui/types.slint";
+
+export { MessageItem, ThreadItem }
+
+// The browser host owns these dimensions. Keeping this adapter separate
+// avoids changing the desktop panel's sizing contract while exposing the
+// narrow data and callback surface used by the demo fixture.
+export component ChatPanel inherits Window {
+    in-out property <length> viewport-width: 640px;
+    in-out property <length> viewport-height: 720px;
+    in-out property <bool> compact: false;
+    in-out property <bool> sidebar-expanded: true;
+    in-out property <string> connection-status: "Demo workspace ready";
+    in-out property <bool> gateway-ready: true;
+    in-out property <bool> project-open: true;
+    in-out property <string> active-project-path: "/projects/snapflow-film";
+    in-out property <int> selected-thread: 0;
+    in-out property <[ThreadItem]> threads: [];
+    in-out property <[MessageItem]> messages: [];
+    in-out property <string> compose-text: "";
+
+    callback thread-selected(int);
+    callback send-requested();
+
+    width: viewport-width;
+    height: viewport-height;
+    background: Theme.bg-chat;
+
+    ProductionChatPanel {
+        width: parent.width;
+        height: parent.height;
+        compact: root.compact;
+        sidebar-expanded <=> root.sidebar-expanded;
+        connection-status: root.connection-status;
+        gateway-ready: root.gateway-ready;
+        project-open: root.project-open;
+        active-project-path: root.active-project-path;
+        selected-thread <=> root.selected-thread;
+        threads: root.threads;
+        messages: root.messages;
+        compose-text <=> root.compose-text;
+
+        thread-selected(index) => { root.thread-selected(index); }
+        send-requested => { root.send-requested(); }
+    }
+}

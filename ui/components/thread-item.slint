@@ -1,0 +1,52 @@
+import { Theme } from "../theme.slint";
+
+export component ThreadItem inherits Rectangle {
+    in property <string> title;
+    in property <string> preview;
+    in property <bool> selected;
+    
+    callback clicked;
+
+    background: selected ? Theme.bg-selected : touch.has-hover ? Theme.bg-hover : transparent;
+    border-radius: Theme.radius-md; // Uses the medium border radius variant
+    border-width: 1px;
+    border-color: selected ? Theme.accent-soft : transparent;
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    VerticalLayout {
+        padding: Theme.space-md;
+        spacing: Theme.space-xs;
+
+        HorizontalLayout {
+            alignment: space-between;
+            Text {
+                text: root.title;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                color: root.selected ? Theme.accent : Theme.text-primary;
+                vertical-alignment: center;
+            }
+
+            if root.selected : Text {
+                text: "Active";
+                font-size: Theme.font-xs;
+                font-weight: 500;
+                color: Theme.accent;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: root.preview;
+            font-size: Theme.font-xs;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}

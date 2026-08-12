@@ -1,0 +1,58 @@
+// Design tokens — single source for colors, spacing, and radius scale.
+
+export global Theme {
+    // Border radius scale (sm / md / lg)
+    in-out property <length> radius-sm: 4px;
+    in-out property <length> radius-md: 8px;
+    in-out property <length> radius-lg: 12px;
+
+    // Spacing
+    in-out property <length> space-xs: 4px;
+    in-out property <length> space-sm: 8px;
+    in-out property <length> space-md: 12px;
+    in-out property <length> space-lg: 16px;
+    in-out property <length> space-xl: 24px;
+
+    // Surfaces
+    in-out property <brush> bg-base: #11111b;
+    in-out property <brush> bg-surface: #1e1e2e;
+    in-out property <brush> bg-elevated: #313244;
+    in-out property <brush> bg-hover: #45475a;
+    in-out property <brush> bg-selected: #2a2a3d;
+
+    // Borders
+    in-out property <brush> border-subtle: #313244;
+    in-out property <brush> border-strong: #45475a;
+
+    // Text
+    in-out property <brush> text-primary: #cdd6f4;
+    in-out property <brush> text-secondary: #a6adc8;
+    in-out property <brush> text-muted: #6c7086;
+
+    // Accent
+    in-out property <brush> accent: #89b4fa;
+    in-out property <brush> accent-soft: #89b4fa33;
+    in-out property <brush> user-bubble: #313244;
+    in-out property <brush> assistant-bubble: #1e2a3a;
+
+    // Status
+    in-out property <brush> status-ok: #a6e3a1;
+    in-out property <brush> status-busy: #f9e2af;
+
+    // Typography
+    in-out property <length> font-xs: 11px;
+    in-out property <length> font-sm: 13px;
+    in-out property <length> font-md: 14px;
+    in-out property <length> font-lg: 16px;
+
+    // Layout
+    in-out property <length> sidebar-width: 220px;
+    in-out property <length> divider-width: 1px;
+}
+
+export enum RadiusVariant {
+    sm,
+    md,
+    lg,
+}
+

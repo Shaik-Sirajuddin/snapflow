@@ -185,12 +185,25 @@ func (r *Registry) EnsureProjectForPath(projectPath string) (*Project, error) {
 	}
 	root := filepath.Dir(abs)
 	fileName := filepath.Base(abs)
-	if filepath.Ext(abs) == "" {
+	explicitFile := filepath.Ext(abs) != ""
+	if !explicitFile {
 		root = abs
 		fileName = DefaultMltFileName
 	}
 	var existing Project
 	if err := r.db.Where("root_dir = ?", root).First(&existing).Error; err == nil {
+		// A caller reporting a different .mlt within the same root (e.g. an
+		// external GUI instance that opened another file in the project
+		// folder) means the registered name is stale -- persist the
+		// observed one so ExternalInstance.ProjectPath and Project.MltFileName
+		// agree instead of silently diverging.
+		if explicitFile && fileName != existing.MltFileName {
+			if err := r.db.Model(&Project{}).Where("id = ?", existing.ID).
+				Update("mlt_file_name", fileName).Error; err != nil {
+				return nil, err
+			}
+			existing.MltFileName = fileName
+		}
 		return &existing, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err

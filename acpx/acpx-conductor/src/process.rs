@@ -321,8 +321,14 @@ fn base_command(program: &str) -> Command {
 #[cfg(windows)]
 fn resolve_windows_spawn_program(program: &str) -> Option<(std::path::PathBuf, bool)> {
     let path = std::path::Path::new(program);
-    let is_script_ext = |ext: &str| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat");
-    if path.extension().is_some() || path.parent().filter(|p| !p.as_os_str().is_empty()).is_some() {
+    let is_script_ext =
+        |ext: &str| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat");
+    if path.extension().is_some()
+        || path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .is_some()
+    {
         let is_script = path
             .extension()
             .and_then(|e| e.to_str())

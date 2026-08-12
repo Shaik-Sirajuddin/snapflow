@@ -1,0 +1,1315 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MultiMedia Agent — Minimal UI</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Google Fonts: Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'monospace'],
+          },
+          colors: {
+            sys: {
+              outer: 'var(--md-sys-color-surface)',
+              sidebar: 'var(--md-sys-color-surface-container)',
+              chat: 'var(--md-sys-color-chat-bg-overlay)',
+              card: 'var(--md-sys-color-surface-container-low)',
+              border: 'var(--md-sys-color-outline)',
+              borderStrong: 'var(--md-sys-color-outline-variant)',
+              textPrimary: 'var(--md-sys-color-on-surface)',
+              textSecondary: 'var(--md-sys-color-on-surface-variant)',
+              textMuted: 'var(--md-sys-color-on-surface-muted)',
+              primary: 'var(--md-sys-color-primary)',
+              primaryContainer: 'var(--md-sys-color-primary-container)',
+              onPrimary: 'var(--md-sys-color-on-primary)',
+              onPrimaryContainer: 'var(--md-sys-color-on-primary-container)',
+              userBubble: 'var(--md-sys-color-surface-variant)',
+              userBubbleBorder: 'var(--md-sys-color-outline)',
+              userBubbleText: 'var(--md-sys-color-on-surface)',
+              agentBubble: 'var(--md-sys-color-surface-container)',
+              agentBubbleBorder: 'var(--md-sys-color-outline)',
+              agentBubbleText: 'var(--md-sys-color-on-surface)',
+              terminalBg: 'var(--md-sys-color-surface-container)',
+              terminalBorder: 'var(--md-sys-color-outline)',
+              terminalText: 'var(--md-sys-color-on-surface-variant)',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    :root {
+      /* LIGHT MODE: Base White Background */
+      --md-sys-color-surface: #ffffff;              
+      --md-sys-color-surface-container: #f4f4f7;            
+      --md-sys-color-surface-container-low: #ffffff;               
+      --md-sys-color-surface-variant: #eaeaea;           
+      
+      --md-sys-color-outline: rgba(0, 0, 0, 0.06);
+      --md-sys-color-outline-variant: rgba(0, 0, 0, 0.12);
+      
+      --md-sys-color-on-surface: #121212;          
+      --md-sys-color-on-surface-variant: #555558;        
+      --md-sys-color-on-surface-muted: #8a8a8f;
+      
+      --md-sys-color-primary: #000000;               /* Base Black Primary */
+      --md-sys-color-primary-container: #e5e5ea;
+      --md-sys-color-on-primary: #ffffff;
+      --md-sys-color-on-primary-container: #000000;
+
+      --md-sys-color-chat-bg-overlay: rgba(250, 250, 252, 0.55);
+      
+      --md-sys-color-blob-1: rgba(0, 0, 0, 0.01);
+      --md-sys-color-blob-2: rgba(0, 0, 0, 0.005);
+    }
+
+    .dark {
+      /* DARK MODE: Base Black Background */
+      --md-sys-color-surface: #000000;              
+      --md-sys-color-surface-container: #09090b;            
+      --md-sys-color-surface-container-low: #09090b;               
+      --md-sys-color-surface-variant: #151518;           
+      
+      --md-sys-color-outline: rgba(255, 255, 255, 0.06);
+      --md-sys-color-outline-variant: rgba(255, 255, 255, 0.12);
+      
+      --md-sys-color-on-surface: #f2f2f7;          
+      --md-sys-color-on-surface-variant: #a1a1a6;        
+      --md-sys-color-on-surface-muted: #636366;
+      
+      --md-sys-color-primary: #ffffff;               /* Base White Primary */
+      --md-sys-color-primary-container: #1c1c1e;
+      --md-sys-color-on-primary: #000000;
+      --md-sys-color-on-primary-container: #ffffff;
+
+      --md-sys-color-chat-bg-overlay: #131313;
+
+      --md-sys-color-blob-1: rgba(255, 255, 255, 0.01);
+      --md-sys-color-blob-2: rgba(255, 255, 255, 0.005);
+    }
+
+    html {
+      font-size: 18px;
+    }
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    
+    /* Scrollbar styling */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 9999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    /* Smooth transitions */
+    .transition-all {
+      transition-property: all;
+      transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+      transition-duration: 200ms;
+    }
+
+    /* Blinking cursor */
+    .cursor-blink::after {
+      content: '▋';
+      animation: blink 1s step-start infinite;
+    }
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+
+    /* Modal zoom */
+    .zoom-in {
+      animation: zoomIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    /* Slide up entrance animation */
+    @keyframes slideUpFadeIn {
+      from {
+        opacity: 0;
+        transform: translateY(16px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    .animate-slide-up {
+      animation: slideUpFadeIn 0.18s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    /* Draw line animation */
+    @keyframes scaleY100 {
+      from { transform: scaleY(0); }
+      to { transform: scaleY(1); }
+    }
+    .animate-draw-line {
+      animation: scaleY100 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    
+    /* Draw left border animation for user cards */
+    @keyframes drawLeftBorder {
+      from { border-left-width: 0px; }
+      to { border-left-width: 2px; }
+    }
+    .animate-draw-border {
+      animation: drawLeftBorder 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    /* Sidebar collapse transition */
+    #sidebar-container {
+      transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease, border-color 0.3s ease;
+      overflow: hidden;
+    }
+    #sidebar-container.collapsed {
+      width: 0px !important;
+      opacity: 0;
+      border-right-width: 0px !important;
+    }
+  </style>
+</head>
+<body class="h-full bg-sys-outer text-sys-textPrimary flex flex-col overflow-hidden relative transition-all duration-300">
+
+  <!-- Minimal Ambient Blurred Blobs -->
+  <div class="fixed inset-0 pointer-events-none z-0 overflow-hidden">
+    <div class="absolute -top-40 -left-40 w-96 h-96 rounded-full bg-[var(--md-sys-color-blob-1)] blur-[120px] transition-all duration-500"></div>
+    <div class="absolute -bottom-40 -right-40 w-96 h-96 rounded-full bg-[var(--md-sys-color-blob-2)] blur-[120px] transition-all duration-500"></div>
+  </div>
+
+  <!-- Header -->
+  <header class="h-16 border-b border-sys-border bg-sys-sidebar/90 backdrop-blur-md px-6 flex items-center justify-between z-10 shrink-0 transition-all">
+    <div class="flex items-center gap-3">
+      <!-- Sidebar Toggle Button -->
+      <button onclick="toggleSidebar()" class="text-sys-textSecondary hover:text-sys-textPrimary p-1.5 rounded hover:bg-sys-outer transition-colors r-sm shrink-0" title="Toggle Sidebar">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+        </svg>
+      </button>
+      <!-- Logo -->
+      <div class="w-9 h-9 bg-sys-primary text-sys-onPrimary flex items-center justify-center font-bold shadow-sm r-md transition-all">
+        M
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="text-sm font-extrabold tracking-tight text-sys-textPrimary">MultiMedia Agent</h1>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold bg-sys-primaryContainer text-sys-onPrimaryContainer rounded r-sm uppercase tracking-wider">Console</span>
+        </div>
+        <p class="text-[10px] text-sys-textMuted font-mono">WORKSPACE: /multimedia_agent/main</p>
+      </div>
+    </div>
+
+    <!-- Theme selection, Layout and Radius controls -->
+    <div class="flex items-center gap-4 relative z-20">
+      
+      <!-- Theme Selection Dropdown (Top Right) -->
+      <div class="flex items-center gap-1.5 bg-sys-outer/90 p-1.5 rounded-lg border border-sys-border">
+        <span class="text-[10px] font-bold text-sys-textMuted px-1 uppercase tracking-wider">Theme:</span>
+        <select id="theme-select" onchange="changeTheme(this.value)" class="bg-sys-sidebar text-sys-textSecondary text-xs font-semibold focus:outline-none cursor-pointer border border-sys-border px-2.5 py-0.5 rounded r-sm transition-all">
+          <option value="dark">🌙 Base Black</option>
+          <option value="light">☀️ Base White</option>
+        </select>
+      </div>
+
+      <!-- Layout Style selector -->
+      <div class="flex items-center gap-1.5 bg-sys-outer/90 p-1.5 rounded-lg border border-sys-border">
+        <span class="text-[10px] font-bold text-sys-textMuted px-1 uppercase tracking-wider">Layout:</span>
+        <select id="layout-select" onchange="changeLayout(this.value)" class="bg-sys-sidebar text-sys-textSecondary text-xs font-semibold focus:outline-none cursor-pointer border border-sys-border px-2 py-0.5 rounded r-sm transition-all">
+          <option value="timeline">Unified Timeline</option>
+          <option value="ltr">Chat: LTR (Agent L / User R)</option>
+          <option value="rtl">Chat: RTL (Agent R / User L)</option>
+          <option value="ll">Chat: LL (Both Left)</option>
+          <option value="rr">Chat: RR (Both Right)</option>
+        </select>
+      </div>
+
+      <!-- Border Radius Scale selector -->
+      <div class="flex items-center gap-1.5 bg-sys-outer/90 p-1.5 rounded-lg border border-sys-border">
+        <span class="text-[10px] font-bold text-sys-textMuted px-1.5 uppercase tracking-wider">Radius:</span>
+        <button onclick="setRadiusPreset('sharp')" id="btn-radius-sharp" class="px-2 py-0.5 text-[11px] font-mono rounded bg-transparent hover:bg-sys-hover text-sys-textMuted transition-colors">
+          Sharp
+        </button>
+        <button onclick="setRadiusPreset('classic')" id="btn-radius-classic" class="px-2 py-0.5 text-[11px] font-mono rounded bg-sys-primary text-sys-onPrimary transition-all font-medium">
+          Classic
+        </button>
+        <button onclick="setRadiusPreset('organic')" id="btn-radius-organic" class="px-2 py-0.5 text-[11px] font-mono rounded bg-transparent hover:bg-sys-hover text-sys-textMuted transition-colors">
+          Organic
+        </button>
+      </div>
+
+      <!-- Sim Trigger -->
+      <div class="flex items-center gap-2">
+        <button onclick="triggerSimulationStep()" class="px-3 py-1 bg-sys-primary/10 hover:bg-sys-primary/20 text-sys-primary border border-sys-primary/30 text-xs font-semibold flex items-center gap-1.5 transition-all r-sm">
+          <span>⚡ Sim Step</span>
+        </button>
+        <button onclick="toggleThemeSidebar()" class="text-sys-textSecondary hover:text-sys-textPrimary p-2 rounded hover:bg-sys-hover transition-colors r-sm">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Layout Container -->
+  <div class="flex-1 flex overflow-hidden z-10">
+
+    <!-- 1. LEFT SIDEBAR: Threads (separated by minimal horizontal dividers, no outer border) -->
+    <aside id="sidebar-container" class="w-80 border-r border-sys-border bg-sys-sidebar flex flex-col justify-between shrink-0 transition-all">
+      
+      <!-- Search Input -->
+      <div class="p-4 border-b border-sys-border">
+        <div class="relative flex items-center">
+          <input type="text" placeholder="Search active threads..." class="w-full bg-sys-outer border border-sys-border text-sys-textPrimary text-xs px-3 py-2 pl-8 pr-8 focus:outline-none focus:border-sys-primary/80 transition-all transition-radius r-sm" />
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 text-sys-textMuted absolute left-2.5 top-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <!-- Tab Clone icon at the right end of search -->
+          <button class="absolute right-2.5 top-2.5 text-sys-textMuted hover:text-sys-textPrimary p-0.5 rounded transition-colors" title="Clone / Add Tab">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Threads List (Fixed Height, Minimal Separator, No Borders) -->
+      <div class="flex-1 overflow-y-auto" id="threads-container">
+        <!-- Rendered dynamically -->
+      </div>
+
+      <!-- Footer Info (Login bar with white border and hover bg effect) -->
+      <div class="m-3 p-3 border border-sys-primary/20 bg-sys-card hover:bg-sys-outer/50 cursor-pointer transition-all duration-200 text-xs transition-radius r-md flex items-center justify-between shadow-sm">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-full bg-sys-primary/15 border border-sys-primary/30 flex items-center justify-center font-bold text-[11px] text-sys-primary">
+            MB
+          </div>
+          <div>
+            <div class="font-semibold text-sys-textSecondary">Media Conductor</div>
+            <div class="text-[9px] text-sys-textMuted font-mono">active_thread: timeline</div>
+          </div>
+        </div>
+        
+        <div class="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-sys-primaryContainer border border-sys-border text-sys-textSecondary text-[10px] font-medium" id="agent-status-tag">
+          <span class="w-1.5 h-1.5 rounded-full bg-sys-textSecondary" id="agent-status-dot"></span>
+          <span id="agent-status-text">idle</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 2. MIDDLE CHAT PANEL: Glassy style slight grey with backdrop-blur for center focus -->
+    <main class="flex-1 flex flex-col bg-sys-chat backdrop-blur-md overflow-hidden transition-all duration-300">
+      
+      <!-- Thread Header -->
+      <section class="h-16 border-b border-sys-border bg-sys-chat px-6 flex items-center justify-between shrink-0 transition-all">
+        <div class="flex items-center gap-3">
+          <div class="w-8 h-8 flex items-center justify-center bg-sys-primary/10 text-sys-primary border border-sys-primary/20 transition-radius r-md">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <div>
+            <h2 class="text-sm font-semibold text-sys-textPrimary" id="active-thread-title">Export timeline</h2>
+            <p class="text-[11px] text-sys-textMuted" id="active-thread-desc">Trim clips and add fades…</p>
+          </div>
+        </div>
+
+        <!-- SEARCH BAR REMOVED -->
+
+        <div class="flex items-center gap-4 text-xs">
+          <div class="flex items-center gap-1.5 text-sys-textSecondary">
+            <span>Agent:</span>
+            <span class="font-mono text-sys-textPrimary bg-sys-outer border border-sys-border px-2 py-0.5 transition-radius r-sm" id="header-agent-name">codex</span>
+          </div>
+          <div class="h-4 w-px bg-sys-border"></div>
+          <div class="flex items-center gap-1 text-sys-textSecondary">
+            <span>Layout:</span>
+            <span class="text-sys-primary font-semibold uppercase font-mono text-[10px]" id="current-layout-label">Unified Timeline</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Main Messages Container -->
+      <section class="flex-1 overflow-y-auto p-6 relative animate-fade-in" id="chat-messages-scroll-area">
+        
+        <!-- WRAPPER A: Unified Timeline view -->
+        <div id="wrapper-timeline" class="max-w-3xl mx-auto relative pb-10">
+          <div id="timeline-events-container" class="space-y-0 relative">
+            <!-- Timeline items will be dynamically injected here, carrying their own line segments -->
+          </div>
+        </div>
+
+        <!-- WRAPPER B: Normal Chat bubble layout (supporting LTR, RTL, LL, RR configurations) -->
+        <div id="wrapper-chat" class="max-w-3xl mx-auto space-y-4 hidden pb-10">
+          <div id="chat-bubbles-container" class="flex flex-col gap-4">
+            <!-- Chat bubbles will be dynamically injected here -->
+          </div>
+        </div>
+
+      </section>
+
+      <!-- Input Area -->
+      <section class="p-4 border-t border-sys-border bg-sys-chat shrink-0 transition-all">
+        <div class="max-w-3xl mx-auto">
+          <form onsubmit="handleMessageSubmit(event)" class="relative bg-sys-sidebar border border-sys-border focus-within:border-sys-primary/80 transition-all shadow-xl transition-radius r-lg p-2 flex flex-col gap-2">
+            <div class="flex gap-2">
+              <textarea 
+                id="message-input" 
+                placeholder="Ask the agent to execute tools or run tasks..."
+                rows="2" 
+                class="w-full bg-transparent text-xs text-sys-textPrimary placeholder-sys-textMuted focus:outline-none resize-none px-3 pt-2"
+                onkeydown="handleTextareaKeyDown(event)"
+              ></textarea>
+              
+              <!-- State Icon space on the right end of the input text box -->
+              <div class="flex items-start pt-3 pr-2 text-sys-textMuted shrink-0 select-none" id="input-state-icon" title="State: Ready">
+                <div class="w-2.5 h-2.5 rounded-full bg-sys-textSecondary" id="input-state-dot"></div>
+              </div>
+            </div>
+            
+            <div class="flex items-center justify-between border-t border-sys-border/40 pt-2 px-3 pb-0.5">
+              <div class="flex items-center gap-1.5 text-sys-textSecondary">
+                <button type="button" class="p-1.5 hover:text-sys-textPrimary rounded hover:bg-sys-outer transition-colors r-sm">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                  </svg>
+                </button>
+                <span class="text-[9px] text-sys-textMuted font-mono select-none">Press Enter to send</span>
+              </div>
+
+              <button 
+                type="submit" 
+                class="px-4 py-1.5 bg-sys-primary hover:opacity-90 text-sys-onPrimary font-bold text-xs flex items-center gap-1.5 shadow-md active:scale-95 transition-all transition-radius r-md"
+              >
+                <span>Send Command</span>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                </svg>
+              </button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Full Screen Zoomable Terminal Modal Overlay -->
+  <div id="terminal-modal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center z-50 hidden" onclick="closeTerminalModal()">
+    <div class="w-full max-w-4xl h-[80vh] bg-slate-900 border border-slate-700 shadow-2xl overflow-hidden flex flex-col transition-radius r-lg zoom-in" onclick="event.stopPropagation()" ondblclick="closeTerminalModal()">
+      <!-- Modal Header -->
+      <div class="bg-slate-950 px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span class="w-3 h-3 rounded-full bg-slate-700"></span>
+          <span class="w-3 h-3 rounded-full bg-slate-700"></span>
+          <span class="w-3 h-3 rounded-full bg-slate-700"></span>
+          <span class="text-xs font-mono text-slate-400 ml-2" id="modal-terminal-title">tool_usage // terminal_zoom</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="text-[10px] font-mono text-slate-500">Double click background or press ESC to exit</span>
+          <button onclick="closeTerminalModal()" class="text-slate-400 hover:text-white p-1 hover:bg-slate-850 rounded">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <!-- Modal Logs Content -->
+      <pre id="modal-terminal-content" class="flex-1 p-6 bg-slate-950 text-slate-300 font-mono text-xs overflow-y-auto leading-relaxed selection:bg-sys-primaryContainer selection:text-sys-onPrimaryContainer"></pre>
+    </div>
+  </div>
+
+  <!-- Floating Details Spec Sidebar (Config Card) -->
+  <div id="settings-sidebar" class="fixed right-0 top-16 bottom-0 w-80 bg-sys-sidebar border-l border-sys-border translate-x-full transition-transform duration-300 ease-in-out z-20 p-5 flex flex-col justify-between shadow-2xl transition-all">
+    <div class="space-y-6">
+      <div class="flex items-center justify-between border-b border-sys-border pb-3">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-sys-textPrimary">Spec Diagnostics</h3>
+        <button onclick="toggleThemeSidebar()" class="text-sys-textMuted hover:text-sys-textPrimary p-1 hover:bg-sys-outer rounded transition-colors r-sm">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+
+      <!-- Spec items -->
+      <div class="space-y-4">
+        <div>
+          <label class="text-[10px] font-bold text-sys-textMuted uppercase tracking-wider">Active Border Radii</label>
+          <div class="mt-2 space-y-2">
+            <div class="p-2.5 bg-sys-outer border border-sys-border transition-radius r-md">
+              <div class="flex justify-between text-xs font-mono mb-1">
+                <span class="text-sys-textSecondary">sm (Badge/Control)</span>
+                <span class="text-sys-primary font-bold" id="spec-val-sm">6px</span>
+              </div>
+            </div>
+            <div class="p-2.5 bg-sys-outer border border-sys-border transition-radius r-md">
+              <div class="flex justify-between text-xs font-mono mb-1">
+                <span class="text-sys-textSecondary">md (Card/Bubble)</span>
+                <span class="text-sys-primary font-bold" id="spec-val-md">10px</span>
+              </div>
+            </div>
+            <div class="p-2.5 bg-sys-outer border border-sys-border transition-radius r-md">
+              <div class="flex justify-between text-xs font-mono mb-1">
+                <span class="text-sys-textSecondary">lg (Outer Panel)</span>
+                <span class="text-sys-primary font-bold" id="spec-val-lg">16px</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <label class="text-[10px] font-bold text-sys-textMuted uppercase tracking-wider">Theming Properties</label>
+          <div class="mt-2 space-y-1 text-xs font-mono p-3 bg-sys-outer border border-sys-border rounded r-md transition-all text-sys-textSecondary">
+            <div>Primary: <span class="text-sys-primary" id="spec-primary-hex">#ffffff</span></div>
+            <div>Background: <span class="text-sys-textPrimary" id="spec-bg-hex">#000000</span></div>
+            <div>Glass Opacity: <span class="text-sys-textPrimary">50% blur</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="text-[9px] text-sys-textMuted font-mono text-center border-t border-sys-border pt-4">
+      RUI Minimal Suite v3.0
+    </div>
+  </div>
+
+  <script>
+    // -------------------------------------------------------------
+    // THREADS DATA: Fixed height cell design
+    // -------------------------------------------------------------
+    const threads = [
+      { id: 0, title: "Export timeline", desc: "Trim clips and add fades…", state: "rendering" },
+      { id: 1, title: "Color grade pass", desc: "Lift shadows on intro…", state: "idle" },
+      { id: 2, title: "Audio sync check", desc: "Align narration bed…", state: "completed" }
+    ];
+    let selectedThreadId = 0;
+
+    // -------------------------------------------------------------
+    // CHAT / TIMELINE DIALOGUE STREAM (Generic tickmarks with grey bg)
+    // -------------------------------------------------------------
+    const conversations = {
+      0: [
+        {
+          type: 'user',
+          body: "Can you export a 30s trailer from the current timeline?",
+          time: "12:40 PM"
+        },
+        {
+          type: 'agent_text',
+          body: "Starting assembly of draft cuts. I will set markers at key cuts, join track stems, and prepare the render pipeline.",
+          time: "12:41 PM"
+        },
+        {
+          type: 'tool_use',
+          toolName: "timeline_trimmer",
+          status: "success", 
+          summary: "Trimmed 3 target video elements on Track 1",
+          logs: "Initializing timeline trimmer daemon...\nTarget track: Track 1 (V1)\nAction: Sub-second split and crossfade insertion.\nParameters:\n  - trim_start: 00:02:15.000\n  - trim_end: 00:02:45.000\n  - transition: linear_fade (15 frames)\nScanning keyframes...\n  [Frame 120] Keyframe index found, creating boundary marker\n  [Frame 240] Splitting track segments\n  [Frame 480] Injecting fade-in curves\n  [Frame 720] Injecting fade-out curves\n  [Frame 1020] Compacting buffer timeline indices\nRe-aligning video assets and snapping markers...\nVerifying sync with auxiliary tracks (A1, A2)...\n[OK] Video V1 is frame-accurate\n[OK] Audio sync verified (+0ms offset)\n[SUCCESS] Timeline successfully trimmed and markers snapshots saved.",
+          time: "12:41 PM",
+          collapsed: true
+        },
+        {
+          type: 'user',
+          body: "Use the gallery assets and keep transitions minimal.",
+          time: "12:42 PM"
+        },
+        {
+          type: 'tool_use',
+          toolName: "asset_fetcher",
+          status: "success",
+          summary: "Retrieved 5 assets from /workspace/gallery/",
+          logs: "Connecting to asset database metadata index...\nExecuting query: SELECT * FROM library WHERE path LIKE '/workspace/gallery/%'\nQuery completed in 1.45ms. 5 matches returned:\n  1. 'intro_card_logo.png' (1.2MB, mime: image/png, sha255: e1a50c8)\n  2. 'outro_credits.mov' (18.4MB, mime: video/quicktime, sha255: 9a2f7c0)\n  3. 'lower_third_title.svg' (45KB, mime: image/svg+xml, sha255: 412b509)\n  4. 'ambient_bed_music.wav' (8.7MB, mime: audio/x-wav, sha255: f2d58a1)\n  5. 'watermark_overlay.png' (210KB, mime: image/png, sha255: a2f592d)\nResolving file pointer locks...\nCaching handles locally to memory directory '/tmp/workspace_cache/'...\n  [CACHE] 'intro_card_logo.png' cached successfully\n  [CACHE] 'outro_credits.mov' cached successfully\n  [CACHE] 'lower_third_title.svg' cached successfully\n  [CACHE] 'ambient_bed_music.wav' cached successfully\n  [CACHE] 'watermark_overlay.png' cached successfully\nVerifying file hashes...\n  [HASH-OK] All 5 asset checksums validated successfully.\n[SUCCESS] Loaded all gallery assets into processing pipeline.",
+          time: "12:42 PM",
+          collapsed: true
+        },
+        {
+          type: 'tool_use',
+          toolName: "render_codec_h264",
+          status: "approval", 
+          summary: "Prompting user for 1080p rendering permission",
+          logs: "Checking render codec availability...\nFound FFmpeg engine (v6.1-static) at bin/ffmpeg\nChecking hardware acceleration availability...\n  [NVENC] CUDA driver version: 12.2 (not configured)\n  [VAAPI] Intel media driver: not found\n  [CPU] Falling back to software encoding (libx264)\nSetting render configuration parameters:\n  - Resolution: 1920x1080 (1080p)\n  - Framerate: 29.97 fps (NTSC)\n  - Profile: High 4.2\n  - Preset: medium\n  - Bitrate: 8000 kbps (CBR)\n  - Pass: 2-Pass encoding\n  - Output: /workspace/renders/trailer_v1_draft.mp4\nEstimated computation usage: 82% CPU load for approx 42 seconds\nPermission level requested: 'workspace-write'\n[WAITING] Awaiting explicit user confirmation to run render job command...",
+          time: "12:43 PM",
+          collapsed: false
+        }
+      ],
+      1: [
+        {
+          type: 'user',
+          body: "The intro looks a bit underexposed. Can you run a color balance sweep?",
+          time: "11:15 AM"
+        },
+        {
+          type: 'agent_text',
+          body: "Analyzing frame histograms... I notice the shadows are compressed in the 0-15% range.",
+          time: "11:16 AM"
+        },
+        {
+          type: 'tool_use',
+          toolName: "histogram_analyzer",
+          status: "success",
+          summary: "Histogram check completed across 900 keyframes",
+          logs: "Initializing matrix histogram sweep on stream...\nProcessing V1 input channel...\nAnalyzing keyframes (Frame 1 to 900):\n  [Frame 100] RGB distribution: R:12% G:11% B:18% - Luma: 13.5%\n  [Frame 200] RGB distribution: R:10% G:10% B:16% - Luma: 11.2%\n  [Frame 300] RGB distribution: R:9%  G:9%  B:14% - Luma: 9.8%\n  [Frame 400] RGB distribution: R:11% G:12% B:17% - Luma: 12.9%\n  [Frame 500] RGB distribution: R:24% G:22% B:28% - Luma: 23.8%\n  [Frame 600] RGB distribution: R:38% G:35% B:40% - Luma: 37.1%\n  [Frame 700] RGB distribution: R:45% G:42% B:48% - Luma: 44.5%\n  [Frame 800] RGB distribution: R:41% G:39% B:43% - Luma: 40.8%\n  [Frame 900] RGB distribution: R:32% G:30% B:34% - Luma: 31.6%\nLuminance statistics summary:\n  - Shadows (0-20%): 48.2% of keyframe surface area compressed\n  - Midtones (20-70%): 42.1% nominal spread\n  - Highlights (70-100%): 9.7% safe range\n[SUCCESS] Matrix luma analysis completed. Sweeping color adjustments recommended.",
+          time: "11:16 AM",
+          collapsed: true
+        },
+        {
+          type: 'tool_use',
+          toolName: "color_grade_sweep",
+          status: "failed",
+          summary: "Adjustment crashed at Frame 245 due to segmentation memory error",
+          logs: "Loading LUT table: '/workspace/luts/cine_fuji_35.cube'...\nLUT size: 33x33x33 matrix loaded into memory\nApplying color transform vector to frame buffer...\n  [Sweep] Adjusting shadow lift (+12% offset on RGB blackpoint)\n  [Sweep] Applying midtone saturation boost (+5% gain)\n  Processing Frames:\n  [Frame 50] Applied OK\n  [Frame 100] Applied OK\n  [Frame 150] Applied OK\n  [Frame 200] Applied OK\n  [Frame 240] Applied OK\n  [Frame 245] [CRITICAL] Segment fault at buffer address 0x7f9901ad\n[WARN] Failed to write modified frame 245 back into cache array\n[ERR] Memory allocation error: block write lock conflict\n[ERR] Process exited with status 139 (SIGSEGV)\n[FAILED] Grade sweep process terminated. Changes discarded.",
+          time: "11:17 AM",
+          collapsed: false
+        }
+      ],
+      2: [
+        {
+          type: 'user',
+          body: "Check if the main voiceover is aligned with the bumper animation.",
+          time: "10:02 AM"
+        },
+        {
+          type: 'tool_use',
+          toolName: "audio_phase_match",
+          status: "timeout",
+          summary: "Network handshake timeout on audio analyzer service",
+          logs: "Attempting handshake with audio-analyzer daemon at port 8092...\nConnecting to TCP socket: 127.0.0.1:8092...\n  [Socket] Connection attempt 1... (No route to host)\n  [Socket] Retrying in 1000ms...\n  [Socket] Connection attempt 2... (Connection pending)\n  [Socket] Connection attempt 3... (Connection pending)\n  [Socket] Connection attempt 4... (Connection pending)\nWaiting for server handshake response...\n  [Timer] 5000ms elapsed...\n  [Timer] 10000ms elapsed...\n  [Timer] 15000ms elapsed...\n  [Timer] 20000ms elapsed...\n  [Timer] 25000ms elapsed...\n  [Timer] 30000ms elapsed...\n[ERR] Timeout: Service took longer than 30000ms to respond to sync request\n[TIMEOUT] System aborted handshake connection task.",
+          time: "10:03 AM",
+          collapsed: false
+        }
+      ]
+    };
+
+    let currentLayout = 'timeline';
+    
+    // Border Radius preset values
+    const radiusPresets = {
+      sharp: { sm: '0px', md: '0px', lg: '0px' },
+      classic: { sm: '6px', md: '10px', lg: '16px' },
+      organic: { sm: '12px', md: '18px', lg: '28px' }
+    };
+    let activeRadiusPreset = 'classic';
+
+    // -------------------------------------------------------------
+    // THEME & COLOR VARIABLES CONFIGURATION (Base Black & Base White)
+    // -------------------------------------------------------------
+    function changeTheme(themeName) {
+      const htmlEl = document.documentElement;
+      
+      if (themeName === 'light') {
+        htmlEl.classList.remove('dark');
+        htmlEl.classList.add('light');
+        document.getElementById('spec-primary-hex').innerText = '#000000';
+        document.getElementById('spec-bg-hex').innerText = '#ffffff';
+      } else {
+        htmlEl.classList.remove('light');
+        htmlEl.classList.add('dark');
+        document.getElementById('spec-primary-hex').innerText = '#ffffff';
+        document.getElementById('spec-bg-hex').innerText = '#000000';
+      }
+    }
+
+    // -------------------------------------------------------------
+    // RENDER LOGIC
+    // -------------------------------------------------------------
+    function init() {
+      renderThreads();
+      switchView(true);
+      setRadiusPreset('classic');
+      changeTheme('dark'); // start with black mode
+    }
+
+    // Render left threads (fixed heights, minimal divider line, no borders)
+    function renderThreads() {
+      const container = document.getElementById('threads-container');
+      container.innerHTML = '';
+      
+      threads.forEach(t => {
+        const isActive = t.id === selectedThreadId;
+        const threadItem = document.createElement('div');
+        
+        // Selected thread gets bg-sys-chat (matching the middle panel)
+        // Set border-l-4 on all items (active uses primary, inactive uses transparent) to prevent text shifting
+        threadItem.className = `h-[72px] cursor-pointer flex flex-col justify-center px-4 transition-all border-b border-sys-border hover:bg-sys-sidebar/55 border-l-4 ${
+          isActive ? 'bg-sys-chat border-l-sys-primary' : 'border-l-transparent'
+        }`;
+        
+        threadItem.onclick = () => selectThread(t.id);
+
+        // Render state indicator icon on the right end
+        let stateIcon = '';
+        if (t.state === 'rendering') {
+          stateIcon = `
+            <span class="flex h-2 w-2 relative shrink-0">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-sys-primary opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-2 w-2 bg-sys-primary"></span>
+            </span>
+          `;
+        } else if (t.state === 'completed') {
+          stateIcon = `<span class="text-[10px] text-sys-primary font-mono shrink-0 select-none">✓</span>`;
+        } else {
+          stateIcon = `<span class="h-1.5 w-1.5 rounded-full bg-sys-textMuted/45 shrink-0"></span>`;
+        }
+        
+        threadItem.innerHTML = `
+          <div class="flex justify-between items-center gap-2">
+            <span class="text-xs font-bold ${isActive ? 'text-sys-primary' : 'text-sys-textPrimary'} truncate">${t.title}</span>
+            <div class="flex items-center gap-1.5 shrink-0">
+              <span class="text-[9px] font-mono text-sys-textMuted opacity-50">${isActive ? 'ACTIVE' : ''}</span>
+              ${stateIcon}
+            </div>
+          </div>
+          <p class="text-[11px] text-sys-textSecondary truncate mt-0.5">${t.desc}</p>
+        `;
+        
+        container.appendChild(threadItem);
+      });
+    }
+
+    function selectThread(id) {
+      selectedThreadId = id;
+      const activeThread = threads.find(t => t.id === selectedThreadId);
+      
+      document.getElementById('active-thread-title').innerText = activeThread.title;
+      document.getElementById('active-thread-desc').innerText = activeThread.desc;
+      
+      renderThreads();
+      switchView(true);
+    }
+
+    // Toggles between the Unified Timeline view and regular Chat layout
+    function switchView(forceScroll = false) {
+      const wrapperTimeline = document.getElementById('wrapper-timeline');
+      const wrapperChat = document.getElementById('wrapper-chat');
+      const scrollArea = document.getElementById('chat-messages-scroll-area');
+      
+      // Check if user is scrolled near the bottom before updating the content
+      const isNearBottom = scrollArea.scrollHeight - scrollArea.clientHeight - scrollArea.scrollTop < 60;
+      
+      if (currentLayout === 'timeline') {
+        wrapperTimeline.classList.remove('hidden');
+        wrapperChat.classList.add('hidden');
+        renderTimeline();
+      } else {
+        wrapperTimeline.classList.add('hidden');
+        wrapperChat.classList.remove('hidden');
+        renderChatBubbles();
+      }
+      
+      applyRadiusStyleToElements();
+      
+      // Only auto scroll to bottom if user was already at the bottom or if forced (like submitting a message)
+      if (isNearBottom || forceScroll) {
+        scrollArea.scrollTop = scrollArea.scrollHeight;
+      }
+    }
+
+    // Change layout mode
+    function changeLayout(val) {
+      currentLayout = val;
+      const label = document.getElementById('current-layout-label');
+      label.innerText = document.getElementById('layout-select').options[document.getElementById('layout-select').selectedIndex].text;
+      switchView(true);
+    }
+
+    // -------------------------------------------------------------
+    // RENDER: UNIFIED TIMELINE VIEW (Generic tickmarks with grey bg)
+    // -------------------------------------------------------------
+    function renderTimeline() {
+      const container = document.getElementById('timeline-events-container');
+      container.innerHTML = '';
+      
+      const stream = conversations[selectedThreadId];
+      if (!stream) return;
+
+      stream.forEach((item, index) => {
+        const itemDiv = document.createElement('div');
+        const isLatest = index === stream.length - 1;
+        const shouldAnimate = isLatest && !item.hasAnimated && (item.type === 'user' || item.type === 'agent_text');
+        itemDiv.className = `flex gap-5 relative group transition-all ${shouldAnimate ? 'animate-slide-up' : ''}`;
+        if (shouldAnimate) {
+          item.hasAnimated = true;
+        }
+        
+        const isFirst = index === 0;
+        const isLast = index === stream.length - 1;
+
+        // Check if this item is the user message or the item immediately following it
+        const isUserMessage = item.type === 'user';
+        const isImmediatelyAfterUser = index > 0 && stream[index - 1].type === 'user';
+        const isHighlighted = isUserMessage || isImmediatelyAfterUser;
+
+        // Determine icon border style (only highlighted for user message and the immediate next item)
+        const iconBorderColor = isHighlighted ? 'border-sys-primary' : 'border-sys-textMuted';
+
+        // Check if the agent is busy/streaming to identify the active live message
+        const isAgentBusy = document.getElementById('agent-status-text')?.innerText === 'busy';
+        const isLiveMessage = isLatest && isAgentBusy && item.type === 'agent_text';
+
+        // 1. Determine timeline point marker details
+        // If it's a live message, there is no end node.
+        let markerIcon = '';
+        if (isLiveMessage) {
+          markerIcon = `<div class="w-6 h-6"></div>`; // No end node!
+        } else if (item.type === 'user') {
+          markerIcon = `
+            <div class="w-6 h-6 rounded-full bg-sys-sidebar border ${iconBorderColor} flex items-center justify-center text-[11px] text-sys-textPrimary font-bold shadow-sm">
+              U
+            </div>
+          `;
+        } else if (item.type === 'tool_use') {
+          // General grey bg tick mark for tools, no fancy green/red circles
+          markerIcon = `
+            <div class="w-6 h-6 rounded-full bg-sys-sidebar border ${iconBorderColor} flex items-center justify-center text-[11px] text-sys-textSecondary font-bold shadow-sm" title="${item.status.toUpperCase()}">
+              ✔
+            </div>
+          `;
+        } else {
+          // agent text stream marker (generic C)
+          markerIcon = `
+            <div class="w-6 h-6 rounded-full bg-sys-sidebar border ${iconBorderColor} flex items-center justify-center text-[11px] text-sys-textSecondary font-bold">
+              C
+            </div>
+          `;
+        }
+
+        // Left Timeline Column with precise Top and Bottom segment lines matching top icon alignment.
+        // Primary variant connects ONLY the user command to its immediate next response item.
+        // Grey variant connects all subsequent agent responses, tools, and transitions.
+        const topLineColor = isImmediatelyAfterUser ? 'bg-sys-primary' : 'bg-sys-textMuted/45';
+        const bottomLineColor = isUserMessage ? 'bg-sys-primary' : 'bg-sys-textMuted/45';
+
+        // If it's the live message, the vertical line flows all the way to the bottom edge of the item card.
+        const topHeight = isLiveMessage ? 'bottom-0' : 'h-[28px]';
+
+        const markerCol = `
+          <div class="flex flex-col items-center shrink-0 w-14 relative min-h-[64px]">
+            <!-- Top Vertical Line segment (runs from top of item to center of icon at top: 28px, or full height if live message) -->
+            ${!isFirst ? `<div class="w-0.5 ${topLineColor} absolute left-[27px] top-0 ${topHeight} z-0 origin-top ${shouldAnimate ? 'animate-draw-line' : ''}"></div>` : ''}
+            
+            <!-- Bottom Vertical Line segment (runs from center of icon at top: 28px to bottom of item, omitted if live message/last) -->
+            ${(!isLast && !isLiveMessage) ? `<div class="w-0.5 ${bottomLineColor} absolute left-[27px] top-[28px] bottom-0 z-0 origin-top ${shouldAnimate ? 'animate-draw-line' : ''}"></div>` : ''}
+            
+            <!-- Icon Wrapper top-aligned (center of icon sits at top: 28px) -->
+            <div class="absolute top-[16px] left-[16px] z-10 shrink-0 w-6 h-6 flex items-center justify-center rounded-full bg-sys-outer">
+              ${markerIcon}
+            </div>
+          </div>
+        `;
+
+        // Right event details column
+        let contentHtml = '';
+        
+        if (item.type === 'user') {
+          // User messages get a special box layout with background
+          // Highlighted with a subtle left border accent matching the primary color
+          // Body text takes base size, header labels take sm (text-xs) size
+          contentHtml = `
+            <div class="flex-1 bg-sys-userBubble border border-sys-border border-l-2 border-l-sys-primary p-3.5 transition-radius r-sm shadow-sm max-w-2xl text-sys-userBubbleText my-1 ${shouldAnimate ? 'animate-draw-border' : ''}">
+              <div class="flex justify-between items-start gap-4">
+                <div class="flex-grow">
+                  <div class="flex justify-between items-center mb-1">
+                    <span class="text-xs font-bold tracking-wider font-mono opacity-65">USER COMMAND</span>
+                    <span class="text-[11px] opacity-50 font-mono">${item.time}</span>
+                  </div>
+                  <p class="text-base leading-relaxed font-medium">${item.body}</p>
+                </div>
+                <!-- State icon slot on the right end -->
+                <div class="text-xs text-sys-textSecondary pt-0.5 shrink-0 select-none" title="Message state: Completed">
+                  ✓
+                </div>
+              </div>
+            </div>
+          `;
+        } else if (item.type === 'agent_text') {
+          // Chat items are plain text
+          // Body text takes base size, header labels take sm (text-xs) size
+          contentHtml = `
+            <div class="flex-1 pt-3 pb-3 max-w-2xl text-sys-textPrimary">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="text-xs font-bold text-sys-textMuted tracking-wider font-mono">AGENT RESPONSE</span>
+                <span class="text-[11px] text-sys-textMuted font-mono">${item.time}</span>
+              </div>
+              <p class="text-base leading-relaxed">${item.body}</p>
+            </div>
+          `;
+        } else if (item.type === 'tool_use') {
+          // Tool Usage items: expandable terminal logs underneath
+          // Body text takes base size, header labels take sm (text-xs) size
+          const statusText = item.status.toUpperCase();
+          const isCollapsed = item.collapsed;
+          
+          contentHtml = `
+            <div class="flex-1 pt-3 pb-3 max-w-2xl text-sys-textPrimary">
+              <div class="flex items-center justify-between gap-2 mb-1.5">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-xs font-bold text-sys-textMuted tracking-wider font-mono">TOOL EXECUTION</span>
+                  <span class="text-xs font-mono font-bold text-sys-primary bg-sys-outer border border-sys-border px-1.5 py-0.5 transition-radius r-sm">${item.toolName}</span>
+                  <span class="text-[11px] px-1.5 py-0.5 border border-sys-border bg-sys-sidebar text-sys-textSecondary rounded-full font-mono">${statusText}</span>
+                </div>
+                <span class="text-[11px] text-sys-textMuted font-mono">${item.time}</span>
+              </div>
+              
+              <div class="text-base font-semibold text-sys-textPrimary mb-2 cursor-pointer select-none" onclick="toggleLogBox(${index}, this)">
+                ${item.summary} 
+                <span class="text-[11px] text-sys-textSecondary hover:text-sys-textPrimary font-mono ml-2 hover:underline toggle-label-text">${isCollapsed ? '[+] show logs' : '[-] hide logs'}</span>
+              </div>
+              
+              <!-- Logbox terminal component wrapper with transition -->
+              <div class="logbox-wrapper overflow-hidden transition-all duration-300 ease-in-out" style="max-height: ${isCollapsed ? '0px' : '300px'}; opacity: ${isCollapsed ? '0' : '1'}; margin-top: ${isCollapsed ? '0px' : '8px'};">
+                <div 
+                  class="bg-sys-terminalBg border border-sys-terminalBorder text-sys-terminalText font-mono text-[11px] p-3 rounded-md max-h-48 overflow-y-auto cursor-pointer relative hover:border-sys-borderStrong select-none group/terminal transition-radius r-md shadow-inner animate-fade-in"
+                  onclick="zoomTerminal(${index})"
+                  title="Click to zoom in fullscreen"
+                >
+                  <!-- Zoom overlay prompt on hover -->
+                  <div class="absolute right-3 top-3 opacity-0 group-hover/terminal:opacity-100 transition-opacity bg-sys-sidebar border border-sys-border px-2 py-0.5 rounded text-[9px] text-sys-textSecondary font-sans shadow">
+                    🔎 Click to Zoom
+                  </div>
+                  <pre class="whitespace-pre-wrap">${item.logs}</pre>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+
+        itemDiv.innerHTML = markerCol + contentHtml;
+        container.appendChild(itemDiv);
+      });
+    }
+
+    // Toggle expand/collapse state on log box with smooth transitions and center-scroll-fix
+    function toggleLogBox(index, element) {
+      const stream = conversations[selectedThreadId];
+      if (stream[index]) {
+        stream[index].collapsed = !stream[index].collapsed;
+        
+        const parent = element.parentElement;
+        const logWrapper = parent.querySelector('.logbox-wrapper');
+        const toggleLabel = element.querySelector('.toggle-label-text');
+        
+        if (!logWrapper) return;
+        
+        if (stream[index].collapsed) {
+          logWrapper.style.maxHeight = '0px';
+          logWrapper.style.opacity = '0';
+          logWrapper.style.marginTop = '0px';
+          if (toggleLabel) toggleLabel.innerText = '[+] show logs';
+        } else {
+          logWrapper.style.maxHeight = '300px';
+          logWrapper.style.opacity = '1';
+          logWrapper.style.marginTop = '8px';
+          if (toggleLabel) toggleLabel.innerText = '[-] hide logs';
+          
+          // Auto scroll-fix logic
+          setTimeout(() => {
+            parent.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }, 150);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------
+    // RENDER: ALTERNATIVE CHAT LAYOUT BUBBLES
+    // -------------------------------------------------------------
+    function renderChatBubbles() {
+      const container = document.getElementById('chat-bubbles-container');
+      container.innerHTML = '';
+      
+      const stream = conversations[selectedThreadId];
+      if (!stream) return;
+
+      stream.forEach((item, index) => {
+        let isUser = item.type === 'user';
+        let bodyText = item.body;
+        let titleLabel = isUser ? 'User' : 'Codex Agent';
+        
+        if (item.type === 'tool_use') {
+          titleLabel = `Tool (${item.toolName})`;
+          bodyText = `[${item.status.toUpperCase()}] ${item.summary}\n\nLogs:\n${item.logs}`;
+        }
+
+        const outerDiv = document.createElement('div');
+        const isLatest = index === stream.length - 1;
+        const shouldAnimate = isLatest && !item.hasAnimated && (item.type === 'user' || item.type === 'agent_text');
+        outerDiv.className = `flex w-full transition-all ${shouldAnimate ? 'animate-slide-up' : ''}`;
+        if (shouldAnimate) {
+          item.hasAnimated = true;
+        }
+
+        if (currentLayout === 'ltr') {
+          outerDiv.classList.add(isUser ? 'justify-end' : 'justify-start');
+        } else if (currentLayout === 'rtl') {
+          outerDiv.classList.add(isUser ? 'justify-start' : 'justify-end');
+        } else if (currentLayout === 'll') {
+          outerDiv.classList.add('justify-start');
+        } else if (currentLayout === 'rr') {
+          outerDiv.classList.add('justify-end');
+        }
+
+        const bubble = document.createElement('div');
+        
+        let bubbleStyle = isUser 
+          ? 'bg-sys-userBubble border-sys-userBubbleBorder text-sys-userBubbleText shadow-sm' 
+          : 'bg-sys-agentBubble border-sys-agentBubbleBorder text-sys-agentBubbleText shadow';
+        
+        bubble.className = `max-w-xl p-3.5 border transition-radius r-md ${bubbleStyle}`;
+
+        bubble.innerHTML = `
+          <div class="flex items-center justify-between gap-8 mb-1.5 border-b border-sys-border/30 pb-1">
+            <span class="text-[9px] font-bold uppercase tracking-wider font-mono opacity-85">${titleLabel}</span>
+            <span class="text-[9px] text-sys-textMuted font-mono opacity-65">${item.time}</span>
+          </div>
+          <pre class="text-xs whitespace-pre-wrap font-sans leading-relaxed">${bodyText}</pre>
+        `;
+
+        outerDiv.appendChild(bubble);
+        container.appendChild(outerDiv);
+      });
+    }
+
+    // -------------------------------------------------------------
+    // INTERACTIVE FULLSCREEN TERMINAL ZOOM
+    // -------------------------------------------------------------
+    function zoomTerminal(index) {
+      const stream = conversations[selectedThreadId];
+      const eventItem = stream[index];
+      if (!eventItem || eventItem.type !== 'tool_use') return;
+
+      const modal = document.getElementById('terminal-modal');
+      const modalContent = document.getElementById('modal-terminal-content');
+      const modalTitle = document.getElementById('modal-terminal-title');
+
+      modalTitle.innerText = `tool_usage // ${eventItem.toolName} (status: ${eventItem.status})`;
+      modalContent.innerText = eventItem.logs;
+
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+    }
+
+    function closeTerminalModal() {
+      const modal = document.getElementById('terminal-modal');
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeTerminalModal();
+      }
+    });
+
+    // -------------------------------------------------------------
+    // INTERACTIVE MESSAGE SUBMIT & STREAM SIMULATOR
+    // -------------------------------------------------------------
+    function handleMessageSubmit(e) {
+      if (e) e.preventDefault();
+      
+      const input = document.getElementById('message-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      const stream = conversations[selectedThreadId];
+      
+      // 1. Smoothly collapse open logboxes in the DOM first
+      document.querySelectorAll('.logbox-wrapper').forEach(wrapper => {
+        wrapper.style.maxHeight = '0px';
+        wrapper.style.opacity = '0';
+        wrapper.style.marginTop = '0px';
+      });
+      document.querySelectorAll('.toggle-label-text').forEach(label => {
+        label.innerText = '[+] show logs';
+      });
+
+      // Update data state for collapse
+      stream.forEach(item => {
+        if (item.type === 'tool_use') item.collapsed = true;
+      });
+
+      // 2. Insert new user command after a short overlapping delay so they slide together
+      setTimeout(() => {
+        stream.push({
+          type: 'user',
+          body: text,
+          time: getFormattedTime()
+        });
+
+        input.value = '';
+        switchView(true);
+        setAgentBusyState(true);
+        simulateAgentResponse();
+      }, 150);
+    }
+
+    function handleTextareaKeyDown(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleMessageSubmit();
+      }
+    }
+
+    // -------------------------------------------------------------
+    // SIMULATION STEP TRIGGER (Runs different states for evaluation)
+    // -------------------------------------------------------------
+    let simIndex = 0;
+    function triggerSimulationStep() {
+      const stream = conversations[selectedThreadId];
+      
+      stream.forEach(item => {
+        if (item.type === 'tool_use') item.collapsed = true;
+      });
+
+      const simSteps = [
+        {
+          type: 'tool_use',
+          toolName: "media_compressor",
+          status: "success",
+          summary: "FFmpeg H.264 compression successfully executed",
+          logs: "ffmpeg -i input.mov -vcodec h264 -crf 20 output.mp4\nframe=  420 fps= 45 q=-1.0 Lsize=   1024kB time=00:00:14.00 bitrate= 599.1kbits/s speed=1.5x\nvideo:890kB audio:122kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 1.2%\n[SUCCESS] Render finished with return code 0.\nAnalyzing audio streams...\n[OK] Video V1 is frame-accurate\n[OK] Audio sync verified (+0ms offset)\n[SUCCESS] Timeline successfully trimmed and markers snapshots saved.",
+          time: getFormattedTime(),
+          collapsed: false
+        },
+        {
+          type: 'tool_use',
+          toolName: "network_synchronizer",
+          status: "failed",
+          summary: "Failed to publish timeline build to remote sync server",
+          logs: "curl -X POST -d @timeline.json http://remoteserver/api/publish\nConnecting to host 192.168.1.55...\n[ERR] Connect timed out. Connection refused.\n[ERR] Retrying attempt 1...\n[ERR] Retrying attempt 2...\n[ERR] Retrying attempt 3...\n[ERR] Retrying attempt 4...\n[FAILED] Server rejected payload request: Status 503 Service Unavailable.\nFailed to sync divergent directories.\nTerminating network daemon thread.\nExit code: 1",
+          time: getFormattedTime(),
+          collapsed: false
+        },
+        {
+          type: 'tool_use',
+          toolName: "workspace_cleaner",
+          status: "timeout",
+          summary: "Purging unused raw assets timed out after 30s",
+          logs: "rm -rf /workspace/cache/temp_renders/*\nDeleting 40,230 items...\n[WARN] Lock held by main thread on thread_buffer_01\n[WARN] Lock held by media_compressor daemon\nWaiting for thread lock release...\nTimeout elapsed (30000ms).\n[TIMEOUT] System task runner aborted command.\nTask cleanup state: partial.",
+          time: getFormattedTime(),
+          collapsed: false
+        },
+        {
+          type: 'tool_use',
+          toolName: "destructive_merge",
+          status: "approval",
+          summary: "Requires explicit root approval to merge divergent master track",
+          logs: "git merge --allow-unrelated-histories master\nAuto-merging Track1.mov\nCONFLICT (content): Merge conflict in Track1.mov\nResolving branch references...\nAnalyzing file system conflicts:\n  - File Track1.mov (size: 450MB) has conflicting binary offsets.\n[WAITING] Input required: Accept local master change or force overwrite?\nConfirm merge decision on dashboard.",
+          time: getFormattedTime(),
+          collapsed: false
+        }
+      ];
+
+      stream.push(simSteps[simIndex]);
+      const newIndex = stream.length - 1;
+      simIndex = (simIndex + 1) % simSteps.length;
+      
+      switchView();
+
+      setTimeout(() => {
+        const listItems = document.querySelectorAll('#timeline-events-container > div');
+        const targetItem = listItems[newIndex];
+        if (targetItem) {
+          targetItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, 60);
+    }
+
+    function getFormattedTime() {
+      const d = new Date();
+      let hours = d.getHours();
+      let minutes = d.getMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12;
+      minutes = minutes < 10 ? '0'+minutes : minutes;
+      return hours + ':' + minutes + ' ' + ampm;
+    }
+
+    function setAgentBusyState(isBusy) {
+      const statusDot = document.getElementById('agent-status-dot');
+      const statusText = document.getElementById('agent-status-text');
+      const statusTag = document.getElementById('agent-status-tag');
+      const inputDot = document.getElementById('input-state-dot');
+      const inputIcon = document.getElementById('input-state-icon');
+      
+      if (isBusy) {
+        statusDot.className = "w-1.5 h-1.5 rounded-full bg-sys-textMuted animate-pulse";
+        statusText.innerText = "busy";
+        statusTag.className = "flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-sys-primaryContainer border border-sys-border text-sys-textSecondary text-[10px] font-medium";
+        inputDot.className = "w-2.5 h-2.5 rounded-full bg-sys-textMuted animate-pulse";
+        inputIcon.title = "State: Busy";
+      } else {
+        statusDot.className = "w-1.5 h-1.5 rounded-full bg-sys-textSecondary";
+        statusText.innerText = "idle";
+        statusTag.className = "flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-sys-primaryContainer border border-sys-border text-sys-textSecondary text-[10px] font-medium";
+        inputDot.className = "w-2.5 h-2.5 rounded-full bg-sys-textSecondary";
+        inputIcon.title = "State: Ready";
+      }
+    }
+
+    function simulateAgentResponse() {
+      const stream = conversations[selectedThreadId];
+      
+      stream.forEach(item => {
+        if (item.type === 'tool_use') item.collapsed = true;
+      });
+
+      const textItemIndex = stream.length;
+      stream.push({
+        type: 'agent_text',
+        body: '',
+        time: getFormattedTime()
+      });
+
+      const fullReply = "Acknowledged. Spawning sub-process to audit parameters and verify files.";
+      let typedCharCount = 0;
+      
+      const textInterval = setInterval(() => {
+        typedCharCount += 2;
+        if (typedCharCount >= fullReply.length) {
+          stream[textItemIndex].body = fullReply;
+          clearInterval(textInterval);
+          setTimeout(() => {
+            simulateToolExecution();
+          }, 800);
+        } else {
+          stream[textItemIndex].body = fullReply.slice(0, typedCharCount);
+        }
+        switchView();
+      }, 35);
+    }
+
+    function simulateToolExecution() {
+      const stream = conversations[selectedThreadId];
+      const toolItemIndex = stream.length;
+      
+      stream.push({
+        type: 'tool_use',
+        toolName: "subagent_runner",
+        status: "success",
+        summary: "Running code verification daemon...",
+        logs: "Initializing core diagnostic matrix...\nChecking workspace rules:\n  - CSS rules checked: OK\n  - HTML validation: OK\n  - Layout validation: OK\n  - Code syntax check: OK\nLoading environment vectors...\nSearching configurations...\nProcessing file nodes...\n[SUCCESS] Code verification completed. No anomalies detected.\nReady for deployment.",
+        time: getFormattedTime(),
+        collapsed: false
+      });
+
+      switchView();
+
+      setTimeout(() => {
+        const listItems = document.querySelectorAll('#timeline-events-container > div');
+        const targetItem = listItems[toolItemIndex];
+        if (targetItem) {
+          targetItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, 60);
+
+      let logIncrementCount = 0;
+      const logsToAppend = [
+        "Analyzing project configurations...\n",
+        "Loading environment vectors...\n",
+        "[SUCCESS] Code verification completed. No anomalies detected.\n"
+      ];
+
+      const logInterval = setInterval(() => {
+        if (logIncrementCount >= logsToAppend.length) {
+          clearInterval(logInterval);
+          setAgentBusyState(false);
+        } else {
+          stream[toolItemIndex].logs += logsToAppend[logIncrementCount];
+          logIncrementCount++;
+        }
+        switchView();
+      }, 1000);
+    }
+
+    // -------------------------------------------------------------
+    // BORDER RADIUS PRESET CUSTOMIZER
+    // -------------------------------------------------------------
+    function setRadiusPreset(presetName) {
+      activeRadiusPreset = presetName;
+      
+      ['sharp', 'classic', 'organic'].forEach(p => {
+        const btn = document.getElementById(`btn-radius-${p}`);
+        if (p === presetName) {
+          btn.className = "px-2.5 py-0.5 text-[11px] font-mono rounded bg-sys-primary text-sys-onPrimary font-medium transition-all";
+        } else {
+          btn.className = "px-2.5 py-0.5 text-[11px] font-mono rounded bg-transparent hover:bg-sys-hover text-sys-textMuted transition-colors";
+        }
+      });
+
+      const preset = radiusPresets[presetName];
+      document.getElementById('spec-val-sm').innerText = preset.sm;
+      document.getElementById('spec-val-md').innerText = preset.md;
+      document.getElementById('spec-val-lg').innerText = preset.lg;
+
+      applyRadiusStyleToElements();
+    }
+
+    function applyRadiusStyleToElements() {
+      const preset = radiusPresets[activeRadiusPreset];
+      
+      document.querySelectorAll('.r-sm').forEach(el => {
+        el.style.borderRadius = preset.sm;
+      });
+
+      document.querySelectorAll('.r-md').forEach(el => {
+        el.style.borderRadius = preset.md;
+      });
+
+      document.querySelectorAll('.r-lg').forEach(el => {
+        el.style.borderRadius = preset.lg;
+      });
+    }
+
+    // Toggle spec details panel
+    let sidebarOpen = false;
+    function toggleThemeSidebar() {
+      const panel = document.getElementById('settings-sidebar');
+      if (sidebarOpen) {
+        panel.classList.add('translate-x-full');
+      } else {
+        panel.classList.remove('translate-x-full');
+      }
+      sidebarOpen = !sidebarOpen;
+    }
+
+    // Toggle Left Threads Sidebar with transitions
+    let sidebarCollapsed = false;
+    function toggleSidebar() {
+      const sidebar = document.getElementById('sidebar-container');
+      sidebar.classList.toggle('collapsed');
+      sidebarCollapsed = !sidebarCollapsed;
+      
+      setTimeout(() => {
+        const scrollArea = document.getElementById('chat-messages-scroll-area');
+        if (scrollArea) {
+          scrollArea.scrollTop = scrollArea.scrollHeight;
+        }
+      }, 310);
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

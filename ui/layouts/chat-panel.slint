@@ -1,0 +1,145 @@
+import { Theme } from "../theme.slint";
+import { MessageData } from "../models.slint";
+import { MessageBubble } from "../components/message-bubble.slint";
+import { ChatInput } from "../components/chat-input.slint";
+import { StatusChip } from "../components/status-chip.slint";
+import { HorizontalDivider } from "../components/divider.slint";
+
+export component ChatPanel inherits Rectangle {
+    in property <string> thread-title;
+    in property <string> agent-name;
+    in property <string> permission-mode;
+    in property <bool> is-busy;
+    in property <[MessageData]> messages;
+    in-out property <string> draft;
+    callback message-submitted(string);
+
+    background: Theme.bg-base;
+
+    VerticalLayout {
+        // 1. Header Bar
+        HorizontalLayout {
+            padding-left: Theme.space-lg;
+            padding-right: Theme.space-lg;
+            padding-top: Theme.space-md;
+            padding-bottom: Theme.space-md;
+            alignment: space-between;
+
+            // Title & Description
+            VerticalLayout {
+                spacing: Theme.space-xs;
+                alignment: center;
+
+                Text {
+                    text: root.thread-title;
+                    font-size: Theme.font-md;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+            }
+
+            // Right Status Bar
+            HorizontalLayout {
+                spacing: Theme.space-md;
+                alignment: end;
+                
+                // Agent Status
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    alignment: center;
+                    
+                    Text {
+                        text: "Agent:";
+                        font-size: Theme.font-xs;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                    }
+
+                    StatusChip {
+                        text: root.agent-name;
+                        is-busy: root.is-busy;
+                    }
+                }
+
+                // Permission Indicator
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    alignment: center;
+                    
+                    Text {
+                        text: "Mode:";
+                        font-size: Theme.font-xs;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        background: Theme.accent-soft;
+                        border-radius: Theme.radius-sm; // Uses small border radius variant
+                        
+                        HorizontalLayout {
+                            padding-left: Theme.space-sm;
+                            padding-right: Theme.space-sm;
+                            padding-top: Theme.space-xs;
+                            padding-bottom: Theme.space-xs;
+
+                            Text {
+                                text: root.permission-mode;
+                                font-size: Theme.font-xs;
+                                color: Theme.accent;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider {}
+
+        // 2. Chat Conversation View
+        Flickable {
+            viewport-y: 0;
+            // Let it scroll and expand
+            VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-md;
+                alignment: start;
+
+                for msg in root.messages : MessageBubble {
+                    body: msg.body;
+                    from-user: msg.from-user;
+                }
+            }
+        }
+
+        // 3. Busy status message if agent is busy
+        if root.is-busy : HorizontalLayout {
+            padding-left: Theme.space-lg;
+            padding-bottom: Theme.space-sm;
+            spacing: Theme.space-sm;
+            alignment: start;
+            
+            Text {
+                text: "✨ " + root.agent-name + " is processing your request...";
+                font-size: Theme.font-xs;
+                color: Theme.accent;
+                font-italic: true;
+            }
+        }
+
+        // 4. Input Area Footer
+        VerticalLayout {
+            padding: Theme.space-lg;
+            
+            ChatInput {
+                draft <=> root.draft;
+                is-busy: root.is-busy;
+                message-submitted(text) => {
+                    root.message-submitted(text);
+                }
+            }
+        }
+    }
+}

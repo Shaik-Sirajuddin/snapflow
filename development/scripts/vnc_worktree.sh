@@ -364,7 +364,8 @@ PY
     snapshotd_home="$(snapshotd_scratch_for "$worktree_dir")/snapshotd-home"
     mkdir -p "$snapshotd_home/run"
     local admin_token
-    admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null)" || die "daemon-managed acpx admin token was not created"
+    admin_token="$(cat "$snapshotd_home/admin-token" 2>/dev/null || cat "$state_dir/snapshotd-scratch/snapshotd-home/admin-token" 2>/dev/null)" \
+        || die "daemon-managed acpx admin token was not created"
     [ -n "$admin_token" ] || die "daemon-managed acpx admin token is empty"
     # The embedded SAP endpoint must be present before panel-rust registers
     # the GUI with snapshotd; otherwise MCP can see the project path but has
@@ -388,6 +389,10 @@ PY
     echo "==> waiting for daemon-managed acpx-server..."
     local acpx_config="$snapshotd_home/acpx-config.json"
     local acpx_pid_file="$snapshotd_home/acpx-server.pid"
+    if [ ! -f "$acpx_pid_file" ]; then
+        acpx_config="$state_dir/snapshotd-scratch/snapshotd-home/acpx-config.json"
+        acpx_pid_file="$state_dir/snapshotd-scratch/snapshotd-home/acpx-server.pid"
+    fi
     local server_pid=""
     local fifo_keeper_pid=""
     for _ in $(seq 1 100); do
@@ -411,7 +416,7 @@ PY
     # the address it actually bound to acpx-http-bind (sibling of
     # acpx-server.pid) before spawning; trust that file over our own
     # reservation when it disagrees.
-    local acpx_bind_file="$snapshotd_home/acpx-http-bind"
+    local acpx_bind_file="$(dirname "$acpx_pid_file")/acpx-http-bind"
     if [ -s "$acpx_bind_file" ]; then
         local resolved_bind resolved_port
         resolved_bind="$(tr -d '[:space:]' <"$acpx_bind_file")"

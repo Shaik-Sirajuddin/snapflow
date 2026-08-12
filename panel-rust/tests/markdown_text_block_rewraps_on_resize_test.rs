@@ -37,7 +37,8 @@ fn markdown_text_block_tracks_narrower_window_width() {
         .window()
         .set_size(slint::LogicalSize::new(1400.0, 800.0));
     let styled = || {
-        let matches: Vec<_> = ElementHandle::find_by_element_type_name(&panel, "StyledText").collect();
+        let matches: Vec<_> =
+            ElementHandle::find_by_element_type_name(&panel, "StyledText").collect();
         assert_eq!(matches.len(), 1, "expected one markdown StyledText element");
         matches.into_iter().next().unwrap()
     };
@@ -48,6 +49,12 @@ fn markdown_text_block_tracks_narrower_window_width() {
         .set_size(slint::LogicalSize::new(420.0, 800.0));
     let narrow = styled().size().width;
     assert!(wide > 1.0, "markdown StyledText must have a live width");
-    assert!(narrow < wide - 50.0, "markdown width did not follow resize: wide={wide} narrow={narrow}");
-    assert!(narrow < 420.0, "markdown block overflows narrow window: {narrow}");
+    assert!(
+        narrow < wide - 50.0,
+        "markdown width did not follow resize: wide={wide} narrow={narrow}"
+    );
+    assert!(
+        narrow < 420.0,
+        "markdown block overflows narrow window: {narrow}"
+    );
 }

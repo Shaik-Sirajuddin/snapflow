@@ -1,0 +1,33 @@
+import { Theme } from "../theme.slint";
+
+export component MessageBubble inherits Rectangle {
+    in property <string> body;
+    in property <bool> from-user;
+
+    background: from-user ? Theme.user-bubble : Theme.assistant-bubble;
+    border-radius: Theme.radius-md; // Uses the medium border radius variant
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+
+    HorizontalLayout {
+        padding: Theme.space-md;
+        
+        VerticalLayout {
+            spacing: Theme.space-xs;
+            
+            Text {
+                text: from-user ? "USER" : "AGENT";
+                font-size: Theme.font-xs;
+                font-weight: 700;
+                color: from-user ? Theme.accent : Theme.text-secondary;
+            }
+
+            Text {
+                text: root.body;
+                font-size: Theme.font-sm;
+                color: Theme.text-primary;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

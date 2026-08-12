@@ -1,0 +1,50 @@
+import { Theme } from "theme.slint";
+import { ThreadData, MessageData } from "models.slint";
+import { ChatShell } from "layouts/chat-shell.slint";
+
+export component MainWindow inherits Window {   
+    title: "Multi Media — Chat";
+    preferred-width: 860px;
+    preferred-height: 560px;
+    background: Theme.bg-base;
+
+    in-out property <[ThreadData]> threads: [
+        { title: "Export timeline", preview: "Trim clips and add fades…" },
+        { title: "Color grade pass", preview: "Lift shadows on intro…" },
+        { title: "Audio sync check", preview: "Align narration bed…" },
+    ];
+
+    in-out property <int> selected-index: 0;
+
+    in-out property <[MessageData]> messages: [
+        { body: "Can you export a 30s trailer from the current timeline?", from-user: true },
+        { body: "Sure — I'll assemble three acts, add title cards, and render H.264.", from-user: false },
+        { body: "Use the gallery assets and keep transitions minimal.", from-user: true },
+        { body: "On it. Running export pipeline now…", from-user: false },
+    ];
+
+    in-out property <string> agent-name: "codex";
+    in-out property <string> permission-mode: "workspace-write";
+    in-out property <bool> is-busy: true;
+    in-out property <string> draft: "";
+
+    ChatShell {
+        threads: root.threads;
+        selected-index <=> root.selected-index;
+        messages: root.messages;
+        agent-name: root.agent-name;
+        permission-mode: root.permission-mode;
+        is-busy: root.is-busy;
+        draft <=> root.draft;
+        message-submitted(text) => {
+            root.is-busy = true;
+            debug("submit: " + text);
+        }
+        settings-clicked => {
+            debug("settings clicked");
+        }
+    }
+}
+
+
+// 
