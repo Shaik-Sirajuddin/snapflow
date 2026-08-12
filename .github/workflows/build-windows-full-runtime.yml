@@ -111,7 +111,14 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$(cygpath -u "$GOROOT")/bin:$PATH"
+          # actions/setup-go only adds its install dir to GITHUB_PATH (the
+          # default runner shell's PATH); GOROOT does not reach this msys2
+          # login shell either, so PATH lookups for `go` fail here even
+          # though setup-go succeeded. Locate go.exe directly under the
+          # hosted tool cache instead of relying on either.
+          GO_BIN="$(find /c/hostedtoolcache/windows/go -maxdepth 3 -type d -iname bin 2>/dev/null | sort -V | tail -1)"
+          test -n "$GO_BIN" || { echo "could not find go install under hostedtoolcache" >&2; exit 1; }
+          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$GO_BIN:$PATH"
           cargo build --manifest-path multi-media-main/acpx/Cargo.toml \
             -p acpx-server --release --target x86_64-pc-windows-gnu
           go build -o multi-media-main/snapshotd/snapflowd.exe \
