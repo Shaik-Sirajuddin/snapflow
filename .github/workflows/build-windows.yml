@@ -176,8 +176,11 @@ jobs:
           repository: Shaik-Sirajuddin/shotcut
           # Keep the GUI source aligned with the Shotcut fork master that
           # contains the fail-closed project-open/save fixes and root-level
-          # MLT resolver contract used by this main branch.
-          ref: a77a1a8
+          # MLT resolver contract used by this main branch. Must be the
+          # full 40-char SHA: actions/checkout can only shallow-fetch a
+          # commit directly by full SHA -- a short SHA falls back to a
+          # branch/tag refspec fetch that doesn't match anything and fails.
+          ref: 1cd31279f4b2b42a3bbc064fb530fb2a24ebe791
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
