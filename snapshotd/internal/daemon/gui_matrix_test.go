@@ -298,15 +298,6 @@ func TestGUIMatrix_DaemonFirstGUIRegistrationDrainsHeadlessBeforeLease(t *testin
 		t.Fatal(err)
 	}
 	path := filepath.Join(project.RootDir, project.MltFileName)
-	guiSocket := filepath.Join(t.TempDir(), "gui.sap.sock")
-	guiListener, err := net.Listen("unix", guiSocket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = guiListener.Close() })
-	if !health.SocketResponsive(guiSocket, time.Second) {
-		t.Fatalf("GUI socket test listener was not responsive: %s", guiSocket)
-	}
 	launched, err := d.Launch(ctx, LaunchParams{ProjectID: project.ID})
 	if err != nil {
 		t.Fatalf("daemon launch: %v", err)
@@ -316,7 +307,11 @@ func TestGUIMatrix_DaemonFirstGUIRegistrationDrainsHeadlessBeforeLease(t *testin
 		PID:           os.Getpid(),
 		ProcessStart:  mustProcessStart(t),
 		ProjectPath:   path,
-		SAPSocketPath: guiSocket,
+		// Reuse the real SAP fixture launched by the daemon. Handoff performs
+		// project.save through the old endpoint before closing it, so a listener
+		// that only accepts and closes connections is not a valid GUI fixture.
+		SAPSocketPath: launched.SocketPath,
+		SAPToken:      launched.Token,
 	})
 	if err != nil {
 		t.Fatalf("GUI registration/handoff: %v", err)

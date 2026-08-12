@@ -653,7 +653,7 @@ func TestDaemon_DiscoveryEmptyProjectPathDoesNotCreateOpenRow(t *testing.T) {
 	}
 }
 
-func TestDaemon_ResolvePrefersReadyProcessInstanceOverExternal(t *testing.T) {
+func TestDaemon_ResolveUsesActiveExternalOwnerOverManaged(t *testing.T) {
 	d := newTestDaemon(t, buildFixture(t))
 	ctx := context.Background()
 	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "pref-project"})
@@ -675,6 +675,21 @@ func TestDaemon_ResolvePrefersReadyProcessInstanceOverExternal(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
+	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "pref-external",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+		// Use the protocol-speaking fixture endpoint for the external owner;
+		// the active-owner contract routes through this endpoint after the GUI
+		// registration claims the project.
+		SAPSocketPath: daemonSocket,
+	}); err != nil {
+		t.Fatalf("register external: %v", err)
+	}
+	// Add a ready managed row after the external claim. The active-owner
+	// marker must keep routing on the external GUI even when a managed row
+	// appears later for the same project.
 	if err := d.Reg.CreateProcessInstance(&registry.ProcessInstance{
 		ID:         "pi-ready",
 		ProjectID:  project.ID,
@@ -685,21 +700,12 @@ func TestDaemon_ResolvePrefersReadyProcessInstanceOverExternal(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create process instance: %v", err)
 	}
-	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
-		InstanceNonce: "pref-external",
-		PID:           os.Getpid(),
-		ProcessStart:  mustProcessStart(t),
-		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
-		SAPSocketPath: filepath.Join(t.TempDir(), "external.sap.sock"),
-	}); err != nil {
-		t.Fatalf("register external: %v", err)
-	}
 	socket, token, err := d.resolveProjectInstance(project.ID)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if socket != daemonSocket || token != "daemon-token" {
-		t.Fatalf("ready process instance must win: socket=%q token=%q", socket, token)
+	if socket != daemonSocket || token != "" {
+		t.Fatalf("active external owner must route through its SAP endpoint: socket=%q token=%q", socket, token)
 	}
 }
 
