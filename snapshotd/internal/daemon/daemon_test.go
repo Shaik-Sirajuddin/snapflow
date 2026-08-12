@@ -335,6 +335,51 @@ func TestDaemon_ResolveProjectInstanceUsesReadyExternalSAPSocket(t *testing.T) {
 	}
 }
 
+func TestDaemon_ResolveProjectInstanceIgnoresPendingExternalOwner(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "pending-routing"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	start := mustProcessStart(t)
+	activeSocket := filepath.Join(t.TempDir(), "active.sap.sock")
+	activeListener, err := net.Listen("unix", activeSocket)
+	if err != nil {
+		t.Fatalf("listen active SAP fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = activeListener.Close(); _ = os.Remove(activeSocket) })
+	active, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "active-owner", PID: os.Getpid(), ProcessStart: start,
+		ProjectPath: filepath.Join(project.RootDir, project.MltFileName), SAPSocketPath: activeSocket,
+	})
+	if err != nil {
+		t.Fatalf("register active external instance: %v", err)
+	}
+	pendingSocket := filepath.Join(t.TempDir(), "pending.sap.sock")
+	pendingListener, err := net.Listen("unix", pendingSocket)
+	if err != nil {
+		t.Fatalf("listen pending SAP fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = pendingListener.Close(); _ = os.Remove(pendingSocket) })
+	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "pending-owner", PID: os.Getpid(), ProcessStart: start,
+		ProjectPath: filepath.Join(project.RootDir, project.MltFileName), SAPSocketPath: pendingSocket,
+	}); err != nil {
+		t.Fatalf("register pending external instance: %v", err)
+	}
+	socket, _, err := d.resolveProjectInstance(project.ID)
+	if err != nil {
+		t.Fatalf("resolve active project instance: %v", err)
+	}
+	if socket != activeSocket {
+		t.Fatalf("pending owner must not receive edits: resolved socket=%q want active=%q", socket, activeSocket)
+	}
+	if active.Instance.ID == "" {
+		t.Fatal("active registration did not return an instance id")
+	}
+}
+
 func TestDaemon_ResolveProjectInstanceIgnoresExpiredExternalSAPSocket(t *testing.T) {
 	d := newTestDaemon(t, buildFixture(t))
 	ctx := context.Background()

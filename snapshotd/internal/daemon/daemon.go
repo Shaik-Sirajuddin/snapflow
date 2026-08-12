@@ -855,11 +855,19 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 // its SAP socket is authoritative in ExternalInstance, but it is not a child
 // represented by ProcessInstance and therefore must not require daemon.launch.
 func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error) {
+	activeOwner, ownerErr := d.Reg.GetProjectActiveOwner(projectID)
+	if ownerErr != nil && !errors.Is(ownerErr, registry.ErrNotFound) {
+		return "", "", ownerErr
+	}
 	instances, err := d.Reg.ListProcessInstancesByProject(projectID)
 	if err != nil {
 		return "", "", err
 	}
 	for _, in := range instances { // newest first, per ListProcessInstancesByProject's ordering
+		if activeOwner != nil && (activeOwner.Owner != registry.OwnershipManaged ||
+			activeOwner.InstanceID != in.ID || activeOwner.PID != in.PID || activeOwner.ProcessStart != in.ProcessStart) {
+			continue
+		}
 		if in.Status == registry.StatusReady && health.PIDAlive(in.PID) && health.SocketResponsive(in.SocketPath, time.Second) {
 			return in.SocketPath, in.Token, nil
 		}
@@ -882,6 +890,11 @@ func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error
 	}
 	now := time.Now().UTC()
 	for _, in := range externalInstances { // newest first, per ListExternalInstances
+		if activeOwner != nil && (activeOwner.Owner != registry.OwnershipExternal ||
+			activeOwner.InstanceID != in.ID || activeOwner.InstanceNonce != in.InstanceNonce ||
+			activeOwner.PID != in.PID || activeOwner.ProcessStart != in.ProcessStart) {
+			continue
+		}
 		if in.Status != registry.ExternalStatusOpen ||
 			in.SAPSocketPath == "" ||
 			!health.ProcessIdentityMatches(in.PID, in.ProcessStart) ||
@@ -1441,6 +1454,12 @@ func (d *Daemon) List(ctx context.Context, p InstanceListParams) (InstanceListRe
 	for _, ext := range external {
 		active := ext.Status == registry.ExternalStatusOpen &&
 			ext.LeaseExpiresAt.After(now) && health.PIDAlive(ext.PID)
+		if active {
+			owner, ownerErr := d.Reg.GetProjectActiveOwner(projectForPath(ext.ProjectPath))
+			active = ownerErr == nil && owner.Owner == registry.OwnershipExternal &&
+				owner.InstanceID == ext.ID && owner.InstanceNonce == ext.InstanceNonce &&
+				owner.PID == ext.PID && owner.ProcessStart == ext.ProcessStart
+		}
 		if active {
 			// An external lease is only active when it exposes a usable SAP
 			// endpoint.  Keep this consistent with resolveProjectInstance,
