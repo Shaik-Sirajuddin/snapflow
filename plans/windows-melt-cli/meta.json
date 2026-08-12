@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "plan": "windows-melt-cli",
+  "status": "in_progress",
+  "updated": "2026-08-12 packaging implementation started",
+  "plan_doc": "00-plan.md",
+  "source_task": "Restore reliable Windows melt export for daemon-managed and self-launched GUI instances.",
+  "ordering_rationale": "Confirm the package contract before modifying the workflow, then verify both resolver modes and the final artifact.",
+  "completed": [
+    {
+      "phase": "inventory_and_contract",
+      "order": 1,
+      "tier": 1,
+      "status": "completed",
+      "description": "Trace historical resolver and Windows packaging commits and record the missing CLI contract.",
+      "implementation_evidence": "2f0b57ec0 switched to MSYS2/manual packaging; 3727b1133/5f19b6934 added resolver logic; current workflow does not copy or assert melt.exe.",
+      "verified": [
+        {"description": "Current main workflow and resolver paths inspected.", "verdict": "CONFIRMED"}
+      ]
+    },
+    {
+      "phase": "windows_packaging",
+      "order": 2,
+      "tier": 2,
+      "status": "completed",
+      "description": "Bundle melt.exe and its dependency closure in the final Windows artifact.",
+      "implementation_evidence": "Windows bundling copies /mingw64/bin/melt.exe, runs bundle_dlls on it, and final packaging asserts Snapflow/melt.exe.",
+      "verified": [{"description": "Workflow and cross-platform bundled-melt resolver test updated.", "verdict": "IMPLEMENTED"}]
+    }
+  ],
+  "pending": [
+    {
+      "phase": "resolver_hardening",
+      "order": 3,
+      "tier": 2,
+      "status": "not_started",
+      "description": "Make daemon and GUI resolution converge on the packaged absolute executable and improve errors.",
+      "verification": "Focused Go/Rust tests cover beside-executable, daemon injection, and missing-tool behavior."
+    },
+    {
+      "phase": "review_gate",
+      "order": 4,
+      "tier": "review_gate",
+      "status": "not_started",
+      "description": "Run two code review passes and address findings.",
+      "max_iterations": 2
+    },
+    {
+      "phase": "verification_gate",
+      "order": 5,
+      "tier": "verification_gate",
+      "status": "not_started",
+      "description": "Verify implementation against the plan and artifact contract.",
+      "misalignments": []
+    },
+    {
+      "phase": "loop_gate",
+      "order": 6,
+      "tier": "loop_gate",
+      "status": "not_started",
+      "description": "Resolve verification misalignments until empty.",
+      "completion_rule": "Close only when verification_gate misalignments is empty."
+    },
+    {
+      "phase": "runtime_gate",
+      "order": 7,
+      "tier": "runtime_gate",
+      "status": "not_started",
+      "description": "Run Windows daemon and native GUI export checks from main.",
+      "matrix_ref": "00-plan.md#verification-matrix",
+      "matrix_rows": []
+    }
+  ]
+}

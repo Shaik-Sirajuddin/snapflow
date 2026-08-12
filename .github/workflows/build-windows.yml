@@ -364,6 +364,17 @@ jobs:
           }
           bundle_dlls "$APPDIR/snapflow.exe"
 
+          # `melt.exe` is a separately invoked export CLI, not a DLL linked by
+          # snapflow.exe. Bundle it explicitly and walk its own dependency
+          # closure; otherwise the editor can open projects but every export
+          # falls back to PATH and fails on an installed machine.
+          test -f /mingw64/bin/melt.exe || {
+            echo "MSYS2 MLT package did not provide /mingw64/bin/melt.exe" >&2
+            exit 1
+          }
+          cp -p /mingw64/bin/melt.exe "$APPDIR/melt.exe"
+          bundle_dlls "$APPDIR/melt.exe"
+
           # Keep the Windows package layout used by v0.1.45 and by the
           # upstream Windows resolver: the MLT repository is a sibling of
           # Snapflow/, not nested below it. Native and daemon launches both
@@ -465,6 +476,18 @@ jobs:
               exit 1
             }
           done
+          # The export CLI is not discovered by walking snapflow.exe's
+          # imports, so assert it independently in the final install tree.
+          if [ ! -f "$OUT/Snapflow/melt.exe" ]; then
+            found=$(find "$OUT" -type f -iname melt.exe -print -quit)
+            if [ -n "$found" ]; then
+              cp -p "$found" "$OUT/Snapflow/melt.exe"
+            fi
+          fi
+          test -f "$OUT/Snapflow/melt.exe" || {
+            echo "final Windows bundle is missing the melt export CLI" >&2
+            exit 1
+          }
           # snapshotd launch --gui must have the real production
           # FfiBackend-linked child in the shipped bundle. The Windows
           # installer persists this executable as SNAPSHOT_BIN_PATH.

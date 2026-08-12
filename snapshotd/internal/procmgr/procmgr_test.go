@@ -64,6 +64,18 @@ func TestBundledMeltBinary_FindsAppSiblingWithoutUsingHome(t *testing.T) {
 	}
 }
 
+func TestBundledMeltBinary_FindsWindowsAppSibling(t *testing.T) {
+	appDir := t.TempDir()
+	melt := filepath.Join(appDir, "melt.exe")
+	if err := os.WriteFile(melt, []byte("fixture"), 0o755); err != nil {
+		t.Fatalf("write bundled melt fixture: %v", err)
+	}
+	got := bundledMeltBinary(filepath.Join(appDir, "snapflow.exe"))
+	if got != melt {
+		t.Fatalf("bundledMeltBinary() = %q, want %q", got, melt)
+	}
+}
+
 func TestAppendBundledMltEnv_UsesAbsoluteBundlePaths(t *testing.T) {
 	installRoot := t.TempDir()
 	appDir := filepath.Join(installRoot, "Snapflow")
