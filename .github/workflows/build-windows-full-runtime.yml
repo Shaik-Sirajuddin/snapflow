@@ -1,0 +1,244 @@
+name: build-windows-full-runtime
+
+# Diagnostic/test workflow for the complete Windows media runtime.  This is
+# deliberately separate from build-windows.yml: it produces an artifact only
+# and never publishes a release.  Promote its packaging steps only after the
+# Nitro/runtime gate is consistently green.
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - windows-full-runtime/**
+
+permissions:
+  contents: read
+
+jobs:
+  full-runtime:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: multi-media-main
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Shaik-Sirajuddin/shotcut
+          ref: master
+          path: shotcut-rebrand
+
+      - name: Provide sibling Rust workspaces to CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -r multi-media-main/sap-rust shotcut-rebrand/../sap-rust
+          cp -r multi-media-main/panel-rust shotcut-rebrand/../panel-rust
+          cp -r multi-media-main/acpx shotcut-rebrand/../acpx
+          cp -r multi-media-main/lib shotcut-rebrand/../lib
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            zip
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-mlt
+            mingw-w64-x86_64-fftw
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-charts
+            mingw-w64-x86_64-qt6-declarative
+            mingw-w64-x86_64-qt6-imageformats
+            mingw-w64-x86_64-qt6-multimedia
+            mingw-w64-x86_64-qt6-svg
+            mingw-w64-x86_64-qt6-tools
+            mingw-w64-x86_64-qt6-translations
+            mingw-w64-x86_64-qt6-websockets
+
+      - name: Add GNU Rust target
+        shell: pwsh
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Add optional Linux-parity plugin packages when available
+        run: |
+          # Package names vary across MSYS2 snapshots.  These are optional
+          # capabilities (core MLT/FFmpeg is required); retain them when the
+          # repository provides them and record the result in the manifest.
+          pacman -S --noconfirm mingw-w64-x86_64-frei0r-plugins || true
+          pacman -S --noconfirm mingw-w64-x86_64-ladspa || true
+
+      - name: Download pinned upstream MLT runtime
+        run: |
+          set -euo pipefail
+          # Follow upstream Shotcut's public dependency pipeline.  This is a
+          # runtime archive, not a bundled Shotcut application; Snapflow is
+          # built and added below in this workflow.
+          MLT_URL="https://s3.amazonaws.com/misc.meltymedia/shotcut-build/mlt-prebuilt-mingw64-v7.txz"
+          curl --fail --location --retry 3 --output "$HOME/mlt-prebuilt-mingw64-v7.txz" "$MLT_URL"
+          tar -xJf "$HOME/mlt-prebuilt-mingw64-v7.txz" -C "$HOME"
+          rm -f "$HOME/mlt-prebuilt-mingw64-v7.txz"
+          test -f "$HOME/bin/melt.exe" || test -f "$HOME/bin/melt"
+          test -d "$HOME/lib/mlt" || test -d "$HOME/lib/mlt-7"
+
+      - name: Configure and build GUI
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          VERSION="$(date +"%y.%-m.%-d")"
+          cmake -S shotcut-rebrand -B shotcut-rebrand/build -G Ninja \
+            -D SNAPFLOW_VERSION="$VERSION" \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D CMAKE_INSTALL_PREFIX="$(pwd)/shotcut-rebrand/build/Snapflow" \
+            -D BUILD_MINIMAL_MEDIA_BACKEND=ON
+          cmake --build shotcut-rebrand/build --parallel
+          cmake --install shotcut-rebrand/build
+
+      - name: Assemble complete app-local media runtime
+        run: |
+          set -euo pipefail
+          APPDIR="$(pwd)/shotcut-rebrand/build/Snapflow"
+          QTDIR="$(pkg-config --variable=prefix Qt6Core)"
+          QT_SHARE_DIR="$QTDIR/share/qt6"
+          test -f "$APPDIR/snapflow.exe"
+
+          # Copy the actual MSYS2-built tools.  Do not substitute a Shotcut
+          # download: melt, libmlt, modules, and FFmpeg must be one package
+          # generation.
+          RUNTIME_ROOT="$HOME"
+          [ -f "$RUNTIME_ROOT/bin/melt.exe" ] || RUNTIME_ROOT="/mingw64"
+          cp -p "$RUNTIME_ROOT/bin/melt.exe" "$APPDIR/melt.exe"
+          cp -p "$RUNTIME_ROOT/bin/ffmpeg.exe" "$APPDIR/ffmpeg.exe"
+          cp -p "$RUNTIME_ROOT/bin/ffprobe.exe" "$APPDIR/ffprobe.exe"
+
+          bundle_dlls() {
+            local target="$1" lib base
+            for lib in $(ldd "$target" | awk '($3 ~ /\/mingw64\/bin\//) {print $3}'); do
+              base="$(basename "$lib")"
+              [ -e "$APPDIR/$base" ] || cp -p "$lib" "$APPDIR/$base"
+            done
+            for lib in $(ldd "$target" | awk '($3 ~ /\/mingw64\/bin\//) {print $3}'); do
+              base="$(basename "$lib")"
+              [ -e "$APPDIR/.bundled-$base" ] && continue
+              touch "$APPDIR/.bundled-$base"
+              bundle_dlls "$APPDIR/$base"
+            done
+          }
+          bundle_dlls "$APPDIR/snapflow.exe"
+          bundle_dlls "$APPDIR/melt.exe"
+          bundle_dlls "$APPDIR/ffmpeg.exe"
+          bundle_dlls "$APPDIR/ffprobe.exe"
+
+          # Preserve the layout installed by the exact MSYS2 MLT package.
+          # These are the paths MLT's Windows relocatable build expects.
+          mkdir -p "$APPDIR/lib" "$APPDIR/share"
+          MLT_LIB_DIR="$RUNTIME_ROOT/lib/mlt"
+          [ -d "$MLT_LIB_DIR" ] || MLT_LIB_DIR="$RUNTIME_ROOT/lib/mlt-7"
+          MLT_DATA_DIR="$RUNTIME_ROOT/share/mlt"
+          [ -d "$MLT_DATA_DIR" ] || MLT_DATA_DIR="$RUNTIME_ROOT/share/mlt-7"
+          cp -a "$MLT_LIB_DIR" "$APPDIR/lib/mlt"
+          cp -a "$MLT_DATA_DIR" "$APPDIR/share/mlt"
+          # MLT modules are dlopen'ed after snapflow starts, so they are not
+          # covered by snapflow.exe's dependency closure. Walk every module
+          # and bundle its MinGW DLL dependencies too.
+          for module in "$APPDIR/lib/mlt"/*.dll; do
+            [ -e "$module" ] && bundle_dlls "$module"
+          done
+
+          # Optional plugin/data families used by Linux builds. Keep the
+          # directories when the matching MSYS2 package is available; the
+          # manifest records their presence instead of silently pretending
+          # that an optional capability was shipped.
+          mkdir -p "$APPDIR/lib"
+          for optional_dir in frei0r-1 ladspa; do
+            if [ -d "/mingw64/lib/$optional_dir" ]; then
+              cp -a "/mingw64/lib/$optional_dir" "$APPDIR/lib/$optional_dir"
+              for plugin in "$APPDIR/lib/$optional_dir"/*.dll; do
+                [ -e "$plugin" ] && bundle_dlls "$plugin"
+              done
+            fi
+          done
+          if [ -d /mingw64/share/movit ]; then
+            cp -a /mingw64/share/movit "$APPDIR/share/movit"
+          fi
+          if [ -d /mingw64/share/vmaf ]; then
+            cp -a /mingw64/share/vmaf "$APPDIR/share/vmaf"
+          fi
+          mkdir -p "$APPDIR/share/translations"
+          cp -p /mingw64/share/qt6/translations/qt_*.qm "$APPDIR/share/translations/" 2>/dev/null || true
+          cp -p /mingw64/share/qt6/translations/qtbase_*.qm "$APPDIR/share/translations/" 2>/dev/null || true
+
+          mkdir -p "$APPDIR/lib/qt6" "$APPDIR/lib/qml"
+          for plugin in generic iconengines imageformats multimedia platforms sqldrivers styles tls; do
+            cp -pr "$QT_SHARE_DIR/plugins/$plugin" "$APPDIR/lib/qt6/"
+            for lib in "$APPDIR/lib/qt6/$plugin"/*.dll; do
+              [ -e "$lib" ] && bundle_dlls "$lib"
+            done
+          done
+          cp -pr "$QT_SHARE_DIR"/qml/{Qt,QtCore,QtMultimedia,QtQml,QtQuick} "$APPDIR/lib/qml/"
+          printf '[Paths]\nPlugins=lib/qt6\nQml2Imports=lib/qml\n' > "$APPDIR/qt.conf"
+
+          # A process-local contract for diagnostics and daemon wrappers.
+          cat > "$APPDIR/runtime-env.cmd" <<'EOF'
+          @echo off
+          set "SNAPFLOW_APP_DIR=%~dp0"
+          set "PATH=%SNAPFLOW_APP_DIR%;%PATH%"
+          set "MLT_REPOSITORY=%SNAPFLOW_APP_DIR%lib\mlt"
+          set "MLT_DATA=%SNAPFLOW_APP_DIR%share\mlt"
+          set "MLT_PROFILES_PATH=%SNAPFLOW_APP_DIR%share\mlt\profiles"
+          set "QT_PLUGIN_PATH=%SNAPFLOW_APP_DIR%lib\qt6"
+          set "QML2_IMPORT_PATH=%SNAPFLOW_APP_DIR%lib\qml"
+          EOF
+
+          manifest="$APPDIR/runtime-manifest.txt"
+          {
+            echo "melt=$($APPDIR/melt.exe -version 2>&1 | head -1)"
+            echo "ffmpeg=$($APPDIR/ffmpeg.exe -version 2>&1 | head -1)"
+            echo "ffprobe=$($APPDIR/ffprobe.exe -version 2>&1 | head -1)"
+            echo "mlt_module_count=$(find "$APPDIR/lib/mlt" -type f -name '*.dll' | wc -l)"
+            echo "profile_count=$(find "$APPDIR/share/mlt/profiles" -type f | wc -l)"
+            echo "frei0r_present=$(test -d "$APPDIR/lib/frei0r-1" && echo true || echo false)"
+            echo "ladspa_present=$(test -d "$APPDIR/lib/ladspa" && echo true || echo false)"
+            echo "movit_present=$(test -d "$APPDIR/share/movit" && echo true || echo false)"
+            echo "vmaf_present=$(test -d "$APPDIR/share/vmaf" && echo true || echo false)"
+          } > "$manifest"
+          find "$APPDIR" -name '.bundled-*' -delete
+
+      - name: Run full runtime smoke test
+        run: |
+          set -euo pipefail
+          APPDIR="$(pwd)/shotcut-rebrand/build/Snapflow"
+          test -s "$APPDIR/melt.exe"
+          test -s "$APPDIR/ffmpeg.exe"
+          test -s "$APPDIR/ffprobe.exe"
+          test -f "$APPDIR/lib/mlt/libmltxml.dll"
+          test -f "$APPDIR/lib/mlt/libmltavformat.dll"
+          test -s "$APPDIR/share/mlt/profiles/atsc_1080p_30"
+          export PATH="$APPDIR:$PATH"
+          export MLT_REPOSITORY="$APPDIR/lib/mlt"
+          export MLT_DATA="$APPDIR/share/mlt"
+          export MLT_PROFILES_PATH="$APPDIR/share/mlt/profiles"
+          "$APPDIR/melt.exe" -version
+          "$APPDIR/ffmpeg.exe" -version | head -1
+          "$APPDIR/ffprobe.exe" -version | head -1
+          "$APPDIR/melt.exe" -query producers > runtime-query.txt 2>&1
+          ! grep -q 'Failed to open' runtime-query.txt
+          grep -q '^  - avformat$' runtime-query.txt
+          grep -q '^  - xml$' runtime-query.txt
+
+      - name: Archive test bundle
+        run: |
+          set -euo pipefail
+          cd shotcut-rebrand/build
+          zip -qr snapflow-windows-full-runtime-test.zip Snapflow
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapflow-windows-full-runtime-test
+          path: shotcut-rebrand/build/snapflow-windows-full-runtime-test.zip
