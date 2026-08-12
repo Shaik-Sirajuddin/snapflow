@@ -49,4 +49,4 @@ installed bundle, where MSYS2 is not present.
 | missing melt in development | export fails with an actionable missing-tool error |
 | packaged MLT modules | XML/MLT module repository loads |
 | packaged melt closure | `melt.exe` starts without MSYS2 PATH |
-| final ZIP | contains `Snapflow/melt.exe`, MLT data/modules, frei0r, and required DLLs |
+| final ZIP | passes archive integrity and contains `Snapflow/melt.exe`, MLT data/modules, frei0r, and required DLLs |

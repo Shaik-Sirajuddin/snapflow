@@ -174,7 +174,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: 1c55061ba76f8e4bb0e8a1041139c8bfd8017695
+          # Keep the GUI source aligned with the Shotcut fork master that
+          # contains the fail-closed project-open/save fixes and root-level
+          # MLT resolver contract used by this main branch.
+          ref: c33b9cca6ee89498006981e5b85883f176e6b64b
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
@@ -478,12 +481,6 @@ jobs:
           done
           # The export CLI is not discovered by walking snapflow.exe's
           # imports, so assert it independently in the final install tree.
-          if [ ! -f "$OUT/Snapflow/melt.exe" ]; then
-            found=$(find "$OUT" -type f -iname melt.exe -print -quit)
-            if [ -n "$found" ]; then
-              cp -p "$found" "$OUT/Snapflow/melt.exe"
-            fi
-          fi
           test -f "$OUT/Snapflow/melt.exe" || {
             echo "final Windows bundle is missing the melt export CLI" >&2
             exit 1
@@ -514,6 +511,7 @@ jobs:
           # Windows ZIP is missing root-level lib/mlt/libmltxml.dll" despite
           # the preceding filesystem check for the same file passing).
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null
+          7z t "$OUT.zip" >/dev/null
           sha256sum "$OUT.zip" > "$OUT.zip.sha256"
 
       - uses: actions/upload-artifact@v4

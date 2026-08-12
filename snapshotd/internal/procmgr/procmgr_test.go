@@ -100,6 +100,10 @@ func TestAppendBundledMltEnv_UsesAbsoluteBundlePaths(t *testing.T) {
 
 func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	fixtureBin := buildFixture(t)
+	meltPath := filepath.Join(filepath.Dir(fixtureBin), "melt.exe")
+	if err := os.WriteFile(meltPath, []byte("fixture"), 0o755); err != nil {
+		t.Fatalf("write bundled melt fixture: %v", err)
+	}
 	reg := openTestRegistry(t)
 
 	if err := reg.CreateProject(&registry.Project{
@@ -164,6 +168,9 @@ func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	}
 	if !strings.Contains(content, "headless=1") {
 		t.Fatalf("fixture did not see SNAPSHOT_HEADLESS=1, got: %s", content)
+	}
+	if !strings.Contains(content, "melt="+meltPath) {
+		t.Fatalf("fixture did not see packaged MELT_BIN=%q, got: %s", meltPath, content)
 	}
 	if strings.Contains(content, "token=\n") {
 		t.Fatalf("fixture saw an empty SNAPSHOT_SAP_TOKEN, expected a generated value: %s", content)

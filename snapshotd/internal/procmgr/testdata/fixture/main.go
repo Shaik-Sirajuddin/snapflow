@@ -26,12 +26,13 @@ func main() {
 	endpoint := os.Getenv("SNAPSHOT_SAP_ENDPOINT")
 	token := os.Getenv("SNAPSHOT_SAP_TOKEN")
 	headless := os.Getenv("SNAPSHOT_HEADLESS")
+	melt := os.Getenv("MELT_BIN")
 	outPath := os.Getenv("SNAPSHOT_FIXTURE_OUT")
 
 	if outPath != "" {
 		f, err := os.Create(outPath)
 		if err == nil {
-			fmt.Fprintf(f, "socket=%s\nendpoint=%s\ntoken=%s\nheadless=%s\n", sock, endpoint, token, headless)
+			fmt.Fprintf(f, "socket=%s\nendpoint=%s\ntoken=%s\nheadless=%s\nmelt=%s\n", sock, endpoint, token, headless, melt)
 			f.Close()
 		}
 	}
