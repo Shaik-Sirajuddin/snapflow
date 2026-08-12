@@ -88,8 +88,11 @@ jobs:
           curl --fail --location --retry 3 --output "$HOME/mlt-prebuilt-mingw64-v7.txz" "$MLT_URL"
           tar -xJf "$HOME/mlt-prebuilt-mingw64-v7.txz" -C "$HOME"
           rm -f "$HOME/mlt-prebuilt-mingw64-v7.txz"
-          test -f "$HOME/bin/melt.exe" || test -f "$HOME/bin/melt"
-          test -d "$HOME/lib/mlt" || test -d "$HOME/lib/mlt-7"
+          # The upstream archive is supplemental (for example JACK/OpenGL
+          # runtime files), not a complete Shotcut application or MLT tree.
+          # The actual melt/MLT build still comes from the MSYS2 toolchain and
+          # the upstream build/deploy contract.
+          test -f "$HOME/bin/libjack64.dll"
 
       - name: Configure and build GUI
         run: |
@@ -128,8 +131,7 @@ jobs:
           # Copy the actual MSYS2-built tools.  Do not substitute a Shotcut
           # download: melt, libmlt, modules, and FFmpeg must be one package
           # generation.
-          RUNTIME_ROOT="$HOME"
-          [ -f "$RUNTIME_ROOT/bin/melt.exe" ] || RUNTIME_ROOT="/mingw64"
+          RUNTIME_ROOT="/mingw64"
           cp -p "$RUNTIME_ROOT/bin/melt.exe" "$APPDIR/melt.exe"
           cp -p "$RUNTIME_ROOT/bin/ffmpeg.exe" "$APPDIR/ffmpeg.exe"
           cp -p "$RUNTIME_ROOT/bin/ffprobe.exe" "$APPDIR/ffprobe.exe"
@@ -156,11 +158,11 @@ jobs:
           # These are the paths MLT's Windows relocatable build expects.
           mkdir -p "$APPDIR/lib" "$APPDIR/share"
           MLT_LIB_DIR="$RUNTIME_ROOT/lib/mlt"
-          [ -d "$MLT_LIB_DIR" ] || MLT_LIB_DIR="$RUNTIME_ROOT/lib/mlt-7"
           MLT_DATA_DIR="$RUNTIME_ROOT/share/mlt"
-          [ -d "$MLT_DATA_DIR" ] || MLT_DATA_DIR="$RUNTIME_ROOT/share/mlt-7"
           cp -a "$MLT_LIB_DIR" "$APPDIR/lib/mlt"
           cp -a "$MLT_DATA_DIR" "$APPDIR/share/mlt"
+          # Supplemental files from the public upstream archive.
+          cp -p "$HOME/bin"/*.dll "$APPDIR/" 2>/dev/null || true
           # MLT modules are dlopen'ed after snapflow starts, so they are not
           # covered by snapflow.exe's dependency closure. Walk every module
           # and bundle its MinGW DLL dependencies too.
