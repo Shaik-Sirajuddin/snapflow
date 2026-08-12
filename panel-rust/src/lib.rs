@@ -2027,11 +2027,11 @@ pub struct PanelHandle {
 
 static SENTINEL: PanelHandle = PanelHandle { _private: () };
 
-/// The native Qt host owns the rollout switch, but panel creation is the
-/// actual side-effect boundary: creating the panel can provision/connect an
-/// ACPX gateway and restore provider metadata. Keep this guard here as well
-/// so a hidden dock, a stale saved layout, or another C ABI caller cannot
-/// start AI infrastructure while the feature is disabled.
+/// The native Qt host owns the rollout switch for the AI UI. Panel creation
+/// must remain available even when that UI is disabled: the hidden panel owns
+/// the snapshotd process registration and heartbeat. ACPX provisioning is
+/// gated separately below, so creating this lifecycle shell cannot start an
+/// agent server.
 fn ai_mode_disabled() -> bool {
     std::env::var("SNAPFLOW_DISABLE_AI_MODE")
         .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -2043,9 +2043,6 @@ fn ai_mode_disabled() -> bool {
 /// this process must run with `QSG_RENDER_LOOP=basic`.
 #[no_mangle]
 pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut PanelHandle {
-    if ai_mode_disabled() {
-        return std::ptr::null_mut();
-    }
     panel_rust_create_with_initial_identity(width, height, None)
 }
 
@@ -2359,11 +2356,9 @@ fn panel_rust_create_with_initial_identity(
             .take(initial_specs.len())
             .collect();
         // The bridge owns the panel-level ACPX server connection as well as
-        // per-thread sessions. Construct it even before a project is open or
-        // a chat thread exists, so Settings > Agents/MCP can discover the
-        // live gateway on the empty-project screen. Project identity remains
-        // optional input to the constructor; it only controls persistence
-        // scope and session cwd.
+        // per-thread sessions. It is intentionally absent in AI-disabled
+        // mode: the panel shell still exists for snapshotd registration and
+        // heartbeat, but no ACPX gateway/server is provisioned.
         let initial_cwd = initial_identity.as_ref().and_then(|identity| {
             crate::project_store::project_store_dir(identity, &resolve_cache_dir())
         });
@@ -2373,7 +2368,9 @@ fn panel_rust_create_with_initial_identity(
             let paths = settings_file::SettingsPaths::from_env();
             crate::agent_bridge::set_snapflow_mcp_enabled_flag(paths.snapflow_mcp_enabled());
         }
-        let (bridge, bridge_available) =
+        let (bridge, bridge_available) = if ai_mode_disabled() {
+            (None, false)
+        } else {
             match AgentBridge::new_with_thread_specs_and_initial_identity_and_panel_state(
                 &initial_specs,
                 initial_cwd,
@@ -2393,7 +2390,8 @@ fn panel_rust_create_with_initial_identity(
                     startup_warnings.push(message);
                     (None, false)
                 }
-            };
+            }
+        };
         if let Some(bridge) = bridge.as_ref() {
             if let Some(store) = panel_state.as_ref() {
                 for (index, record) in restored_records.iter().enumerate() {
@@ -3670,9 +3668,6 @@ pub extern "C" fn panel_rust_create_with_identity(
     path_len: usize,
     untitled: bool,
 ) -> *mut PanelHandle {
-    if ai_mode_disabled() {
-        return std::ptr::null_mut();
-    }
     let identity = if untitled {
         Some(model::ProjectIdentity::Untitled(
             uuid::Uuid::new_v4().to_string(),
