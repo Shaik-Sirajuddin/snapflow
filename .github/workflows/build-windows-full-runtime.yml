@@ -121,8 +121,7 @@ jobs:
           export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$GO_BIN:$PATH"
           cargo build --manifest-path multi-media-main/acpx/Cargo.toml \
             -p acpx-server --release --target x86_64-pc-windows-gnu
-          go build -o multi-media-main/snapshotd/snapflowd.exe \
-            ./multi-media-main/snapshotd/cmd/snapshotd
+          (cd multi-media-main/snapshotd && go build -o snapflowd.exe ./cmd/snapshotd)
 
       - name: Assemble complete app-local media runtime
         run: |
