@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestOpen_NoBackupOnFreshInstall(t *testing.T) {
@@ -104,5 +105,45 @@ func TestAuditOnce_InitKindIdempotent(t *testing.T) {
 	}
 	if len(events2) != 1 || events2[0].Kind != AuditInit {
 		t.Fatalf("expected one init for proj-2, got %+v", events2)
+	}
+}
+
+func TestEnsureProjectForPath_RefreshesSelectedMltFilename(t *testing.T) {
+	reg := openTestRegistry(t)
+	root := t.TempDir()
+	first, err := reg.EnsureProjectForPath(filepath.Join(root, "d.mlt"))
+	if err != nil {
+		t.Fatalf("first path: %v", err)
+	}
+	second, err := reg.EnsureProjectForPath(filepath.Join(root, "ds.mlt"))
+	if err != nil {
+		t.Fatalf("second path: %v", err)
+	}
+	if first.ID != second.ID || second.MltFileName != "ds.mlt" {
+		t.Fatalf("same folder should retain id and refresh filename: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestListProjects_ExternalActiveOwnerSetsStatusFlags(t *testing.T) {
+	reg := openTestRegistry(t)
+	root := t.TempDir()
+	project, err := reg.EnsureProjectForPath(filepath.Join(root, "ds.mlt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	instance := &ExternalInstance{ID: "external-1", InstanceNonce: "nonce-1", PID: 1, ProcessStart: "start-1", ProjectPath: filepath.Join(root, "ds.mlt"), Status: ExternalStatusOpen, LastSeenAt: now, LeaseExpiresAt: now.Add(time.Minute)}
+	if err := reg.SaveExternalInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.SaveProjectActiveOwner(&ProjectActiveOwner{ProjectID: project.ID, Owner: OwnershipExternal, InstanceID: instance.ID, InstanceNonce: instance.InstanceNonce, PID: instance.PID, ProcessStart: instance.ProcessStart, LeaseExpiresAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := reg.ListProjects()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || !projects[0].Active || !projects[0].IsOpen || !projects[0].Open {
+		t.Fatalf("expected external owner to set active/open flags: %+v", projects)
 	}
 }

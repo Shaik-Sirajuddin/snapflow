@@ -119,6 +119,7 @@ type ExternalInstanceResult struct {
 	Instance       registry.ExternalInstance `json:"instance"`
 	HeartbeatEvery time.Duration             `json:"heartbeatEvery"`
 	LeaseDuration  time.Duration             `json:"leaseDuration"`
+	Pending        bool                      `json:"pending,omitempty"`
 }
 
 type discardSink struct{}
@@ -141,25 +142,18 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 		}
 	}
 	projectPath := ""
+	projectID := ""
 	if p.ProjectPath != "" {
 		abs, err := canonicalExternalPath(p.ProjectPath)
 		if err != nil {
 			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: projectPath: %w", err)
 		}
 		projectPath = abs
-		if _, err := d.Reg.EnsureProjectForPath(projectPath); err != nil {
+		project, err := d.Reg.EnsureProjectForPath(projectPath)
+		if err != nil {
 			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: project: %w", err)
 		}
-		// A GUI may register its process identity before its SAP endpoint is
-		// listening. In that startup window keep the registration advisory and
-		// let the later project-open/update path perform the handoff; attempting
-		// a save through a socket that is not live would incorrectly reject GUI
-		// startup. Once the endpoint is responsive, drain the daemon owner now.
-		if p.SAPSocketPath != "" && health.SocketResponsive(p.SAPSocketPath, time.Second) {
-			if err := d.handoffDaemonProjectToGUI(ctx, projectPath); err != nil {
-				return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: GUI handoff: %w", err)
-			}
-		}
+		projectID = project.ID
 	}
 	now := time.Now().UTC()
 	instance, err := d.Reg.GetExternalInstanceByNonce(p.InstanceNonce)
@@ -190,7 +184,28 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	if err := d.Reg.SaveExternalInstance(instance); err != nil {
 		return ExternalInstanceResult{}, err
 	}
-	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease}, nil
+	// External GUI registration participates in the same durable ownership
+	// arbitration as daemon-managed children. This must happen after the lease
+	// row exists so reconciliation can validate a pending candidate, and before
+	// any GUI handoff or MCP routing can treat the GUI as authoritative.
+	pendingRegistration := false
+	if projectID != "" {
+		pendingRegistration, err = d.claimProjectOwner(InstanceProjectChangedParams{
+			Owner: registry.OwnershipExternal, InstanceID: instance.ID,
+			InstanceNonce: instance.InstanceNonce, PID: instance.PID,
+			ProcessStart: instance.ProcessStart, ProjectPath: projectPath,
+			Reason: "registered", Generation: instance.Generation,
+		}, projectID)
+		if err != nil {
+			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: ownership: %w", err)
+		}
+		if !pendingRegistration && p.SAPSocketPath != "" && health.SocketResponsive(p.SAPSocketPath, time.Second) {
+			if err := d.handoffDaemonProjectToGUI(ctx, projectPath); err != nil {
+				return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: GUI handoff: %w", err)
+			}
+		}
+	}
+	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease, Pending: pendingRegistration}, nil
 }
 
 // validateExternalSAPEndpoint prevents the discovery/control endpoint from
@@ -466,10 +481,26 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 		if err != nil {
 			return registry.ExternalInstance{}, err
 		}
-		instance.ProjectPath = path
-		if _, err := d.Reg.EnsureProjectForPath(path); err != nil {
+		project, err := d.Reg.EnsureProjectForPath(path)
+		if err != nil {
 			return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: project: %w", err)
 		}
+		pending, _, err := d.Reg.ClaimProjectOwner(registry.PendingProjectCandidate{
+			ProjectID: project.ID, Owner: registry.OwnershipExternal,
+			InstanceID: instance.ID, InstanceNonce: instance.InstanceNonce,
+			PID: instance.PID, ProcessStart: instance.ProcessStart,
+			ProjectPath: path, Generation: p.Generation,
+			Status: registry.PendingStatus, LastSeenAt: time.Now().UTC(),
+			LeaseExpiresAt: time.Now().UTC().Add(externalInstanceLease),
+			CreatedAt:      time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		}, time.Now().UTC())
+		if err != nil {
+			return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: ownership: %w", err)
+		}
+		if pending {
+			return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: project ownership pending")
+		}
+		instance.ProjectPath = path
 		if instance.SAPSocketPath != "" && health.SocketResponsive(instance.SAPSocketPath, time.Second) {
 			handoffStarted := time.Now()
 			d.projectSwitchDebug("GUI handoff begin", "instance", projectSwitchIDHint(p.InstanceID))
@@ -532,6 +563,11 @@ func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID stri
 	// mutating the now-unregistered GUI/in-memory instance.
 	d.invalidateProjectForPath(instance.ProjectPath)
 	_ = d.Reg.ReleaseProjectOwnership(registry.OwnershipExternal, instance.ID, instance.InstanceNonce, instance.ProcessStart, "")
+	// A close can free a project for a pending GUI immediately; do not wait for
+	// the periodic reconciliation tick before promoting the newest live owner.
+	if err := d.ReconcileProjectOwnerships(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -602,6 +638,8 @@ func (d *Daemon) ReconcileExternalInstances(ctx context.Context) ([]registry.Ext
 			if err := d.Reg.SaveExternalInstance(&instances[i]); err != nil {
 				return nil, err
 			}
+			d.invalidateProjectForPath(instances[i].ProjectPath)
+			_ = d.Reg.ReleaseProjectOwnership(registry.OwnershipExternal, instances[i].ID, instances[i].InstanceNonce, instances[i].ProcessStart, "")
 		}
 	}
 	contexts, err := d.Reg.ListMcpContexts()
@@ -629,18 +667,23 @@ func (d *Daemon) ReconcileProjectOwnerships(ctx context.Context) error {
 	now := time.Now().UTC()
 	for _, project := range projects {
 		active, err := d.Reg.GetProjectActiveOwner(project.ID)
-		if errors.Is(err, registry.ErrNotFound) {
-			continue
-		}
-		if err != nil {
+		if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return err
 		}
-		if d.projectOwnerLive(active, now) {
+		if active != nil && d.projectOwnerLive(active, now) {
 			continue
 		}
 		candidates, err := d.Reg.ListPendingProjectCandidates(project.ID)
 		if err != nil {
 			return err
+		}
+		// Remove the invalid routing marker before attempting promotion. The
+		// promotion path itself uses ClaimProjectOwner, which must see the
+		// project as unowned; lifecycle rows are retained for audit/retry.
+		if active != nil {
+			if err := d.Reg.ReleaseProjectOwnership(active.Owner, active.InstanceID, active.InstanceNonce, active.ProcessStart, ""); err != nil {
+				return err
+			}
 		}
 		for i := range candidates {
 			candidate := &candidates[i]
@@ -1128,8 +1171,20 @@ func (d *Daemon) ProjectList(ctx context.Context, p ProjectListParams) ([]regist
 		return projects, nil
 	}
 	for i := range projects {
-		projects[i].Active = false
-		projects[i].IsOpen = false
+		// Registry.ListProjects already accounts for a live external owner;
+		// refresh only replaces managed status after probing its process/socket.
+		externalActive := false
+		externalOpen := false
+		if owner, ownerErr := d.Reg.GetProjectActiveOwner(projects[i].ID); ownerErr == nil && owner.Owner == registry.OwnershipExternal {
+			if instance, instanceErr := d.Reg.GetExternalInstance(owner.InstanceID); instanceErr == nil &&
+				instance.Status == registry.ExternalStatusOpen && instance.InstanceNonce == owner.InstanceNonce &&
+				instance.PID == owner.PID && instance.ProcessStart == owner.ProcessStart &&
+				instance.LeaseExpiresAt.After(time.Now().UTC()) && health.ProcessIdentityMatches(instance.PID, instance.ProcessStart) {
+				externalActive, externalOpen = true, true
+			}
+		}
+		projects[i].Active = externalActive
+		projects[i].IsOpen = externalOpen
 		instances, err := d.Reg.ListProcessInstancesByProject(projects[i].ID)
 		if err != nil {
 			return nil, err

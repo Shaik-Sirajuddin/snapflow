@@ -40,6 +40,17 @@ fn project_switch_debug(message: impl std::fmt::Display) {
     }
 }
 
+// Ownership conflicts are returned by snapshotd as a successful JSON result
+// with `pending: true`, not as a transport failure. Treat that response like a
+// failed lifecycle delivery so both managed and external workers retry the
+// latest queued path until reconciliation promotes them.
+fn lifecycle_update_failed(result: Result<Value, SnapshotdClientError>) -> bool {
+    match result {
+        Ok(value) => value.get("pending").and_then(Value::as_bool).unwrap_or(false),
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SnapshotdClientError {
     #[error("snapshotd control socket is unavailable: {0}")]
@@ -674,7 +685,7 @@ impl SnapshotdRegistration {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
                         if managed {
-                            managed_pending = runtime
+                            managed_pending = lifecycle_update_failed(runtime
                                 .block_on(client.instance_project_changed(
                                     "managed",
                                     id,
@@ -682,8 +693,7 @@ impl SnapshotdRegistration {
                                     current_project_path.as_deref(),
                                     &current_reason,
                                     current_generation,
-                                ))
-                                .is_err();
+                                )));
                         }
                     }
                     loop {
@@ -726,7 +736,7 @@ impl SnapshotdRegistration {
                                 }
                                 if let Some(id) = current_id.as_deref() {
                                     if managed {
-                                        managed_pending = runtime
+                                        managed_pending = lifecycle_update_failed(runtime
                                             .block_on(client.instance_project_changed(
                                                 "managed",
                                                 id,
@@ -734,17 +744,15 @@ impl SnapshotdRegistration {
                                                 current_project_path.as_deref(),
                                                 &current_reason,
                                                 current_generation,
-                                            ))
-                                            .is_err();
+                                            )));
                                     } else {
-                                        pending_update = runtime
+                                        pending_update = lifecycle_update_failed(runtime
                                             .block_on(client.update_open_project(
                                                 id,
                                                 current_project_path.as_deref(),
                                                 &current_reason,
                                                 current_generation,
-                                            ))
-                                            .is_err();
+                                            )));
                                     }
                                 }
                             }
@@ -761,7 +769,7 @@ impl SnapshotdRegistration {
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 if let Some(id) = current_id.as_deref() {
                                     if managed && managed_pending {
-                                        managed_pending = runtime
+                                        managed_pending = lifecycle_update_failed(runtime
                                             .block_on(client.instance_project_changed(
                                                 "managed",
                                                 id,
@@ -769,18 +777,16 @@ impl SnapshotdRegistration {
                                                 current_project_path.as_deref(),
                                                 &current_reason,
                                                 current_generation,
-                                            ))
-                                            .is_err();
+                                            )));
                                     }
                                     if !managed && pending_update {
-                                        pending_update = runtime
+                                        pending_update = lifecycle_update_failed(runtime
                                             .block_on(client.update_open_project(
                                                 id,
                                                 current_project_path.as_deref(),
                                                 &current_reason,
                                                 current_generation,
-                                            ))
-                                            .is_err();
+                                            )));
                                     }
                                     if last_heartbeat.elapsed() < Duration::from_secs(10) {
                                         continue;
@@ -802,7 +808,7 @@ impl SnapshotdRegistration {
                                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                                 Some(id.clone());
                                             if managed {
-                                                managed_pending = runtime
+                                                managed_pending = lifecycle_update_failed(runtime
                                                     .block_on(client.instance_project_changed(
                                                         "managed",
                                                         id,
@@ -810,17 +816,15 @@ impl SnapshotdRegistration {
                                                         current_project_path.as_deref(),
                                                         &current_reason,
                                                         current_generation,
-                                                    ))
-                                                    .is_err();
+                                                    )));
                                             } else {
-                                                pending_update = runtime
+                                                pending_update = lifecycle_update_failed(runtime
                                                     .block_on(client.update_open_project(
                                                         id,
                                                         current_project_path.as_deref(),
                                                         &current_reason,
                                                         current_generation,
-                                                    ))
-                                                    .is_err();
+                                                    )));
                                             }
                                         }
                                     }
@@ -839,7 +843,7 @@ impl SnapshotdRegistration {
                                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                             Some(id.clone());
                                         if managed {
-                                            managed_pending = runtime
+                                            managed_pending = lifecycle_update_failed(runtime
                                                 .block_on(client.instance_project_changed(
                                                     "managed",
                                                     id,
@@ -847,17 +851,15 @@ impl SnapshotdRegistration {
                                                     current_project_path.as_deref(),
                                                     &current_reason,
                                                     current_generation,
-                                                ))
-                                                .is_err();
+                                                )));
                                         } else {
-                                            pending_update = runtime
+                                            pending_update = lifecycle_update_failed(runtime
                                                 .block_on(client.update_open_project(
                                                     id,
                                                     current_project_path.as_deref(),
                                                     &current_reason,
                                                     current_generation,
-                                                ))
-                                                .is_err();
+                                                )));
                                         }
                                     }
                                 }
@@ -953,9 +955,15 @@ async fn register_and_extract_id(
 ) -> Option<String> {
     let mut last_error = None;
     for attempt in 0..10 {
-        match client.register_external_instance(registration).await {
-            Ok(value) => {
-                return value
+		match client.register_external_instance(registration).await {
+			Ok(value) => {
+				if value.get("pending").and_then(Value::as_bool).unwrap_or(false) {
+					// The instance row is valid, but ownership is queued behind a
+					// live owner. Returning None makes the worker retry the latest
+					// registration on its normal wake/heartbeat loop.
+					return None;
+				}
+				return value
                     .get("instance")?
                     .get("instanceId")?
                     .as_str()
@@ -1469,6 +1477,13 @@ mod tests {
     #[test]
     fn lifecycle_epoch_keeps_recreated_panel_newer_than_old_events() {
         assert!(scoped_generation(2, 1) > scoped_generation(1, u64::MAX));
+    }
+
+    #[test]
+    fn pending_lifecycle_response_is_retried_like_transport_failure() {
+        assert!(lifecycle_update_failed(Ok(json!({"pending": true}))));
+        assert!(!lifecycle_update_failed(Ok(json!({"pending": false}))));
+        assert!(lifecycle_update_failed(Err(SnapshotdClientError::Timeout)));
     }
 
     #[test]
