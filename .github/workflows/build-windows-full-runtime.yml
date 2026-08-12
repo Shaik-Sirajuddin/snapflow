@@ -30,6 +30,10 @@ jobs:
           ref: master
           path: shotcut-rebrand
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: multi-media-main/snapshotd/go.mod
+
       - name: Provide sibling Rust workspaces to CMake
         shell: bash
         run: |
@@ -100,6 +104,16 @@ jobs:
           cmake --build shotcut-rebrand/build --parallel
           cmake --install shotcut-rebrand/build
 
+      - name: Build daemon and ACP runtime binaries
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          cargo build --manifest-path multi-media-main/acpx/Cargo.toml \
+            -p acpx-server --release --target x86_64-pc-windows-gnu
+          go build -o multi-media-main/snapshotd/snapflowd.exe \
+            ./multi-media-main/snapshotd/cmd/snapshotd
+
       - name: Assemble complete app-local media runtime
         run: |
           set -euo pipefail
@@ -107,6 +121,9 @@ jobs:
           QTDIR="$(pkg-config --variable=prefix Qt6Core)"
           QT_SHARE_DIR="$QTDIR/share/qt6"
           test -f "$APPDIR/snapflow.exe"
+          mkdir -p "$APPDIR/bin"
+          cp -p multi-media-main/snapshotd/snapflowd.exe "$APPDIR/bin/snapflowd.exe"
+          cp -p multi-media-main/acpx/target/x86_64-pc-windows-gnu/release/acpx-server.exe "$APPDIR/acpx-server.exe"
 
           # Copy the actual MSYS2-built tools.  Do not substitute a Shotcut
           # download: melt, libmlt, modules, and FFmpeg must be one package
@@ -203,6 +220,8 @@ jobs:
             echo "ffprobe=$($APPDIR/ffprobe.exe -version 2>&1 | head -1)"
             echo "mlt_module_count=$(find "$APPDIR/lib/mlt" -type f -name '*.dll' | wc -l)"
             echo "profile_count=$(find "$APPDIR/share/mlt/profiles" -type f | wc -l)"
+            echo "snapflowd_present=$(test -f "$APPDIR/bin/snapflowd.exe" && echo true || echo false)"
+            echo "acpx_server_present=$(test -f "$APPDIR/acpx-server.exe" && echo true || echo false)"
             echo "frei0r_present=$(test -d "$APPDIR/lib/frei0r-1" && echo true || echo false)"
             echo "ladspa_present=$(test -d "$APPDIR/lib/ladspa" && echo true || echo false)"
             echo "movit_present=$(test -d "$APPDIR/share/movit" && echo true || echo false)"
@@ -217,6 +236,8 @@ jobs:
           test -s "$APPDIR/melt.exe"
           test -s "$APPDIR/ffmpeg.exe"
           test -s "$APPDIR/ffprobe.exe"
+          test -s "$APPDIR/bin/snapflowd.exe"
+          test -s "$APPDIR/acpx-server.exe"
           test -f "$APPDIR/lib/mlt/libmltxml.dll"
           test -f "$APPDIR/lib/mlt/libmltavformat.dll"
           test -s "$APPDIR/share/mlt/profiles/atsc_1080p_30"
