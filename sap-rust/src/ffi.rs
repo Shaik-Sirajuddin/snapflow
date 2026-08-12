@@ -537,12 +537,9 @@ extern "C" {
     pub fn sap_save_project(main_window_handle: *mut c_void) -> c_int;
 
     /// C++ side: `int sap_set_project_file(void* mainWindowHandle, const
-    /// char* filename);` -- binds this session's "current file" (what
-    /// `sap_save_project` saves to) to `filename` without opening/loading
-    /// anything from disk. Called once at `FfiBackend::new()` time with
-    /// `<projectRoot>/<mltFileName>` so `project.save` persists to the
-    /// real project folder. Returns 0 on success, -1 if the handle or
-    /// filename is invalid.
+    /// char* filename);` -- binds a new project's current file, or loads
+    /// and validates an existing project at `filename`. Returns 0 on
+    /// success, -1 on an invalid path or failed load.
     pub fn sap_set_project_file(main_window_handle: *mut c_void, filename: *const c_char) -> c_int;
 
     /// C++ side: `int sap_open_project(void* mainWindowHandle, const char*
