@@ -269,6 +269,7 @@ jobs:
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
             mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf \
             mingw-w64-x86_64-mlt mingw-w64-x86_64-frei0r-plugins \
+            mingw-w64-x86_64-ffmpeg \
             mingw-w64-x86_64-fftw \
             mingw-w64-x86_64-libsamplerate mingw-w64-x86_64-rubberband \
             mingw-w64-x86_64-rnnoise mingw-w64-x86_64-libebur128 \
@@ -367,16 +368,19 @@ jobs:
           }
           bundle_dlls "$APPDIR/snapflow.exe"
 
-          # `melt.exe` is a separately invoked export CLI, not a DLL linked by
-          # snapflow.exe. Bundle it explicitly and walk its own dependency
-          # closure; otherwise the editor can open projects but every export
-          # falls back to PATH and fails on an installed machine.
-          test -f /mingw64/bin/melt.exe || {
-            echo "MSYS2 MLT package did not provide /mingw64/bin/melt.exe" >&2
-            exit 1
-          }
-          cp -p /mingw64/bin/melt.exe "$APPDIR/melt.exe"
-          bundle_dlls "$APPDIR/melt.exe"
+          # These are separately invoked CLI tools, not DLLs linked by
+          # snapflow.exe. Bundle all three from this same MSYS2 environment
+          # and walk each tool's dependency closure. In particular, the
+          # Shotcut C++ jobs resolve ffmpeg/ffprobe beside the GUI executable;
+          # relying on PATH would make export behavior depend on the host.
+          for tool in melt.exe ffmpeg.exe ffprobe.exe; do
+            test -f "/mingw64/bin/$tool" || {
+              echo "MSYS2 runtime packages did not provide /mingw64/bin/$tool" >&2
+              exit 1
+            }
+            cp -p "/mingw64/bin/$tool" "$APPDIR/$tool"
+            bundle_dlls "$APPDIR/$tool"
+          done
 
           # Keep the Windows package layout used by v0.1.45 and by the
           # upstream Windows resolver: the MLT repository is a sibling of
@@ -485,6 +489,12 @@ jobs:
             echo "final Windows bundle is missing the melt export CLI" >&2
             exit 1
           }
+          for tool in ffmpeg.exe ffprobe.exe; do
+            test -f "$OUT/Snapflow/$tool" || {
+              echo "final Windows bundle is missing required media CLI: $tool" >&2
+              exit 1
+            }
+          done
           # snapshotd launch --gui must have the real production
           # FfiBackend-linked child in the shipped bundle. The Windows
           # installer persists this executable as SNAPSHOT_BIN_PATH.
