@@ -136,6 +136,19 @@ jobs:
           cp -p "$RUNTIME_ROOT/bin/ffmpeg.exe" "$APPDIR/ffmpeg.exe"
           cp -p "$RUNTIME_ROOT/bin/ffprobe.exe" "$APPDIR/ffprobe.exe"
 
+          # Match upstream deploy(): the Qt runtime DLLs are placed beside
+          # the GUI executable before dependency closure is walked.
+          for qt_dll in \
+            Qt6Charts Qt6Concurrent Qt6Core Qt6Gui Qt6Multimedia \
+            Qt6MultimediaQuick Qt6Network Qt6OpenGL Qt6OpenGLWidgets \
+            Qt6Qml Qt6QmlMeta Qt6QmlModels Qt6QmlWorkerScript Qt6Quick \
+            Qt6QuickControls2 Qt6QuickDialogs2 Qt6QuickDialogs2QuickImpl \
+            Qt6QuickDialogs2Utils Qt6QuickLayouts Qt6QuickShapes \
+            Qt6QuickTemplates2 Qt6QuickWidgets Qt6Sql Qt6Svg \
+            Qt6SvgWidgets Qt6UiTools Qt6WebSockets Qt6Widgets Qt6Xml; do
+            [ -f "$QTDIR/bin/${qt_dll}.dll" ] && cp -p "$QTDIR/bin/${qt_dll}.dll" "$APPDIR/"
+          done
+
           bundle_dlls() {
             local target="$1" lib base
             for lib in $(ldd "$target" | awk '($3 ~ /\/mingw64\/bin\//) {print $3}'); do
@@ -153,6 +166,11 @@ jobs:
           bundle_dlls "$APPDIR/melt.exe"
           bundle_dlls "$APPDIR/ffmpeg.exe"
           bundle_dlls "$APPDIR/ffprobe.exe"
+          # The daemon and ACP server are shipped in the same app-local
+          # prefix; bundle their MinGW closure just like upstream's
+          # find(... '*.exe') deploy pass does for every executable.
+          bundle_dlls "$APPDIR/bin/snapflowd.exe"
+          bundle_dlls "$APPDIR/acpx-server.exe"
 
           # Preserve the layout installed by the exact MSYS2 MLT package.
           # These are the paths MLT's Windows relocatable build expects.
