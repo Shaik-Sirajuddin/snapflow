@@ -2027,11 +2027,25 @@ pub struct PanelHandle {
 
 static SENTINEL: PanelHandle = PanelHandle { _private: () };
 
+/// The native Qt host owns the rollout switch, but panel creation is the
+/// actual side-effect boundary: creating the panel can provision/connect an
+/// ACPX gateway and restore provider metadata. Keep this guard here as well
+/// so a hidden dock, a stale saved layout, or another C ABI caller cannot
+/// start AI infrastructure while the feature is disabled.
+fn ai_mode_disabled() -> bool {
+    std::env::var("SNAPFLOW_DISABLE_AI_MODE")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Create (or resize, if already created) the process's single panel
 /// instance. See module docs: must only be called from one OS thread, and
 /// this process must run with `QSG_RENDER_LOOP=basic`.
 #[no_mangle]
 pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut PanelHandle {
+    if ai_mode_disabled() {
+        return std::ptr::null_mut();
+    }
     panel_rust_create_with_initial_identity(width, height, None)
 }
 
@@ -3656,6 +3670,9 @@ pub extern "C" fn panel_rust_create_with_identity(
     path_len: usize,
     untitled: bool,
 ) -> *mut PanelHandle {
+    if ai_mode_disabled() {
+        return std::ptr::null_mut();
+    }
     let identity = if untitled {
         Some(model::ProjectIdentity::Untitled(
             uuid::Uuid::new_v4().to_string(),

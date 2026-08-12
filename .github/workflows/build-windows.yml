@@ -177,7 +177,7 @@ jobs:
           # Keep the GUI source aligned with the Shotcut fork master that
           # contains the fail-closed project-open/save fixes and root-level
           # MLT resolver contract used by this main branch.
-          ref: c33b9cca6ee89498006981e5b85883f176e6b64b
+          ref: e9e5818
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
