@@ -170,17 +170,10 @@ func (r *Registry) ClaimProjectOwner(candidate PendingProjectCandidate, now time
 			return tx.Save(&active).Error
 		}
 		pending = true
-		// A switch away from another project relinquishes this identity's old
-		// active marker even when the requested project is currently owned by a
-		// different identity. Keep the new request pending, but never leave the
-		// instance active for two projects at once.
-		q := tx.Where("owner = ? AND instance_id = ? AND process_start = ? AND project_id <> ?", candidate.Owner, candidate.InstanceID, candidate.ProcessStart, candidate.ProjectID)
-		if candidate.InstanceNonce != "" {
-			q = q.Where("instance_nonce = ?", candidate.InstanceNonce)
-		}
-		if err := q.Delete(&ProjectActiveOwner{}).Error; err != nil {
-			return err
-		}
+		// Keep this identity's old active marker while the requested project is
+		// owned by another live instance. Reconciliation will release it only
+		// after the pending candidate can be promoted, preventing a switch from
+		// silently losing the GUI's current routing owner.
 		pq := tx.Model(&PendingProjectCandidate{}).Where("owner = ? AND instance_id = ? AND process_start = ? AND project_id <> ? AND status = ?", candidate.Owner, candidate.InstanceID, candidate.ProcessStart, candidate.ProjectID, PendingStatus)
 		if candidate.InstanceNonce != "" {
 			pq = pq.Where("instance_nonce = ?", candidate.InstanceNonce)
@@ -378,12 +371,23 @@ func (r *Registry) EnsureProjectForPath(projectPath string) (*Project, error) {
 	}
 	root := filepath.Dir(abs)
 	fileName := filepath.Base(abs)
-	if filepath.Ext(abs) == "" {
+	explicitFile := filepath.Ext(abs) != ""
+	if !explicitFile {
 		root = abs
 		fileName = DefaultMltFileName
 	}
 	var existing Project
 	if err := r.db.Where("root_dir = ?", root).First(&existing).Error; err == nil {
+		// A different concrete .mlt in the same folder is a selected-file
+		// transition, not a new project. Keep the stable folder/project ID while
+		// refreshing the filename exposed to MCP and lifecycle registration.
+		if explicitFile && fileName != existing.MltFileName {
+			if err := r.db.Model(&Project{}).Where("id = ?", existing.ID).
+				Update("mlt_file_name", fileName).Error; err != nil {
+				return nil, err
+			}
+			existing.MltFileName = fileName
+		}
 		return &existing, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
@@ -420,6 +424,7 @@ func (r *Registry) ListProjects() ([]Project, error) {
 	}
 	for i := range out {
 		projectRoot := filepath.Clean(out[i].RootDir)
+		activeOwner, _ := r.GetProjectActiveOwner(out[i].ID)
 		for _, instance := range instances {
 			if instance.ProjectPath == "" {
 				continue
@@ -436,6 +441,11 @@ func (r *Registry) ListProjects() ([]Project, error) {
 			out[i].InstanceCount++
 			if instance.Status == ExternalStatusOpen && instance.LeaseExpiresAt.After(time.Now().UTC()) {
 				out[i].Open = true
+				if activeOwner != nil && activeOwner.Owner == OwnershipExternal && activeOwner.InstanceID == instance.ID &&
+					activeOwner.InstanceNonce == instance.InstanceNonce && activeOwner.PID == instance.PID && activeOwner.ProcessStart == instance.ProcessStart {
+					out[i].Active = true
+					out[i].IsOpen = true
+				}
 				out[i].DiscoveryState = "registered"
 			}
 			if instance.LastSeenAt.After(out[i].LastSeenAt) {

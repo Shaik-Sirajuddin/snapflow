@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "plan": "unified-project-ownership",
+  "status": "in_progress",
+  "updated": "2026-08-12 implementation complete",
+  "plan_doc": "00-plan.md",
+  "source_task": "Unify external and daemon-managed project registration, `.mlt` propagation, retry, ownership, and MCP status.",
+  "ordering_rationale": "Stabilize registry identity first, then claim external ownership, then verify retry/reconciliation and runtime behavior.",
+  "completed": [
+    {"phase":"registry_identity","order":1,"tier":1,"status":"completed","description":"Persist observed `.mlt` filename and expose live external owners as active/open.","implementation_evidence":"EnsureProjectForPath refreshes mltFileName; ListProjects validates the active external owner marker when setting active/isOpen.","verified":[{"description":"Registry tests for same-root filename refresh and external active flags pass.","verdict":"PASS"}]},
+    {"phase":"external_claim_lifecycle","order":2,"tier":2,"status":"completed","description":"Use ClaimProjectOwner for external registration and switches with pending conflicts.","implementation_evidence":"External registration and UpdateOpenProject claim durable ownership; conflicting registrations remain pending.","verified":[{"description":"Daemon tests for external switch owner movement and conflicting registration retention pass.","verdict":"PASS"}]},
+    {"phase":"retry_cleanup_reconcile","order":3,"tier":3,"status":"completed","description":"Verify latest-path retry, close cleanup, stale-owner promotion, and managed parity.","implementation_evidence":"Close/stale cleanup releases markers and triggers reconciliation; Rust lifecycle worker retries pending JSON responses for both owner modes.","verified":[{"description":"Rust lifecycle tests and full snapshotd Go test suite pass.","verdict":"PASS"}]}
+  ],
+  "pending": [
+    {"phase":"review_gate","order":4,"tier":"review_gate","status":"completed","description":"Review daemon/registry lifecycle changes twice.","max_iterations":2,"verified":[{"description":"Review pass 1 identified and corrected pending old-owner loss, refresh external-status regression, and first-registration retry gap.","verdict":"FIXED"},{"description":"Review pass 2 confirmed marker retention, live external refresh validation, pending registration retry, and managed/external parity.","verdict":"PASS"}]},
+    {"phase":"verification_gate","order":5,"tier":"verification_gate","status":"completed","description":"Verify implementation against the plan and matrix.","misalignments":[],"verified":[{"description":"Full snapshotd Go suite, registry/daemon focused tests, panel snapshotd-client tests, and diff checks pass.","verdict":"PASS"}]},
+    {"phase":"loop_gate","order":6,"tier":"loop_gate","status":"completed","description":"Resolve verification misalignments until the gate is empty.","completion_rule":"Closed: verification_gate misalignments is empty."},
+    {"phase":"runtime_gate","order":7,"tier":"runtime_gate","status":"not_started","description":"Verify Nitro close/reopen and MCP path/status parity.","matrix_ref":"00-plan.md#verification-matrix","matrix_rows":[]}
+  ]
+}

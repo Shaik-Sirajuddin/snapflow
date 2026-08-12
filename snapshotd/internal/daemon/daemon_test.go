@@ -180,6 +180,22 @@ func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
 	if err != nil || updated.ProjectPath != filepath.Join(projectB.RootDir, projectB.MltFileName) {
 		t.Fatalf("update project: %+v err=%v", updated, err)
 	}
+	projectOwner, err := d.Reg.GetProjectActiveOwner(projectB.ID)
+	if err != nil || projectOwner.Owner != registry.OwnershipExternal || projectOwner.InstanceID != first.Instance.ID {
+		t.Fatalf("external switch must claim project B owner: %+v err=%v", projectOwner, err)
+	}
+	if _, err := d.Reg.GetProjectActiveOwner(projectA.ID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("external switch must release project A owner, err=%v", err)
+	}
+	listed, err := d.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, project := range listed {
+		if project.ID == projectB.ID && (!project.Active || !project.IsOpen || !project.Open) {
+			t.Fatalf("MCP project status must reflect external owner: %+v", project)
+		}
+	}
 	if _, err := d.HeartbeatExternalInstance(ctx, first.Instance.ID); err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
@@ -249,6 +265,44 @@ func TestDaemon_ListIncludesExternalProjectIDAndActiveFilter(t *testing.T) {
 	}
 }
 
+func TestDaemon_ExternalConflictIsRetainedPending(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "shared-project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project.RootDir, project.MltFileName)
+	start := mustProcessStart(t)
+	first, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "owner-a", PID: os.Getpid(), ProcessStart: start, ProjectPath: path,
+	})
+	if err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	second, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "owner-b", PID: os.Getpid(), ProcessStart: start, ProjectPath: path,
+	})
+	if err != nil {
+		t.Fatalf("conflicting registration should retain live lease: %v", err)
+	}
+	owner, err := d.Reg.GetProjectActiveOwner(project.ID)
+	if err != nil || owner.InstanceID != first.Instance.ID {
+		t.Fatalf("first owner must remain active: %+v err=%v", owner, err)
+	}
+	pending, err := d.Reg.ListPendingProjectCandidates(project.ID)
+	if err != nil || len(pending) != 1 || pending[0].InstanceID != second.Instance.ID {
+		t.Fatalf("second owner must be retained pending: %+v err=%v", pending, err)
+	}
+	if err := d.UnregisterExternalInstance(ctx, first.Instance.ID); err != nil {
+		t.Fatalf("closing first owner: %v", err)
+	}
+	owner, err = d.Reg.GetProjectActiveOwner(project.ID)
+	if err != nil || owner.InstanceID != second.Instance.ID {
+		t.Fatalf("pending owner must be promoted after close: %+v err=%v", owner, err)
+	}
+}
+
 func TestDaemon_ResolveProjectInstanceUsesReadyExternalSAPSocket(t *testing.T) {
 	d := newTestDaemon(t, buildFixture(t))
 	ctx := context.Background()
@@ -278,6 +332,51 @@ func TestDaemon_ResolveProjectInstanceUsesReadyExternalSAPSocket(t *testing.T) {
 	}
 	if socket != external.Instance.SAPSocketPath || token != "" {
 		t.Fatalf("unexpected external resolution: socket=%q token=%q instance=%+v", socket, token, external.Instance)
+	}
+}
+
+func TestDaemon_ResolveProjectInstanceIgnoresPendingExternalOwner(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "pending-routing"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	start := mustProcessStart(t)
+	activeSocket := filepath.Join(t.TempDir(), "active.sap.sock")
+	activeListener, err := net.Listen("unix", activeSocket)
+	if err != nil {
+		t.Fatalf("listen active SAP fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = activeListener.Close(); _ = os.Remove(activeSocket) })
+	active, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "active-owner", PID: os.Getpid(), ProcessStart: start,
+		ProjectPath: filepath.Join(project.RootDir, project.MltFileName), SAPSocketPath: activeSocket,
+	})
+	if err != nil {
+		t.Fatalf("register active external instance: %v", err)
+	}
+	pendingSocket := filepath.Join(t.TempDir(), "pending.sap.sock")
+	pendingListener, err := net.Listen("unix", pendingSocket)
+	if err != nil {
+		t.Fatalf("listen pending SAP fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = pendingListener.Close(); _ = os.Remove(pendingSocket) })
+	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "pending-owner", PID: os.Getpid(), ProcessStart: start,
+		ProjectPath: filepath.Join(project.RootDir, project.MltFileName), SAPSocketPath: pendingSocket,
+	}); err != nil {
+		t.Fatalf("register pending external instance: %v", err)
+	}
+	socket, _, err := d.resolveProjectInstance(project.ID)
+	if err != nil {
+		t.Fatalf("resolve active project instance: %v", err)
+	}
+	if socket != activeSocket {
+		t.Fatalf("pending owner must not receive edits: resolved socket=%q want active=%q", socket, activeSocket)
+	}
+	if active.Instance.ID == "" {
+		t.Fatal("active registration did not return an instance id")
 	}
 }
 

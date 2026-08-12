@@ -145,7 +145,7 @@ func TestClaimProjectOwnerConcurrentFirstCallbacksKeepOneActive(t *testing.T) {
 	}
 }
 
-func TestClaimProjectOwnerConflictReleasesPriorProjectMarker(t *testing.T) {
+func TestClaimProjectOwnerConflictRetainsPriorProjectMarker(t *testing.T) {
 	r, err := Open(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -163,8 +163,8 @@ func TestClaimProjectOwnerConflictReleasesPriorProjectMarker(t *testing.T) {
 	if err != nil || !pending || active.InstanceID != "a" {
 		t.Fatalf("expected conflict pending under active owner a: pending=%v active=%+v err=%v", pending, active, err)
 	}
-	if _, err := r.GetProjectActiveOwner("old"); err != ErrNotFound {
-		t.Fatalf("prior project marker should be released: %v", err)
+	if owner, err := r.GetProjectActiveOwner("old"); err != nil || owner.InstanceID != "b" {
+		t.Fatalf("prior project marker must remain until pending promotion: owner=%+v err=%v", owner, err)
 	}
 	current, err := r.GetProjectActiveOwner("new")
 	if err != nil || current.InstanceID != "a" {
