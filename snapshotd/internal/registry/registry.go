@@ -384,6 +384,13 @@ func (r *Registry) EnsureProjectForPath(projectPath string) (*Project, error) {
 	}
 	var existing Project
 	if err := r.db.Where("root_dir = ?", root).First(&existing).Error; err == nil {
+		if explicitFile && fileName != existing.MltFileName {
+			if err := r.db.Model(&Project{}).Where("id = ?", existing.ID).
+				Update("mlt_file_name", fileName).Error; err != nil {
+				return nil, err
+			}
+			existing.MltFileName = fileName
+		}
 		return &existing, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
@@ -436,6 +443,8 @@ func (r *Registry) ListProjects() ([]Project, error) {
 			out[i].InstanceCount++
 			if instance.Status == ExternalStatusOpen && instance.LeaseExpiresAt.After(time.Now().UTC()) {
 				out[i].Open = true
+				out[i].Active = true
+				out[i].IsOpen = true
 				out[i].DiscoveryState = "registered"
 			}
 			if instance.LastSeenAt.After(out[i].LastSeenAt) {
