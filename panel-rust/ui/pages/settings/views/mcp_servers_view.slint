@@ -1,16 +1,17 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { CursorHost } from "../../../tokens/cursor_host.slint";
-import { Button } from "../../../base/button.slint";
-import { Toggle } from "../../../base/toggle.slint";
-import { TextField } from "../../../base/text_field.slint";
-import { SettingsRow } from "../../../base/settings_row.slint";
-import { SettingsSection, SettingsSectionHeader, SettingsRowGroup, SettingsField } from "../../../base/settings_section.slint";
+import { Button } from "../../../base/buttons/button.slint";
+import { Toggle } from "../../../base/form/toggle.slint";
+import { TextField } from "../../../base/form/text_field.slint";
+import { SettingsRow } from "../../../base/layout/settings_row.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsRowGroup, SettingsField } from "../../../base/layout/settings_section.slint";
 import { McpServerOption, McpToolOption, McpServerFormData } from "../../../types.slint";
-import { TextUtil } from "../../../base/text_util.slint";
-import { StatusDot } from "../../../base/status_dot.slint";
-import { Spinner } from "../../../base/spinner.slint";
-import { ThinScrollbar } from "../../../base/thin_scrollbar.slint";
+import { TextUtil } from "../../../base/text/text_util.slint";
+import { StatusDot } from "../../../base/feedback/status_dot.slint";
+import { Spinner } from "../../../base/feedback/spinner.slint";
+import { ThinScrollbar } from "../../../base/layout/thin_scrollbar.slint";
+import { Text } from "../../../base/text/base_text.slint";
 
 // Multi-line text box for the env-var/header editors below (`KEY=VALUE`/
 // `Header: value` one per line, parsed Rust-side -- see
@@ -53,7 +54,7 @@ component MultilineField inherits Rectangle {
         text: root.placeholder;
         color: Theme.text-muted;
         font-family: Theme.font-mono;
-        font-size: 10px * Theme.font-scale;
+        size: "sm";
         x: Metrics.pad-md;
         y: Metrics.pad-xs;
         width: parent.width - 2 * Metrics.pad-md;
@@ -256,7 +257,7 @@ export component McpServersView inherits Rectangle {
                     if server-block.status-line != "" : Text {
                         text: server-block.status-line;
                         color: Theme.text-muted;
-                        font-size: 9px * Theme.font-scale;
+                        size: "xs";
                         vertical-alignment: center;
                         max-width: 120px;
                         overflow: elide;
@@ -424,7 +425,7 @@ export component McpServersView inherits Rectangle {
                                 Text {
                                     text: "Fetching tools from server…";
                                     color: Theme.text-muted;
-                                    font-size: 9px * Theme.font-scale;
+                                    size: "xs";
                                     vertical-alignment: center;
                                 }
                             }
@@ -434,7 +435,7 @@ export component McpServersView inherits Rectangle {
                                     ? "No tools (fetch failed)."
                                     : "No tools discovered yet — click Fetch tools.";
                                 color: Theme.text-muted;
-                                font-size: 9px * Theme.font-scale;
+                                size: "xs";
                             }
 
                             for tool in server.tools : VerticalLayout {
@@ -455,7 +456,7 @@ export component McpServersView inherits Rectangle {
                                         text: tool.name;
                                         color: Theme.text-primary;
                                         font-family: Theme.font-mono;
-                                        font-size: 10px * Theme.font-scale;
+                                        size: "sm";
                                         vertical-alignment: center;
                                         overflow: elide;
                                         horizontal-stretch: 1;
@@ -465,7 +466,7 @@ export component McpServersView inherits Rectangle {
                                         text: tool.token-usage + " tok";
                                         color: Theme.text-muted;
                                         font-family: Theme.font-mono;
-                                        font-size: 9px * Theme.font-scale;
+                                        size: "xs";
                                         vertical-alignment: center;
                                         horizontal-stretch: 0;
                                     }
@@ -474,7 +475,7 @@ export component McpServersView inherits Rectangle {
                                 if tool.description != "" : Text {
                                     text: tool.description;
                                     color: Theme.text-muted;
-                                    font-size: 9px * Theme.font-scale;
+                                    size: "xs";
                                     overflow: elide;
                                 }
                             }
@@ -523,7 +524,7 @@ export component McpServersView inherits Rectangle {
                         // uses for `toast-kind == "error"` -- no dedicated
                         // `Theme.text-danger` token exists yet.
                         color: #ef4444;
-                        font-size: 9px * Theme.font-scale;
+                        size: "xs";
                         overflow: elide;
                         wrap: word-wrap;
                     }
@@ -551,7 +552,7 @@ export component McpServersView inherits Rectangle {
             if root.editing-name != "" : Text {
                 text: "Editing \"" + root.editing-name + "\"";
                 color: Theme.text-muted;
-                font-size: 9px * Theme.font-scale;
+                size: "xs";
             }
 
             SettingsSectionHeader {

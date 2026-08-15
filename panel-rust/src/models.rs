@@ -49,7 +49,7 @@ fn assign_tool_group_lengths(rows: &mut [MessageItem]) {
     }
 }
 
-/// Maps `markdown::LineKind` to tags used by `base/markdown_view.slint`.
+/// Maps `markdown::LineKind` to tags used by `base/text/markdown_view.slint`.
 fn line_kind_str(kind: LineKind) -> &'static str {
     match kind {
         LineKind::Heading(1) => "h1",

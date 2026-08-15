@@ -1,7 +1,8 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
-import { IconButton } from "../../../base/icon_button.slint";
+import { IconButton } from "../../../base/buttons/icon_button.slint";
+import { Text } from "../../../base/text/base_text.slint";
 
 // A user message still in the send queue -- chat-items-redesign.md #2.
 // Tertiary background (same role as `UserBubble`, since a queued message
@@ -35,8 +36,6 @@ export component QueuedMessageBar inherits Rectangle {
         spacing: Metrics.space-3;
         Text {
             text: root.text;
-            font-family: Theme.font-sans;
-            font-size: 12px * Theme.font-scale;
             color: Theme.text-primary;
             wrap: word-wrap;
             overflow: elide;

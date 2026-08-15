@@ -2,12 +2,13 @@ import { Theme } from "../../../tokens/theme.slint";
 import { SelectionFocus } from "../../../tokens/selection_focus.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
-import { IconButton } from "../../../base/icon_button.slint";
-import { ExpandablePanel } from "../../../base/expandable_panel.slint";
-import { CollapseExpand } from "../../../base/collapse_expand.slint";
+import { IconButton } from "../../../base/buttons/icon_button.slint";
+import { ExpandablePanel } from "../../../base/layout/expandable_panel.slint";
+import { CollapseExpand } from "../../../base/layout/collapse_expand.slint";
 import { ApiCallView } from "../execution/api_call_view.slint";
 import { TerminalView } from "../execution/terminal_view.slint";
 import { HoverSurface } from "../../../base/hover.slint";
+import { Text } from "../../../base/text/base_text.slint";
 
 // One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
 // background (these are inline stream markers, not cards); a dot + an
@@ -78,14 +79,6 @@ export component ToolEventRow inherits Rectangle {
         is-terminal
         || ((kind == "tool_use" || kind == "mcp_server_call")
             && (raw-input != "" || raw-output != ""));
-
-    // Local open state tracks the host `expanded` prop until the user
-    // clicks (assignment breaks the binding). That keeps the button
-    // working in slint-viewer / fixtures where `toggle-expanded` has no
-    // Rust handler, while production still gets the callback so the
-    // host vec stays in sync.
-    property <bool> details-open: root.expanded;
-    changed expanded => { details-open = root.expanded; }
 
     // Dot (8px) + Gap (Metrics.space-2) + Icon (16px) + Gap (Metrics.space-2) + Padding (Metrics.space-2)
     property <length> lead-indent: Metrics.space-2 + 8px + Metrics.space-2 + 16px + Metrics.space-2;
@@ -168,16 +161,15 @@ export component ToolEventRow inherits Rectangle {
                 min-width: 48px;
                 max-width: 48px;
                 height: 22px;
-                button-accessible-label: root.details-open ? "Hide" : "Show";
+                button-accessible-label: root.expanded ? "Hide" : "Show";
                 clicked => {
-                    root.details-open = !root.details-open;
                     root.toggle-expanded(root.index);
                 }
                 Text {
-                    text: root.details-open ? "Hide" : "Show";
+                    text: root.expanded ? "Hide" : "Show";
                     font-family: Theme.font-mono;
-                    font-size: 10px * Theme.font-scale;
-                    font-weight: 600;
+                    size: "sm";
+                    weight: "semibold";
                     color: Theme.text-primary;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -227,7 +219,7 @@ export component ToolEventRow inherits Rectangle {
             vertical-stretch: 0;
             spacing: Metrics.gap-sm;
             CollapseExpand {
-                open: root.details-open;
+                open: root.expanded;
                 // Vertical height + opacity; full width (no width shrink —
                 // that would reflow mono payloads mid-animation).
                 animate-width: false;

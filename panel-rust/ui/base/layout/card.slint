@@ -1,0 +1,43 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+
+// Layer 3 (base) -- the shared surface shell for content cards. Card owns
+// the visual container only; callers own the content structure and provide
+// it through the fixed vertical slot below.
+export component Card inherits Rectangle {
+    in property <string> bg: "secondary";
+    in property <string> radius: "md";
+    in property <bool> bordered: false;
+    in property <string> border: "default";
+    // Theme.border-default is the default escape-hatch value. When it is
+    // unchanged, the semantic `border` value resolves the actual tone;
+    // another color supplied by a caller wins as a raw override.
+    in property <color> border-col: Theme.border-default;
+    in property <string> shadow: "none";
+    in property <length> pad: Metrics.pad-md;
+
+    background: bg == "primary" ? Theme.bg-primary-container
+        : bg == "danger" ? Theme.status-error.with-alpha(0.18)
+        : bg == "success" ? Theme.status-success.with-alpha(0.18)
+        : Theme.bg-tertiary;
+    border-radius: radius == "sm" ? Theme.radius-sm
+        : radius == "lg" ? Theme.radius-lg
+        : Theme.radius-md;
+    border-width: bordered ? 1px : 0px;
+    border-color: bordered
+        ? (border-col == Theme.border-default
+            ? (border == "strong" ? Theme.border-strong
+                : border == "danger" ? Theme.status-error
+                : border == "success" ? Theme.status-success
+                : Theme.border-default)
+            : border-col)
+        : transparent;
+    drop-shadow-blur: shadow == "sm" ? 8px : 0px;
+    drop-shadow-color: shadow == "sm" ? #000000.with-alpha(0.28) : transparent;
+    drop-shadow-offset-y: shadow == "sm" ? 1px : 0px;
+
+    VerticalLayout {
+        padding: root.pad;
+        @children
+    }
+}

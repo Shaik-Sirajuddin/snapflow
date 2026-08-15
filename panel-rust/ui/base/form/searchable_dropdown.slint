@@ -1,0 +1,515 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { Strings } from "../../tokens/strings.slint";
+import { DropdownEntry } from "../../types.slint";
+import { TextUtil } from "../text/text_util.slint";
+import { FilterSearchBar } from "filter_search_bar.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
+import { ThinScrollbar } from "../layout/thin_scrollbar.slint";
+
+// Layer 3 (base) -- trigger + upward popup list of `DropdownEntry` rows.
+// Search UX mirrors the compose `/` skills popup:
+//   - shared FilterSearchBar (when `searchable`)
+//   - TextUtil.matches-filter live filter (label / id / value)
+//   - keyboard highlight + Up/Down/Enter/Esc
+// Domain-neutral: mode + model (config) selectors both use this.
+export component SearchableDropdown inherits Rectangle {
+    in property <string> trigger-label;
+    in property <[DropdownEntry]> options: [];
+    in property <bool> searchable: true;
+    in property <string> placeholder: Strings.search-ellipsis;
+    in property <length> popup-width: 200px;
+    in property <length> popup-max-height: 220px;
+    // When true, popup right edge lines up with the trigger (opens leftward).
+    in property <bool> popup-align-end: false;
+    // Optimistic selection so the chosen row stays highlighted before the
+    // host rewrites options[].is-current. Config/model matches `value`;
+    // mode matches `id` when value is empty.
+    in property <string> selected-id: "";
+    in property <string> selected-value: "";
+    // False renders the trigger dimmed and read-only (no popup, no
+    // accessible action) instead of hiding it outright -- for a control
+    // that's contextually locked (e.g. the profile picker after a
+    // session has attached) rather than simply absent, so the user sees
+    // *why* it's inert instead of it vanishing.
+    in property <bool> enabled: true;
+    in property <string> size: "md";
+    // Narrow docks may shrink below the default 72px so several
+    // triggers still fit side-by-side without painting past the panel edge.
+    in property <length> trigger-min-width: 72px;
+    // id, value, label — label lets callers update the trigger without
+    // re-scanning the model.
+    callback entry-selected(string /* id */, string /* value */, string /* label */);
+    // Fired synchronously from open-popup() (an imperative callback, not
+    // a `changed` property-graph notification, so a sibling host is
+    // guaranteed to see it before the same event finishes processing) so
+    // a dropdown host (e.g. chat_input_layout.slint's profile/mode/config
+    // trio) can close its other open popups right when this one opens --
+    // each SearchableDropdown instance otherwise tracks `open` fully
+    // independently, so without this two of them can render open and
+    // overlapping at once.
+    callback opened();
+
+    property <bool> open: false;
+    property <string> filter: "";
+    // Same always-on search affordance as the / skills mini bar (when
+    // searchable). Short lists still benefit from type-to-filter.
+    property <bool> show-search: searchable;
+    // Keyboard highlight index into `options` (skips headers + filtered-out).
+    property <int> kb-sel: -1;
+    // See FilterSearchBar.input-has-focus's doc comment: re-exposed here so
+    // callers can OR it into the host input-key gate. `dd-search-bar` only
+    // exists while `show-search` is true (conditional element), but
+    // referencing its property outside that scope still resolves to false
+    // when absent, matching the intent here.
+    out property <bool> search-has-focus: dd-search-bar.input-has-focus;
+    // Whether the popup is currently open -- exposed for hosts that must
+    // adapt their own clipping while a popup paints outside the trigger
+    // band (chat_input_layout's min-width pan host, consolidation plan
+    // phase 10: a clipping ancestor would cut the upward popup off, so
+    // the host only clips while every popup is closed).
+    out property <bool> is-open: open;
+
+    pure function row-current(entry: DropdownEntry) -> bool {
+        if (entry.is-header) {
+            return false;
+        }
+        // Config/model: match the chosen value exclusively.
+        if (root.selected-value != "") {
+            return entry.value == root.selected-value;
+        }
+        // Mode (no value payload on host rows): match chosen id.
+        if (root.selected-id != "") {
+            return entry.id == root.selected-id;
+        }
+        return entry.is-current;
+    }
+
+    // Hide non-header rows that fail the live filter. Headers stay visible
+    // (section labels). Uses matches-filter so pure slint-viewer without
+    // TextUtil does not blank the whole list.
+    pure function entry-hidden(entry: DropdownEntry) -> bool {
+        if (entry.is-header) {
+            return false;
+        }
+        // Single matches-filter call — avoid double contains-ci on the
+        // same SharedString (known generator quirk).
+        return !TextUtil.matches-filter(
+            entry.label + "\n" + entry.id + "\n" + entry.value,
+            root.filter);
+    }
+
+    pure function entry-hidden-at(i: int) -> bool {
+        if (i < 0 || i >= root.options.length) {
+            return true;
+        }
+        return root.entry-hidden(root.options[i]);
+    }
+
+    pure function is-selectable(i: int) -> bool {
+        if (i < 0 || i >= root.options.length) {
+            return false;
+        }
+        if (root.options[i].is-header) {
+            return false;
+        }
+        return !root.entry-hidden-at(i);
+    }
+
+    // Walk from `from` in `dir` (+1 / -1), skip headers + hidden, wrap.
+    // Unrolled (no recursion — recursive helpers trip binding loops).
+    function next-visible(from: int, dir: int) -> int {
+        if (root.options.length <= 0) {
+            return -1;
+        }
+        if (root.is-selectable(Math.mod(from + 1 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 1 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 2 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 2 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 3 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 3 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 4 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 4 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 5 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 5 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 6 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 6 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 7 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 7 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 8 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 8 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 9 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 9 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 10 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 10 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 12 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 12 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 16 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 16 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 20 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 20 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 24 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 24 * dir + root.options.length * 64, root.options.length);
+        }
+        return -1;
+    }
+
+    function reselect-closest() {
+        root.kb-sel = root.next-visible(-1, 1);
+    }
+
+    function kb-move(dir: int) {
+        if (root.options.length == 0) {
+            return;
+        }
+        if (root.kb-sel < 0 || !root.is-selectable(root.kb-sel)) {
+            root.kb-sel = root.next-visible(-1, 1);
+            return;
+        }
+        root.kb-sel = root.next-visible(root.kb-sel, dir);
+    }
+
+    function apply-kb-sel() {
+        if (!root.is-selectable(root.kb-sel)) {
+            return;
+        }
+        root.entry-selected(
+            root.options[root.kb-sel].id,
+            root.options[root.kb-sel].value,
+            root.options[root.kb-sel].label);
+        root.close();
+    }
+
+    function dd-key(event: KeyEvent) -> EventResult {
+        if (event.text == Key.Escape) {
+            root.close();
+            return EventResult.accept;
+        }
+        if (event.text == Key.DownArrow) {
+            root.kb-move(1);
+            return EventResult.accept;
+        }
+        if (event.text == Key.UpArrow) {
+            root.kb-move(-1);
+            return EventResult.accept;
+        }
+        if (event.text == Key.LeftArrow || event.text == Key.RightArrow
+            || event.text == Key.Home || event.text == Key.End
+            || event.text == Key.PageUp || event.text == Key.PageDown
+            || event.text == Key.Delete) {
+            return EventResult.reject;
+        }
+        if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
+            root.apply-kb-sel();
+            return EventResult.accept;
+        }
+        return EventResult.reject;
+    }
+
+    property <length> row-h: 30px;
+    property <length> search-block-h: show-search ? 36px : 0px;
+    property <length> content-h: Math.min(
+        search-block-h + options.length * row-h + 2 * Metrics.space-3,
+        popup-max-height);
+
+    public function close() {
+        open = false;
+        filter = "";
+        kb-sel = -1;
+    }
+
+    function open-popup() {
+        filter = "";
+        open = true;
+        root.opened();
+        // No keyboard pre-highlight on open. `reselect-closest()` used to
+        // run here, which parks `kb-sel` on row 0 and paints it with the
+        // same strong treatment the genuinely-selected row needs -- so
+        // e.g. picking `claude-acp` and reopening showed row 0
+        // (`codex-acp`) as the chosen one. `kb-move()` already treats
+        // kb-sel < 0 as "start at the first visible row", so Up/Down is
+        // unaffected. `changed filter` still pre-highlights the first
+        // match, which is what Enter-to-accept-a-search needs.
+        kb-sel = -1;
+    }
+
+    function toggle-popup() {
+        if (!root.enabled) {
+            return;
+        }
+        if (open) {
+            close();
+        } else {
+            open-popup();
+        }
+    }
+
+    changed filter => {
+        if (open) {
+            reselect-closest();
+        }
+    }
+
+    // Fixed 24px trigger — compose-row peers (ContextRing).
+    height: 24px;
+    preferred-height: 24px;
+    vertical-stretch: 0;
+    min-width: root.trigger-min-width;
+    max-width: 140px;
+    background: trigger-touch.has-hover || open ? Theme.bg-primary-container : Theme.bg-canvas;
+    animate background { duration: 100ms; }
+    opacity: root.enabled ? 1.0 : 0.5;
+    border-color: Theme.border-default;
+    border-width: 1px;
+    border-radius: Theme.radius-sm;
+
+    trigger-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        accessible-role: button;
+        accessible-label: root.trigger-label;
+        accessible-enabled: root.enabled;
+        accessible-action-default => { root.toggle-popup(); }
+        clicked => { root.toggle-popup(); }
+        changed has-hover => { CursorHost.kind = (self.has-hover && root.enabled) ? "pointer" : "default"; }
+    }
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Metrics.space-3;
+        padding-right: Metrics.space-3;
+        spacing: Metrics.space-2;
+        alignment: stretch;
+        cross-axis-alignment: center;
+        // Own-bounds horizontal scroll for the trigger label -- when the
+        // assigned trigger width (e.g. a narrow docked panel, or several
+        // triggers competing for space in chat_input_layout.slint's
+        // row2-strip) is too small for the full label, text must stay
+        // containable within the trigger rather than spilling past its
+        // border (root's `clip` defaults to false). Mirrors row2-host's
+        // own pattern one level up: a TouchArea handling only
+        // `scroll-event` (wheel/trackpad) so plain clicks still fall
+        // through undisturbed to `trigger-touch` below (declared before
+        // this HorizontalLayout, so it only sees events this layout's
+        // children don't consume), plus a ThinScrollbar overlay for a
+        // visible affordance. `active` mirrors row2-strip's ThinScrollbar
+        // (pressed, not has-hover) -- see chat_input_layout.slint.
+        label-scroll-host := Rectangle {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            height: parent.height;
+            clip: true;
+            property <length> pan: 0px;
+            property <length> overflow: max(0px, label-text.preferred-width - self.width);
+            label-scroll := TouchArea {
+                width: 100%;
+                height: 100%;
+                mouse-cursor: root.enabled ? pointer : default;
+                // This TouchArea is declared (and therefore hit-tested)
+                // above `trigger-touch` for every pixel under the label,
+                // since it covers label-scroll-host's full bounds -- most
+                // of the trigger's clickable area. A TouchArea absorbs
+                // pointer events it overlaps regardless of which callbacks
+                // it defines, so without its own `clicked` handler here,
+                // clicks anywhere over the label silently went nowhere and
+                // only the untouched arrow-icon sliver (outside
+                // label-scroll-host) ever reached `trigger-touch` below.
+                // Mirror trigger-touch's open/close so the whole visual
+                // button responds, not just the arrow.
+                clicked => { root.toggle-popup(); }
+                scroll-event(e) => {
+                    if (label-scroll-host.overflow > 0px) {
+                        label-scroll-host.pan = max(-label-scroll-host.overflow,
+                            min(0px, label-scroll-host.pan + e.delta-x + e.delta-y));
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            label-text := Text {
+                x: label-scroll-host.overflow > 0px ? label-scroll-host.pan : 0px;
+                height: parent.height;
+                text: root.trigger-label;
+                color: Theme.text-primary;
+                font-family: Theme.font-mono;
+                font-size: (root.size == "sm" ? 9px : root.size == "lg" ? 11px : 10px) * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: clip;
+            }
+            ThinScrollbar {
+                horizontal: true;
+                x: 0px;
+                y: parent.height - self.thumb-width;
+                visible-width: label-scroll-host.width;
+                viewport-width: label-scroll-host.width + label-scroll-host.overflow;
+                viewport-x <=> label-scroll-host.pan;
+                thumb-width: 2px;
+                active: label-scroll.pressed;
+            }
+        }
+        Text {
+            text: "\u{25BE}";
+            color: Theme.text-muted;
+            font-size: (root.size == "sm" ? 8px : root.size == "lg" ? 10px : 9px) * Theme.font-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+
+    // Unconditionally mounted (visible:, not if:) -- `search-has-focus`
+    // above needs to reference `dd-search-bar`'s id from outside this
+    // popup, which Slint doesn't allow for `if`-only elements ("Cannot
+    // access id"). Positioned via explicit x/y (not in a layout flow), so
+    // staying mounted-but-hidden doesn't disturb sibling layout the way it
+    // would for a normal in-flow element.
+    popup-panel := Rectangle {
+        visible: root.open;
+        x: root.popup-align-end ? root.width - root.popup-width : 0px;
+        y: -root.content-h - Metrics.space-2;
+        width: root.popup-width;
+        height: root.content-h;
+        z: 9000;
+        background: Theme.bg-card;
+        border-color: Theme.border-strong;
+        border-width: 1px;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #000000.with-alpha(0.4);
+        drop-shadow-offset-y: 2px;
+
+        // Was `init =>` when this Rectangle only existed while `open` --
+        // that only ever fires once now that it's permanently mounted, so
+        // this needs to re-run on every open instead. `changed` only
+        // accepts a local property name (not a qualified `root.open`
+        // path), hence this reactive local mirror. Clears the keyboard
+        // highlight for the same reason `open-popup()` does.
+        property <bool> local-open: root.open;
+        changed local-open => {
+            if (root.open) {
+                root.kb-sel = -1;
+            }
+        }
+
+        VerticalLayout {
+            padding: Metrics.space-3;
+            spacing: Metrics.space-1;
+            // Always-on FilterSearchBar (when searchable) — same chrome as
+            // / skills. Focus on open so type-to-filter works immediately.
+            // Unconditionally mounted (visible:, not if:) -- same reasoning
+            // as sidebar.slint's thread-search: `search-has-focus` above
+            // needs to reference this element's id from outside this
+            // VerticalLayout, which Slint doesn't allow for `if`-only
+            // elements ("Cannot access id"). No live caller sets
+            // `searchable: false` today, so this has no visible effect.
+            // Cursor-kind reporting (pointer/text) lives inside
+            // FilterSearchBar itself, so every call site inherits it.
+            dd-search-bar := FilterSearchBar {
+                visible: root.show-search;
+                query <=> root.filter;
+                placeholder: root.placeholder;
+                bar-accessible-label: Strings.filter-options;
+                show-icon: true;
+                edited => { }
+                key-pressed(event) => {
+                    return root.dd-key(event);
+                }
+                init => {
+                    self.focus-input();
+                }
+            }
+            // Wrapper Rectangle so `options-scrollbar` below can overlay
+            // the Flickable as a free-floating sibling positioned against
+            // a fixed-size parent -- same pattern used for the compose
+            // bar's row2-host horizontal scrollbar and the Settings page's
+            // vertical one, both added earlier this session.
+            options-scroll-host := Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+                options-flickable := Flickable {
+                    width: parent.width;
+                    height: parent.height;
+                    viewport-height: options-col.preferred-height;
+                options-col := VerticalLayout {
+                    alignment: start;
+                    for entry[i] in root.options : Rectangle {
+                        property <bool> hidden: root.entry-hidden(entry);
+                        property <bool> current: root.row-current(entry);
+                        property <bool> hi: !hidden && i == root.kb-sel;
+                        height: hidden ? 0px : root.row-h;
+                        clip: true;
+                        // The selected row must not share a token with the
+                        // plain hover state -- it did (bg-primary-container
+                        // both), leaving the only cue a 600-vs-400 font
+                        // weight, which read as "my pick didn't register".
+                        background: entry.is-header ? transparent
+                            : (hi || current) ? Theme.bg-primary
+                            : row-touch.has-hover ? Theme.bg-primary-container
+                            : transparent;
+                        animate background { duration: 100ms; }
+                        border-radius: Theme.radius-sm;
+                        row-touch := TouchArea {
+                            enabled: !entry.is-header && !hidden;
+                            mouse-cursor: entry.is-header ? default : pointer;
+                            accessible-role: button;
+                            accessible-label: entry.label;
+                            accessible-action-default => {
+                                root.kb-sel = i;
+                                root.entry-selected(entry.id, entry.value, entry.label);
+                                root.close();
+                            }
+                            clicked => {
+                                root.kb-sel = i;
+                                root.entry-selected(entry.id, entry.value, entry.label);
+                                root.close();
+                            }
+                            changed has-hover => {
+                                CursorHost.kind = (self.has-hover && !entry.is-header) ? "pointer" : "default";
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: Metrics.space-5;
+                            padding-right: Metrics.space-5;
+                            Text {
+                                text: entry.is-header ? entry.label + ":" : entry.label;
+                                color: entry.is-header ? Theme.text-secondary
+                                    : (hi || current) ? Theme.text-on-primary
+                                    : Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: (entry.is-header
+                                    ? (root.size == "sm" ? 8px : root.size == "lg" ? 10px : 9px)
+                                    : (root.size == "sm" ? 9px : root.size == "lg" ? 11px : 10px)) * Theme.font-scale;
+                                font-weight: entry.is-header ? 700 : ((hi || current) ? 600 : 400);
+                                preferred-width: 0px;
+                                min-width: 0px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+                }
+                ThinScrollbar {
+                    x: parent.width - self.width - 2px;
+                    y: 2px;
+                    visible-height: options-flickable.height - 4px;
+                    viewport-height: options-col.preferred-height;
+                    viewport-y <=> options-flickable.viewport-y;
+                    thumb-width: 4px;
+                }
+            }
+        }
+    }
+}

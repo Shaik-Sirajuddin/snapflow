@@ -7,8 +7,10 @@
 import { Theme } from "tokens/theme.slint";
 import { Metrics } from "tokens/metrics.slint";
 import { Strings } from "tokens/strings.slint";
-import { Button } from "base/button.slint";
+import { Button } from "base/buttons/button.slint";
 import { SettingsSearchBar } from "pages/settings/components/search_bar.slint";
+import { Text } from "base/text/base_text.slint";
+import { Divider } from "base/layout/divider.slint";
 
 export component SettingsPanePreview inherits Window {
     preferred-width: 720px;
@@ -29,28 +31,21 @@ export component SettingsPanePreview inherits Window {
         HorizontalLayout {
             spacing: Metrics.space-4;
             height: 32px;
-            for tab[i] in [{ id: "project", label: Strings.project }, { id: "global", label: Strings.global }] : Rectangle {
-                width: 100px;
-                border-radius: Theme.radius-sm;
-                background: active-scope == tab.id ? Theme.bg-primary-container : transparent;
-                border-width: active-scope == tab.id ? 0px : 1px;
-                border-color: Theme.border-default;
-                Text {
-                    text: tab.label;
-                    color: active-scope == tab.id ? Theme.text-on-primary-container : Theme.text-secondary;
-                    font-size: 12px * Theme.font-scale;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-                TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { active-scope = tab.id; }
-                }
+            for tab[i] in [{ id: "project", label: Strings.project }, { id: "global", label: Strings.global }] : Button {
+                label: tab.label;
+                btn-width: 100px;
+                btn-height: 32px;
+                bg: active-scope == tab.id ? Theme.bg-primary-container : transparent;
+                fg: active-scope == tab.id ? Theme.text-on-primary-container : Theme.text-secondary;
+                border-w: active-scope == tab.id ? 0px : 1px;
+                border-col: Theme.border-default;
+                font-size: 12px;
+                font-weight: 600;
+                clicked => { active-scope = tab.id; }
             }
         }
 
-        Rectangle { height: 1px; background: Theme.border-default; }
+        Divider { }
 
         HorizontalLayout {
             spacing: Metrics.space-6;
@@ -59,22 +54,16 @@ export component SettingsPanePreview inherits Window {
             VerticalLayout {
                 width: 160px;
                 spacing: Metrics.space-2;
-                for section[i] in [{ id: "mcp", label: Strings.mcp-servers }, { id: "agents", label: Strings.agents }] : Rectangle {
-                    height: 32px;
-                    border-radius: Theme.radius-sm;
-                    background: active-section == section.id ? Theme.bg-sidebar : transparent;
-                    Text {
-                        text: section.label;
-                        color: active-section == section.id ? Theme.text-primary : Theme.text-secondary;
-                        font-size: 12px * Theme.font-scale;
-                        font-weight: active-section == section.id ? 600 : 400;
-                        vertical-alignment: center;
-                        x: Metrics.space-5;
-                    }
-                    TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { active-section = section.id; }
-                    }
+                for section[i] in [{ id: "mcp", label: Strings.mcp-servers }, { id: "agents", label: Strings.agents }] : Button {
+                    label: section.label;
+                    btn-width: 160px;
+                    btn-height: 32px;
+                    bg: active-section == section.id ? Theme.bg-sidebar : transparent;
+                    fg: active-section == section.id ? Theme.text-primary : Theme.text-secondary;
+                    border-w: 0px;
+                    font-size: 12px;
+                    font-weight: active-section == section.id ? 600 : 400;
+                    clicked => { active-section = section.id; }
                 }
             }
 
@@ -99,8 +88,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: Strings.default-command-timeout; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: Strings.seconds-before-mcp-stalled; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.default-command-timeout; color: Theme.text-primary; weight: "semibold"; }
+                            Text { text: Strings.seconds-before-mcp-stalled; color: Theme.text-muted; size: "sm"; }
                         }
                         Rectangle {
                             width: 60px;
@@ -108,7 +97,7 @@ export component SettingsPanePreview inherits Window {
                             border-radius: Theme.radius-sm;
                             border-width: 1px;
                             border-color: Theme.border-default;
-                            Text { text: "30s"; color: Theme.text-primary; font-size: 11px * Theme.font-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "30s"; color: Theme.text-primary; size: "sm"; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
 
@@ -118,8 +107,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: Strings.auto-restart-on-failure; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: Strings.relaunch-crashed-mcp; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.auto-restart-on-failure; color: Theme.text-primary; weight: "semibold"; }
+                            Text { text: Strings.relaunch-crashed-mcp; color: Theme.text-muted; size: "sm"; }
                         }
                         property <bool> checked: true;
                         Rectangle {
@@ -152,8 +141,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: Strings.default-agent; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: Strings.used-when-no-agent-specified; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.default-agent; color: Theme.text-primary; weight: "semibold"; }
+                            Text { text: Strings.used-when-no-agent-specified; color: Theme.text-muted; size: "sm"; }
                         }
                         Rectangle {
                             width: 100px;
@@ -161,7 +150,7 @@ export component SettingsPanePreview inherits Window {
                             border-radius: Theme.radius-sm;
                             border-width: 1px;
                             border-color: Theme.border-default;
-                            Text { text: "codex"; color: Theme.text-primary; font-size: 11px * Theme.font-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "codex"; color: Theme.text-primary; size: "sm"; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
 
@@ -171,8 +160,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: "claude-code (installable)"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: Strings.not-yet-installed; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: "claude-code (installable)"; color: Theme.text-primary; weight: "semibold"; }
+                            Text { text: Strings.not-yet-installed; color: Theme.text-muted; size: "sm"; }
                         }
                         Button { label: Strings.install; btn-width: 64px; }
                     }

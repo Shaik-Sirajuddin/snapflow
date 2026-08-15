@@ -1,9 +1,13 @@
 import { Theme } from "../../tokens/theme.slint";
 import { Icon } from "../../base/icon.slint";
-import { ThinScrollbar } from "../../base/thin_scrollbar.slint";
+import { Button } from "../../base/buttons/button.slint";
+import { ThinScrollbar } from "../../base/layout/thin_scrollbar.slint";
+import { Text } from "../../base/text/base_text.slint";
+import { OnboardingPreviewCard, OnboardingPill, OnboardingSectionHeader } from "./onboarding_components.slint";
 
 export component OnboardingGuideView inherits Rectangle {
     callback start-chat-clicked();
+    property <bool> narrow: root.width < 420px;
     background: Theme.bg-chat;
     clip: true;
 
@@ -19,12 +23,16 @@ export component OnboardingGuideView inherits Rectangle {
             border-width: 1px;
 
             HorizontalLayout {
-                padding-left: 20px;
-                padding-right: 20px;
+                padding-left: root.narrow ? 12px : 20px;
+                padding-right: root.narrow ? 12px : 20px;
                 alignment: space-between;
+                cross-axis-alignment: center;
 
                 HorizontalLayout {
                     spacing: 10px;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    cross-axis-alignment: center;
 
                     Icon {
                         source: @image-url("../../assets/icons/sparkles.svg");
@@ -35,15 +43,16 @@ export component OnboardingGuideView inherits Rectangle {
 
                     Text {
                         text: "Welcome to SnapFlow";
-                        font-family: Theme.font-sans;
-                        font-size: 16px;
-                        font-weight: 600;
-                        color: Theme.text-primary;
+                        size: "lg";
+                        weight: "semibold";
                         vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        overflow: elide;
                     }
                 }
 
-                Rectangle {
+                if !root.narrow : Rectangle {
                     background: Theme.bg-card;
                     border-radius: 12px;
                     border-color: Theme.border-default;
@@ -55,9 +64,8 @@ export component OnboardingGuideView inherits Rectangle {
 
                         Text {
                             text: "Getting Started Guide";
-                            font-family: Theme.font-sans;
-                            font-size: 11px;
-                            font-weight: 500;
+                            size: "sm";
+                            weight: "medium";
                             color: Theme.md-link;
                             vertical-alignment: center;
                         }
@@ -67,16 +75,17 @@ export component OnboardingGuideView inherits Rectangle {
         }
 
         // --- Scrollable Body ---
-        Rectangle {
-            vertical-stretch: 1;
+            Rectangle {
+                vertical-stretch: 1;
 
-            flick := Flickable {
-                width: 100%;
-                height: 100%;
-                viewport-height: content-column.preferred-height + 40px;
+                flick := Flickable {
+                    width: 100%;
+                    height: 100%;
+                    viewport-height: content-column.preferred-height + 40px;
 
-                content-column := VerticalLayout {
-                    width: parent.width;
+                    content-column := VerticalLayout {
+                        width: parent.width;
+                        preferred-width: 0px;
                     padding-top: 24px;
                     padding-bottom: 24px;
                     padding-left: 24px;
@@ -86,191 +95,163 @@ export component OnboardingGuideView inherits Rectangle {
 
                     // Title banner
                     VerticalLayout {
+                        width: parent.width;
+                        preferred-width: 0px;
                         spacing: 6px;
                         Text {
                             text: "Welcome aboard! Let's get you set up.";
-                            font-family: Theme.font-sans;
-                            font-size: 22px;
-                            font-weight: 700;
-                            color: Theme.text-primary;
+                            size: "xl";
+                            weight: "bold";
                         }
                         Text {
                             text: "Explore key features and configuration workflows to start pair programming with your AI agents.";
-                            font-family: Theme.font-sans;
-                            font-size: 13px;
                             color: Theme.text-secondary;
-                            wrap: word-wrap;
                         }
                     }
 
                     // Section 1: Choose Your Agent
                     Rectangle {
+                        width: parent.width;
+                        preferred-width: 0px;
                         background: Theme.bg-sidebar;
                         border-color: Theme.border-default;
                         border-width: 1px;
                         border-radius: Theme.radius-lg;
 
                         VerticalLayout {
+                            width: parent.width;
+                            preferred-width: 0px;
                             padding: 18px;
                             spacing: 14px;
 
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Icon {
-                                    source: @image-url("../../assets/icons/sparkles.svg");
-                                    width: 18px;
-                                    height: 18px;
-                                    colorize: Theme.md-link;
-                                }
-                                Text {
-                                    text: "1. Choose Your Agent";
-                                    font-family: Theme.font-sans;
-                                    font-size: 15px;
-                                    font-weight: 600;
-                                    color: Theme.text-primary;
-                                }
+                            OnboardingSectionHeader {
+                                icon-source: @image-url("../../assets/icons/sparkles.svg");
+                                title: "1. Choose Your Agent";
                             }
 
                             Text {
                                 text: "Select from built-in AI agents like **Codex**, **Claude Sonnet**, or **Custom ACP Agents**. Each agent delivers specialized capabilities for codebase exploration, refactoring, and multi-file generation.";
-                                font-family: Theme.font-sans;
-                                font-size: 13px;
                                 color: Theme.text-secondary;
                                 wrap: word-wrap;
+                                preferred-width: 0px;
+                                min-width: 0px;
                             }
 
                             // Image insertion placeholder / visual card
-                            Rectangle {
-                                background: Theme.bg-chat;
-                                border-color: Theme.border-default;
-                                border-width: 1px;
-                                border-radius: Theme.radius-md;
-
-                                VerticalLayout {
-                                    padding: 14px;
-                                    spacing: 10px;
-
-                                    HorizontalLayout {
-                                        alignment: space-between;
-                                        Text {
-                                            text: "Agent Options & Catalog";
-                                            font-family: Theme.font-sans;
-                                            font-size: 12px;
-                                            font-weight: 600;
-                                            color: Theme.text-primary;
-                                        }
-                                        Text {
-                                            text: "[ Image Gap / Preview ]";
-                                            font-family: Theme.font-mono;
-                                            font-size: 10px;
-                                            color: Theme.md-link;
-                                        }
-                                    }
+                            OnboardingPreviewCard {
+                                title: "Agent Options & Catalog";
 
                                     HorizontalLayout {
                                         spacing: 10px;
 
                                         Rectangle {
                                             horizontal-stretch: 1;
+                                            preferred-width: 0px;
+                                            min-width: 0px;
                                             background: Theme.bg-sidebar;
                                             border-color: Theme.md-link;
                                             border-width: 1px;
                                             border-radius: Theme.radius-sm;
 
                                             VerticalLayout {
+                                                width: parent.width;
+                                                preferred-width: 0px;
+                                                min-width: 0px;
                                                 padding: 10px;
                                                 spacing: 4px;
                                                 Text {
                                                     text: "Codex Agent";
-                                                    font-family: Theme.font-sans;
-                                                    font-size: 12px;
-                                                    font-weight: 600;
+                                                    weight: "semibold";
                                                     color: Theme.md-link;
                                                 }
                                                 Text {
                                                     text: "Autonomous CLI & Code Base Expert";
-                                                    font-family: Theme.font-sans;
-                                                    font-size: 11px;
+                                                    size: "sm";
                                                     color: Theme.text-secondary;
+                                                    wrap: word-wrap;
+                                                    preferred-width: 0px;
+                                                    min-width: 0px;
                                                 }
                                             }
                                         }
 
                                         Rectangle {
                                             horizontal-stretch: 1;
+                                            preferred-width: 0px;
+                                            min-width: 0px;
                                             background: Theme.bg-sidebar;
                                             border-color: Theme.border-default;
                                             border-width: 1px;
                                             border-radius: Theme.radius-sm;
 
                                             VerticalLayout {
+                                                width: parent.width;
+                                                preferred-width: 0px;
+                                                min-width: 0px;
                                                 padding: 10px;
                                                 spacing: 4px;
                                                 Text {
                                                     text: "Claude 3.5 Sonnet";
-                                                    font-family: Theme.font-sans;
-                                                    font-size: 12px;
-                                                    font-weight: 600;
+                                                    weight: "semibold";
                                                     color: Theme.text-primary;
                                                 }
                                                 Text {
                                                     text: "Architectural & Context Analysis";
-                                                    font-family: Theme.font-sans;
-                                                    font-size: 11px;
+                                                    size: "sm";
                                                     color: Theme.text-secondary;
+                                                    wrap: word-wrap;
+                                                    preferred-width: 0px;
+                                                    min-width: 0px;
                                                 }
                                             }
                                         }
                                     }
-                                }
                             }
                         }
                     }
 
                     // Section 2: Live Connected Project
                     Rectangle {
+                        width: parent.width;
+                        preferred-width: 0px;
                         background: Theme.bg-sidebar;
                         border-color: Theme.border-default;
                         border-width: 1px;
                         border-radius: Theme.radius-lg;
 
                         VerticalLayout {
+                            width: parent.width;
+                            preferred-width: 0px;
+                            min-width: 0px;
                             padding: 18px;
                             spacing: 14px;
 
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Icon {
-                                    source: @image-url("../../assets/icons/plug-zap.svg");
-                                    width: 18px;
-                                    height: 18px;
-                                    colorize: Theme.md-link;
-                                }
-                                Text {
-                                    text: "2. Live Connected Project";
-                                    font-family: Theme.font-sans;
-                                    font-size: 15px;
-                                    font-weight: 600;
-                                    color: Theme.text-primary;
-                                }
+                            OnboardingSectionHeader {
+                                icon-source: @image-url("../../assets/icons/plug-zap.svg");
+                                title: "2. Live Connected Project";
                             }
 
                             Text {
                                 text: "SnapFlow automatically bridges your active workspace repository via `snapshotd`. Monitor live context, file modifications, and isolated execution threads per workspace root.";
-                                font-family: Theme.font-sans;
-                                font-size: 13px;
                                 color: Theme.text-secondary;
                                 wrap: word-wrap;
+                                preferred-width: 0px;
+                                min-width: 0px;
                             }
 
                             // Image insertion placeholder / visual card
                             Rectangle {
+                                width: parent.width;
+                                preferred-width: 0px;
                                 background: Theme.bg-chat;
                                 border-color: Theme.border-default;
                                 border-width: 1px;
                                 border-radius: Theme.radius-md;
 
                                 VerticalLayout {
+                                    width: parent.width;
+                                    preferred-width: 0px;
+                                    min-width: 0px;
                                     padding: 14px;
                                     spacing: 10px;
 
@@ -278,15 +259,13 @@ export component OnboardingGuideView inherits Rectangle {
                                         alignment: space-between;
                                         Text {
                                             text: "Workspace Connection Status";
-                                            font-family: Theme.font-sans;
-                                            font-size: 12px;
-                                            font-weight: 600;
+                                            weight: "semibold";
                                             color: Theme.text-primary;
                                         }
                                         Text {
                                             text: "[ Image Gap / Preview ]";
                                             font-family: Theme.font-mono;
-                                            font-size: 10px;
+                                            size: "sm";
                                             color: Theme.md-link;
                                         }
                                     }
@@ -304,8 +283,12 @@ export component OnboardingGuideView inherits Rectangle {
                                         Text {
                                             text: "snapshotd • Live connected workspace root (/multi_media_main)";
                                             font-family: Theme.font-mono;
-                                            font-size: 11px;
+                                            size: "sm";
                                             color: Theme.text-primary;
+                                            horizontal-stretch: 1;
+                                            preferred-width: 0px;
+                                            min-width: 0px;
+                                            wrap: word-wrap;
                                         }
                                     }
                                 }
@@ -315,48 +298,46 @@ export component OnboardingGuideView inherits Rectangle {
 
                     // Section 3: Add MCP Servers from Settings
                     Rectangle {
+                        width: parent.width;
+                        preferred-width: 0px;
                         background: Theme.bg-sidebar;
                         border-color: Theme.border-default;
                         border-width: 1px;
                         border-radius: Theme.radius-lg;
 
                         VerticalLayout {
+                            width: parent.width;
+                            preferred-width: 0px;
+                            min-width: 0px;
                             padding: 18px;
                             spacing: 14px;
 
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Icon {
-                                    source: @image-url("../../assets/icons/server.svg");
-                                    width: 18px;
-                                    height: 18px;
-                                    colorize: Theme.md-link;
-                                }
-                                Text {
-                                    text: "3. Add MCP Servers from Settings";
-                                    font-family: Theme.font-sans;
-                                    font-size: 15px;
-                                    font-weight: 600;
-                                    color: Theme.text-primary;
-                                }
+                            OnboardingSectionHeader {
+                                icon-source: @image-url("../../assets/icons/server.svg");
+                                title: "3. Add MCP Servers from Settings";
                             }
 
                             Text {
                                 text: "Expand your agent's powers with Model Context Protocol (MCP) servers. Open **Settings > MCP Servers** to enable tools, database connectors, external APIs, and custom integrations.";
-                                font-family: Theme.font-sans;
-                                font-size: 13px;
                                 color: Theme.text-secondary;
                                 wrap: word-wrap;
+                                preferred-width: 0px;
+                                min-width: 0px;
                             }
 
                             // Image insertion placeholder / visual card
                             Rectangle {
+                                width: parent.width;
+                                preferred-width: 0px;
                                 background: Theme.bg-chat;
                                 border-color: Theme.border-default;
                                 border-width: 1px;
                                 border-radius: Theme.radius-md;
 
                                 VerticalLayout {
+                                    width: parent.width;
+                                    preferred-width: 0px;
+                                    min-width: 0px;
                                     padding: 14px;
                                     spacing: 10px;
 
@@ -364,15 +345,13 @@ export component OnboardingGuideView inherits Rectangle {
                                         alignment: space-between;
                                         Text {
                                             text: "MCP Server Integration Pane";
-                                            font-family: Theme.font-sans;
-                                            font-size: 12px;
-                                            font-weight: 600;
+                                            weight: "semibold";
                                             color: Theme.text-primary;
                                         }
                                         Text {
                                             text: "[ Image Gap / Preview ]";
                                             font-family: Theme.font-mono;
-                                            font-size: 10px;
+                                            size: "sm";
                                             color: Theme.md-link;
                                         }
                                     }
@@ -382,6 +361,8 @@ export component OnboardingGuideView inherits Rectangle {
 
                                         Rectangle {
                                             horizontal-stretch: 1;
+                                            preferred-width: 0px;
+                                            min-width: 0px;
                                             background: Theme.bg-sidebar;
                                             border-color: Theme.border-default;
                                             border-width: 1px;
@@ -394,13 +375,12 @@ export component OnboardingGuideView inherits Rectangle {
                                                 Text {
                                                     text: "axolink (Task Queue)";
                                                     font-family: Theme.font-mono;
-                                                    font-size: 11px;
+                                                    size: "sm";
                                                     color: Theme.text-primary;
                                                 }
                                                 Text {
                                                     text: "Active";
-                                                    font-family: Theme.font-sans;
-                                                    font-size: 10px;
+                                                    size: "sm";
                                                     color: #22C55E;
                                                 }
                                             }
@@ -408,6 +388,8 @@ export component OnboardingGuideView inherits Rectangle {
 
                                         Rectangle {
                                             horizontal-stretch: 1;
+                                            preferred-width: 0px;
+                                            min-width: 0px;
                                             background: Theme.bg-sidebar;
                                             border-color: Theme.border-default;
                                             border-width: 1px;
@@ -420,13 +402,12 @@ export component OnboardingGuideView inherits Rectangle {
                                                 Text {
                                                     text: "github (API Connector)";
                                                     font-family: Theme.font-mono;
-                                                    font-size: 11px;
+                                                    size: "sm";
                                                     color: Theme.text-primary;
                                                 }
                                                 Text {
                                                     text: "Configured";
-                                                    font-family: Theme.font-sans;
-                                                    font-size: 10px;
+                                                    size: "sm";
                                                     color: Theme.md-link;
                                                 }
                                             }
@@ -439,48 +420,46 @@ export component OnboardingGuideView inherits Rectangle {
 
                     // Section 4: Create Skills
                     Rectangle {
+                        width: parent.width;
+                        preferred-width: 0px;
                         background: Theme.bg-sidebar;
                         border-color: Theme.border-default;
                         border-width: 1px;
                         border-radius: Theme.radius-lg;
 
                         VerticalLayout {
+                            width: parent.width;
+                            preferred-width: 0px;
+                            min-width: 0px;
                             padding: 18px;
                             spacing: 14px;
 
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Icon {
-                                    source: @image-url("../../assets/icons/wrench.svg");
-                                    width: 18px;
-                                    height: 18px;
-                                    colorize: Theme.md-link;
-                                }
-                                Text {
-                                    text: "4. Create & Customize Skills";
-                                    font-family: Theme.font-sans;
-                                    font-size: 15px;
-                                    font-weight: 600;
-                                    color: Theme.text-primary;
-                                }
+                            OnboardingSectionHeader {
+                                icon-source: @image-url("../../assets/icons/wrench.svg");
+                                title: "4. Create & Customize Skills";
                             }
 
                             Text {
                                 text: "Teach your agents repeatable workflows. Create custom skills with structured prompt directives, audit recipes, and helper scripts under **Settings > Skills**.";
-                                font-family: Theme.font-sans;
-                                font-size: 13px;
                                 color: Theme.text-secondary;
                                 wrap: word-wrap;
+                                preferred-width: 0px;
+                                min-width: 0px;
                             }
 
                             // Image insertion placeholder / visual card
                             Rectangle {
+                                width: parent.width;
+                                preferred-width: 0px;
                                 background: Theme.bg-chat;
                                 border-color: Theme.border-default;
                                 border-width: 1px;
                                 border-radius: Theme.radius-md;
 
                                 VerticalLayout {
+                                    width: parent.width;
+                                    preferred-width: 0px;
+                                    min-width: 0px;
                                     padding: 14px;
                                     spacing: 10px;
 
@@ -488,81 +467,24 @@ export component OnboardingGuideView inherits Rectangle {
                                         alignment: space-between;
                                         Text {
                                             text: "Skills Library";
-                                            font-family: Theme.font-sans;
-                                            font-size: 12px;
-                                            font-weight: 600;
+                                            weight: "semibold";
                                             color: Theme.text-primary;
                                         }
                                         Text {
                                             text: "[ Image Gap / Preview ]";
                                             font-family: Theme.font-mono;
-                                            font-size: 10px;
+                                            size: "sm";
                                             color: Theme.md-link;
                                         }
                                     }
 
-                                    HorizontalLayout {
+                                    VerticalLayout {
                                         spacing: 8px;
+                                        alignment: start;
 
-                                        Rectangle {
-                                            background: Theme.bg-sidebar;
-                                            border-color: Theme.border-default;
-                                            border-width: 1px;
-                                            border-radius: 12px;
-
-                                            HorizontalLayout {
-                                                padding-left: 10px;
-                                                padding-right: 10px;
-                                                padding-top: 4px;
-                                                padding-bottom: 4px;
-                                                Text {
-                                                    text: "rust-audit";
-                                                    font-family: Theme.font-mono;
-                                                    font-size: 11px;
-                                                    color: Theme.text-primary;
-                                                }
-                                            }
-                                        }
-
-                                        Rectangle {
-                                            background: Theme.bg-sidebar;
-                                            border-color: Theme.border-default;
-                                            border-width: 1px;
-                                            border-radius: 12px;
-
-                                            HorizontalLayout {
-                                                padding-left: 10px;
-                                                padding-right: 10px;
-                                                padding-top: 4px;
-                                                padding-bottom: 4px;
-                                                Text {
-                                                    text: "slint-reference";
-                                                    font-family: Theme.font-mono;
-                                                    font-size: 11px;
-                                                    color: Theme.text-primary;
-                                                }
-                                            }
-                                        }
-
-                                        Rectangle {
-                                            background: Theme.bg-sidebar;
-                                            border-color: Theme.border-default;
-                                            border-width: 1px;
-                                            border-radius: 12px;
-
-                                            HorizontalLayout {
-                                                padding-left: 10px;
-                                                padding-right: 10px;
-                                                padding-top: 4px;
-                                                padding-bottom: 4px;
-                                                Text {
-                                                    text: "phase-plan";
-                                                    font-family: Theme.font-mono;
-                                                    font-size: 11px;
-                                                    color: Theme.text-primary;
-                                                }
-                                            }
-                                        }
+                                        OnboardingPill { label: "rust-audit"; }
+                                        OnboardingPill { label: "slint-reference"; }
+                                        OnboardingPill { label: "phase-plan"; }
                                     }
                                 }
                             }
@@ -594,43 +516,30 @@ export component OnboardingGuideView inherits Rectangle {
 
                 HorizontalLayout {
                     spacing: 8px;
+                    padding-left: root.narrow ? 12px : 24px;
+                    padding-right: root.narrow ? 12px : 24px;
                     Text {
                         text: "Ready to start pair programming?";
-                        font-family: Theme.font-sans;
-                        font-size: 13px;
                         color: Theme.text-secondary;
                         vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        wrap: word-wrap;
                     }
                 }
 
-                btn-touch := TouchArea {
-                    width: btn-layout.preferred-width + 32px;
-                    height: 40px;
-                    mouse-cursor: pointer;
-
+                Button {
+                    label: "Start Chat >";
+                    button-accessible-label: "Start Chat";
+                    btn-width: 150px;
+                    btn-height: 40px;
+                    primary: true;
+                    bg: Theme.bg-primary;
+                    fg: Theme.text-on-primary;
+                    border-w: 0px;
                     clicked => {
                         root.start-chat-clicked();
-                    }
-
-                    Rectangle {
-                        width: 100%;
-                        height: 100%;
-                        background: btn-touch.pressed ? Theme.bg-primary.darker(20%) : (btn-touch.has-hover ? Theme.bg-primary.brighter(10%) : Theme.bg-primary);
-                        border-radius: Theme.radius-md;
-
-                        btn-layout := HorizontalLayout {
-                            alignment: center;
-                            spacing: 8px;
-
-                            Text {
-                                text: "Start Chat >";
-                                font-family: Theme.font-sans;
-                                font-size: 14px;
-                                font-weight: 600;
-                                color: Theme.text-on-primary;
-                                vertical-alignment: center;
-                            }
-                        }
                     }
                 }
             }

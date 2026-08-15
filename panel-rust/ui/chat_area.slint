@@ -1,9 +1,11 @@
 import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
+import { Text } from "./base/text/base_text.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
 import { SelectionFocus } from "./tokens/selection_focus.slint";
-import { IconButton } from "./base/icon_button.slint";
+import { IconButton } from "./base/buttons/icon_button.slint";
+import { Button } from "./base/buttons/button.slint";
 import { MessageItem, ToolGroupItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
@@ -13,14 +15,16 @@ import { QueuedMessageBar } from "./chat-view/components/message/queued_message_
 import { PendingStatusRow } from "./chat-view/components/message/pending_status_row.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { ToolGroupView } from "./chat-view/components/message/tool_group_view.slint";
-import { Spinner } from "./base/spinner.slint";
+import { Spinner } from "./base/feedback/spinner.slint";
 import { PermissionCard } from "./components/permission_card.slint";
 import { LocalTerminalCard } from "./components/local_terminal_card.slint";
 // PUI-002b: reuse the same boxed-row primitive the @/#/skill mention
 // popups already use (`chat_input_layout.slint`) instead of hand-rolling
 // a new list-row component for the terminals popup.
-import { MentionPickRow } from "./base/mention_pick_row.slint";
-import { ThinScrollbar } from "./base/thin_scrollbar.slint";
+import { MentionPickRow } from "./base/form/mention_pick_row.slint";
+import { ThinScrollbar } from "./base/layout/thin_scrollbar.slint";
+import { Divider } from "./base/layout/divider.slint";
+import { ModalScrim } from "./base/layout/modal_scrim.slint";
 import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
 import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
 import { OnboardingGuideView } from "./chat-view/components/onboarding_guide_view.slint";
@@ -603,10 +607,8 @@ export component ChatArea inherits Rectangle {
                                 : "");
                         color: Theme.text-primary;
                         // Match sidebar "Chats" title when rail collapsed.
-                        font-size: (root.match-title-bar ? 14px
-                            : (compact ? 13px : 15px)) * Theme.font-scale;
-                        font-weight: 600;
-                        font-family: Theme.font-sans;
+                        size: (root.match-title-bar ? "lg" : "md");
+                        weight: "semibold";
                         horizontal-alignment: left;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
@@ -665,8 +667,7 @@ export component ChatArea inherits Rectangle {
                         }
                     }
                     if !root.rename-editing && active-thread-name != "" : IconButton {
-                        btn-width: 20px;
-                        btn-height: 20px;
+                        size: "lg";
                         button-accessible-label: "Rename thread";
                         clicked => { root.begin-thread-rename(); }
                         Icon {
@@ -676,8 +677,7 @@ export component ChatArea inherits Rectangle {
                         }
                     }
                     if root.rename-editing : IconButton {
-                        btn-width: 20px;
-                        btn-height: 20px;
+                        size: "lg";
                         button-accessible-label: "Save thread name";
                         clicked => { root.confirm-thread-rename(); }
                         Icon {
@@ -687,8 +687,7 @@ export component ChatArea inherits Rectangle {
                         }
                     }
                     if root.rename-editing : IconButton {
-                        btn-width: 20px;
-                        btn-height: 20px;
+                        size: "lg";
                         button-accessible-label: "Cancel thread rename";
                         clicked => { root.cancel-thread-rename(); }
                         Icon {
@@ -723,7 +722,7 @@ export component ChatArea inherits Rectangle {
                         Text {
                             text: root.project-name;
                             color: Theme.text-muted;
-                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
+                            size: "xs";
                             font-family: Theme.font-mono;
                             vertical-alignment: center;
                             overflow: elide;
@@ -733,7 +732,7 @@ export component ChatArea inherits Rectangle {
                     Text {
                         text: agent-badge;
                         color: Theme.text-primary;
-                        font-size: (root.match-title-bar ? 10px : 11px) * Theme.font-scale;
+                        size: "sm";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-alignment: left;
@@ -755,12 +754,10 @@ export component ChatArea inherits Rectangle {
                 }
             }
         }
-        Rectangle {
+        Divider {
             // Separator under the header -- Slint has no per-edge
             // border, so a thin standalone Rectangle stands in for the
             // HTML's `border-b border-sys-border`.
-            height: 1px;
-            background: Theme.border-default;
         }
         // PROF-8: yellow "reachable but not authenticated" strip,
         // directly below the top bar (ahead of the red error banner
@@ -780,7 +777,7 @@ export component ChatArea inherits Rectangle {
                 auth-banner-text := Text {
                     text: "⚠ Agent is reachable but not authenticated. Configure an auth method for this profile.";
                     color: #eab308;
-                    font-size: 10px * Theme.font-scale;
+                    size: "sm";
                     font-family: Theme.font-mono;
                     wrap: word-wrap;
                     horizontal-stretch: 1;
@@ -821,14 +818,14 @@ export component ChatArea inherits Rectangle {
                                 : entry.status == "in_progress" ? "▶" : "○";
                             color: entry.status == "completed" ? Theme.text-muted
                                 : Theme.text-primary;
-                            font-size: 10px * Theme.font-scale;
+                            size: "sm";
                             font-family: Theme.font-mono;
                             vertical-alignment: center;
                         }
                         Text {
                             text: entry.content;
                             color: entry.status == "completed" ? Theme.text-muted : Theme.text-primary;
-                            font-size: 10px * Theme.font-scale;
+                            size: "sm";
                             font-family: Theme.font-mono;
                             wrap: word-wrap;
                             horizontal-stretch: 1;
@@ -863,25 +860,22 @@ export component ChatArea inherits Rectangle {
                 error-banner-text := Text {
                     text: "⚠ " + root.last-error;
                     color: #ef4444;
-                    font-size: 10px * Theme.font-scale;
+                    size: "sm";
                     font-family: Theme.font-mono;
                     wrap: word-wrap;
                     horizontal-stretch: 1;
                     preferred-width: 0px;
                     min-width: 0px;
                 }
-                dismiss-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    width: 16px;
-                    accessible-role: button;
-                    accessible-label: "Dismiss error";
-                    accessible-action-default => { root.error-banner-dismissed(); }
+                IconButton {
+                    btn-width: 16px;
+                    btn-height: 16px;
+                    button-accessible-label: "Dismiss error";
                     clicked => { root.error-banner-dismissed(); }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
                         text: "\u{2715}";
                         color: Theme.text-muted;
-                        font-size: 10px * Theme.font-scale;
+                        size: "sm";
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
@@ -992,38 +986,22 @@ export component ChatArea inherits Rectangle {
                 spacing: 0px;
                 if has-older-messages : VerticalLayout {
                     spacing: 0px;
-                    Rectangle {
-                        height: 22px;
-                        border-radius: Theme.radius-sm;
-                        background: load-older-button.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
-                        animate background { duration: 100ms; }
-                        load-older-button := TouchArea {
-                            mouse-cursor: loading-older-messages ? default : pointer;
-                            accessible-role: button;
-                            accessible-label: "Load older messages";
-                            enabled: !loading-older-messages;
-                            accessible-action-default => {
-                                if !loading-older-messages {
-                                    loading-older-messages = true;
-                                    load-older-requested();
-                                }
+                    Button {
+                        label: loading-older-messages ? "Loading older messages..." : "Load older messages";
+                        button-accessible-label: "Load older messages";
+                        btn-width: 160px;
+                        btn-height: 22px;
+                        font-size: 10px;
+                        font-weight: 400;
+                        bg: Theme.bg-sidebar;
+                        fg: Theme.text-secondary;
+                        border-col: transparent;
+                        border-w: 0px;
+                        clicked => {
+                            if !loading-older-messages {
+                                loading-older-messages = true;
+                                load-older-requested();
                             }
-                            clicked => {
-                                if !loading-older-messages {
-                                    loading-older-messages = true;
-                                    load-older-requested();
-                                }
-                            }
-                            changed has-hover => {
-                                CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
-                            }
-                        }
-                        Text {
-                            text: loading-older-messages ? "Loading older messages..." : "Load older messages";
-                            color: Theme.text-secondary;
-                            font-size: 10px * Theme.font-scale;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
                         }
                     }
                     // This block is only ever visible alongside real message
@@ -1040,7 +1018,7 @@ export component ChatArea inherits Rectangle {
                         text: "No project open";
                         color: Theme.text-muted;
                         opacity: 0.8;
-                        font-size: 11px * Theme.font-scale;
+                            size: "sm";
                         font-italic: true;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -1056,7 +1034,7 @@ export component ChatArea inherits Rectangle {
                             : "Send a message to start the conversation";
                         color: Theme.text-muted;
                         opacity: reloading ? blink : 0.8;
-                        font-size: 11px * Theme.font-scale;
+                            size: "sm";
                         font-italic: true;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -1327,21 +1305,8 @@ export component ChatArea inherits Rectangle {
 
             // Centered full view overlay popup inside message-area (between top bar & chat input)
             // Only show full-view backdrop if full-view is explicitly open (not just inherited from popup)
-            if root.full-view-open : Rectangle {
-                x: 0px;
-                y: 0px;
-                width: 100%;
-                height: 100%;
-                background: #00000080;
-
-                TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Close full view";
-                    accessible-action-default => { self.clicked(); }
-                    // Only close full-view, restoring previous state if nested
-                    clicked => { root.close-full-view(); }
-                }
+            if root.full-view-open : ModalScrim {
+                clicked => { root.close-full-view(); }
 
                 Rectangle {
                     x: max(10px, (parent.width - 720px) / 2);
@@ -1376,15 +1341,14 @@ export component ChatArea inherits Rectangle {
                             Text {
                                 text: root.full-view-title != "" ? root.full-view-title : "FULL CALL DETAILS & PAYLOAD";
                                 font-family: Theme.font-mono;
-                                font-size: 11px * Theme.font-scale;
-                                font-weight: 700;
+                                size: "sm";
+                                weight: "bold";
                                 color: Theme.text-primary;
                                 vertical-alignment: center;
                             }
                             Rectangle { horizontal-stretch: 1; height: 0px; }
                             IconButton {
-                                btn-width: 20px;
-                                btn-height: 20px;
+                                size: "lg";
                                 button-accessible-label: "Close full view";
                                 clicked => { root.close-full-view(); }
                                 Text {
@@ -1396,7 +1360,7 @@ export component ChatArea inherits Rectangle {
                             }
                         }
 
-                        Rectangle { height: 1px; background: Theme.border-default; }
+                        Divider { }
 
                         Flickable {
                             horizontal-stretch: 1;
@@ -1524,10 +1488,7 @@ export component ChatArea inherits Rectangle {
         if root.shown-pending.active : VerticalLayout {
             vertical-stretch: 0;
             // Top hairline only (full border on the band looked heavy).
-            Rectangle {
-                height: 1px;
-                background: Theme.border-strong;
-            }
+            Divider { bg: Theme.border-strong; }
             Rectangle {
                 vertical-stretch: 0;
                 background: Theme.bg-approval-band;
@@ -1552,10 +1513,7 @@ export component ChatArea inherits Rectangle {
             }
         }
         // Separator above the compose bar.
-        Rectangle {
-            height: 1px;
-            background: Theme.border-default;
-        }
+        Divider { }
         // User input + mode/model selectors (extracted ChatInputLayout).
         // vertical-stretch:0 keeps the composer a chrome band so the
         // message Flickable remains the only elastic region (bottom-box
@@ -1658,7 +1616,7 @@ export component ChatArea inherits Rectangle {
             if root.terminals.length == 0 : Text {
                 text: "No active terminals";
                 color: Theme.text-muted;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 horizontal-alignment: center;
                 height: 28px;
                 vertical-alignment: center;

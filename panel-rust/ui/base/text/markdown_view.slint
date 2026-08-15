@@ -1,0 +1,440 @@
+import { Theme } from "../../tokens/theme.slint";
+import { SelectionFocus } from "../../tokens/selection_focus.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { MarkdownLine, MarkdownRun, MarkdownBlock } from "../../types.slint";
+import { TerminalLogBlock } from "../terminal/terminal_log_block.slint";
+import { Divider } from "../layout/divider.slint";
+
+// Renders `MessageItem.markdown-lines` (see `src/markdown.rs` / `types.
+// slint`'s doc comments). Each `MarkdownLine` is already a fully wrapped
+// visual row -- the Rust side did the word-wrapping (`markdown::
+// wrap_runs`) because Slint's `Text` element has no native way to mix
+// differently-styled runs inside one reflowing, wrapped line the way
+// grok-build's ratatui-based renderer does with `Span`s. So this view
+// never wraps text itself: it just lays each line's runs out
+// horizontally and stacks lines vertically, styling each row by `kind`.
+//
+// ## Why left-align is explicit (and easy to regress)
+//
+// Slint `HorizontalLayout` defaults to `alignment: stretch`. When every
+// child is content-sized (`Text` has horizontal-stretch: 0), leftover
+// free space is *not* left at the end -- the engine packs the group as a
+// whole in the middle of the row. That is the opposite of CSS flexbox
+// (`justify-content: flex-start` default). Setting each run's
+// `horizontal-alignment: left` only controls glyphs *inside* that run's
+// own box; it does not decide where the box sits in the row. Visible
+// symptom: agent markdown bodies look centered in the bubble.
+//
+// Fix: every horizontal row uses `alignment: start` and a trailing
+// zero-height stretch spacer that absorbs free space so even a future
+// accidental `stretch` realignment cannot re-center the run group.
+//
+// Known simplifications vs. the ratatui original (acceptable for a v1
+// chat body, see markdown.rs's module doc for the full rationale):
+// no code-fence syntax highlighting, no clickable link targets, tables
+// render as a single unwrapped monospace row per row, and `strike` runs
+// are shown muted rather than with a real strikethrough decoration
+// (Slint's `Text` has no text-decoration property to draw one).
+export component MarkdownView inherits VerticalLayout {
+    // Phase 17: emitted with the link target on click (host applies
+    // the Ctrl requirement + opens file/URL).
+    callback link-activated(string);
+    // Architecture v2 (markdown-thread-freeze-fix phase 3): when
+    // non-empty, preferred over `lines` below -- one native `StyledText`
+    // per block instead of Rust-computed wrap. See markdown.rs's
+    // `segment_blocks` doc comment and
+    // memory/acpx/gen/plans/panel-thread-switch-freeze-fix-plan.md's
+    // "Architecture v2" section for why this coexists with `lines`
+    // rather than replacing it outright: `MessageItem.markdown-blocks`
+    // is populated at every current call site, but keeping `lines` live
+    // too means nothing else in this file has to change shape yet.
+    in property <[MarkdownBlock]> blocks: [];
+    in property <[MarkdownLine]> lines: [];
+    // Shown as plain wrapped text when both `blocks` and `lines` are
+    // empty -- covers a "agent" row cached before either existed (see
+    // `MessageItem.markdown-lines`'s doc comment) and any non-agent
+    // caller that hasn't bothered to markdown-parse its body.
+    in property <string> fallback-text: "";
+    in property <length> row-width: 0px;
+
+    spacing: 0px;
+    // Cross-axis for VerticalLayout = horizontal. Stretch children to
+    // the full row width so text starts at the left edge of the bubble,
+    // not at the left edge of a shrink-wrapped content column floating
+    // inside a wider parent.
+    alignment: stretch;
+
+    function same-code-group(idx: int) -> bool {
+        idx > 0 && root.lines[idx].kind == "code" && root.lines[idx - 1].kind == "code"
+            && root.lines[idx].code-block-id == root.lines[idx - 1].code-block-id
+    }
+
+    pure function heading-size(kind: string) -> length {
+        if kind == "h1" {
+            18px
+        } else if kind == "h2" {
+            16px
+        } else if kind == "h3" {
+            14px
+        } else {
+            13px
+        }
+    }
+
+    if blocks.length == 0 && lines.length == 0 : TextInput {
+        text: fallback-text;
+        font-family: Theme.font-sans;
+        font-size: 12px * Theme.font-scale;
+        color: Theme.text-primary;
+        read-only: true;
+        // Report focus so the host does not drop keystrokes while a
+        // selectable-text surface holds focus (see SelectionFocus).
+        changed has-focus => {
+            SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+        }
+        wrap: word-wrap;
+        horizontal-alignment: left;
+        // Stretch across the bubble; no explicit width (can't combine
+        // with min-width under Slint's layout rules).
+        horizontal-stretch: 1;
+        preferred-width: 0px;
+        min-width: 0px;
+        selection-foreground-color: Theme.text-primary;
+        selection-background-color: Theme.selection-bg;
+    }
+
+    // Architecture v2 block path -- takes over entirely when `blocks` is
+    // non-empty (the `lines` loop below is gated to skip in that case,
+    // not run alongside it).
+    if blocks.length > 0 : VerticalLayout {
+        spacing: 0px;
+        alignment: stretch;
+
+        for block[i] in blocks : VerticalLayout {
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            alignment: stretch;
+
+            if i > 0 : Rectangle { height: Metrics.space-2; }
+
+            // `x`/explicit positioning on a StyledText here would fight
+            // the enclosing VerticalLayout, which owns this child's
+            // geometry (Slint's "layout computes x/y for you" rule --
+            // any indent has to go through `padding-left` on a
+            // wrapping layout instead, same as the `lines` path above
+            // already does for its own indent handling).
+            if block.kind == "text" : HorizontalLayout {
+                padding-left: block.indent * 14px;
+                StyledText {
+                    text: block.text;
+                    default-font-size: block.default-font-size > 0px
+                        ? block.default-font-size * Theme.font-scale
+                        : 12px * Theme.font-scale;
+                    default-font-family: Theme.font-sans;
+                    // StyledText's `default-color` defaults to the Slint
+                    // library's own built-in palette, not this app's
+                    // Theme -- left unset it renders with colors that
+                    // don't match (and can look inverted against) every
+                    // other text element in the panel, which all read
+                    // Theme.text-primary explicitly.
+                    default-color: Theme.text-primary;
+                    link-color: Theme.md-link;
+                    horizontal-alignment: left;
+                    // Resize-rewrap fix: without an explicit stretch
+                    // factor, StyledText (like plain `Text`) defaults to
+                    // `horizontal-stretch: 0` -- see this file's own
+                    // header comment on why a zero-stretch child of a
+                    // (default `alignment: stretch`) HorizontalLayout
+                    // does NOT fill the row. Instead it's sized to its
+                    // own preferred/implicit width (computed once from
+                    // its content at whatever width was available then,
+                    // i.e. the *previous* container width) and the whole
+                    // packed block gets centered in the row. That
+                    // preferred size does not get recomputed just
+                    // because the window/bubble is resized -- only a
+                    // `text` content change (which recomputes implicit
+                    // size) or an explicit width the layout forces on it
+                    // does. Net effect: the message keeps its old wrap
+                    // points after a resize instead of reflowing to the
+                    // new width. `horizontal-stretch: 1` (matching every
+                    // other text-rendering path in this file: the
+                    // fallback TextInput above, the wrapped-line `run`
+                    // elements below, and the code-block wrapper) makes
+                    // the layout hand this element the row's live
+                    // width every layout pass, so live-width-driven
+                    // wrapping tracks a resize like all the sibling
+                    // paths already do. `min-width: 0px` keeps the
+                    // implicit natural (unwrapped) width from acting as
+                    // a floor that would otherwise stop the row from
+                    // ever shrinking below it.
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    link-clicked(link) => { root.link-activated(link); }
+                }
+            }
+
+            if block.kind == "code" : TerminalLogBlock {
+                text: block.code-text;
+                scrollable: false;
+                font-size: 11px;
+            }
+
+            if block.kind == "rule" : Divider { }
+
+            if block.kind == "table" : Flickable {
+                height: table-grid.preferred-height;
+                viewport-width: table-grid.preferred-width;
+                viewport-height: table-grid.preferred-height;
+
+                table-grid := VerticalLayout {
+                    spacing: 1px;
+                    // Row-major flat cell list -> rows of table-col-count
+                    // cells each. Slint has no dynamic GridLayout (its
+                    // rows/cols are fixed at compile time -- see the
+                    // Slint skill's GridLayout note), so a table with a
+                    // runtime-known row/column count has to be hand-rolled
+                    // as `for`-generated HorizontalLayout rows instead.
+                    for row-start[ri] in block.table-cells.length / max(1, block.table-col-count) : HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        for col[ci] in block.table-col-count : StyledText {
+                            text: block.table-cells[row-start * block.table-col-count + col];
+                            default-font-size: 12px * Theme.font-scale;
+                            default-font-family: Theme.font-sans;
+                            default-color: Theme.text-primary;
+                            link-color: Theme.md-link;
+                            min-width: 80px;
+                            horizontal-alignment: left;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for line[i] in blocks.length == 0 ? lines : [] : VerticalLayout {
+        property <bool> is-code: line.kind == "code";
+        property <bool> is-quote: line.kind == "quote";
+        property <bool> is-hr: line.kind == "hr";
+        property <bool> is-li: line.kind == "li" || line.kind == "li-ordered";
+        property <bool> is-heading: line.kind == "h1" || line.kind == "h2" || line.kind == "h3"
+            || line.kind == "h4" || line.kind == "h5" || line.kind == "h6";
+        property <bool> group-start: !is-code || !root.same-code-group(i);
+        property <bool> group-end: !is-code
+            || i + 1 >= root.lines.length
+            || !(root.lines[i + 1].kind == "code" && root.lines[i + 1].code-block-id == line.code-block-id);
+
+        horizontal-stretch: 1;
+        preferred-width: 0px;
+        min-width: 0px;
+        alignment: stretch;
+
+        // Contiguous lines in the same code-fence group sit flush
+        // against each other (one continuous background box); every
+        // other line gets a small breathing-room gap above it.
+        if i > 0 && !(is-code && !group-start) : Rectangle { height: Metrics.space-2; }
+
+        // One content row. Background for code is painted *behind* the
+        // runs (same geometry), not as a stretch sibling that steals
+        // half the row.
+        row-box := Rectangle {
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            background: is-code ? Theme.bg-terminal : transparent;
+            border-color: is-code ? Theme.border-terminal : transparent;
+            border-width: is-code ? 1px : 0px;
+            border-top-left-radius: is-code && group-start ? Theme.radius-sm : 0px;
+            border-top-right-radius: is-code && group-start ? Theme.radius-sm : 0px;
+            border-bottom-left-radius: is-code && group-end ? Theme.radius-sm : 0px;
+            border-bottom-right-radius: is-code && group-end ? Theme.radius-sm : 0px;
+
+            // Invisible click-drag-select overlay: a real (glyph-transparent)
+            // `TextInput` positioned to match the visual run cluster below,
+            // holding `line.plain-text` (the same characters the colored
+            // `Text` runs render, just unstyled). Plain `Text` never
+            // captures pointer events (see the Slint skill's anti-pattern
+            // #5), so mouse-down/drag on this row falls through to this
+            // `TextInput` underneath and gets native browser-style
+            // click-and-drag selection + Ctrl+C copy + the selection
+            // highlight, without re-deriving rich multi-run selection by
+            // hand. Declared *before* the visual `HorizontalLayout` below
+            // so it paints first (behind); paint/hit-test order in Slint
+            // follows declaration order for same-`z` siblings.
+            if !is-hr : TextInput {
+                x: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
+                y: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
+                width: max(0px, parent.width - self.x - (is-code ? Metrics.space-4 : 0px));
+                height: max(0px, parent.height - self.y - (is-code && group-end ? Metrics.space-3 : 0px));
+                text: line.plain-text;
+                font-family: is-code ? Theme.font-mono : Theme.font-sans;
+                font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
+                read-only: true;
+                // Report focus so the host does not drop keystrokes while a
+                // selectable-text surface holds focus (see SelectionFocus).
+                changed has-focus => {
+                    SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+                }
+                wrap: word-wrap;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                // Glyphs stay invisible -- the colored `Text` runs painted
+                // on top supply the actual visible characters. Only the
+                // selection highlight (painted behind those runs, which
+                // have no background of their own) shows through.
+                color: transparent;
+                selection-foreground-color: transparent;
+                selection-background-color: Theme.selection-bg;
+            }
+
+            HorizontalLayout {
+                width: 100%;
+                padding-left: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
+                padding-right: is-code ? Metrics.space-4 : 0px;
+                padding-top: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
+                padding-bottom: is-code ? (group-end ? Metrics.space-3 : 0px) : 0px;
+                spacing: Metrics.space-2;
+                // CRITICAL: start packing — see module comment.
+                alignment: start;
+
+                // Blockquote left accent bar.
+                if is-quote : Rectangle {
+                    width: 2px;
+                    horizontal-stretch: 0;
+                    background: Theme.border-strong;
+                }
+
+                if is-hr : Divider {
+                    horizontal-stretch: 1;
+                    y: parent.height / 2;
+                }
+
+                if is-li : Text {
+                    text: line.kind == "li-ordered" ? line.ordinal + "." : "\u{2022}";
+                    font-family: Theme.font-sans;
+                    font-size: 12px * Theme.font-scale;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: left;
+                    vertical-alignment: top;
+                    horizontal-stretch: 0;
+                }
+
+                if !is-hr : HorizontalLayout {
+                    // Content-sized run cluster, packed by the outer
+                    // `alignment: start`. Do *not* set horizontal-stretch:1
+                    // here without a trailing spacer — a full-width stretch
+                    // child with only non-stretch Text grandchildren and
+                    // default stretch alignment re-centers the glyph group.
+                    alignment: start;
+                    horizontal-stretch: 0;
+                    spacing: 0px;
+                    for run[ri] in line.runs : Text {
+                        text: run.text;
+                        font-family: (run.code || is-code) ? Theme.font-mono : Theme.font-sans;
+                        font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
+                        font-weight: (run.bold || is-heading) ? 700 : 400;
+                        font-italic: run.italic;
+                        // Phase 17: token-colored highlighting -- links
+                        // blue + underline, headings yellow, bold stays
+                        // high-contrast text-primary at weight 700.
+                        color: run.link != "" ? Theme.md-link
+                            : run.strike ? Theme.text-muted
+                            : is-heading ? Theme.md-heading
+                            : is-code ? Theme.text-terminal
+                            : Theme.text-primary;
+                        // TextDecoration: underline links only.
+                        // (Slint Text has no underline property pre-1.9?
+                        // it does: `text-decoration` not available; use
+                        // overline-free fallback -- omitted.)
+                        horizontal-alignment: left;
+                        vertical-alignment: top;
+                        horizontal-stretch: 0;
+                        // `markdown.rs`'s `wrap_runs` already breaks
+                        // *between* runs/words to fit its column
+                        // estimate, but it never splits a single word
+                        // (a long URL, file path, or minified-JSON
+                        // token) that alone exceeds that estimate --
+                        // greedy word-wrap only inserts breaks at space
+                        // boundaries. Before this, that one oversized
+                        // run rendered at its full natural width,
+                        // unconstrained (this cluster is
+                        // horizontal-stretch: 0, sized to content), and
+                        // got silently clipped by the ancestor
+                        // `Flickable` in `agent_bubble.slint` with no
+                        // ellipsis -- the worst case: unreadable AND no
+                        // sign anything was cut.
+                        wrap: word-wrap;
+                        property <length> run-max-width: max(24px, root.width
+                            - line.indent * 14px
+                            - (is-code ? Metrics.space-4 * 2 : 0px)
+                            - (is-quote ? 2px + Metrics.space-2 : 0px)
+                            - (is-li ? 14px + Metrics.space-2 : 0px));
+                        // BUG (one-character-per-line collapse): this
+                        // run cluster's `HorizontalLayout` uses
+                        // `alignment: start` (not the Slint default
+                        // `stretch`), so a non-stretch child (`horizontal
+                        // -stretch: 0`, no explicit `width`) is sized to
+                        // its *minimum* width, never its preferred
+                        // (natural) width -- see the Slint skill's
+                        // layout-defaults section. Turning on `wrap:
+                        // word-wrap` (above) makes that auto-computed
+                        // minimum collapse toward the width of a single
+                        // glyph, since `word-wrap`'s mid-word fallback
+                        // means the text CAN always be squeezed
+                        // narrower by breaking again -- same class of
+                        // bug the CSS `overflow-wrap: break-word`
+                        // min-content quirk causes in flex/grid items
+                        // without `min-width: 0` overridden the other
+                        // way. Every run, not just oversized ones, got
+                        // laid out at that collapsed minimum and
+                        // wrapped into a vertical stack of near-single
+                        // characters -- reproduced live (headless
+                        // geometry test) as multiple ~9px-wide, 164px-
+                        // tall `Text` boxes for ordinary short runs at a
+                        // realistic chat-bubble width. Setting an
+                        // explicit `width` (which layout always honors
+                        // over its min/preferred fallback) to the
+                        // smaller of the run's own natural width and
+                        // the row budget keeps normal runs at their
+                        // natural size and only engages `word-wrap`'s
+                        // reflow for the rare run that alone exceeds
+                        // `run-max-width`.
+                        width: min(self.preferred-width, run-max-width);
+                        // Click or Ctrl+Click both open the target -- kept
+                        // in sync with the Architecture v2 `blocks` path
+                        // below, where StyledText's own built-in
+                        // link-clicked fires on a plain click with no way
+                        // to gate it on a modifier (the widget owns its
+                        // own hit-testing, no raw pointer-event access).
+                        // A drag that ends its release over the link's own
+                        // small run TouchArea still counts as a click here
+                        // (no drag-distance threshold) -- same limitation
+                        // StyledText's native handling already has, so
+                        // this is no worse than the new path, not a
+                        // regression introduced by removing the Ctrl gate.
+                        if run.link != "" : TouchArea {
+                            mouse-cursor: pointer;
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.up) {
+                                    root.link-activated(run.link);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Absorbs free space so run/bullet boxes stay at the
+                // start edge even if this layout's alignment is ever
+                // changed back to the Slint default (`stretch`).
+                if !is-hr : Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    preferred-width: 0px;
+                    height: 0px;
+                    vertical-stretch: 0;
+                }
+            }
+        }
+    }
+}

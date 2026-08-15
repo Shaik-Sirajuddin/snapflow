@@ -2,16 +2,19 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Strings } from "../tokens/strings.slint";
 import { Icon } from "../base/icon.slint";
-import { SearchableDropdown } from "../base/searchable_dropdown.slint";
-import { FilterSearchBar } from "../base/filter_search_bar.slint";
-import { ContextRing } from "../base/context_ring.slint";
-import { ThinScrollbar } from "../base/thin_scrollbar.slint";
-import { Toggle } from "../base/toggle.slint";
-import { TextUtil } from "../base/text_util.slint";
-import { MentionPickRow } from "../base/mention_pick_row.slint";
-import { SelectableChip } from "../base/selectable_chip.slint";
+import { IconButton } from "../base/buttons/icon_button.slint";
+import { SearchableDropdown } from "../base/form/searchable_dropdown.slint";
+import { FilterSearchBar } from "../base/form/filter_search_bar.slint";
+import { ContextRing } from "../base/layout/context_ring.slint";
+import { ThinScrollbar } from "../base/layout/thin_scrollbar.slint";
+import { Toggle } from "../base/form/toggle.slint";
+import { TextUtil } from "../base/text/text_util.slint";
+import { Text } from "../base/text/base_text.slint";
+import { MentionPickRow } from "../base/form/mention_pick_row.slint";
+import { SelectableChip } from "../base/layout/selectable_chip.slint";
 import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
+import { Divider } from "../base/layout/divider.slint";
 
 // ChatInputLayout — bottom compose surface for ChatArea:
 //   row 1: multi-line user input + send/stop
@@ -618,8 +621,7 @@ export component ChatInputLayout inherits Rectangle {
                     // doesn't need a second one.
                     text: Strings.composer-placeholder;
                     color: Theme.text-muted;
-                    font-size: 11px * Theme.font-scale;
-                    font-family: Theme.font-sans;
+                    size: "sm";
                     wrap: no-wrap;
                     overflow: elide;
                     visible: compose.text == "";
@@ -737,16 +739,11 @@ export component ChatInputLayout inherits Rectangle {
                 alignment: end;
                 horizontal-stretch: 0;
                 width: 34px;
-                Rectangle {
-                    width: 34px;
-                    height: 34px;
-                    background: root.sending ? Theme.border-default
-                        : !(root.sending || compose.text != "") ? Theme.border-default
-                        : send-stop-button.has-hover ? Theme.bg-primary.with-alpha(0.85)
-                        : Theme.bg-primary;
-                    animate background { duration: 100ms; }
-                    border-radius: Theme.radius-md;
-                    opacity: (root.sending || compose.text != "") ? 1.0 : 0.7;
+                IconButton {
+                    btn-width: 34px;
+                    btn-height: 34px;
+                    button-accessible-label: root.sending ? Strings.stop-response : Strings.send-message;
+                    enabled: root.inputs-enabled && (root.sending || compose.text != "");
                     // chat_input_send_box_double_busy_indicator: this used to
                     // also render a spinning ring behind the stop icon while
                     // `root.sending` was true (setup-followups plan,
@@ -758,20 +755,9 @@ export component ChatInputLayout inherits Rectangle {
                     // `busy_thread_animating` check (lib.rs) still applies --
                     // it also drives chat_area.slint's header Spinner and
                     // sidebar row spinners, so it stays as-is.
-                    send-stop-button := TouchArea {
-                        mouse-cursor: pointer;
-                        accessible-role: button;
-                        accessible-label: root.sending ? Strings.stop-response : Strings.send-message;
-                        accessible-action-default => {
-                            if root.sending { root.stop-requested(); }
-                            else { root.send-requested(); }
-                        }
-                        enabled: root.inputs-enabled && (root.sending || compose.text != "");
-                        clicked => {
-                            if root.sending { root.stop-requested(); }
-                            else { root.send-requested(); }
-                        }
-                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                    clicked => {
+                        if root.sending { root.stop-requested(); }
+                        else { root.send-requested(); }
                     }
                     VerticalLayout {
                         alignment: center;
@@ -1016,9 +1002,8 @@ export component ChatInputLayout inherits Rectangle {
                 Text {
                     text: "Fast";
                     color: Theme.text-secondary;
-                    font-size: 10px * Theme.font-scale;
-                    font-family: Theme.font-sans;
-                    font-weight: 600;
+                    size: "sm";
+                    weight: "semibold";
                     vertical-alignment: center;
                     horizontal-stretch: 0;
                 }
@@ -1097,15 +1082,14 @@ export component ChatInputLayout inherits Rectangle {
 
         // PUI-002a: background-terminals chip, own row below the row2
         // selector strip. Mirrors the hr + chip convention used elsewhere
-        // (e.g. terminal_card.slint's `Rectangle { height: 1px; background:
-        // Theme.border-default; }` divider) rather than inventing a new
-        // one. Hidden when there are no terminals for the displayed
+        // (e.g. terminal_card.slint's shared Divider) rather than inventing
+        // a new one. Hidden when there are no terminals for the displayed
         // thread -- PUI-018 keeps terminal-count scoped per-ThreadSlot, so
         // switching threads/agents changes this without any extra wiring
         // here.
         if root.terminal-count > 0 : VerticalLayout {
             spacing: Metrics.gap-sm;
-            Rectangle { height: 1px; background: Theme.border-default; }
+            Divider { }
             // Reuses SelectableChip (base/) rather than hand-rolling a
             // TouchArea+Rectangle+Text -- agy -p's review-ui pass caught
             // the hand-rolled version both misusing a padding token
@@ -1175,20 +1159,19 @@ export component ChatInputLayout inherits Rectangle {
             Text {
                 text: Strings.session-context;
                 color: Theme.text-secondary;
-                font-size: 9px * Theme.font-scale;
-                font-weight: 700;
+                size: "xs";
+                weight: "bold";
                 font-family: Theme.font-mono;
             }
             Text {
                 text: root.context-used-tokens + " / " + root.context-limit-tokens + " tokens";
                 color: Theme.text-primary;
-                font-size: 11px * Theme.font-scale;
-                font-family: Theme.font-sans;
+                size: "sm";
             }
             Text {
                 text: context-ring.pct + "% used";
                 color: context-ring.ring-color;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 font-family: Theme.font-mono;
             }
         }
@@ -1272,7 +1255,7 @@ export component ChatInputLayout inherits Rectangle {
                         if root.slash-source.length == 0 : Text {
                             text: "No commands available";
                             color: Theme.text-muted;
-                            font-size: 11px * Theme.font-scale;
+                            size: "sm";
                         }
                     }
 
@@ -1314,7 +1297,7 @@ export component ChatInputLayout inherits Rectangle {
                         if root.mcp-options.length == 0 : Text {
                             text: "No MCP servers registered";
                             color: Theme.text-muted;
-                            font-size: 11px * Theme.font-scale;
+                            size: "sm";
                         }
                     }
 
@@ -1339,7 +1322,7 @@ export component ChatInputLayout inherits Rectangle {
                         if root.file-options.length == 0 : Text {
                             text: "No files indexed yet";
                             color: Theme.text-muted;
-                            font-size: 11px * Theme.font-scale;
+                            size: "sm";
                         }
                     }
                 }
@@ -1370,7 +1353,7 @@ export component ChatInputLayout inherits Rectangle {
         Text {
             text: "Archived thread - resume it to continue the conversation";
             color: Theme.text-muted;
-            font-size: 10px * Theme.font-scale;
+            size: "sm";
             font-italic: true;
             horizontal-alignment: center;
             vertical-alignment: center;

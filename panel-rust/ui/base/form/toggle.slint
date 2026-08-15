@@ -1,0 +1,59 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { Strings } from "../../tokens/strings.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
+
+// Layer 3 (base) -- the "switch"-shaped on/off control. Until now every
+// toggle-shaped setting in this codebase was hand-rolled per call site
+// (see `harness_view.slint`, which renders its background-session toggles
+// as full-width label rows with an inline `TouchArea`, not a switch), so
+// there was no shared switch primitive at all. This centralizes the
+// pill-track + sliding-knob shape so settings views can drop a real
+// toggle next to a `SettingsRow` label instead of restyling one by hand.
+// Monochrome only -- `Theme.bg-primary` for the on-track, no accent/status
+// hue, matching this project's no-status-color design language.
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <bool> enabled: true;
+    in property <string> toggle-accessible-label: Strings.toggle-default-label;
+    in property <string> size: "md";
+    callback toggled(bool);
+
+    width: size == "sm" ? 28px : size == "lg" ? 36px : 32px;
+    height: size == "sm" ? 16px : size == "lg" ? 20px : 18px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: self.height / 2;
+    background: root.checked ? Theme.bg-primary : Theme.bg-sidebar;
+    animate background { duration: 100ms; }
+    border-width: 1px;
+    border-color: root.checked ? Theme.bg-primary : Theme.border-default;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.toggle-accessible-label;
+        accessible-checkable: true;
+        accessible-checked: root.checked;
+        accessible-action-default => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+    }
+
+    knob := Rectangle {
+        width: root.size == "sm" ? 12px : root.size == "lg" ? 16px : 14px;
+        height: root.size == "sm" ? 12px : root.size == "lg" ? 16px : 14px;
+        border-radius: self.height / 2;
+        background: root.checked ? Theme.text-on-primary : Theme.text-muted;
+        y: (parent.height - self.height) / 2;
+        x: root.checked ? parent.width - self.width - Metrics.space-1 : Metrics.space-1;
+        animate x, background { duration: 100ms; }
+    }
+}

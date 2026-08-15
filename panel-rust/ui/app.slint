@@ -7,8 +7,10 @@ import { TerminalOverlay } from "components/terminal_card.slint";
 import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
 import { SettingsPage } from "pages/settings/settings_page.slint";
 import { SkillEditorView } from "pages/skills/skill_view.slint";
-import { TextUtil } from "base/text_util.slint";
+import { TextUtil } from "base/text/text_util.slint";
+import { Text } from "base/text/base_text.slint";
 import { CursorHost } from "tokens/cursor_host.slint";
+import { ModalScrim } from "base/layout/modal_scrim.slint";
 
 export { ThreadItem, ThreadViewItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme, CursorHost }
 
@@ -925,7 +927,7 @@ export component ChatPanel inherits Window {
                 width: parent.width - 28px;
                 text: (root.toast-kind == "error" ? "⚠ " : "") + root.toast-message;
                 color: root.toast-kind == "error" ? #ef4444 : Theme.text-primary;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 font-family: Theme.font-mono;
                 wrap: word-wrap;
             }
@@ -966,14 +968,10 @@ export component ChatPanel inherits Window {
         // width/height under FocusScope collapses to 0×0; SettingsPage
         // then binds width/height to that parent and never paints even
         // when `settings-open` is true (sidebar click / Ctrl+, look dead).
-        if settings-open : Rectangle {
+        if settings-open : ModalScrim {
             z: 7000;
-            width: root.width;
-            height: root.height;
-            // Dim chat behind the sheet so the overlay is obvious.
-            background: #00000088;
+            shade: "lg";
             // Click-through guard on the dimmer (close is via X / Escape).
-            TouchArea { }
         }
 
         // SettingsPage itself is a sibling of the dimmer above, not nested

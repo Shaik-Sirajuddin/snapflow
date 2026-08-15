@@ -1,9 +1,13 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
-import { Button } from "../base/button.slint";
+import { Button } from "../base/buttons/button.slint";
 import { TerminalItem } from "../types.slint";
-import { TerminalHeader } from "../base/terminal_header.slint";
+import { TerminalHeader } from "../base/terminal/terminal_header.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { Text } from "../base/text/base_text.slint";
+import { Card } from "../base/layout/card.slint";
+import { IconButton } from "../base/buttons/icon_button.slint";
+import { Divider } from "../base/layout/divider.slint";
 
 // Real embedded terminal view -- Phase 4 terminal-view addition. Two
 // components:
@@ -26,19 +30,20 @@ import { HoverSurface } from "../base/hover.slint";
 // read-only, matching the plan's "close to a real terminal ui" framing
 // for the *client*-created case while the *agent*-created case stays a
 // bounded streaming log.
-export component TerminalCard inherits Rectangle {
+export component TerminalCard inherits Card {
     in property <TerminalItem> item;
     in property <bool> compact: true;
     callback expand();
 
+    bordered: true;
+    border: "default";
+    border-col: Theme.border-terminal;
+    pad: Metrics.space-4;
     background: Theme.bg-terminal;
-    border-color: Theme.border-terminal;
-    border-width: 1px;
-    border-radius: Theme.radius-md;
     height: compact ? 96px : 140px;
 
     VerticalLayout {
-        padding: Metrics.space-4;
+        padding: 0px;
         spacing: Metrics.space-2;
         TerminalHeader {
             title: "terminal " + item.terminal-id;
@@ -49,7 +54,7 @@ export component TerminalCard inherits Rectangle {
             Text {
                 text: "\u{2922}"; // expand glyph
                 color: Theme.text-muted;
-                font-size: 11px * Theme.font-scale;
+                size: "sm";
                 vertical-alignment: center;
             }
         }
@@ -59,7 +64,7 @@ export component TerminalCard inherits Rectangle {
                 text: item.output + (item.truncated ? "\n... (truncated)" : "");
                 color: Theme.text-terminal;
                 font-family: Theme.font-mono;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 wrap: word-wrap;
                 overflow: clip;
                 horizontal-stretch: 1;
@@ -81,7 +86,7 @@ export component TerminalCard inherits Rectangle {
 // `item` stays the single *active* one (unchanged prop, still what the
 // header/content read for "which tab is current"). See the tab-strip and
 // content-`for`-loop below for how each tab keeps its own scroll position.
-export component TerminalOverlay inherits Rectangle {
+export component TerminalOverlay inherits Card {
     in property <TerminalItem> item;
     in property <[TerminalItem]> open-tabs: [];
     // A standalone exported component has no compile-time-resolvable
@@ -102,13 +107,15 @@ export component TerminalOverlay inherits Rectangle {
     y: 8px;
     width: container-width - 16px;
     height: container-height - 16px;
+    bordered: true;
+    border: "strong";
+    border-col: Theme.border-strong;
+    // Keep the overlay's existing larger content inset.
+    pad: Metrics.space-5;
     background: Theme.bg-terminal;
-    border-color: Theme.border-strong;
-    border-width: 1px;
-    border-radius: Theme.radius-md;
 
     VerticalLayout {
-        padding: Metrics.space-5;
+        padding: 0px;
         spacing: Metrics.space-4;
 
         // Tab strip: one pill per open terminal (title elided, running/
@@ -156,25 +163,21 @@ export component TerminalOverlay inherits Rectangle {
                                 text: tab-item.title != "" ? tab-item.title : tab-item.terminal-id;
                                 color: (tab-item.terminal-id == root.item.terminal-id) ? Theme.text-on-primary : Theme.text-primary;
                                 font-family: Theme.font-mono;
-                                font-size: 10px * Theme.font-scale;
+                                size: "sm";
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 preferred-width: 0px;
                                 min-width: 0px;
                                 overflow: elide;
                             }
-                            close-tab-touch := TouchArea {
-                                width: 14px;
-                                height: 14px;
-                                mouse-cursor: pointer;
-                                accessible-role: button;
-                                accessible-label: "Close terminal tab " + (tab-item.title != "" ? tab-item.title : tab-item.terminal-id);
-                                accessible-action-default => { self.clicked(); }
+                            close-tab-touch := IconButton {
+                                btn-width: 14px;
+                                btn-height: 14px;
+                                button-accessible-label: "Close terminal tab " + (tab-item.title != "" ? tab-item.title : tab-item.terminal-id);
                                 clicked => { root.tab-closed(tab-item.terminal-id); }
                                 Text {
                                     text: "×";
                                     color: (tab-item.terminal-id == root.item.terminal-id) ? Theme.text-on-primary : Theme.text-muted;
-                                    font-size: 12px * Theme.font-scale;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                     width: 100%;
@@ -189,7 +192,7 @@ export component TerminalOverlay inherits Rectangle {
                 text: "exit " + item.exit-code;
                 color: Theme.text-muted;
                 font-family: Theme.font-mono;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 vertical-alignment: center;
             }
             Button {
@@ -201,10 +204,7 @@ export component TerminalOverlay inherits Rectangle {
                 clicked => { close(); }
             }
         }
-        Rectangle {
-            height: 1px;
-            background: Theme.border-default;
-        }
+        Divider { }
         // One persistent Flickable+Text per open tab, same `wrap:word-
         // wrap` + `horizontal-stretch:1` + `preferred-width:0px` +
         // `min-width:0px` trio the pre-existing single-terminal `full-
@@ -258,7 +258,7 @@ export component TerminalOverlay inherits Rectangle {
                     text: tab-item.output + (tab-item.truncated ? "\n... (truncated)" : "");
                     color: Theme.text-terminal;
                     font-family: Theme.font-mono;
-                    font-size: 11px * Theme.font-scale;
+                    size: "sm";
                     wrap: word-wrap;
                     overflow: clip;
                     horizontal-stretch: 1;

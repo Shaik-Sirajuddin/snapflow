@@ -1,0 +1,91 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Icon } from "../../base/icon.slint";
+import { Text } from "../../base/text/base_text.slint";
+
+// Shared onboarding primitives. Content-specific text and icons are passed
+// by the guide page; spacing, typography, borders, and surface roles live
+// here so the page does not repeat raw visual metrics.
+export component OnboardingSectionHeader inherits HorizontalLayout {
+    in property <image> icon-source;
+    in property <string> title;
+
+    spacing: 10px;
+    cross-axis-alignment: center;
+    horizontal-stretch: 1;
+    min-width: 0px;
+
+    Icon {
+        source: root.icon-source;
+        width: 18px;
+        height: 18px;
+        colorize: Theme.md-link;
+        horizontal-stretch: 0;
+        vertical-stretch: 0;
+    }
+    Text {
+        text: root.title;
+        size: "lg";
+        weight: "semibold";
+        horizontal-stretch: 1;
+    }
+}
+
+export component OnboardingPreviewCard inherits Rectangle {
+    in property <string> title;
+
+    background: Theme.bg-chat;
+    border-color: Theme.border-default;
+    border-width: 1px;
+    border-radius: Theme.radius-md;
+    preferred-width: 0px;
+    min-width: 0px;
+
+    VerticalLayout {
+        width: 100%;
+        preferred-width: 0px;
+        min-width: 0px;
+        padding: 14px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            cross-axis-alignment: center;
+            Text {
+                text: root.title;
+                weight: "semibold";
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: "[ Image Gap / Preview ]";
+                font-family: Theme.font-mono;
+                size: "sm";
+                color: Theme.md-link;
+                horizontal-stretch: 0;
+                overflow: elide;
+            }
+        }
+        @children
+    }
+}
+
+export component OnboardingPill inherits Rectangle {
+    in property <string> label;
+
+    background: Theme.bg-sidebar;
+    border-color: Theme.border-default;
+    border-width: 1px;
+    border-radius: 12px;
+    horizontal-stretch: 0;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        Text {
+            text: root.label;
+            font-family: Theme.font-mono;
+            size: "sm";
+        }
+    }
+}

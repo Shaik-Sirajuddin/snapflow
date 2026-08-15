@@ -1,12 +1,13 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
-import { Button } from "../../../base/button.slint";
-import { Toggle } from "../../../base/toggle.slint";
+import { Button } from "../../../base/buttons/button.slint";
+import { Toggle } from "../../../base/form/toggle.slint";
 import { SettingsSearchBar } from "../components/search_bar.slint";
-import { TextUtil } from "../../../base/text_util.slint";
-import { SettingsRow } from "../../../base/settings_row.slint";
-import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
+import { TextUtil } from "../../../base/text/text_util.slint";
+import { SettingsRow } from "../../../base/layout/settings_row.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/layout/settings_section.slint";
 import { SkillOption } from "../../../types.slint";
+import { Text } from "../../../base/text/base_text.slint";
 
 // Skills settings left-tab view -- `skills_management_settings` phase.
 // Same layout convention as `mcp_servers_view.slint`: a `SettingsRow`
@@ -116,8 +117,7 @@ export component SkillsView inherits Rectangle {
                 if skill.scope == "project" && skill.started-from != "" : Text {
                     text: "from " + skill.started-from;
                     color: Theme.text-muted;
-                    font-size: 9px * Theme.font-scale;
-                    vertical-alignment: center;
+                    size: "xs";
                     max-width: 120px;
                     overflow: elide;
                 }
@@ -125,9 +125,8 @@ export component SkillsView inherits Rectangle {
                 Text {
                     text: skill.scope;
                     color: Theme.text-muted;
-                    font-size: 9px * Theme.font-scale;
+                    size: "xs";
                     font-family: Theme.font-mono;
-                    vertical-alignment: center;
                 }
 
                 // Promote a project-local skill to global -- moves its
@@ -136,7 +135,7 @@ export component SkillsView inherits Rectangle {
                 if skill.scope == "project" : Button {
                     label: "Make Global";
                     button-accessible-label: "Make skill " + skill.name + " global";
-                    btn-width: 80px;
+                    btn-width: self.content-width;
                     btn-height: 22px;
                     font-size: 9px;
                     font-weight: 400;

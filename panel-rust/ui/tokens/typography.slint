@@ -10,4 +10,18 @@ export global Typography {
     // explicit component font consumes `Theme.font-scale` so host
     // accessibility scaling and this base multiplier compose cleanly.
     out property <float> font-scale-base: 1.3;
+
+    // Five-step type scale grounded in the existing UI font-size clusters.
+    // `md` preserves the current Text default exactly at 13px.
+    out property <length> text-xs: 9px;
+    out property <length> text-sm: 11px;
+    out property <length> text-md: 13px;
+    out property <length> text-lg: 16px;
+    out property <length> text-xl: 20px;
+
+    // Named weights for the values already used throughout the UI.
+    out property <int> weight-regular: 400;
+    out property <int> weight-medium: 500;
+    out property <int> weight-semibold: 600;
+    out property <int> weight-bold: 700;
 }

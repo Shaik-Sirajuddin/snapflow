@@ -1,11 +1,13 @@
 import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Icon } from "../../base/icon.slint";
-import { IconButton } from "../../base/icon_button.slint";
-import { TextPillButton } from "../../base/text_pill_button.slint";
+import { IconButton } from "../../base/buttons/icon_button.slint";
+import { TextPillButton } from "../../base/buttons/text_pill_button.slint";
 import { CursorHost } from "../../tokens/cursor_host.slint";
-import { MarkdownView } from "../../base/markdown_view.slint";
+import { MarkdownView } from "../../base/text/markdown_view.slint";
 import { MarkdownLine } from "../../types.slint";
+import { Text } from "../../base/text/base_text.slint";
+import { Divider } from "../../base/layout/divider.slint";
 
 // Skill editor -- `active_pane_and_editor_view` phase. Replaces
 // `ChatArea` in the main content area (see `app.slint`'s `active-pane`
@@ -96,9 +98,7 @@ export component SkillEditorView inherits Rectangle {
                     Text {
                         text: root.skill-name;
                         color: Theme.text-primary;
-                        font-size: 12px * Theme.font-scale;
-                        font-weight: 600;
-                        font-family: Theme.font-sans;
+                        weight: "semibold";
                         vertical-alignment: center;
                         horizontal-alignment: left;
                         horizontal-stretch: 1;
@@ -118,7 +118,7 @@ export component SkillEditorView inherits Rectangle {
                     if root.skill-saving : Text {
                         text: "Saving…";
                         color: Theme.text-muted;
-                        font-size: 9px * Theme.font-scale;
+                        size: "xs";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-stretch: 0;
@@ -160,10 +160,7 @@ export component SkillEditorView inherits Rectangle {
             }
         }
 
-        Rectangle {
-            height: 1px;
-            background: Theme.border-default;
-        }
+        Divider { }
 
         Rectangle {
             vertical-stretch: 1;

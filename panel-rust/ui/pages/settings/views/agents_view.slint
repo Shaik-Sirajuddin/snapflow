@@ -1,16 +1,17 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Strings } from "../../../tokens/strings.slint";
-import { Button } from "../../../base/button.slint";
-import { TextField } from "../../../base/text_field.slint";
-import { SettingsRow } from "../../../base/settings_row.slint";
-import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider } from "../../../base/settings_section.slint";
-import { ThinScrollbar } from "../../../base/thin_scrollbar.slint";
+import { Button } from "../../../base/buttons/button.slint";
+import { TextField } from "../../../base/form/text_field.slint";
+import { SettingsRow } from "../../../base/layout/settings_row.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider } from "../../../base/layout/settings_section.slint";
+import { ThinScrollbar } from "../../../base/layout/thin_scrollbar.slint";
 import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
-import { TextUtil } from "../../../base/text_util.slint";
-import { SelectableChip } from "../../../base/selectable_chip.slint";
+import { TextUtil } from "../../../base/text/text_util.slint";
+import { SelectableChip } from "../../../base/layout/selectable_chip.slint";
+import { Text } from "../../../base/text/base_text.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
 // former `components/settings_sheet.slint` that is agent/profile/session
@@ -524,7 +525,7 @@ export component AgentsView inherits Rectangle {
             if agent-count == 0 : Text {
                 text: "No agents found";
                 color: Theme.text-muted;
-                font-size: 11px * Theme.font-scale;
+                size: "sm";
                 vertical-alignment: center;
                 height: 28px;
             }
@@ -611,7 +612,7 @@ export component AgentsView inherits Rectangle {
         if root.recoverable-sessions.length == 0 : Text {
             text: Strings.no-orphaned-sessions;
             color: Theme.text-muted;
-            font-size: 10px * Theme.font-scale;
+            size: "sm";
         }
         for session in root.recoverable-sessions : SettingsRow {
             label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";

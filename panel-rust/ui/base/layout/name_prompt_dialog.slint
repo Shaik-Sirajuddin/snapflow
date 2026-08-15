@@ -1,0 +1,148 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Strings } from "../../tokens/strings.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
+
+// Shared small text-entry modal for naming user-created objects such as
+// skills and chat threads. Hosts own the actual create/rename operation.
+export component NamePromptDialog inherits Rectangle {
+    in-out property <bool> open: false;
+    in property <string> title: "";
+    in property <string> field-accessible-label: "";
+    in property <string> confirm-label: Strings.save-label;
+    in property <string> initial-value: "";
+    property <string> draft: "";
+    callback confirmed(string);
+    callback cancelled();
+    // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
+    // own doc comment -- without this, the host's editable-surface OR-chain
+    // has no way to know this modal's input is focused, so every keystroke
+    // typed into it (renaming a thread/skill, naming a new skill) would be
+    // silently dropped before reaching Slint.
+    out property <bool> has-focus: name-input.has-focus;
+
+    visible: open;
+    background: Theme.bg-canvas.with-alpha(0.85);
+
+    changed open => {
+        if (open) {
+            draft = initial-value;
+        }
+    }
+
+    backdrop := TouchArea {
+        mouse-cursor: default;
+        clicked => {
+            root.open = false;
+            root.cancelled();
+        }
+    }
+
+    dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: Math.min(240px, parent.width - 2 * Metrics.space-6);
+        height: 110px;
+        background: Theme.bg-card;
+        border-color: Theme.border-strong;
+        border-width: 1px;
+        border-radius: Theme.radius-md;
+
+        // Keep clicks inside the modal from reaching its backdrop.
+        TouchArea {}
+
+        VerticalLayout {
+            padding: Metrics.space-4;
+            spacing: Metrics.space-3;
+            Text {
+                text: root.title;
+                color: Theme.text-primary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: 600;
+                font-family: Theme.font-sans;
+            }
+            Rectangle {
+                height: 28px;
+                background: Theme.bg-sidebar;
+                border-color: Theme.border-default;
+                border-width: 1px;
+                border-radius: Theme.radius-sm;
+                name-input := TextInput {
+                    x: Metrics.space-3;
+                    y: 0px;
+                    width: parent.width - 2 * Metrics.space-3;
+                    height: parent.height;
+                    accessible-label: root.field-accessible-label;
+                    text <=> root.draft;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-sans;
+                    font-size: 11px * Theme.font-scale;
+                    vertical-alignment: center;
+                    single-line: true;
+                    key-pressed(event) => {
+                        if (event.text == Key.Return && self.text != "") {
+                            root.confirmed(self.text);
+                            root.open = false;
+                            return EventResult.accept;
+                        }
+                        if (event.text == Key.Escape) {
+                            root.open = false;
+                            root.cancelled();
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
+                    changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
+                }
+            }
+            HorizontalLayout {
+                spacing: Metrics.space-3;
+                alignment: end;
+                cancel-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: Strings.cancel;
+                    accessible-action-default => {
+                        root.open = false;
+                        root.cancelled();
+                    }
+                    clicked => {
+                        root.open = false;
+                        root.cancelled();
+                    }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                    Text {
+                        text: Strings.cancel;
+                        color: Theme.text-secondary;
+                        font-size: 10px * Theme.font-scale;
+                        vertical-alignment: center;
+                    }
+                }
+                confirm-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: root.confirm-label;
+                    enabled: name-input.text != "";
+                    accessible-action-default => {
+                        root.confirmed(name-input.text);
+                        root.open = false;
+                    }
+                    clicked => {
+                        root.confirmed(name-input.text);
+                        root.open = false;
+                    }
+                    changed has-hover => {
+                        CursorHost.kind = (self.has-hover && name-input.text != "") ? "pointer" : "default";
+                    }
+                    Text {
+                        text: root.confirm-label;
+                        color: name-input.text != "" ? Theme.bg-primary : Theme.text-muted;
+                        font-size: 10px * Theme.font-scale;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

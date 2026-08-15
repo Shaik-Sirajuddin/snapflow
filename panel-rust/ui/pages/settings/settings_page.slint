@@ -27,13 +27,14 @@
 // unchanged.
 import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
-import { Button } from "../../base/button.slint";
+import { Button } from "../../base/buttons/button.slint";
 import { Icon } from "../../base/icon.slint";
-import { IconButton } from "../../base/icon_button.slint";
+import { IconButton } from "../../base/buttons/icon_button.slint";
 import { SettingsTopTabs } from "components/top_tabs.slint";
 import { SettingsLeftTabs } from "components/left_tabs.slint";
 import { SettingsSearchBar } from "components/search_bar.slint";
-import { ThinScrollbar } from "../../base/thin_scrollbar.slint";
+import { ThinScrollbar } from "../../base/layout/thin_scrollbar.slint";
+import { Text } from "../../base/text/base_text.slint";
 import { McpServersView } from "views/mcp_servers_view.slint";
 import { AgentsView } from "views/agents_view.slint";
 import { HarnessView } from "views/harness_view.slint";
@@ -196,8 +197,7 @@ export component SettingsPage inherits Rectangle {
             Text {
                 text: "Settings";
                 color: Theme.text-primary;
-                font-size: 13px * Theme.font-scale;
-                font-weight: 700;
+                weight: "bold";
                 vertical-alignment: center;
             }
         }

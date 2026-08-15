@@ -1,10 +1,12 @@
 import { Theme } from "../tokens/theme.slint";
 import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
-import { Badge } from "../base/badge.slint";
-import { TerminalLogBlock } from "../base/terminal_log_block.slint";
+import { Badge } from "../base/feedback/badge.slint";
+import { TerminalLogBlock } from "../base/terminal/terminal_log_block.slint";
 import { MessageItem } from "../types.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { Text } from "../base/text/base_text.slint";
+import { Card } from "../base/layout/card.slint";
 
 // Agent / thinking / legacy tool-call card.
 // Styling on top of the working baseline:
@@ -12,7 +14,7 @@ import { HoverSurface } from "../base/hover.slint";
 // - Thinking: transparent, small pad
 // - Body keeps Flickable + preferred-height (baseline-stable)
 // - Empty layout spacers must not fill parent height (Slint skill)
-export component MessageCard inherits Rectangle {
+export component MessageCard inherits Card {
     in property <MessageItem> item;
     callback toggle-expanded(int);
 
@@ -26,13 +28,20 @@ export component MessageCard inherits Rectangle {
     clip: true;
 
     // Agent: subtle Theme.bg-agent-bubble (not primary-container).
+    bg: is-thinking ? "secondary" : is-user ? "secondary" : is-tool-call ? "secondary" : is-agent ? "secondary" : "primary";
+    radius: "lg";
+    bordered: is-tool-call;
+    border: "strong";
+    border-col: is-tool-call ? Theme.border-strong : Theme.border-default;
+    pad: is-thinking ? Metrics.space-2 : is-agent ? Metrics.space-4 : Metrics.space-5;
+
+    // Preserve message-specific bubble roles; Card's enum intentionally does
+    // not replace these domain colors.
     background: is-thinking ? transparent
         : is-user ? Theme.bg-user-bubble
         : is-tool-call ? Theme.bg-agent-bubble
         : is-agent ? Theme.bg-tertiary
         : Theme.bg-primary-container;
-    border-color: is-tool-call ? Theme.border-strong : transparent;
-    border-width: is-thinking ? 0px : is-tool-call ? 1px : 0px;
 
     border-top-left-radius: is-thinking ? 0px : Theme.radius-lg;
     border-top-right-radius: is-thinking ? 0px : Theme.radius-lg;
@@ -44,9 +53,7 @@ export component MessageCard inherits Rectangle {
         : Theme.radius-lg;
 
     VerticalLayout {
-        padding: is-thinking ? Metrics.space-2
-            : is-agent ? Metrics.space-4
-            : Metrics.space-5;
+        padding: 0px;
         spacing: Metrics.space-3;
 
         // No header for agent messages. Tool-call rows are status-only --
@@ -58,8 +65,8 @@ export component MessageCard inherits Rectangle {
             if !is-tool-call : Text {
                 text: header-label;
                 font-family: Theme.font-mono;
-                font-size: 9px * Theme.font-scale;
-                font-weight: 700;
+                size: "xs";
+                weight: "bold";
                 letter-spacing: 0.5px;
                 color: Theme.text-muted;
                 vertical-alignment: center;
@@ -116,9 +123,7 @@ export component MessageCard inherits Rectangle {
                     spacing: Metrics.space-3;
                     Text {
                         text: item.text;
-                        font-family: Theme.font-sans;
-                        font-size: 12px * Theme.font-scale;
-                        font-weight: 600;
+                        weight: "semibold";
                         color: Theme.text-primary;
                         wrap: word-wrap;
                         overflow: elide;
@@ -129,7 +134,7 @@ export component MessageCard inherits Rectangle {
                     Text {
                         text: item.expanded ? "[-] hide logs" : "[+] show logs";
                         font-family: Theme.font-mono;
-                        font-size: 9px * Theme.font-scale;
+                        size: "xs";
                         color: Theme.text-secondary;
                         vertical-alignment: center;
                         horizontal-stretch: 0;

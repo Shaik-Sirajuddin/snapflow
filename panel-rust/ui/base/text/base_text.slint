@@ -1,0 +1,46 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Typography } from "../../tokens/typography.slint";
+
+// Shared text primitive. Pages should only override typography when the
+// content has a deliberate semantic variant (for example mono, muted, or a
+// heading size); common theme defaults belong here.
+export component Text inherits Text {
+    in property <string> size: "md";
+    in property <string> weight: "regular";
+    in property <bool> mono: false;
+
+    pure function size-value(value: string) -> length {
+        if value == "xs" {
+            Typography.text-xs
+        } else if value == "sm" {
+            Typography.text-sm
+        } else if value == "lg" {
+            Typography.text-lg
+        } else if value == "xl" {
+            Typography.text-xl
+        } else {
+            Typography.text-md
+        }
+    }
+
+    pure function weight-value(value: string) -> int {
+        if value == "medium" {
+            Typography.weight-medium
+        } else if value == "semibold" {
+            Typography.weight-semibold
+        } else if value == "bold" {
+            Typography.weight-bold
+        } else {
+            Typography.weight-regular
+        }
+    }
+
+    font-family: mono ? Theme.font-mono : Theme.font-sans;
+    font-size: size-value(size) * Theme.font-scale;
+    font-weight: weight-value(weight);
+    color: Theme.text-primary;
+    wrap: word-wrap;
+    vertical-alignment: center;
+    preferred-width: 0px;
+    min-width: 0px;
+}

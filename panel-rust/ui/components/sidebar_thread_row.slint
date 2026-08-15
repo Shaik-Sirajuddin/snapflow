@@ -1,10 +1,11 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
-import { IconButton } from "../base/icon_button.slint";
+import { IconButton } from "../base/buttons/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
 import { ThreadItem } from "../types.slint";
-import { Spinner } from "../base/spinner.slint";
+import { Spinner } from "../base/feedback/spinner.slint";
+import { Text } from "../base/text/base_text.slint";
 
 // One sidebar thread row -- shared by the active list and the bottom
 // Archived section so both share one implementation.
@@ -189,9 +190,8 @@ export component SidebarThreadRow inherits HoverSurface {
                     if expanded && rename-thread-index != index : Text {
                         text: thread.name;
                         color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: 600;
-                        font-family: Theme.font-sans;
+                        size: "sm";
+                        weight: "semibold";
                         vertical-alignment: center;
                         overflow: elide;
                         horizontal-stretch: 1;
@@ -201,8 +201,8 @@ export component SidebarThreadRow inherits HoverSurface {
                     if expanded && thread.relative-time != "" && rename-thread-index != index : Text {
                         text: thread.relative-time;
                         color: index == selected-thread ? Theme.bg-primary : (thread.relative-time == "now" ? Theme.text-accent-bright : Theme.text-secondary);
-                        font-size: 9px * Theme.font-scale;
-                        font-weight: thread.relative-time == "now" ? 600 : 400;
+                        size: "xs";
+                        weight: thread.relative-time == "now" ? "semibold" : "regular";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-stretch: 0;
@@ -285,7 +285,7 @@ export component SidebarThreadRow inherits HoverSurface {
                         && thread.project-path != "" && thread.project-path != active-project-path : Text {
                         text: thread.project-name;
                         color: Theme.text-tertiary;
-                        font-size: 8px * Theme.font-scale;
+                        size: "xs";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         overflow: elide;
@@ -295,7 +295,7 @@ export component SidebarThreadRow inherits HoverSurface {
                         && thread.project-instance-live : Text {
                         text: "OPEN ELSEWHERE";
                         color: Theme.text-accent-bright;
-                        font-size: 7px * Theme.font-scale;
+                        font-size: 7px;
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-stretch: 0;
@@ -308,7 +308,7 @@ export component SidebarThreadRow inherits HoverSurface {
                         // disappearing, which looks like a no-op.
                         text: "ARCHIVED";
                         color: Theme.text-muted;
-                        font-size: 8px * Theme.font-scale;
+                        size: "xs";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-stretch: 0;
@@ -317,7 +317,7 @@ export component SidebarThreadRow inherits HoverSurface {
                         && thread.closed && !thread.archived : Text {
                         text: "CLOSED";
                         color: Theme.text-muted;
-                        font-size: 8px * Theme.font-scale;
+                        size: "xs";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-stretch: 0;
@@ -327,7 +327,7 @@ export component SidebarThreadRow inherits HoverSurface {
                         && index == selected-thread : Text {
                         text: "ACTIVE";
                         color: Theme.text-muted;
-                        font-size: 8px * Theme.font-scale;
+                        size: "xs";
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
                         horizontal-stretch: 0;
@@ -503,7 +503,7 @@ export component SidebarThreadRow inherits HoverSurface {
                 if expanded && thread.has-session && thread.model != "" : Text {
                     text: thread.provider != "" ? thread.provider + " \u{00B7} " + thread.model : thread.model;
                     color: Theme.text-muted;
-                    font-size: 9px * Theme.font-scale;
+                    size: "xs";
                     font-family: Theme.font-mono;
                     overflow: elide;
                     horizontal-stretch: 1;

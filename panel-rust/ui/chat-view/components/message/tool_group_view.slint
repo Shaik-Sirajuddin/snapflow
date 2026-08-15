@@ -1,10 +1,12 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
-import { Badge } from "../../../base/badge.slint";
+import { Badge } from "../../../base/feedback/badge.slint";
 import { Icon } from "../../../base/icon.slint";
-import { IconButton } from "../../../base/icon_button.slint";
+import { IconButton } from "../../../base/buttons/icon_button.slint";
 import { MessageItem } from "../../../types.slint";
 import { ToolEventRow } from "./tool_event_row.slint";
+import { Text } from "../../../base/text/base_text.slint";
+import { Divider } from "../../../base/layout/divider.slint";
 
 // Grouped / scrollable container box for tool calls and MCP calls.
 // Provides:
@@ -94,8 +96,8 @@ export component ToolGroupView inherits Rectangle {
             Text {
                 text: root.label;
                 font-family: Theme.font-mono;
-                font-size: 10px * Theme.font-scale;
-                font-weight: 600;
+                size: "sm";
+                weight: "semibold";
                 letter-spacing: 0.8px;
                 color: Theme.text-primary;
                 vertical-alignment: center;
@@ -150,10 +152,7 @@ export component ToolGroupView inherits Rectangle {
         }
 
         // Separator line under header (visible when expanded)
-        if root.show-header && root.expanded : Rectangle {
-            height: 1px;
-            background: Theme.border-default;
-        }
+        if root.show-header && root.expanded : Divider { }
 
         // Main content area with scrollable Flickable + right-side fixed index scrollbar
         HorizontalLayout {

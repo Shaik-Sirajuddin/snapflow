@@ -1,0 +1,10 @@
+import { Theme } from "../../tokens/theme.slint";
+
+// Layer 3 (base) -- a general-purpose 1px rule. Width is intentionally left
+// to the containing layout, matching the existing hand-rolled dividers.
+export component Divider inherits Rectangle {
+    in property <color> bg: Theme.border-default;
+
+    height: 1px;
+    background: bg;
+}

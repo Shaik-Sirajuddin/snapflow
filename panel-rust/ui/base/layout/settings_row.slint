@@ -1,0 +1,113 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+
+// Layer 3 (base) -- the repeated "label + optional hint on the left,
+// one control on the right" row shape that `components/settings_sheet.slint`
+// hand-rolled per section (MCP server rows, agent rows, recoverable-session
+// rows all share this silhouette but never a common component). Generic on
+// purpose: no settings-domain knowledge lives here, only the label/hint/
+// control layout, so `ui/pages/settings/views/*` (and anything else that
+// wants a labeled row with a trailing control) can reuse it rather than
+// re-hand-rolling the same `Rectangle` + `HorizontalLayout` shape again.
+// The control itself is caller-supplied via `@children` -- this component
+// has no opinion on whether it's a `Button`, a toggle, a text field, or
+// several controls side by side.
+export component SettingsRow inherits Rectangle {
+    in property <string> label;
+    in property <string> hint: "";
+    in property <length> row-height: 30px;
+    // Per-call-site font-family override for the label/hint text --
+    // several settings_sheet.slint rows put the monospace treatment on
+    // whichever of the two held an identifier-shaped value (an MCP
+    // server's name, an agent's status string), never consistently on
+    // one or the other, so this stays a plain override rather than a
+    // fixed convention.
+    in property <string> label-font-family: Theme.font-sans;
+    in property <string> hint-font-family: Theme.font-sans;
+
+    height: root.hint == "" ? root.row-height : root.row-height + 12px;
+    background: row-hover.has-hover ? Theme.bg-primary-container.with-alpha(0.35) : Theme.bg-sidebar;
+    animate background { duration: 100ms; }
+    border-radius: Theme.radius-sm;
+
+    row-hover := TouchArea {
+        // Hover-only -- doesn't intercept clicked, the row has no default
+        // action of its own (the trailing control in `@children` does).
+    }
+
+    HorizontalLayout {
+        // Explicit -- this Rectangle's sole-child HorizontalLayout doesn't
+        // reliably auto-fill its parent's width (same class of bug fixed
+        // repeatedly elsewhere in this settings page); left unbound, a
+        // row with several trailing controls (transport tag/status/Connect/
+        // Toggle/Remove, see `mcp_servers_view.slint`) sized itself to its
+        // own natural/wider preferred width instead of the row's real
+        // available width, overflowing past the page edge.
+        width: parent.width;
+        padding-left: Metrics.space-4;
+        padding-right: Metrics.space-4;
+        spacing: Metrics.space-4;
+        // Row-items-should-be-left-aligned fix: an explicit `alignment`
+        // (any value other than the layout default `stretch`) makes
+        // Slint size every child to its own preferred width and lay the
+        // whole set out as a group per that alignment -- it does NOT
+        // merely pick where leftover space goes, it also suppresses each
+        // child's own `horizontal-stretch` from filling that space. With
+        // `center` here, the label `VerticalLayout` below (which sets
+        // `horizontal-stretch: 1` expecting to fill the row) instead
+        // collapsed to its text's natural width, so the whole label+
+        // control group rendered as a compact island floating in the
+        // middle of the row instead of the label starting at the row's
+        // left edge and the control(s) trailing at its right (confirmed
+        // live via slint-viewer: Harness's "Background sessions" row had
+        // a large empty left margin before the label text started).
+        // `stretch` (Slint's own layout default -- explicit here per
+        // `markdown_view.slint`'s own doc comment on why this codebase
+        // states it explicitly rather than relying on the implicit
+        // default) restores the label `VerticalLayout`'s
+        // `horizontal-stretch: 1` actually filling the row's leftover
+        // width, so the label starts at the row's left edge and the
+        // trailing control(s) dock at its right edge -- `start` alone
+        // was tried first and confirmed (via slint-viewer) to still
+        // suppress per-child stretch, just anchoring the now-compact
+        // label+control island to the left instead of centering it,
+        // which collapsed the gap between label and control instead of
+        // spanning the full row.
+        alignment: stretch;
+        cross-axis-alignment: center;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: Metrics.space-1;
+            Text {
+                text: root.label;
+                color: Theme.text-primary;
+                font-family: root.label-font-family;
+                font-size: 11px * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.hint != "" : Text {
+                text: root.hint;
+                color: Theme.text-muted;
+                font-family: root.hint-font-family;
+                font-size: 9px * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        HorizontalLayout {
+            horizontal-stretch: 0;
+            alignment: end;
+            cross-axis-alignment: center;
+            // `gap-md`, up from `gap-sm` -- MCP server rows in particular
+            // pack several trailing items (status line, Connect, Tools
+            // count, enable Toggle, Remove) and read as too cramped at
+            // the tighter gap.
+            spacing: Metrics.gap-md;
+            @children
+        }
+    }
+}

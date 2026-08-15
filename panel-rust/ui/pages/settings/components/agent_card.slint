@@ -3,9 +3,11 @@ import { Strings } from "../../../tokens/strings.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { AgentLogo } from "../components/agent_logo.slint";
-import { Button } from "../../../base/button.slint";
-import { LinkText } from "../../../base/link_text.slint";
-import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
+import { Button } from "../../../base/buttons/button.slint";
+import { LinkText } from "../../../base/text/link_text.slint";
+import { ResetOnFlipToggle } from "../../../base/form/reset_on_flip_toggle.slint";
+import { Text } from "../../../base/text/base_text.slint";
+import { Card } from "../../../base/layout/card.slint";
 
 // Grid tile for the Agents view -- one per catalog entry (auto-discovered
 // or installable), per the settings-pane-redesign plan's "Agents view is a
@@ -34,7 +36,7 @@ import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
 // `theme.slint`'s module doc and `AgentCatalogEntry.status`'s doc
 // comment). Default selection is now an explicit `Toggle` (was a silent
 // whole-card click before).
-export component AgentCard inherits Rectangle {
+export component AgentCard inherits Card {
     in property <string> agent-id;
     in property <string> agent-name;
     in property <string> website: "";
@@ -95,6 +97,8 @@ export component AgentCard inherits Rectangle {
     // card gets the primary-container tint to stand out. No hover tint on
     // the card body itself -- only its interactive controls get hover
     // feedback.
+    bg: is-default ? "primary" : "secondary";
+    pad: Metrics.space-6;
     background: is-default ? Theme.bg-primary-container : Theme.bg-tertiary;
     animate background { duration: 100ms; }
     // setup-followups plan, agent_settings_ordering_and_install_enable_
@@ -107,7 +111,6 @@ export component AgentCard inherits Rectangle {
     // convention (dimming, not a new color).
     opacity: is-present ? 1.0 : 0.7;
     animate opacity { duration: 100ms; }
-    border-radius: Theme.radius-md;
     // Defensive: contain any future internal overflow at this card's own
     // boundary instead of letting it bleed into the neighboring grid
     // column (no element anywhere on this page had `clip: true` before --
@@ -130,7 +133,7 @@ export component AgentCard inherits Rectangle {
         // stretch: 1` below is meant to produce.
         width: parent.width;
         height: parent.height;
-        padding: Metrics.space-6;
+        padding: 0px;
         spacing: Metrics.space-3;
 
         // Row 1: logo + name, left-aligned.
@@ -144,8 +147,7 @@ export component AgentCard inherits Rectangle {
             Text {
                 text: root.agent-name;
                 color: Theme.text-primary;
-                font-size: 13px * Theme.font-scale;
-                font-weight: 700;
+                weight: "bold";
                 horizontal-stretch: 1;
                 vertical-alignment: center;
                 overflow: elide;
@@ -177,14 +179,14 @@ export component AgentCard inherits Rectangle {
             Text {
                 text: root.is-connected ? Strings.connected : (root.is-present ? Strings.installed : Strings.not-found);
                 color: Theme.text-secondary;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
             Text {
                 text: Strings.default-badge;
                 color: Theme.text-secondary;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 vertical-alignment: center;
             }
             // See base/reset_on_flip_toggle.slint's doc comment for why a
@@ -210,7 +212,7 @@ export component AgentCard inherits Rectangle {
             Text {
                 text: root.loading ? "Updating…" : Strings.enabled;
                 color: Theme.text-secondary;
-                font-size: 10px * Theme.font-scale;
+                size: "sm";
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
@@ -224,7 +226,6 @@ export component AgentCard inherits Rectangle {
             if root.loading : Text {
                 text: "…";
                 color: Theme.text-secondary;
-                font-size: 12px * Theme.font-scale;
                 vertical-alignment: center;
             }
         }

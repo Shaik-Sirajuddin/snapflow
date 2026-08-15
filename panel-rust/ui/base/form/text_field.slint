@@ -1,0 +1,99 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
+
+// Layer 3 (base) -- the repeated "bordered box + inset TextInput" pattern
+// hand-rolled at every free-text input site across the settings page
+// (MCP server name/command, agent default-profile/permission-profile) --
+// same background/border/radius, same left-inset TextInput. Extracted so
+// every call site shares one definition instead of repeating the shape.
+// Inset uses `Metrics.pad-md` (bumped up from `pad-sm`, the semantic
+// alias for the `6px` every call site originally hardcoded -- felt too
+// tight for a real bordered input box once extracted).
+export component TextField inherits Rectangle {
+    in-out property <string> text: "";
+    in property <string> field-accessible-label: "";
+    in property <string> size: "md";
+    in property <length> field-font-size: size == "sm" ? 10px : size == "lg" ? 12px : 11px;
+    // Ghost hint text shown when `text` is empty -- same convention
+    // `FilterSearchBar`/`Select`/`SearchableDropdown` already use for
+    // their own placeholder text. This component never had one before,
+    // so every plain-text form built on it (MCP server name/command/
+    // args/url/headers/timeout/oauth-client-id, agent default-profile/
+    // permission-profile) rendered as a blank, unlabeled box with no
+    // inline guidance about what to type.
+    in property <string> placeholder: "";
+    callback edited();
+    // See FilterSearchBar.input-has-focus's doc comment: real keystrokes
+    // only reach any editable Slint surface when *something* in the
+    // host's OR-chain aggregate reads true. Unlike FilterSearchBar, this
+    // component never exposed its own focus state at all, so every call
+    // site (MCP server name/command, agent default-profile/
+    // permission-profile) was structurally unable to wire itself into
+    // that chain -- clicking in focused the field (a real click), but
+    // every typed keystroke afterward was silently dropped before ever
+    // reaching Slint.
+    out property <bool> has-focus: field-input.has-focus;
+
+    // Explicit fill-parent default -- this Rectangle's only children
+    // (the placeholder `Text` and `field-input`) are free-positioned via
+    // `x`/`y`, not laid out through an inner `*Layout`, so it has no
+    // intrinsic content size of its own for a layout parent to infer.
+    // Every call site that happens to also set its own `width:
+    // parent.width` (the tools-search field here, `SettingsSearchBar`
+    // elsewhere) renders fine; every call site that omits it (MCP
+    // server name/command/args/url/oauth/timeout, agent default-profile/
+    // permission-profile -- the majority of this component's actual
+    // uses) collapsed to a ~0px-wide box: no visible border (nothing to
+    // draw a 1px edge around) and no visible placeholder (its own width
+    // is `parent.width - 2 * pad`, i.e. also ~0). Confirmed live via the
+    // Slint debug MCP server: the MCP add-server form's fields were
+    // entirely absent from the window's element tree even though their
+    // `SettingsField` caption `Text` siblings rendered normally.
+    // Defaulting to full width here fixes every existing call site that
+    // forgot it and is a no-op for the ones that already set it
+    // explicitly (an instance-level binding always wins over this
+    // component-level default).
+    width: 100%;
+    height: 26px;
+    background: Theme.bg-sidebar;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+
+    // Plain `Text`, not interactive -- a bare `Text` element has no
+    // `TouchArea` of its own, so it never intercepts clicks; they always
+    // reach `field-input` beneath/behind it.
+    if root.placeholder != "" && root.text == "" : Text {
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-size: root.field-font-size * Theme.font-scale;
+        x: Metrics.pad-md;
+        y: 0px;
+        width: parent.width - 2 * Metrics.pad-md;
+        height: parent.height;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    field-input := TextInput {
+        accessible-label: root.field-accessible-label;
+        accessible-action-default => { self.focus(); }
+        text <=> root.text;
+        color: Theme.text-primary;
+        font-size: root.field-font-size * Theme.font-scale;
+        x: Metrics.pad-md;
+        // `settings_view_input_and_propagation` phase: this TextInput had
+        // no explicit y/height, so it defaulted to its own single-line
+        // preferred height anchored at y:0 -- leaving most of this 26px
+        // field's lower area outside the actual clickable/focusable
+        // element even though it visually looks like part of the input box,
+        // matching the reported "input box doesn't accept input" symptom.
+        y: 0px;
+        height: parent.height;
+        width: parent.width - 2 * Metrics.pad-md;
+        vertical-alignment: center;
+        edited => { root.edited(); }
+        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
+    }
+}

@@ -1,6 +1,7 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
-import { TerminalLogBlock } from "../../../base/terminal_log_block.slint";
+import { TerminalLogBlock } from "../../../base/terminal/terminal_log_block.slint";
+import { Text } from "../../../base/text/base_text.slint";
 
 // Execution-view content variant for `tool_use`/`mcp_server_call` rows --
 // chat-items-remaining-wiring.md #4 (chat-items-redesign.md #9). First-cut
@@ -36,8 +37,8 @@ export component ApiCallView inherits VerticalLayout {
             Text {
                 text: "INPUT PAYLOAD";
                 font-family: Theme.font-mono;
-                font-size: 10px * Theme.font-scale;
-                font-weight: 600;
+                size: "sm";
+                weight: "semibold";
                 letter-spacing: 0.8px;
                 color: Theme.text-primary;
             }
@@ -60,8 +61,8 @@ export component ApiCallView inherits VerticalLayout {
             Text {
                 text: "OUTPUT RESPONSE";
                 font-family: Theme.font-mono;
-                font-size: 10px * Theme.font-scale;
-                font-weight: 600;
+                size: "sm";
+                weight: "semibold";
                 letter-spacing: 0.8px;
                 color: Theme.text-primary;
             }
@@ -73,8 +74,7 @@ export component ApiCallView inherits VerticalLayout {
 
     if raw-input == "" && raw-output == "" : Text {
         text: "No structured payload available for this call.";
-        font-family: Theme.font-sans;
-        font-size: 11px * Theme.font-scale;
+        size: "sm";
         font-italic: true;
         color: Theme.text-secondary;
     }

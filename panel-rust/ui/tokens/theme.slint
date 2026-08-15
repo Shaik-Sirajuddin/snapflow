@@ -74,6 +74,9 @@ export global Theme {
     out property <color> text-primary: is-dark ? ColorScale.dark-text-primary : ColorScale.light-text-primary;
     out property <color> text-secondary: is-dark ? ColorScale.dark-text-secondary : ColorScale.light-text-secondary;
     out property <color> text-muted: is-dark ? ColorScale.dark-text-muted : ColorScale.light-text-muted;
+    out property <color> text-danger: is-dark ? ColorScale.dark-danger : ColorScale.light-danger;
+    out property <color> text-success: status-success;
+    out property <color> text-warning: is-dark ? ColorScale.dark-warning : ColorScale.light-warning;
     // Highlight behind click-drag-selected text in the read-only selectable
     // surfaces (markdown/user bubble/tool rows/terminal blocks). One token
     // instead of the same literal repeated at every `selection-background-

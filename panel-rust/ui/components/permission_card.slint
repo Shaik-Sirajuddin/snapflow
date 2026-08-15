@@ -1,14 +1,17 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { PendingRequestItem } from "../types.slint";
-import { Badge } from "../base/badge.slint";
+import { Badge } from "../base/feedback/badge.slint";
+import { Text } from "../base/text/base_text.slint";
+import { Button } from "../base/buttons/button.slint";
+import { Card } from "../base/layout/card.slint";
 
 // Approval card docked above the compose bar.
 //
 // Model: Zed-style one-of select (`PermissionOptions::Flat`).
 // Surface uses Theme.bg-approval (+ accent rail) so it reads apart from
 // ordinary cards, chat, and the compose bar — still monochrome.
-export component PermissionCard inherits Rectangle {
+export component PermissionCard inherits Card {
     in property <PendingRequestItem> item;
     callback option-selected(string /* option-id */);
     callback approve();
@@ -16,6 +19,15 @@ export component PermissionCard inherits Rectangle {
 
     vertical-stretch: 0;
     horizontal-stretch: 1;
+    bg: "primary";
+    bordered: true;
+    border: "default";
+    border-col: Theme.border-approval;
+    shadow: "sm";
+    pad: 0px;
+    // Distinct approval fill — not bg-card.
+    background: Theme.bg-approval;
+    clip: true;
     // Root-cause fix (docked-band full-height bug): this card is placed
     // inside a `HorizontalLayout` in chat_area.slint (the approval band
     // row). A `HorizontalLayout`'s cross axis (height, since its main
@@ -36,16 +48,6 @@ export component PermissionCard inherits Rectangle {
     // stretch-to-fill target, so the card always hugs its real content
     // height regardless of what the enclosing row computes.
     height: self.preferred-height;
-    // Distinct approval fill — not bg-card.
-    background: Theme.bg-approval;
-    border-color: Theme.border-approval;
-    border-width: 1px;
-    border-radius: Theme.radius-md;
-    // Soft lift off the band so the card is the focus target.
-    drop-shadow-blur: 8px;
-    drop-shadow-color: #000000.with-alpha(0.28);
-    drop-shadow-offset-y: 1px;
-    clip: true;
 
     pure function kind-glyph(kind: string) -> string {
         if (kind == "allow_always") {
@@ -60,166 +62,129 @@ export component PermissionCard inherits Rectangle {
         return "\u{2717}";
     }
 
-    // Leading primary accent rail — “needs decision” marker.
     Rectangle {
-        x: 0px;
-        y: 0px;
-        width: 3px;
-        height: parent.height;
-        background: Theme.bg-primary;
-        border-radius: Theme.radius-md;
-        // Only round the left corners so the rail meets the card edge.
-        // (Full radius on a 3px strip is fine — reads as a solid bar.)
-    }
-
-    VerticalLayout {
         width: 100%;
-        // Clear the 3px rail.
-        padding-left: Metrics.pad-md + 3px;
-        padding-right: Metrics.pad-md;
-        padding-top: Metrics.pad-sm;
-        padding-bottom: Metrics.pad-sm;
-        spacing: Metrics.gap-sm;
-        alignment: start;
+        height: content.preferred-height;
 
-        HorizontalLayout {
+        // Leading primary accent rail — “needs decision” marker.
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 3px;
+            height: parent.height;
+            background: Theme.bg-primary;
+            border-radius: Theme.radius-md;
+            // Only round the left corners so the rail meets the card edge.
+            // (Full radius on a 3px strip is fine — reads as a solid bar.)
+        }
+
+        content := VerticalLayout {
             width: 100%;
-            height: 18px;
-            preferred-height: 18px;
-            vertical-stretch: 0;
+            // Clear the 3px rail.
+            padding-left: Metrics.pad-md + 3px;
+            padding-right: Metrics.pad-md;
+            padding-top: Metrics.pad-sm;
+            padding-bottom: Metrics.pad-sm;
             spacing: Metrics.gap-sm;
-            alignment: stretch;
-            cross-axis-alignment: center;
-            Text {
-                text: "\u{26A0}";
-                color: Theme.bg-primary;
-                font-size: 11px * Theme.font-scale;
-                vertical-alignment: center;
-                horizontal-stretch: 0;
-            }
-            Text {
-                text: item.title;
-                color: Theme.text-primary;
-                font-family: Theme.font-sans;
-                font-size: 11px * Theme.font-scale;
-                font-weight: 700;
-                horizontal-stretch: 1;
-                preferred-width: 0px;
-                min-width: 0px;
-                overflow: elide;
-                vertical-alignment: center;
-            }
-            // Small pill so “approval” is labeled even at a glance.
-            Badge {
-                horizontal-stretch: 0;
-                height: 16px;
-                label: "Approval";
-                bg: Theme.bg-primary-container;
-                font-size: 8px;
-                badge-font-weight: 700;
-                pad-h: Metrics.space-2;
-                pad-v: 0px;
-            }
-            Text {
-                text: item.method;
-                color: Theme.text-muted;
-                font-family: Theme.font-mono;
-                font-size: 9px * Theme.font-scale;
-                vertical-alignment: center;
-                horizontal-stretch: 0;
-            }
-        }
-
-        Text {
-            text: item.summary;
-            color: Theme.text-secondary;
-            font-family: Theme.font-sans;
-            font-size: 10px * Theme.font-scale;
-            wrap: word-wrap;
-            overflow: elide;
-            max-height: 32px;
-            vertical-stretch: 0;
-        }
-
-        if item.supported && item.options.length > 0 : VerticalLayout {
-            width: 100%;
-            spacing: Metrics.space-1;
-            vertical-stretch: 0;
             alignment: start;
-            for opt in item.options : Rectangle {
-                height: 24px;
-                preferred-height: 24px;
-                vertical-stretch: 0;
-                width: 100%;
-                border-radius: Theme.radius-sm;
-                border-width: opt.is-allow ? 0px : 1px;
-                border-color: Theme.border-default;
-                background: opt-touch.has-hover
-                    ? (opt.is-allow ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary-container)
-                    : (opt.is-allow ? Theme.bg-primary : Theme.bg-primary-container.with-alpha(0.55));
-                animate background { duration: 100ms; }
 
-                opt-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: opt.name == "Approve" ? "Approve request"
+            HorizontalLayout {
+                width: 100%;
+                height: 18px;
+                preferred-height: 18px;
+                vertical-stretch: 0;
+                spacing: Metrics.gap-sm;
+                alignment: stretch;
+                cross-axis-alignment: center;
+                Text {
+                    text: "\u{26A0}";
+                    color: Theme.bg-primary;
+                    size: "sm";
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+                Text {
+                    text: item.title;
+                    color: Theme.text-primary;
+                    size: "sm";
+                    weight: "bold";
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                // Small pill so “approval” is labeled even at a glance.
+                Badge {
+                    horizontal-stretch: 0;
+                    height: 16px;
+                    label: "Approval";
+                    bg: Theme.bg-primary-container;
+                    font-size: 8px;
+                    badge-font-weight: 700;
+                    pad-h: Metrics.space-2;
+                    pad-v: 0px;
+                }
+                Text {
+                    text: item.method;
+                    color: Theme.text-muted;
+                    font-family: Theme.font-mono;
+                    size: "xs";
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+            }
+
+            Text {
+                text: item.summary;
+                color: Theme.text-secondary;
+                size: "sm";
+                wrap: word-wrap;
+                overflow: elide;
+                max-height: 32px;
+                vertical-stretch: 0;
+            }
+
+            if item.supported && item.options.length > 0 : VerticalLayout {
+                width: 100%;
+                spacing: Metrics.space-1;
+                vertical-stretch: 0;
+                alignment: start;
+                for opt in item.options : Button {
+                    label: root.kind-glyph(opt.kind) + "  " + opt.name;
+                    button-accessible-label: opt.name == "Approve" ? "Approve request"
                         : (opt.name == "Reject" ? "Reject request"
                             : ("Permission option: " + opt.name));
-                    accessible-action-default => {
-                        root.option-selected(opt.option-id);
-                    }
-                    clicked => {
-                        root.option-selected(opt.option-id);
-                    }
-                }
-
-                HorizontalLayout {
+                    primary: opt.is-allow;
                     width: 100%;
-                    height: 100%;
-                    padding-left: Metrics.pad-sm;
-                    padding-right: Metrics.pad-sm;
-                    spacing: Metrics.gap-sm;
-                    alignment: stretch;
-                    cross-axis-alignment: center;
-                    Text {
-                        text: root.kind-glyph(opt.kind);
-                        color: opt.is-allow ? Theme.text-on-primary : Theme.text-secondary;
-                        font-size: 10px * Theme.font-scale;
-                        horizontal-stretch: 0;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        text: opt.name;
-                        color: opt.is-allow ? Theme.text-on-primary : Theme.text-primary;
-                        font-family: Theme.font-sans;
-                        font-size: 10px * Theme.font-scale;
-                        font-weight: opt.is-allow ? 700 : 600;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
+                    btn-height: 24px;
+                    font-size: 10px;
+                    font-weight: opt.is-allow ? 700 : 600;
+                    bg: opt.is-allow ? Theme.bg-primary : Theme.bg-primary-container.with-alpha(0.55);
+                    fg: opt.is-allow ? Theme.text-on-primary : Theme.text-primary;
+                    border-col: Theme.border-default;
+                    border-w: opt.is-allow ? 0px : 1px;
+                    clicked => { root.option-selected(opt.option-id); }
                 }
             }
-        }
 
-        if item.supported && item.options.length == 0 : Text {
-            text: "No options offered for this request.";
-            color: Theme.text-muted;
-            font-family: Theme.font-sans;
-            font-size: 10px * Theme.font-scale;
-            font-italic: true;
-            wrap: word-wrap;
-            vertical-stretch: 0;
-        }
+            if item.supported && item.options.length == 0 : Text {
+                text: "No options offered for this request.";
+                color: Theme.text-muted;
+                size: "sm";
+                font-italic: true;
+                wrap: word-wrap;
+                vertical-stretch: 0;
+            }
 
-        if !item.supported : Text {
-            text: "This request kind isn't supported yet.";
-            color: Theme.text-muted;
-            font-family: Theme.font-sans;
-            font-size: 10px * Theme.font-scale;
-            font-italic: true;
-            wrap: word-wrap;
-            vertical-stretch: 0;
+            if !item.supported : Text {
+                text: "This request kind isn't supported yet.";
+                color: Theme.text-muted;
+                size: "sm";
+                font-italic: true;
+                wrap: word-wrap;
+                vertical-stretch: 0;
+            }
         }
     }
 }

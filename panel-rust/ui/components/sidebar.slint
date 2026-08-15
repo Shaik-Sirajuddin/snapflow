@@ -1,13 +1,14 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
-import { IconButton } from "../base/icon_button.slint";
+import { IconButton } from "../base/buttons/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
-import { NavItem } from "../base/nav_item.slint";
-import { Toggle } from "../base/toggle.slint";
-import { FilterSearchBar } from "../base/filter_search_bar.slint";
-import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
-import { TextUtil } from "../base/text_util.slint";
+import { NavItem } from "../base/layout/nav_item.slint";
+import { Toggle } from "../base/form/toggle.slint";
+import { FilterSearchBar } from "../base/form/filter_search_bar.slint";
+import { NamePromptDialog } from "../base/layout/name_prompt_dialog.slint";
+import { TextUtil } from "../base/text/text_util.slint";
+import { Text } from "../base/text/base_text.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
 import { SidebarThreadRow } from "./sidebar_thread_row.slint";
 
@@ -242,9 +243,8 @@ export component Sidebar inherits Rectangle {
                     Text {
                         text: skill-mode ? "Skills" : "Chats";
                         color: Theme.text-primary;
-                        font-size: 14px * Theme.font-scale;
-                        font-family: Theme.font-sans;
-                        font-weight: 600;
+                        size: "lg";
+                        weight: "semibold";
                         vertical-alignment: center;
                     }
                 }
@@ -424,8 +424,8 @@ export component Sidebar inherits Rectangle {
                 Text {
                     text: "Show global skills";
                     color: Theme.text-secondary;
-                    font-size: 10px * Theme.font-scale;
-                    font-weight: root.show-global-skills ? 700 : 400;
+                    size: "sm";
+                    weight: root.show-global-skills ? "bold" : "regular";
                     vertical-alignment: center;
                     horizontal-stretch: 0;
                 }
@@ -506,9 +506,8 @@ export component Sidebar inherits Rectangle {
                             Text {
                                 text: skill.name;
                                 color: Theme.text-primary;
-                                font-size: (expanded ? 11px : 9px) * Theme.font-scale;
-                                font-family: Theme.font-sans;
-                                font-weight: 600;
+                                size: expanded ? "sm" : "xs";
+                                weight: "semibold";
                                 vertical-alignment: center;
                                 horizontal-alignment: expanded ? left : center;
                                 horizontal-stretch: 1;
@@ -519,7 +518,7 @@ export component Sidebar inherits Rectangle {
                             if expanded && skill.scope == "project" && skill.started-from != "" : Text {
                                 text: "\u{2192} " + skill.started-from;
                                 color: Theme.text-tertiary;
-                                font-size: 9px * Theme.font-scale;
+                                size: "xs";
                                 font-family: Theme.font-mono;
                                 vertical-alignment: center;
                                 horizontal-stretch: 0;
@@ -529,7 +528,7 @@ export component Sidebar inherits Rectangle {
                             if expanded : Text {
                                 text: skill.scope;
                                 color: Theme.text-muted;
-                                font-size: 9px * Theme.font-scale;
+                                size: "xs";
                                 font-family: Theme.font-mono;
                                 vertical-alignment: center;
                                 horizontal-stretch: 0;
@@ -538,8 +537,7 @@ export component Sidebar inherits Rectangle {
                         if expanded && skill.description != "" : Text {
                             text: skill.description;
                             color: Theme.text-muted;
-                            font-size: 10px * Theme.font-scale;
-                            font-family: Theme.font-sans;
+                            size: "sm";
                             horizontal-stretch: 1;
                             preferred-width: 0px;
                             min-width: 0px;
@@ -587,7 +585,7 @@ export component Sidebar inherits Rectangle {
                     if threads.length == 0 && expanded : Text {
                         text: "No conversations yet - create one with +";
                         color: Theme.text-muted;
-                        font-size: 10px * Theme.font-scale;
+                        size: "sm";
                         font-italic: true;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -680,8 +678,8 @@ export component Sidebar inherits Rectangle {
                         Text {
                             text: root.archived-count > 0 ? "Archived  [" + root.archived-count + "]" : "Archived";
                             color: Theme.text-secondary;
-                            font-size: 10px * Theme.font-scale;
-                            font-weight: 700;
+                            size: "sm";
+                            weight: "bold";
                             font-family: Theme.font-sans;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
@@ -808,7 +806,7 @@ export component Sidebar inherits Rectangle {
                 Text {
                     text: "Skills config";
                     color: Theme.text-secondary;
-                    font-size: 10px * Theme.font-scale;
+                    size: "sm";
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                 }
@@ -853,8 +851,7 @@ export component Sidebar inherits Rectangle {
                 Text {
                     text: "Settings";
                     color: Theme.text-secondary;
-                    font-size: 11px * Theme.font-scale;
-                    font-family: Theme.font-sans;
+                    size: "sm";
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                 }

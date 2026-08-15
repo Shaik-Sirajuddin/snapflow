@@ -1,0 +1,114 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
+import { Spinner } from "../feedback/spinner.slint";
+
+// Layer 3 (base) -- the repeated hand-rolled "small pill button" pattern
+// found across `components/`: a fixed-size `Rectangle` with a
+// background/border, a sibling `TouchArea` (accessible-role: button +
+// accessible-label + accessible-action-default + clicked), and a
+// centered `Text` label. Two variants existed by convention (never
+// declared as such): a filled "primary" action (approve/save/add, the
+// same treatment as the compose bar's Send button) and a bordered
+// "secondary" action (reject/close/cancel/remove) -- `primary` below
+// picks between them. Every other visual knob the call sites varied
+// (size, font size/weight, exact color) stays overridable so this one
+// component can replace every instance without changing pixels.
+export component Button inherits Rectangle {
+    in property <string> label;
+    in property <string> button-accessible-label: label;
+    in property <bool> primary: false;
+    // Additive size scale. The md defaults intentionally preserve the
+    // original fixed 72x26 button; btn-width/btn-height remain raw
+    // escape hatches for one-off dimensions at existing call sites.
+    in property <string> size: "md";
+    in property <length> btn-width: size == "sm" ? 44px : size == "lg" ? 88px : 72px;
+    in property <length> btn-height: size == "sm" ? 16px : size == "lg" ? 30px : 26px;
+    in property <length> font-size: 10px;
+    in property <int> font-weight: 600;
+    // Semantic tone defaults for new callers. The existing primary bool is
+    // deliberately retained as the compatibility axis; the secondary
+    // default preserves the pre-variant rendering for legacy call sites.
+    in property <string> variant: "secondary";
+    // Secondary default is a tinted container fill, not a plain surface
+    // tone -- `Theme.bg-card` and `Theme.bg-sidebar` resolve to the exact
+    // same color in dark mode, so a secondary button sitting on either
+    // surface (a `SettingsRow`, an `AgentCard`) using either as its own
+    // background was invisible except for its 1px border. Every call site
+    // that used to override `bg: Theme.bg-card` for a "quiet" secondary
+    // look hit this same collision -- fixed once here instead of at each
+    // site.
+    in property <color> bg: primary || variant == "primary"
+        ? Theme.bg-primary
+        : variant == "danger"
+            ? Theme.status-error.with-alpha(0.18)
+            : variant == "success"
+                ? Theme.status-success.with-alpha(0.18)
+                : Theme.bg-primary-container.with-alpha(0.6);
+    in property <color> fg: primary || variant == "primary"
+        ? Theme.text-on-primary
+        : variant == "danger"
+            ? Theme.text-danger
+            : variant == "success"
+                ? Theme.text-success
+                : Theme.text-primary;
+    in property <color> border-col: variant == "danger"
+        ? Theme.status-error
+        : variant == "success"
+            ? Theme.status-success
+            : Theme.border-default;
+    in property <length> border-w: (primary || variant == "primary") ? 0px : 1px;
+    // Shows a `Spinner` in place of `label` and ignores `clicked` while
+    // true -- for a button whose action dispatches a real background RPC
+    // (see `AgentBridge::mcp_operations_in_flight`'s doc comment), so a
+    // second click can't fire a duplicate request while the first is
+    // still in flight. Default `false` is the exact previous behavior
+    // for every call site that doesn't set it.
+    in property <bool> busy: false;
+    callback clicked();
+    out property <length> content-width: label_text.preferred-width + 2 * Metrics.space-6;
+
+    preferred-width: btn-width;
+    preferred-height: btn-height;
+    min-width: btn-width;
+    min-height: btn-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    // Hover feedback -- previously missing entirely (this component had
+    // no visual response to `has-hover` at all). Primary buttons dim
+    // slightly on hover; secondary/bordered ones go from the tinted idle
+    // fill above to the full-strength container tint on hover.
+    background: touch.has-hover
+        ? ((primary || variant == "primary") ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary-container)
+        : bg;
+    animate background { duration: 100ms; }
+    border-color: border-col;
+    border-width: border-w;
+    border-radius: Theme.radius-sm;
+    opacity: root.busy ? 0.7 : 1.0;
+
+    touch := TouchArea {
+        mouse-cursor: root.busy ? default : pointer;
+        accessible-role: button;
+        accessible-label: root.button-accessible-label;
+        accessible-action-default => { if (!root.busy) { root.clicked(); } }
+        clicked => { if (!root.busy) { root.clicked(); } }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+    }
+    label_text := Text {
+        visible: !root.busy;
+        text: root.label;
+        color: root.fg;
+        font-family: Theme.font-sans;
+        font-size: root.font-size * Theme.font-scale;
+        font-weight: root.font-weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.busy : Spinner {
+        size: 12px;
+        stroke: root.fg;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
