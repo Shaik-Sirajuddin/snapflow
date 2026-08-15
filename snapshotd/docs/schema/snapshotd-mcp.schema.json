@@ -509,13 +509,90 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
-      "description": "List known process instances (running and previously running).",
+      "description": "List daemon-owned and externally launched Snapflow instances. Use active=true to find live SAP-editable instances or active=false for inactive/stale rows.",
       "inputSchema": {
-        "properties": {},
+        "properties": {
+          "active": {
+            "description": "Optional live-state filter; omitted returns both active and inactive instances.",
+            "type": "boolean"
+          }
+        },
         "required": [],
         "type": "object"
       },
-      "name": "daemon.list"
+      "name": "daemon.list",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "items": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "projectId": {
+                  "type": "string"
+                },
+                "projectPath": {
+                  "type": "string"
+                },
+                "pid": {
+                  "type": "integer"
+                },
+                "socketPath": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "active": {
+                  "type": "boolean"
+                },
+                "managed": {
+                  "type": "boolean"
+                },
+                "headless": {
+                  "type": "boolean"
+                },
+                "startedAt": {
+                  "type": "string"
+                },
+                "lastSeenAt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "pid",
+                "status",
+                "active",
+                "managed"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "active",
+          "items"
+        ],
+        "additionalProperties": false
+      }
     },
     {
       "annotations": {
@@ -539,9 +616,13 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
-      "description": "Add a video or audio timeline track.",
+      "description": "Add a video or audio timeline track, appended by default or inserted at an explicit index.",
       "inputSchema": {
         "properties": {
+          "index": {
+            "description": "Omit to append the track (default). Provide a 0-based index of an existing track to insert there instead, shifting that track and everything after it up by one; the returned Track.index equals this value. Out-of-range indices are rejected, so appending the very first track must omit index. Note the track ordering convention here: index 0 is the TOPMOST timeline track, not the bottom one, so a lower index means a higher video layer.",
+            "type": "integer"
+          },
           "kind": {
             "description": "Track kind",
             "enum": [
@@ -564,6 +645,9 @@
             "type": "integer"
           },
           "kind": {
+            "type": "string"
+          },
+          "name": {
             "type": "string"
           },
           "muted": {
@@ -857,6 +941,9 @@
                 "kind": {
                   "type": "string"
                 },
+                "name": {
+                  "type": "string"
+                },
                 "muted": {
                   "type": "boolean"
                 },
@@ -1148,6 +1235,9 @@
                 "kind": {
                   "type": "string"
                 },
+                "name": {
+                  "type": "string"
+                },
                 "muted": {
                   "type": "boolean"
                 },
@@ -1325,6 +1415,9 @@
             "type": "integer"
           },
           "kind": {
+            "type": "string"
+          },
+          "name": {
             "type": "string"
           },
           "muted": {
@@ -2040,7 +2133,7 @@
       "inputSchema": {
         "properties": {
           "hexColor": {
-            "description": "Hex color, e.g. \"#00000000\" for transparent",
+            "description": "Hex color, alpha always LAST on input: \"#RGB\", \"#RRGGBB\", \"#RRGGBBAA\", \"0xRRGGBB\" or \"0xRRGGBBAA\" (case-insensitive; alpha defaults to ff/opaque when omitted). Examples: \"#ff0000\" opaque red, \"#00000000\" fully transparent. The value is canonicalized to MLT's internal #AARRGGBB form for you, so callers never need to account for MLT parsing \"#\" as alpha-first and \"0x\" as alpha-last. Anything else is rejected.",
             "type": "string"
           }
         },
@@ -4305,17 +4398,19 @@
         "idempotentHint": false,
         "openWorldHint": true
       },
-      "description": "Select a timeline track as the current selection scope. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
+      "description": "Select a timeline track by native track name or numeric index as the current selection scope. trackName is optional; omit it and use trackIndex when the backend does not provide a name. Mutating tools that omit an explicit trackIndex act on this track; an explicitly-passed trackIndex on those tools is never honored as an override.",
       "inputSchema": {
         "properties": {
           "trackIndex": {
-            "description": "Track index to select",
+            "description": "Zero-based track index to select",
             "type": "integer"
+          },
+          "trackName": {
+            "description": "Native track name; use edit.listTracks to discover names",
+            "type": "string"
           }
         },
-        "required": [
-          "trackIndex"
-        ],
+        "required": [],
         "type": "object"
       },
       "name": "track.enter",

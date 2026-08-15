@@ -650,15 +650,27 @@ impl Backend for FfiBackend {
         }
     }
 
-    fn edit_add_track(&mut self, _project_id: &str, kind: &str) -> BackendResult<Track> {
-        let index = match kind {
-            "video" => unsafe { ffi::sap_add_video_track(self.main_window) },
-            "audio" => unsafe { ffi::sap_add_audio_track(self.main_window) },
+    fn edit_add_track(
+        &mut self,
+        _project_id: &str,
+        kind: &str,
+        at: Option<usize>,
+    ) -> BackendResult<Track> {
+        let is_video = match kind {
+            "video" => true,
+            "audio" => false,
             other => {
                 return Err(BackendError::InvalidParams(format!(
                     "bad track kind: {other}"
                 )));
             }
+        };
+        let index = match at {
+            Some(at) => unsafe {
+                ffi::sap_insert_track(self.main_window, at as c_int, is_video as c_int)
+            },
+            None if is_video => unsafe { ffi::sap_add_video_track(self.main_window) },
+            None => unsafe { ffi::sap_add_audio_track(self.main_window) },
         };
         if index < 0 {
             return Err(BackendError::InvalidParams("failed to add track".into()));
@@ -1968,6 +1980,7 @@ impl Backend for FfiBackend {
                 BackendError::InvalidParams("generator.createColor requires hexColor".into())
             })?
             .to_string();
+        let hex = crate::media_tools::normalize_hex_color(&hex)?;
         let c_hex = CString::new(hex)
             .map_err(|e| BackendError::InvalidParams(format!("bad hexColor: {e}")))?;
         let raw = unsafe { ffi::sap_generator_create_color(self.main_window, c_hex.as_ptr()) };

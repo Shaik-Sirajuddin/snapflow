@@ -234,6 +234,74 @@ async fn add_track_and_list_tracks_round_trip() {
 }
 
 #[tokio::test]
+async fn add_track_index_inserts_and_omitting_it_appends() {
+    let path = start_server("add-track-index", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client
+        .call("project.select", json!({"projectId": "proj-idx"}))
+        .await;
+
+    // Two appends, no index — unchanged behavior.
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    let appended = client.call("edit.addTrack", json!({"kind": "video"})).await;
+    assert_eq!(
+        appended
+            .result
+            .expect("append returns the new track")
+            .get("index"),
+        Some(&json!(1)),
+        "omitting index must still append at the end"
+    );
+
+    let inserted = client
+        .call("edit.addTrack", json!({"kind": "audio", "index": 1}))
+        .await;
+    assert!(
+        inserted.error.is_none(),
+        "indexed edit.addTrack should succeed: {:?}",
+        inserted.error
+    );
+    let inserted = inserted.result.expect("insert returns the new track");
+    assert_eq!(inserted["index"], 1);
+    assert_eq!(inserted["kind"], "audio");
+
+    let tracks = client
+        .call("edit.listTracks", json!({}))
+        .await
+        .result
+        .expect("edit.listTracks returns a list");
+    let tracks = tracks.as_array().expect("tracks is a JSON array");
+    let kinds: Vec<&str> = tracks.iter().map(|t| t["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec!["video", "audio", "video"],
+        "the audio track must land at index 1, shifting the second video down"
+    );
+    let indices: Vec<u64> = tracks.iter().map(|t| t["index"].as_u64().unwrap()).collect();
+    assert_eq!(indices, vec![0, 1, 2], "indices must be renumbered densely");
+
+    // Appending after an insert still goes to the end.
+    let after = client
+        .call("edit.addTrack", json!({"kind": "video"}))
+        .await
+        .result
+        .expect("append returns the new track");
+    assert_eq!(after["index"], 3);
+
+    let out_of_range = client
+        .call("edit.addTrack", json!({"kind": "video", "index": 9}))
+        .await;
+    assert_eq!(
+        out_of_range
+            .error
+            .expect("out-of-range index must be rejected")
+            .code,
+        error_codes::INVALID_PARAMS
+    );
+}
+
+#[tokio::test]
 async fn track_reorder_properties_and_clip_remove_move_dispatch() {
     let path = start_server("track-clip-ops", TOKEN).await;
     let mut client = Client::connect(&path).await;

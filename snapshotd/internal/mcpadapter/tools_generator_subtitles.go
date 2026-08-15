@@ -18,7 +18,7 @@ func generatorSubtitlesTools(s *server.MCPServer, h Handler) []server.ServerTool
 			dynamicOutputSchema[PlaylistEntry](),
 		),
 		sapTool(s, h, "generator.createColor", "generator.createColor", "Create a solid-color producer for the project playlist, e.g. a transparent spacer.",
-			mcp.WithString("hexColor", mcp.Required(), mcp.Description(`Hex color, e.g. "#00000000" for transparent`)),
+			mcp.WithString("hexColor", mcp.Required(), mcp.Description(`Hex color, alpha always LAST on input: "#RGB", "#RRGGBB", "#RRGGBBAA", "0xRRGGBB" or "0xRRGGBBAA" (case-insensitive; alpha defaults to ff/opaque when omitted). Examples: "#ff0000" opaque red, "#00000000" fully transparent. The value is canonicalized to MLT's internal #AARRGGBB form for you, so callers never need to account for MLT parsing "#" as alpha-first and "0x" as alpha-last. Anything else is rejected.`)),
 			dynamicOutputSchema[PlaylistEntry](),
 		),
 		sapTool(s, h, "subtitles.addTrack", "subtitles.addTrack", "Add a subtitles track.",

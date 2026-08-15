@@ -283,6 +283,83 @@ func TestMCPAdapter_TypedToolForwardsToSAP(t *testing.T) {
 	}
 }
 
+// TestMCPAdapter_AddTrackIndexForwarded pins edit.addTrack's optional "index"
+// argument to the SAP wire: when supplied it must round-trip into the
+// forwarded params as camelCase "index" with the same value (so sap-rust
+// inserts at that slot), and when omitted the key must be absent entirely
+// rather than defaulted to 0 -- absence is what preserves the append
+// behavior every existing caller relies on.
+func TestMCPAdapter_AddTrackIndexForwarded(t *testing.T) {
+	h := &fakeHandler{}
+	mcpServer := mcpadapter.New(h)
+	testServer := server.NewTestServer(mcpServer)
+	defer testServer.Close()
+
+	c, err := mcpclient.NewSSEMCPClient(testServer.URL + "/sse")
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := c.Initialize(ctx, mcp.InitializeRequest{}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	selectReq := mcp.CallToolRequest{}
+	selectReq.Params.Name = "project.select"
+	selectReq.Params.Arguments = map[string]any{"projectId": "proj-1"}
+	if res, err := c.CallTool(ctx, selectReq); err != nil || res.IsError {
+		t.Fatalf("project.select: err=%v result=%s", err, toolResultText(res))
+	}
+
+	callAddTrack := func(t *testing.T, args map[string]any) map[string]any {
+		t.Helper()
+		req := mcp.CallToolRequest{}
+		req.Params.Name = "edit.addTrack"
+		req.Params.Arguments = args
+		res, err := c.CallTool(ctx, req)
+		if err != nil {
+			t.Fatalf("call edit.addTrack %+v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("edit.addTrack %+v returned tool error: %s", args, toolResultText(res))
+		}
+		if h.lastMethod != "edit.addTrack" {
+			t.Fatalf("expected ForwardSAP dispatch to edit.addTrack, got %s", h.lastMethod)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(h.lastParams, &got); err != nil {
+			t.Fatalf("unmarshal forwarded params: %v", err)
+		}
+		return got
+	}
+
+	t.Run("index forwarded", func(t *testing.T) {
+		got := callAddTrack(t, map[string]any{"kind": "video", "index": 2})
+		if got["kind"] != "video" {
+			t.Fatalf("expected kind forwarded, got %+v", got)
+		}
+		if string(mustJSON(t, got["index"])) != string(mustJSON(t, 2)) {
+			t.Fatalf("expected index=2 forwarded to SAP, got %+v", got)
+		}
+	})
+
+	t.Run("index omitted", func(t *testing.T) {
+		got := callAddTrack(t, map[string]any{"kind": "audio"})
+		if got["kind"] != "audio" {
+			t.Fatalf("expected kind forwarded, got %+v", got)
+		}
+		if _, ok := got["index"]; ok {
+			t.Fatalf("expected no index key when omitted (append behavior), got %+v", got)
+		}
+	})
+}
+
 // TestMCPAdapter_NewTypedMethods verifies the newly exposed native surfaces
 // are real MCP tools (not just entries in the documentation schema), forward
 // their arguments to SAP, and remain callable over the same SSE transport as

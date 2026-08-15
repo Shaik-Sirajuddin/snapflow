@@ -248,6 +248,48 @@ pub(crate) fn probe_media(path: &str) -> BackendResult<FileProbe> {
     })
 }
 
+/// Canonicalize a caller-supplied hex color to MLT's `#AARRGGBB` form.
+///
+/// MLT's own convention depends on the prefix character: `#`-prefixed
+/// 8-digit hex is parsed as `aarrggbb` (alpha first) while `0x`-prefixed
+/// 8-digit hex is parsed as `rrggbbaa` (alpha last). Callers of this API get
+/// one contract instead: **alpha is always last on input** (`#RRGGBBAA` /
+/// `0xRRGGBBAA`), matching CSS and the common `0x` convention. Accepted
+/// inputs are `#RGB`, `#RRGGBB`, `#RRGGBBAA`, `0xRRGGBB` and `0xRRGGBBAA`
+/// (hex digits case-insensitive); alpha defaults to `ff` (opaque) when the
+/// input carries no alpha channel. The output is always the `#AARRGGBB`
+/// form, which is what MLT's `#` path actually parses.
+pub(crate) fn normalize_hex_color(input: &str) -> BackendResult<String> {
+    let trimmed = input.trim();
+    let digits = trimmed
+        .strip_prefix('#')
+        .or_else(|| trimmed.strip_prefix("0x"))
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .filter(|d| d.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| invalid_hex_color(input))?
+        .to_ascii_lowercase();
+
+    let (rgb, alpha) = match digits.len() {
+        3 if trimmed.starts_with('#') => (
+            digits.chars().flat_map(|c| [c, c]).collect::<String>(),
+            "ff".to_string(),
+        ),
+        6 => (digits, "ff".to_string()),
+        8 => {
+            let (rgb, alpha) = digits.split_at(6);
+            (rgb.to_string(), alpha.to_string())
+        }
+        _ => return Err(invalid_hex_color(input)),
+    };
+    Ok(format!("#{alpha}{rgb}"))
+}
+
+fn invalid_hex_color(input: &str) -> BackendError {
+    BackendError::InvalidParams(format!(
+        "invalid hexColor {input:?}: expected #RGB, #RRGGBB, #RRGGBBAA, 0xRRGGBB or 0xRRGGBBAA (alpha last)"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +382,26 @@ mod tests {
             Some("foo unrecognised - ignoring")
         );
         assert_eq!(detect_unrecognised_codec("all clean"), None);
+    }
+
+    #[test]
+    fn normalize_hex_color_canonicalizes_accepted_formats() {
+        assert_eq!(normalize_hex_color("#f00").unwrap(), "#ffff0000");
+        assert_eq!(normalize_hex_color("#FF0000").unwrap(), "#ffff0000");
+        assert_eq!(normalize_hex_color("#00000000").unwrap(), "#00000000");
+        assert_eq!(normalize_hex_color("#11223344").unwrap(), "#44112233");
+        assert_eq!(normalize_hex_color("0x00FF00").unwrap(), "#ff00ff00");
+        assert_eq!(normalize_hex_color("0x11223344").unwrap(), "#44112233");
+        assert_eq!(normalize_hex_color("  #AbCdEf  ").unwrap(), "#ffabcdef");
+    }
+
+    #[test]
+    fn normalize_hex_color_rejects_bad_input() {
+        for bad in ["blue", "#12", "#12345", "", "#gg0000", "0x123", "123456"] {
+            assert!(
+                normalize_hex_color(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 }

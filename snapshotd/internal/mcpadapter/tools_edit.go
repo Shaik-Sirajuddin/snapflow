@@ -11,8 +11,9 @@ func editTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	sourceOpt := clipSourceOpt()
 
 	return []server.ServerTool{
-		sapTool(s, h, "edit.addTrack", "edit.addTrack", "Add a video or audio timeline track.",
+		sapTool(s, h, "edit.addTrack", "edit.addTrack", "Add a video or audio timeline track, appended by default or inserted at an explicit index.",
 			mcp.WithString("kind", mcp.Required(), mcp.Enum("video", "audio"), mcp.Description("Track kind")),
+			mcp.WithInteger("index", mcp.Description("Omit to append the track (default). Provide a 0-based index of an existing track to insert there instead, shifting that track and everything after it up by one; the returned Track.index equals this value. Out-of-range indices are rejected, so appending the very first track must omit index. Note the track ordering convention here: index 0 is the TOPMOST timeline track, not the bottom one, so a lower index means a higher video layer.")),
 			dynamicOutputSchema[Track](),
 		),
 		sapTool(s, h, "edit.removeTrack", "edit.removeTrack", "Remove a timeline track.",

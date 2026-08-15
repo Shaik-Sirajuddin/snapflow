@@ -429,10 +429,12 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             #[serde(rename_all = "camelCase")]
             struct P {
                 kind: String,
+                #[serde(default)]
+                index: Option<usize>,
             }
             let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
             Ok(Box::new(move |b| {
-                match b.edit_add_track(&project_id, &p.kind) {
+                match b.edit_add_track(&project_id, &p.kind, p.index) {
                     Ok(track) => BackendCallResult {
                         result: Ok(serde_json::to_value(&track).expect("Track serializes")),
                         notify: Some(RpcNotification::new(

@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "phase-plan execution file",
+  "plan": "snapflow-mcp-schema-fixes",
+  "plan_doc": "00-plan.md",
+  "source_task": "memory/build/tasks/fixes.md (snapflow MCP hexColor/addTrack/selection-tool schema issues), cross-checked against /home/siraj/Desktop/edits/animated-emojis/project/snapflow-mcp-issues.md and current code in shotcut/src/rustbridge/sap_ffi.cpp, sap-rust/src/{ffi.rs,ffi_backend.rs,backend.rs,server.rs}, snapshotd/internal/mcpadapter.",
+  "status": "in_progress",
+  "updated": "2026-08-07",
+  "ordering_rationale": "cpp -> rust -> mcp per fix, since mcp schemas wrap rust backend methods which wrap cpp FFI exports. Within phase 3: cheap verify/doc items first (3a, 3d), then new-capability items (3b batch keyframes, 3c fps) last since they carry the most implementation risk.",
+  "execution_strategy": {
+    "mode": "sequential_with_verification",
+    "subagents": false,
+    "blocks": [
+      {"id": "phase1", "name": "hexColor formats", "tasks": ["rust hex normalizer", "mcp schema doc"], "phases": ["hexcolor_rust_normalize", "hexcolor_mcp_doc"], "depends_on": []},
+      {"id": "phase2", "name": "addTrack index", "tasks": ["cpp FFI insert-track export", "rust binding + backend wiring", "mcp schema param"], "phases": ["addtrack_cpp_ffi", "addtrack_rust_wiring", "addtrack_mcp_schema"], "depends_on": ["phase1"]},
+      {"id": "phase3", "name": "selection tools + suggested custom tools", "tasks": ["verify clipId scoping", "batch keyframe tool", "export fps override", "doc-only fixes"], "phases": ["clipid_scoping_verify", "selection_error_hardening", "batch_addkeyframes", "export_fps_override", "doc_fixes_qtblend_title"], "depends_on": ["phase2"]}
+    ]
+  },
+  "completed": [],
+  "pending": [
+    {
+      "phase": "hexcolor_rust_normalize",
+      "order": 1,
+      "tier": 2,
+      "status": "completed",
+      "description": "Add hex color normalizer in sap-rust (ffi_backend.rs::generator_create_color) accepting #RGB/#RRGGBB/#RRGGBBAA/0xRRGGBB/0xRRGGBBAA, canonicalizing to MLT's real #AARRGGBB before the FFI call; reject anything else.",
+      "verification": "sap-rust unit tests: each accepted format maps to correct #AARRGGBB output; one invalid-format rejection case; cargo test passes.",
+      "implementation_evidence": "Added normalize_hex_color()/invalid_hex_color() in sap-rust/src/media_tools.rs (after probe_media, ~lines 250-292) rather than ffi_backend.rs: ffi_backend.rs is #![cfg(feature = \"real_ffi\")] so inline tests there would not run under the crate's default cargo test, while media_tools.rs is the existing ungated 'helpers shared by FfiBackend' module. Input contract: alpha always LAST (#RGB, #RRGGBB, #RRGGBBAA, 0xRRGGBB, 0xRRGGBBAA, case-insensitive, alpha defaults to ff); output always MLT's #AARRGGBB; anything else -> BackendError::InvalidParams listing the accepted formats. 3-digit shorthand is accepted only with the # prefix (0xRGB is not a listed format). Called from ffi_backend.rs::generator_create_color (line 1971) before the CString/ffi::sap_generator_create_color call. Tests: media_tools::tests::normalize_hex_color_canonicalizes_accepted_formats and ::normalize_hex_color_rejects_bad_input (blue, #12, #12345, empty, #gg0000, 0x123, bare 123456). Command: cd sap-rust && cargo test -> all green (26 lib + 29 server_integration + 0 doc tests, 0 failures); the 7 'unreachable pattern' warnings in server.rs are pre-existing and untouched."
+    },
+    {
+      "phase": "hexcolor_mcp_doc",
+      "order": 2,
+      "tier": 1,
+      "status": "completed",
+      "description": "Update hexColor param description in snapshotd/internal/mcpadapter/tools_generator_subtitles.go to state accepted formats and the canonicalization behavior.",
+      "verification": "Schema description text reviewed; no behavior change to verify.",
+      "implementation_evidence": "Rewrote the hexColor mcp.Description on the generator.createColor registration in snapshotd/internal/mcpadapter/tools_generator_subtitles.go:21 to list the accepted formats (#RGB/#RRGGBB/#RRGGBBAA/0xRRGGBB/0xRRGGBBAA, case-insensitive, alpha last, defaults to ff), give opaque-red and fully-transparent examples, and state that the value is canonicalized to MLT's #AARRGGBB internally so callers need not know MLT's #-vs-0x alpha-position inconsistency. Description-only change. Verified with: cd snapshotd && go build ./internal/mcpadapter/ (clean)."
+    },
+    {
+      "phase": "addtrack_cpp_ffi",
+      "order": 3,
+      "tier": 2,
+      "status": "in_progress",
+      "description": "Add sap_insert_track(mainWindowHandle, trackIndex, isVideo) to shotcut/src/rustbridge/sap_ffi.cpp wrapping Timeline::InsertTrackCommand (mirrors sap_add_video_track/sap_add_audio_track's AddTrackCommand pattern), returning the resulting track index.",
+      "verification": "cpp build succeeds; new FFI symbol exported and callable, returns expected index for a manual insert-at-index call.",
+      "implementation_evidence": "Added sap_insert_track(void*, int trackIndex, int isVideo) in shotcut/src/rustbridge/sap_ffi.cpp (immediately before sap_remove_track, ~line 226) and declared it in shotcut/src/rustbridge/sap_ffi.h (~line 61, after sap_add_audio_track). Deviation from the plan text: it does NOT push Timeline::InsertTrackCommand directly -- it uses TimelineDock::insertVideoTrack()/insertAudioTrack(), which are the dock slots that push that exact command (timelinedock.cpp:2258/2270, InsertTrackCommand(m_model, currentTrack(), Audio|VideoTrackType)). Those slots also clear any live timeline selection first (m_selection.selectedTrack != -1 -> setSelection()), which the add-track path does too and which a raw command push would skip. Since they have no indexed overload, this sets dock->setCurrentTrack(trackIndex) first -- structurally identical to the existing sap_remove_track, whose in-file comment documents the same trick. Same Qt::BlockingQueuedConnection + mainWindowFromHandle + dock->model() null/range checks + syncTimelineProducer(mw) as its neighbours; no new includes needed. Returns trackIndex on success, -1 on error; trackIndex is validated against [0, model->trackList().size()) so appending (and the first track on an empty timeline) must go through sap_add_video_track/sap_add_audio_track -- this deliberately avoids relying on InsertTrackCommand's silent qBound() clamp to rowCount()-1, which would otherwise turn an out-of-range insert into a surprise insert at the last index. STATUS is in_progress, not completed: the cpp could NOT be build-verified here. The shotcut submodule was not even checked out in this worktree (git submodule status showed '-9c5cb36...'); it was cloned locally from the sibling checkout at commit 12a85c6 (the recorded pointer 9c5cb36 does not exist in that clone -- stale) and sap_ffi.cpp/timelinecommands.cpp were diffed byte-for-byte against the sibling working copy before editing. A Qt+MLT build is unavailable in this environment, so correctness rests on pattern-matching against sap_remove_track and the two dock slots. This needs the integration_realsaprust phase's real cpp build to close."
+    },
+    {
+      "phase": "addtrack_rust_wiring",
+      "order": 4,
+      "tier": 2,
+      "status": "completed",
+      "description": "Add sap_insert_track binding in ffi.rs; extend Backend::edit_add_track (backend.rs) and ffi_backend.rs impl to accept optional index, dispatching insert-at-index vs append; wire through server.rs edit.addTrack handler.",
+      "depends_on": ["addtrack_cpp_ffi"],
+      "verification": "sap-rust integration test: edit.addTrack with index inserts at that position (checked via edit.listTracks before/after); omitting index still appends (no regression).",
+      "implementation_evidence": "ffi.rs: added the sap_insert_track extern \"C\" declaration after sap_add_audio_track (~line 36). backend.rs: Backend::edit_add_track (trait decl ~line 277) now takes index: Option<usize>; the MockBackend impl (~line 905) validates Some(i) < len (InvalidParams 'index {i} out of range (len {len}); omit index to append'), inserts at that position, then renumbers every Track.index densely and shifts the clips HashMap keys at-or-after the insert point up by one -- the same reindex+remap discipline edit_reorder_track already uses, so listTracks/listClips stay coherent after an insert. index: None keeps the exact previous append path. ffi_backend.rs::edit_add_track (~line 653) now maps kind -> is_video once, then dispatches Some(at) -> ffi::sap_insert_track(handle, at as c_int, is_video as c_int) vs None -> the untouched sap_add_video_track/sap_add_audio_track calls; the kind-validation error, the index < 0 -> InvalidParams check, and the returned Track construction are unchanged. server.rs 'edit.addTrack' handler (~line 427): params struct gained #[serde(default)] index: Option<usize> (camelCase already via serde(rename_all)), passed straight through -- absent and explicit null both mean append. Also migrated 14 pre-existing 2-arg b.edit_add_track(\"p\", \"video\") call sites in backend.rs's #[cfg(test)] module to pass None. Tests: new tests/server_integration.rs::add_track_index_inserts_and_omitting_it_appends (~lines 234-300) asserts two no-index adds land at 0 then 1, an {kind:audio,index:1} insert returns index 1 and makes listTracks read [video, audio, video] with densely renumbered indices 0/1/2, a subsequent no-index add still appends at 3, and index:9 is rejected with INVALID_PARAMS. Commands: cd sap-rust && cargo test -> all green (26 lib + 30 server_integration, 0 failed); cargo check --features real_ffi -> clean (the 7 unreachable-pattern warnings in server.rs are pre-existing)."
+    },
+    {
+      "phase": "addtrack_mcp_schema",
+      "order": 5,
+      "tier": 1,
+      "status": "completed",
+      "description": "Add optional index integer param to edit.addTrack in tools_edit.go; document current insertion order (index 0 = topmost) either way.",
+      "depends_on": ["addtrack_rust_wiring"],
+      "verification": "MCP adapter test: edit.addTrack with index param forwards to sap-rust and inserts at requested position; existing no-index addTrack tests still pass.",
+      "implementation_evidence": "snapshotd/internal/mcpadapter/tools_edit.go:14 -- edit.addTrack's summary now reads 'appended by default or inserted at an explicit index', plus a new optional mcp.WithInteger(\"index\") whose description states: omit to append (the default, unchanged); a 0-based index of an existing track inserts there and shifts that track and everything after it up by one; the returned Track.index equals the requested value; out-of-range is rejected so the very first track must omit index; and -- stated plainly per the plan -- that index 0 is the TOPMOST timeline track, not the bottom one, so a lower index is a higher video layer. Test: snapshotd/internal/mcpadapter/mcpadapter_test.go:286-360, TestMCPAdapter_AddTrackIndexForwarded, using the package's existing fakeHandler + server.NewTestServer + SSE-client pattern (no real backend). Two subtests: 'index forwarded' calls edit.addTrack{kind:video,index:2} and asserts the dispatched sap method is edit.addTrack with params index==2; 'index omitted' calls {kind:audio} and asserts the dispatched params carry NO index key at all (append is not silently defaulted to 0). Regenerating the committed tool-schema golden was required: snapshotd/docs/schema/snapshotd-mcp.schema.json is asserted byte-equal by TestCommittedSchemaMatchesCurrentTools, so `bash scripts/gen_mcp_schema.sh` was run from snapshotd/ after this and the Phase 1 hexColor description change. CAVEAT for the reviewer: that regeneration swept in PRE-EXISTING golden staleness unrelated to Phases 1-2 -- the committed schema had not been regenerated since 896a96692, so the diff also carries (a) daemon.list gaining a description rewrite, an optional boolean `active` input, and a whole new ~72-line outputSchema; (b) `name` appearing on the Track output object in four places; (c) track.enter gaining a `trackName` param and dropping trackIndex from its `required` array (now []). No Go source behind those three surfaces is dirty in this worktree (git status shows only tools_edit.go, tools_generator_subtitles.go, mcpadapter_test.go), so this is legitimate gen_mcp_schema.sh output against current HEAD, not something these phases introduced -- but it means the schema hunk is larger than Phases 1-2 and may deserve splitting into its own commit. Commands: cd snapshotd && go build ./... (clean); go test ./internal/mcpadapter/... -count=1 -> ok 0.060s, with TestMCPAdapter_AddTrackIndexForwarded (both subtests) and TestCommittedSchemaMatchesCurrentTools passing; the realsaprust-tagged suite is out of scope until the integration_realsaprust phase."
+    },
+    {
+      "phase": "clipid_scoping_verify",
+      "order": 6,
+      "tier": 1,
+      "status": "not_started",
+      "description": "The 'clipId declared but ignored' issue (#6 in the original build-log issues doc) does not reproduce in current code: filter.add/list/setProperty/addKeyframe in tools_filter.go all require clipId and server.rs parses it directly via Backend::parse_clip_id, no clip.enter selection fallback. No code change. Add/extend a regression test asserting filter.add targets the passed clipId even when it differs from the current clip.enter selection, to lock in this behavior.",
+      "verification": "New/extended mcpadapter or sap-rust test: filter.add with an explicit clipId different from clip.enter's current selection still mutates the passed clipId's filters."
+    },
+    {
+      "phase": "selection_error_hardening",
+      "order": 7,
+      "tier": 2,
+      "status": "not_started",
+      "description": "Audit server.rs handlers for selection-scoped (implicit trackIndex/clipId) tools that silently fall back to a default/stale selection when track.enter/clip.enter was never called or was skipped; tighten those to return an explicit InvalidParams/NotFound error instead (issue #8).",
+      "verification": "Test: calling a selection-scoped mutating tool with no prior track.enter/clip.enter returns a typed error, not a silent no-op or action on stale state."
+    },
+    {
+      "phase": "batch_addkeyframes",
+      "order": 8,
+      "tier": 2,
+      "status": "not_started",
+      "description": "Add filter.addKeyframes (plural) to reduce the N-sequential-call cost of building animated objects (issue #7): rust backend method taking an array of {position,value,interpolation} for one (clipId,filterIndex,property), looping the existing per-keyframe FFI call inside one Backend call; mcp tool in tools_filter.go mirroring filter.addKeyframe with a keyframes array param.",
+      "depends_on": ["clipid_scoping_verify", "selection_error_hardening"],
+      "verification": "Test: filter.addKeyframes with N keyframes produces identical MLT state (via filter.listKeyframes) to N sequential filter.addKeyframe calls."
+    },
+    {
+      "phase": "export_fps_override",
+      "order": 9,
+      "tier": 3,
+      "status": "not_started",
+      "description": "Investigate melt/MLT consumer-level fps override support for file.export (issue #2); add optional fps param to file_export in ffi_backend.rs and file.export in tools_file_jobs.go if a real consumer-side override is feasible without breaking keyframe timing. If a genuine retime (not just consumer fps) is required, scope that explicitly as a follow-up rather than shipping an unverified primitive.",
+      "verification": "Either: export at overridden fps produces a file with the requested frame rate and documented (no-retime) semantics, with a test; or: explicitly recorded as a scoped-out follow-up in 00-plan.md/follow_ups with the blocking reason."
+    },
+    {
+      "phase": "doc_fixes_qtblend_title",
+      "order": 10,
+      "tier": 1,
+      "status": "not_started",
+      "description": "Doc-only: document melt's qtblend/display dependency as a file.export precondition for >1 composited video track (issue #4) in tools_file_jobs.go; document generator.createTitle's actual composition (transparent color: producer + dynamictext filter, not a distinct title producer) in tools_generator_subtitles.go (issue #5).",
+      "verification": "Schema description text reviewed; no behavior change to verify."
+    },
+    {
+      "phase": "integration_realsaprust",
+      "order": 11,
+      "tier": "runtime_gate",
+      "status": "not_started",
+      "description": "Build the real stack (shotcut cpp + sap-rust + snapshotd) and run against a real sap-rust instance rather than the fake backend: the existing *_realsaprust_test.go suite in snapshotd/internal/mcpadapter (audio_namespace, logparity, sapcall_export, phase_b_concurrency, phase_c_isolation, etc.) must stay green with the new addTrack/hexColor/filter.addKeyframes tools present, and new realsaprust-tagged coverage must be added for: hexColor format normalization (Phase 1), edit.addTrack with an explicit index (Phase 2), filter.addKeyframes batch equivalence and the selection-error-hardening cases (Phase 3), and file.export fps override if shipped (3c). This is the alignment check against the current real-instance mcp test convention already used in this package, not just fake-backend unit tests.",
+      "matrix_ref": "00-plan.md#acceptance",
+      "harness": "cpp build (shotcut) -> cargo build sap-rust -> go test ./internal/mcpadapter/... -run Realsaprust (or equivalent real-backend test selection already used by this package)",
+      "depends_on": ["hexcolor_rust_normalize", "addtrack_mcp_schema", "clipid_scoping_verify", "selection_error_hardening", "batch_addkeyframes", "export_fps_override", "doc_fixes_qtblend_title"],
+      "verification": "Full real-instance build succeeds; all existing realsaprust-tagged tests pass unmodified in behavior; new realsaprust tests for each phase above pass against the real cpp+rust binaries, not the fake backend."
+    },
+    {
+      "phase": "review_gate",
+      "order": 12,
+      "tier": "review_gate",
+      "status": "not_started",
+      "description": "Run /rust-audit over touched sap-rust files (lock/selection-state safety) and a general review pass over touched cpp/go files; fix findings.",
+      "max_iterations": 3
+    },
+    {
+      "phase": "verification_gate",
+      "order": 13,
+      "tier": "verification_gate",
+      "status": "not_started",
+      "description": "Run /verify-impl against this meta.json: check implemented code against 00-plan.md and each phase's verification field.",
+      "misalignments": []
+    },
+    {
+      "phase": "loop_gate",
+      "order": 14,
+      "tier": "loop_gate",
+      "status": "not_started",
+      "description": "If verification_gate found misalignments, fix and re-run it.",
+      "completion_rule": "Closes only when verification_gate's misalignments array is empty."
+    }
+  ],
+  "open_risks_ref": "00-plan.md#acceptance",
+  "notes": [
+    "Working in worktree .claude/worktrees/mcp-schema-fixes (branch worktree-mcp-schema-fixes), branched from local main which matched origin/main at creation time (6e91f14c5).",
+    "Phase 3a (clipId scoping) was originally scoped as a fix but investigation found it already resolved in current code -- kept as a verify-only phase rather than dropped, per user instruction to include everything from the referenced issues file."
+  ]
+}

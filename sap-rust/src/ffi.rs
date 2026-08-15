@@ -33,6 +33,17 @@ extern "C" {
     /// C++ side: `int sap_add_audio_track(void* mainWindowHandle);`
     pub fn sap_add_audio_track(main_window_handle: *mut c_void) -> c_int;
 
+    /// C++ side: `int sap_insert_track(void* mainWindowHandle, int trackIndex, int isVideo);`
+    /// Inserts a track *at* `track_index` (shifting it and everything below
+    /// down) via `Timeline::InsertTrackCommand`. Returns the new track's
+    /// 0-based index (== `track_index`), or -1 on error (invalid handle, or
+    /// `track_index` outside the existing track list).
+    pub fn sap_insert_track(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        is_video: c_int,
+    ) -> c_int;
+
     /// C++ side: `int sap_remove_track(void* mainWindowHandle, int trackIndex);`
     /// Returns 0 on success, -1 on error (invalid handle/index).
     pub fn sap_remove_track(main_window_handle: *mut c_void, track_index: c_int) -> c_int;

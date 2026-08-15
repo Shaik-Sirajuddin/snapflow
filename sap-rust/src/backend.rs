@@ -272,7 +272,14 @@ pub trait Backend: Send {
     /// `project.getProfile` -- live canvas dimensions / frame rate.
     fn project_get_profile(&mut self, project_id: &str) -> BackendResult<ProfileInfo>;
 
-    fn edit_add_track(&mut self, project_id: &str, kind: &str) -> BackendResult<Track>;
+    /// `index: None` appends; `Some(i)` inserts at `i`, shifting the track
+    /// currently at `i` (and everything below it) down.
+    fn edit_add_track(
+        &mut self,
+        project_id: &str,
+        kind: &str,
+        index: Option<usize>,
+    ) -> BackendResult<Track>;
     fn edit_remove_track(&mut self, project_id: &str, track_index: usize) -> BackendResult<()>;
     fn edit_list_tracks(&mut self, project_id: &str) -> BackendResult<Vec<Track>>;
     fn edit_append_clip(
@@ -895,15 +902,29 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    fn edit_add_track(&mut self, project_id: &str, kind: &str) -> BackendResult<Track> {
+    fn edit_add_track(
+        &mut self,
+        project_id: &str,
+        kind: &str,
+        index: Option<usize>,
+    ) -> BackendResult<Track> {
         if kind != "video" && kind != "audio" {
             return Err(BackendError::InvalidParams(format!(
                 "bad track kind: {kind}"
             )));
         }
         let data = self.project_mut(project_id);
+        let len = data.tracks.len();
+        if let Some(i) = index {
+            if i >= len {
+                return Err(BackendError::InvalidParams(format!(
+                    "index {i} out of range (len {len}); omit index to append"
+                )));
+            }
+        }
+        let at = index.unwrap_or(len);
         let track = Track {
-            index: data.tracks.len(),
+            index: at,
             kind: kind.to_string(),
             name: None,
             muted: false,
@@ -913,7 +934,23 @@ impl Backend for MockBackend {
             // Upper video tracks default composite-on in mock (bottom stays off).
             composite: kind == "video" && !data.tracks.is_empty(),
         };
-        data.tracks.push(track.clone());
+        data.tracks.insert(at, track.clone());
+        if index.is_some() {
+            // Same reindex + clips remap as edit_reorder_track: everything at
+            // or below `at` shifts down one.
+            for (i, t) in data.tracks.iter_mut().enumerate() {
+                t.index = i;
+            }
+            let old_clips: HashMap<usize, Vec<Clip>> = data.clips.drain().collect();
+            for (old_index, clips) in old_clips {
+                let new_index = if old_index >= at {
+                    old_index + 1
+                } else {
+                    old_index
+                };
+                data.clips.insert(new_index, clips);
+            }
+        }
         data.dirty = true;
         data.undo_depth += 1;
         data.redo_depth = 0;
@@ -2418,7 +2455,7 @@ mod tests {
     fn clip_speed_validates_and_updates_mock_clip() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         b.edit_append_clip("p", 0, json!({"path":"x.mp4"})).unwrap();
         let c = b.edit_set_clip_speed("p", 0, 0, 2.0).unwrap();
         assert_eq!(c.speed, 2.0);
@@ -2430,9 +2467,9 @@ mod tests {
     fn edit_reorder_track_remaps_clips_to_follow_their_track() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
-        b.edit_add_track("p", "video").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         let clip0 = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/track0.mp4"}))
             .unwrap();
@@ -2459,7 +2496,7 @@ mod tests {
     fn edit_set_track_properties_is_a_partial_update() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
 
         let t = b
             .edit_set_track_properties("p", 0, Some(true), None, None, None, None)
@@ -2516,7 +2553,7 @@ mod tests {
     fn edit_set_track_height_round_trips_via_state() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         assert!(b.edit_set_track_height("p", 120).is_ok());
     }
 
@@ -2524,7 +2561,7 @@ mod tests {
     fn edit_remove_clip_reindexes_remaining_clips() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
         let keep = b
@@ -2546,8 +2583,8 @@ mod tests {
     fn edit_move_clip_same_track_and_cross_track() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         let a = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
@@ -2576,7 +2613,7 @@ mod tests {
     fn edit_insert_clip_splices_mid_track_and_ripples_downstream_indices() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         let a = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
@@ -2616,7 +2653,7 @@ mod tests {
     fn edit_overwrite_clip_replaces_in_place_without_rippling_downstream() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         let a = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
@@ -2661,7 +2698,7 @@ mod tests {
     fn edit_split_clip_splits_and_reindexes() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         let clip = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
@@ -2691,7 +2728,7 @@ mod tests {
     fn edit_split_clip_rejects_boundary_position() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
         b.edit_trim_clip_in("p", 0, 0, 10, false).unwrap();
@@ -2704,7 +2741,7 @@ mod tests {
     fn filter_lifecycle_list_remove_reorder_keyframes() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
-        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video", None).unwrap();
         let clip = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
