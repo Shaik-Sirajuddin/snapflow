@@ -7370,6 +7370,18 @@ impl AgentBridge {
     pub fn request_gateway_catalog_refresh(&self, idx: usize) {
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
         const FETCHING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        // The "owning Tokio runtime is shutting down" class of failure
+        // (see `acpx_client::raw::is_runtime_shutdown_error`) cannot
+        // self-heal by retrying -- it means this bridge's own background
+        // runtime lost its execution context, so every future RPC on it
+        // will fail identically no matter how soon we ask again. Falling
+        // back to `MIN_INTERVAL`'s 2s cadence in that state is what
+        // produced the "agents/list attempt 1 failed ... retrying"
+        // spam observed looping forever on `nitro` (2026-08-05, once per
+        // frame-driven refresh tick, indefinitely, until the app was
+        // restarted): back off far more aggressively instead so the
+        // condition is still visible in logs but stops flooding them.
+        const RUNTIME_SHUTDOWN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         {
             let Ok(cache) = self.gateway_catalog.try_lock() else {
                 return;
@@ -7385,7 +7397,11 @@ impl AgentBridge {
                         Some(crate::protocol_types::McpToolCatalog::Fetching)
                     )
                 });
-            let min_interval = if any_tools_fetching {
+            let min_interval = if acpx_client::raw::is_runtime_shutdown_error(
+                &cache.agent_catalog_error,
+            ) {
+                RUNTIME_SHUTDOWN_INTERVAL
+            } else if any_tools_fetching {
                 FETCHING_INTERVAL
             } else {
                 MIN_INTERVAL
@@ -7445,6 +7461,25 @@ impl AgentBridge {
                 loop {
                     match handle.list_agents().await {
                         Ok(agents) => return Ok(agents),
+                        // The "owning Tokio runtime is shutting down" class
+                        // (see `ClientError::is_runtime_shutdown`) is not a
+                        // transient disconnect -- the transport's own
+                        // reconnect loop (`Gateway::reconnect`) already
+                        // gave up immediately rather than re-dialing a dead
+                        // context, so every further attempt here would fail
+                        // identically. Bail out now instead of burning the
+                        // rest of the backoff budget on a hopeless retry --
+                        // observed live on `nitro` (2026-08-05) looping
+                        // this way, once per ~2s catalog-refresh tick,
+                        // indefinitely until the app was restarted.
+                        Err(error) if error.is_runtime_shutdown() => {
+                            eprintln!(
+                                "panel-rust: agents/list attempt {} aborted ({error}) -- \
+                                 caller's Tokio runtime is shutting down, not retrying",
+                                attempt + 1
+                            );
+                            return Err(error);
+                        }
                         Err(error) if attempt + 1 < AGENTS_LIST_MAX_ATTEMPTS => {
                             attempt += 1;
                             let backoff = std::time::Duration::from_millis(

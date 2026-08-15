@@ -362,6 +362,18 @@ impl Gateway {
     /// reconnect happened. Returns whether a live connection exists
     /// afterward (`false` leaves this `Gateway` in HTTP-degraded mode,
     /// same as a fresh `connect()` whose initial handshake failed).
+    ///
+    /// Bails out of the attempt loop early (instead of burning all
+    /// [`RECONNECT_MAX_ATTEMPTS`]) the moment `connect()` reports
+    /// [`ClientError::is_runtime_shutdown`]: that error means the *task
+    /// dialing the socket* has lost its own Tokio execution context, not
+    /// that the peer is unreachable, so every further attempt on this
+    /// same task would fail identically -- confirmed live on `nitro`
+    /// (2026-08-05), where this loop kept re-dialing a dead context
+    /// forever under `panel-rust`'s per-frame catalog refresh, spamming
+    /// identical "being shutdown" errors until the whole app was
+    /// restarted. Logged distinctly here so a future occurrence is
+    /// diagnosable from one line instead of generic retry spam.
     pub async fn reconnect(&self) -> bool {
         let _reconnect_guard = self.reconnect_lock.lock().await;
         // Another observer may have completed the reconnect while this
@@ -379,6 +391,21 @@ impl Gateway {
                 GatewayWsClient::connect(&self.base_url),
             )
             .await;
+            if let Ok(Err(error)) = &attempt_result {
+                if error.is_runtime_shutdown() {
+                    eprintln!(
+                        "acpx-client: gateway reconnect to {} aborted after {attempt}/{RECONNECT_MAX_ATTEMPTS} \
+                         attempts -- the calling task's own Tokio runtime is shutting down \
+                         ({error}); further reconnect attempts on this task cannot succeed",
+                        self.base_url
+                    );
+                    *self
+                        .websocket
+                        .write()
+                        .expect("gateway websocket lock poisoned") = None;
+                    return false;
+                }
+            }
             if let Ok(Ok(client)) = attempt_result {
                 *self
                     .websocket

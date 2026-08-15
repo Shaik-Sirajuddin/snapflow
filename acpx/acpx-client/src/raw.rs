@@ -67,14 +67,47 @@ pub enum ClientError {
     InvalidParams(String),
 }
 
+/// Substring of Tokio's own internal error text (`tokio::runtime::
+/// TryCurrentError`/reactor-registration failures) returned when I/O is
+/// attempted -- e.g. `connect_async`'s `TcpStream::connect` -- from a task
+/// whose owning `Runtime` has begun `shutdown_background`/`shutdown_timeout`
+/// or been dropped. Unlike a dropped socket or a refused connection, this
+/// means the *execution context* itself is gone: no amount of re-dialing
+/// the gateway can fix it, because the task doing the dialing is running on
+/// a reactor that will never accept new I/O registrations again. Observed
+/// live on `nitro` (2026-08-05): once this hit, every subsequent WebSocket
+/// reconnect attempt failed with the identical message, looping forever
+/// under `panel-rust`'s `agents/list` retry-with-backoff until the whole
+/// app was restarted -- see `is_transient`'s doc comment for why this
+/// string is special-cased out of the generic "any `WebSocket` error is
+/// worth retrying" rule.
+const RUNTIME_SHUTDOWN_ERROR_SUBSTR: &str = "being shutdown";
+
+/// Whether `message` (a `ClientError::WebSocket` payload, or any other
+/// string a caller has stashed away, e.g. `panel-rust`'s catalog-refresh
+/// cache which stores this as a plain `String` rather than the typed
+/// error) indicates the unrecoverable "owning Tokio runtime is shutting
+/// down" condition rather than an ordinary transport hiccup. Public so
+/// callers that only have the rendered message (not a live `ClientError`)
+/// can still classify it the same way `ClientError::is_runtime_shutdown`
+/// does. See [`RUNTIME_SHUTDOWN_ERROR_SUBSTR`].
+pub fn is_runtime_shutdown_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("tokio") && message.contains(RUNTIME_SHUTDOWN_ERROR_SUBSTR)
+}
+
 impl ClientError {
     /// Only transport loss and gateway-startup/recovery responses are safe
     /// to retry. Authentication and capacity errors are stable server-side
     /// conditions; retrying them just repeats the same failure or creates
     /// pressure while the user still has no valid credentials/capacity.
+    /// A `WebSocket` error carrying [`RUNTIME_SHUTDOWN_ERROR_SUBSTR`] is
+    /// likewise excluded -- it is not a "the peer went away" condition,
+    /// it is "the local task's own execution context is gone", which
+    /// retrying (even against a freshly dialed connection) cannot fix.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::WebSocket(_) => true,
+            Self::WebSocket(message) => !is_runtime_shutdown_error(message),
             Self::Http(error) => error.is_connect() || error.is_timeout(),
             Self::Rpc { message, .. } => {
                 let message = message.to_ascii_lowercase();
@@ -94,6 +127,15 @@ impl ClientError {
             }
             _ => false,
         }
+    }
+
+    /// `true` for the specific "owning Tokio runtime is shutting down"
+    /// class of [`Self::WebSocket`] failure -- see
+    /// [`RUNTIME_SHUTDOWN_ERROR_SUBSTR`]. Exposed so callers that need to
+    /// log or surface this distinctly (rather than as an ordinary
+    /// transient disconnect) don't have to duplicate the substring match.
+    pub fn is_runtime_shutdown(&self) -> bool {
+        matches!(self, Self::WebSocket(message) if is_runtime_shutdown_error(message))
     }
 }
 
@@ -130,6 +172,18 @@ mod tests {
                 .into(),
         }
         .is_authentication_or_capacity());
+    }
+
+    #[test]
+    fn runtime_shutdown_websocket_errors_are_not_transient() {
+        let error = ClientError::WebSocket(
+            "IO error: A Tokio 1.x context was found, but it is being shutdown.".into(),
+        );
+        assert!(!error.is_transient(), "must not be retried forever");
+        assert!(error.is_runtime_shutdown());
+        // An ordinary dropped connection is still retried as before.
+        assert!(ClientError::WebSocket("connection reset by peer".into()).is_transient());
+        assert!(!ClientError::WebSocket("connection reset by peer".into()).is_runtime_shutdown());
     }
 }
 

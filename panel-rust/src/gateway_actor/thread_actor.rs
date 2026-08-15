@@ -54,6 +54,17 @@ impl AcpxThreadError {
     pub(crate) fn is_authentication_or_capacity(&self) -> bool {
         matches!(self, Self::Gateway(error) if error.is_authentication_or_capacity())
     }
+
+    /// `true` when the underlying [`ClientError`] is the unrecoverable
+    /// "owning Tokio runtime is shutting down" class (see
+    /// `ClientError::is_runtime_shutdown`'s doc comment) rather than an
+    /// ordinary transient disconnect. Exposed so callers with their own
+    /// retry loop on top of this actor (e.g. `agent_bridge.rs`'s
+    /// `agents/list` catalog refresh) can stop early instead of burning
+    /// their whole retry budget against a context that can never recover.
+    pub(crate) fn is_runtime_shutdown(&self) -> bool {
+        matches!(self, Self::Gateway(error) if error.is_runtime_shutdown())
+    }
 }
 
 fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
