@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Button } from "../base/button.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { LocalTerminalItem } from "../types.slint";
@@ -39,16 +40,16 @@ export component LocalTerminalCard inherits Rectangle {
             padding: Metrics.space-4;
             spacing: Metrics.space-2;
             TerminalHeader {
-                title: "local terminal";
-                status-text: item.has-exited ? "exited" : (focus-scope.has-focus ? "focused" : "click to focus");
+                title: Strings.local-terminal;
+                status-text: item.has-exited ? Strings.exited : (focus-scope.has-focus ? Strings.focused : Strings.click-to-focus);
                 status-color: item.has-exited ? Theme.text-muted : Theme.text-secondary;
-                button-accessible-label: "Focus local terminal";
+                button-accessible-label: Strings.focus-local-terminal;
                 clicked => {
                     focus-scope.focus();
                 }
                 Button {
-                    label: "Kill";
-                    button-accessible-label: "Close local terminal";
+                    label: Strings.kill;
+                    button-accessible-label: Strings.close-local-terminal;
                     btn-width: 44px;
                     btn-height: 16px;
                     font-size: 8px;
@@ -60,7 +61,7 @@ export component LocalTerminalCard inherits Rectangle {
                 local-terminal-expand := IconButton {
                     btn-width: 16px;
                     btn-height: 16px;
-                    button-accessible-label: "Expand local terminal";
+                    button-accessible-label: Strings.expand-local-terminal;
                     clicked => { expand(); }
                     Text {
                         text: "\u{2922}"; // expand glyph, same as TerminalCard
@@ -119,7 +120,7 @@ export component LocalTerminalOverlay inherits Rectangle {
             HorizontalLayout {
                 spacing: Metrics.space-3;
                 Text {
-                    text: "local terminal" + (item.has-exited ? " (exited)" : "");
+                    text: Strings.local-terminal + (item.has-exited ? " (" + Strings.exited + ")" : "");
                     color: Theme.text-primary;
                     font-family: Theme.font-mono;
                     font-size: 12px * Theme.font-scale;
@@ -131,16 +132,16 @@ export component LocalTerminalOverlay inherits Rectangle {
                     vertical-alignment: center;
                 }
                 Button {
-                    label: "Kill";
-                    button-accessible-label: "Close local terminal";
+                    label: Strings.kill;
+                    button-accessible-label: Strings.close-local-terminal;
                     btn-width: 60px;
                     btn-height: 24px;
                     font-weight: 400;
                     clicked => { close-requested(); }
                 }
                 Button {
-                    label: "Close";
-                    button-accessible-label: "Close local terminal overlay";
+                    label: Strings.close-local-terminal-overlay;
+                    button-accessible-label: Strings.close-local-terminal-overlay;
                     btn-width: 60px;
                     btn-height: 24px;
                     font-weight: 400;

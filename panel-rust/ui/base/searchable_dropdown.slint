@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { Strings } from "../tokens/strings.slint";
 import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
@@ -15,7 +16,7 @@ export component SearchableDropdown inherits Rectangle {
     in property <string> trigger-label;
     in property <[DropdownEntry]> options: [];
     in property <bool> searchable: true;
-    in property <string> placeholder: "Search...";
+    in property <string> placeholder: Strings.search-ellipsis;
     in property <length> popup-width: 200px;
     in property <length> popup-max-height: 220px;
     // When true, popup right edge lines up with the trigger (opens leftward).
@@ -351,7 +352,7 @@ export component SearchableDropdown inherits Rectangle {
                 visible: root.show-search;
                 query <=> root.filter;
                 placeholder: root.placeholder;
-                bar-accessible-label: "Filter options";
+                bar-accessible-label: Strings.filter-options;
                 show-icon: true;
                 edited => { }
                 key-pressed(event) => {

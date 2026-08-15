@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Select } from "select.slint";
 
@@ -14,7 +15,7 @@ export component LabeledSelect inherits VerticalLayout {
     in property <string> label;
     in property <[string]> options: [];
     in-out property <string> value: "";
-    in property <string> placeholder: "Select...";
+    in property <string> placeholder: Strings.select-ellipsis;
     in property <bool> searchable: false;
     in property <string> select-accessible-label: label;
     callback selected(string);

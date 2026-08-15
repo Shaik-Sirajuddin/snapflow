@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Badge } from "../base/badge.slint";
 import { TerminalLogBlock } from "../base/terminal_log_block.slint";
@@ -19,7 +20,7 @@ export component MessageCard inherits Rectangle {
     property <bool> is-agent: item.kind == "agent";
     property <bool> is-tool-call: item.kind == "tool-call";
     property <bool> is-thinking: item.kind == "thinking";
-    property <string> header-label: is-user ? "USER" : is-agent ? "AGENT" : is-thinking ? "THINKING" : "TOOL";
+    property <string> header-label: is-user ? Strings.user : is-agent ? Strings.agent : is-thinking ? Strings.thinking-label : Strings.tool-label;
 
     vertical-stretch: 0;
 

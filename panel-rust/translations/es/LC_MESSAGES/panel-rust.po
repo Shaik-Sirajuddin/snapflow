@@ -13,3 +13,198 @@ msgstr "Enviar mensaje"
 
 msgid "Stop response"
 msgstr "Detener respuesta"
+
+msgid "Project"
+msgstr "Proyecto"
+
+msgid "Global"
+msgstr "Global"
+
+msgid "MCP Servers"
+msgstr "Servidores MCP"
+
+msgid "Agents"
+msgstr "Agentes"
+
+msgid "Default command timeout"
+msgstr "Tiempo de espera de comando predeterminado"
+
+msgid "Seconds before an MCP server call is considered stalled"
+msgstr "Segundos antes de que una llamada al servidor MCP se considere estancada"
+
+msgid "Auto-restart on failure"
+msgstr "Reinicio automático en caso de fallo"
+
+msgid "Relaunch a crashed MCP server process automatically"
+msgstr "Reinicia automáticamente un proceso de servidor MCP bloqueado"
+
+msgid "Default agent"
+msgstr "Agente predeterminado"
+
+msgid "Used when a new thread doesn't specify one"
+msgstr "Se usa cuando un nuevo hilo no especifica uno"
+
+msgid "Install"
+msgstr "Instalar"
+
+msgid "Not yet installed on this machine"
+msgstr "Aún no instalado en esta máquina"
+
+msgid "Search..."
+msgstr "Buscar..."
+
+msgid "Filter options"
+msgstr "Opciones de filtro"
+
+msgid "Attach"
+msgstr "Adjuntar"
+
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgid "Chat Defaults"
+msgstr "Valores predeterminados del chat"
+
+msgid "No orphaned sessions for this provider."
+msgstr "No hay sesiones huérfanas para este proveedor."
+
+msgid "Permission profile"
+msgstr "Perfil de permisos"
+
+msgid "Profile"
+msgstr "Perfil"
+
+msgid "Recoverable Sessions"
+msgstr "Sesiones recuperables"
+
+msgid "Search agents"
+msgstr "Buscar agentes"
+
+msgid "Search agents..."
+msgstr "Buscar agentes..."
+
+msgid "Close local terminal"
+msgstr "Cerrar terminal local"
+
+msgid "Close local terminal overlay"
+msgstr "Cerrar superposición del terminal local"
+
+msgid "Expand local terminal"
+msgstr "Expandir terminal local"
+
+msgid "Focus local terminal"
+msgstr "Enfocar terminal local"
+
+msgid "Kill"
+msgstr "Terminar"
+
+msgid "click to focus"
+msgstr "clic para enfocar"
+
+msgid "exited"
+msgstr "salió"
+
+msgid "focused"
+msgstr "enfocado"
+
+msgid "local terminal"
+msgstr "terminal local"
+
+msgid "Skills"
+msgstr "Habilidades"
+
+msgid "Session context"
+msgstr "Contexto de sesión"
+
+msgid "Show global settings"
+msgstr "Mostrar configuración global"
+
+msgid "Show project settings"
+msgstr "Mostrar configuración del proyecto"
+
+msgid "Agents section"
+msgstr "Sección de agentes"
+
+msgid "Harness"
+msgstr "Arnés"
+
+msgid "Harness section"
+msgstr "Sección de arnés"
+
+msgid "MCP Servers section"
+msgstr "Sección de servidores MCP"
+
+msgid "Skills section"
+msgstr "Sección de habilidades"
+
+msgid "Enabled"
+msgstr "Habilitado"
+
+msgid "Search settings"
+msgstr "Buscar en configuración"
+
+msgid "Search settings..."
+msgstr "Buscar en configuración..."
+
+msgid "Connected"
+msgstr "Conectado"
+
+msgid "Installed"
+msgstr "Instalado"
+
+msgid "Not found"
+msgstr "No encontrado"
+
+msgid "AGENT"
+msgstr "AGENTE"
+
+msgid "THINKING"
+msgstr "PENSANDO"
+
+msgid "TOOL"
+msgstr "HERRAMIENTA"
+
+msgid "USER"
+msgstr "USUARIO"
+
+msgid "Select"
+msgstr "Seleccionar"
+
+msgid "Select..."
+msgstr "Seleccionar..."
+
+msgid "Select "
+msgstr "Seleccionar "
+
+msgid "Toggle"
+msgstr "Alternar"
+
+msgid "Search"
+msgstr "Buscar"
+
+msgid "Save"
+msgstr "Guardar"
+
+msgid "FULL CALL DETAILS & PAYLOAD"
+msgstr "DETALLES COMPLETOS DE LA LLAMADA Y CARGA ÚTIL"
+
+msgid "Install agent "
+msgstr "Instalar agente "
+
+msgid "Default"
+msgstr "Predeterminado"
+
+msgid "Unset "
+msgstr "Desactivar "
+
+msgid "Set "
+msgstr "Establecer "
+
+msgid " as default agent"
+msgstr " como agente predeterminado"
+
+msgid "Disable "
+msgstr "Desactivar "
+
+msgid "Enable "
+msgstr "Activar "
