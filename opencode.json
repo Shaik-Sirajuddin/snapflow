@@ -1,0 +1,118 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "bifrost": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Bifrost",
+      "options": {
+        "baseURL": "http://bifrost.localdev.com/anthropic/v1",
+        "apiKey": "sk-bf-68800e3a-a9f4-4f5a-b640-4eb41e53f82b",
+        "headers": {
+          "x-bf-vk": "sk-bf-68800e3a-a9f4-4f5a-b640-4eb41e53f82b"
+        }
+      },
+      "models": {
+        "claude-proxy/claude-fable-5": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-haiku-4-5-20251001": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-opus-4-1-20250805": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-opus-4-5-20251101": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-opus-4-6": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-opus-4-7": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-opus-4-8": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-opus-5": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-sonnet-4-5-20250929": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-sonnet-4-6": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "claude-proxy/claude-sonnet-5": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/codex-auto-review": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/gpt-5.4": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/gpt-5.4-mini": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/gpt-5.5": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/gpt-5.6-luna": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/gpt-5.6-sol": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "codex/gpt-5.6-terra": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-4.20-0309-non-reasoning": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-4.20-0309-reasoning": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-4.20-multi-agent-0309": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-4.3": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-4.5": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-build-0.1": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-imagine-image": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-imagine-image-quality": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-imagine-video": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "grok/grok-imagine-video-1.5": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "ollama/embeddinggemma:latest": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "ollama/gemma3:270m": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "ollama/glm-5.2:cloud": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "ollama/qwen2.5:0.5b": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        },
+        "ollama/qwen3:0.6b": {
+          "name": "Claude Sonnet 5 (Bifrost)"
+        }
+      }
+    }
+  },
+  "model": "bifrost/claude-proxy/claude-sonnet-5"
+}

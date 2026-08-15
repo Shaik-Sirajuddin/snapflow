@@ -1,0 +1,34 @@
+[
+  {
+    "card": "providers_1280x720.png",
+    "ok": true,
+    "png": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/providers_1280x720.png",
+    "png2x": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/providers_1280x720@2x.png",
+    "texts": 10,
+    "viewBox": "24 48 1280 720"
+  },
+  {
+    "card": "use-cases_1280x720.png",
+    "ok": true,
+    "png": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/use-cases_1280x720.png",
+    "png2x": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/use-cases_1280x720@2x.png",
+    "texts": 10,
+    "viewBox": "40 1680 1280 720"
+  },
+  {
+    "card": "media-tools_1280x720.png",
+    "ok": true,
+    "png": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/media-tools_1280x720.png",
+    "png2x": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/media-tools_1280x720@2x.png",
+    "texts": 10,
+    "viewBox": "40 860 1280 720"
+  },
+  {
+    "card": "agentic-video-editor_1280x720.png",
+    "ok": true,
+    "png": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/agentic-video-editor_1280x720.png",
+    "png2x": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/cards/agentic-video-editor_1280x720@2x.png",
+    "texts": 6,
+    "viewBox": "40 2500 1280 720"
+  }
+]

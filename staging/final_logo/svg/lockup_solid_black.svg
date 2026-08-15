@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 320" width="1024" height="320">
+  <defs>
+    <linearGradient id="snapflow_prism_grad" x1="0%" y1="0%" x2="100%" y2="100%">
+  <stop offset="0%" stop-color="#6366F1"/>
+  <stop offset="50%" stop-color="#3B82F6"/>
+  <stop offset="100%" stop-color="#06B6D4"/>
+</linearGradient>
+  </defs>
+  <rect width="1024" height="320" rx="48" fill="#000000"/>
+  <g transform="translate(60, 40) scale(0.47)">
+    <polygon points="120,80 340,80 440,256 340,432 120,432 220,256" fill="none" stroke="url(#snapflow_prism_grad)" stroke-width="40" stroke-linejoin="round"/>
+<polygon points="247,190 346,256 247,322" fill="url(#snapflow_prism_grad)"/>
+  </g>
+  <text x="340" y="195" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="108" font-weight="800" fill="#FFFFFF" letter-spacing="-2">snap<tspan fill="url(#snapflow_prism_grad)">flow</tspan></text>
+</svg>

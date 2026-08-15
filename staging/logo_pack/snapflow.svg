@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title>Snapflow</title>
+  <rect width="64" height="64" rx="12" fill="#0a0a0a"/>
+  <path d="M18 16h28v8H28l-4 8h22v8H18v-8l4-8h-4z" fill="#6366f1"/>
+</svg>

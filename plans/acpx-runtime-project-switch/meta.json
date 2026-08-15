@@ -1,0 +1,52 @@
+{
+  "plan": "acpx-runtime-project-switch",
+  "status": "in_progress",
+  "updated": "2026-08-05",
+  "plan_doc": "00-plan.md",
+  "source_task": "Fix ACPX client/server failures and project-switch session recovery",
+  "ordering_rationale": "Inspect runtime ownership and session state first, implement lifecycle invariants, then audit and verify.",
+  "completed": [],
+  "pending": [
+    {
+      "phase": "runtime_and_lifecycle_inspection",
+      "order": 1,
+      "tier": 1,
+      "status": "in_progress",
+      "description": "Confirm runtime shutdown and stale session state paths from source and Nitro logs.",
+      "verification": "Source and logs identify exact failing ownership/state transitions."
+    },
+    {
+      "phase": "implement_lifecycle_invariants",
+      "order": 2,
+      "tier": 2,
+      "status": "not_started",
+      "description": "Implement runtime-safe gateway task ownership and explicit detached session state.",
+      "verification": "Focused Rust tests cover shutdown and detach transitions."
+    },
+    {
+      "phase": "project_switch_recovery",
+      "order": 3,
+      "tier": 2,
+      "status": "not_started",
+      "description": "Serialize switch teardown and ensure next prompt reattaches before sending.",
+      "verification": "Project-switch integration test passes."
+    },
+    {
+      "phase": "rust_audit",
+      "order": 4,
+      "tier": "review_gate",
+      "status": "not_started",
+      "description": "Audit touched async, lock, and connection code.",
+      "max_iterations": 2,
+      "verification": "No unresolved runtime/lock/timeout findings."
+    },
+    {
+      "phase": "verification",
+      "order": 5,
+      "tier": "verification_gate",
+      "status": "not_started",
+      "description": "Run focused tests and bounded integration verification.",
+      "verification": "All required matrix rows pass or are explicitly documented."
+    }
+  ]
+}

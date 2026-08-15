@@ -1,0 +1,29 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "plan": "windows-release-consolidation",
+  "plan_doc": "00-plan.md",
+  "status": "in_progress",
+  "updated": "2026-08-10",
+  "source_task": "Consolidate reviewed Windows/runtime/UI fixes, review twice, push, and trigger release builds.",
+  "ordering_rationale": "Integrate and test before review; run two review/fix gates before verification, push, and release runtime gates.",
+  "execution_strategy": {
+    "mode": "serialized_release_workflow",
+    "subagents": true,
+    "blocks": [
+      {"id": "integration", "name": "Clean integration", "phases": ["integrate_squashed_features"], "tasks": ["Cherry-pick and squash reviewed feature worktrees"], "depends_on": []},
+      {"id": "review", "name": "Independent review loops", "phases": ["review_loop_one", "review_loop_two"], "tasks": ["Review, fix, rerun tests twice"], "depends_on": ["integration"], "serialization_reason": "Each review must inspect the previous fixes."},
+      {"id": "verify", "name": "Verification", "phases": ["verification_gate", "runtime_gate"], "tasks": ["Run local matrix, then CI/native Windows gate"], "depends_on": ["review"]},
+      {"id": "publish", "name": "Push and release", "phases": ["push_and_release"], "tasks": ["Push branch/main and create release tag"], "depends_on": ["verify"]}
+    ]
+  },
+  "completed": [],
+  "pending": [
+    {"phase": "integrate_squashed_features", "order": 1, "tier": 3, "status": "in_progress", "description": "Build a clean integration branch from local main and squash feature worktrees."},
+    {"phase": "review_loop_one", "order": 2, "tier": "review_gate", "status": "not_started", "description": "First independent post-integration review/fix loop.", "max_iterations": 3},
+    {"phase": "review_loop_two", "order": 3, "tier": "review_gate", "status": "not_started", "description": "Second independent review/fix loop over loop-one output.", "max_iterations": 3},
+    {"phase": "verification_gate", "order": 4, "tier": "verification_gate", "status": "not_started", "description": "Verify code against the plan and tests.", "misalignments": []},
+    {"phase": "runtime_gate", "order": 5, "tier": "runtime_gate", "status": "not_started", "description": "Run Linux locally and Windows native CI/runtime matrix."},
+    {"phase": "push_and_release", "order": 6, "tier": "note", "status": "not_started", "description": "Push the approved branch/main and create a release tag."}
+  ],
+  "open_risks_ref": "00-plan.md#open-risks"
+}

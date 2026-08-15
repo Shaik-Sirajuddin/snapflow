@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "watch-base": {
+      "source": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/memory/_com/skills/watch-base",
+      "sourceType": "local",
+      "computedHash": "4b05198c57db54b543bb7d976fbafbd08ed7fbb3accd5692a0adfad81b3b452a"
+    }
+  }
+}

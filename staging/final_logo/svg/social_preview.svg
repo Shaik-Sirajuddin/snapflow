@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="snapflow_prism_grad" x1="0%" y1="0%" x2="100%" y2="100%">
+  <stop offset="0%" stop-color="#6366F1"/>
+  <stop offset="50%" stop-color="#3B82F6"/>
+  <stop offset="100%" stop-color="#06B6D4"/>
+</linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#000000"/>
+  <circle cx="600" cy="315" r="400" fill="#6366F1" opacity="0.18" filter="blur(60px)"/>
+  <g transform="translate(180, 155) scale(0.65)">
+    <polygon points="120,80 340,80 440,256 340,432 120,432 220,256" fill="none" stroke="url(#snapflow_prism_grad)" stroke-width="40" stroke-linejoin="round"/>
+<polygon points="247,190 346,256 247,322" fill="url(#snapflow_prism_grad)"/>
+  </g>
+  <text x="530" y="350" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="120" font-weight="800" fill="#FFFFFF" letter-spacing="-3">snap<tspan fill="url(#snapflow_prism_grad)">flow</tspan></text>
+  <text x="535" y="410" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="32" font-weight="500" fill="#94A3B8" letter-spacing="4">NEXT-GEN VIDEO EDITOR</text>
+</svg>

@@ -1,0 +1,117 @@
+{
+  "board": {
+    "x": 24.0,
+    "y": 48.0,
+    "w": 1280.0,
+    "h": 720.0
+  },
+  "truth_text_count": 10,
+  "export_text_count_before": 10,
+  "faults_before_fix": [
+    {
+      "severity": "high",
+      "type": "viewBox_mismatch",
+      "detail": "Export viewBox='0 0 1280 720' crops/shifts board; truth board origin is (24,48). Should be \"24 48 1280 720\"."
+    }
+  ],
+  "fault_count_before": 1,
+  "residual_after_fix": [
+    {
+      "chars": "Motion Effects",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 636.0,
+      "truth_top_y": 615.0
+    },
+    {
+      "chars": "Transitions",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 638.0,
+      "truth_top_y": 615.0
+    },
+    {
+      "chars": "Filters",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 638.0,
+      "truth_top_y": 615.0
+    },
+    {
+      "chars": "snapflow",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 292.5,
+      "truth_top_y": 250.5
+    },
+    {
+      "chars": "codex",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 307.5,
+      "truth_top_y": 294.5
+    },
+    {
+      "chars": "claude",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 307.5,
+      "truth_top_y": 294.5
+    },
+    {
+      "chars": "any",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 307.5,
+      "truth_top_y": 294.5
+    },
+    {
+      "chars": "Agents",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 217.5,
+      "truth_top_y": 204.5
+    },
+    {
+      "chars": "Agents Editing Tools",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 165.85,
+      "truth_top_y": 123.85
+    },
+    {
+      "chars": "Tools",
+      "x_delta": 0.0,
+      "textLength_vs_w": 0.0,
+      "export_baseline_y": 431.01,
+      "truth_top_y": 397.01
+    }
+  ],
+  "visual_png_checks": {
+    "title_strip_black_frac": 0.6027692307692307,
+    "title_strip_white_frac": 0.33371428571428574,
+    "corner_pixel": [
+      244,
+      247,
+      252
+    ],
+    "png_size": [
+      1280,
+      720
+    ]
+  },
+  "files": {
+    "svg": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/Providers-board.svg",
+    "png": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/Providers-board.png",
+    "png2x": "/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/staging/penpot-slide-assets/Providers-board@2x.png",
+    "svg_bytes": 1670576,
+    "png_bytes": 155532,
+    "png2_bytes": 399038
+  },
+  "match_summary": {
+    "texts_present": true,
+    "viewBox_fixed": true,
+    "images_embedded": 7,
+    "max_abs_x_delta": 0.0
+  }
+}
